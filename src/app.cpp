@@ -1,17 +1,126 @@
 #include "app.hpp"
 #include <cassert>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <numeric>
 #include <cmath>
 #include <vector>
 #include <stdexcept>
+#include <chrono>
+#include <fstream>
 #if defined(DLLAMA_VULKAN)
     #include "nn/nn-vulkan.hpp"
 #endif
 
 // 引入 LLM 头文件以获取 createPartitionPlan 等定义
 #include "llm.hpp"
+
+static inline void maybeAppendPerfJsonl(const std::vector<LlmPerfPacket> &perf) {
+    const char *path = std::getenv("DLLAMA_PERF_STREAM_FILE");
+    if (path == nullptr || path[0] == '\0')
+        return;
+    FILE *f = std::fopen(path, "ab");
+    if (!f)
+        return;
+
+    // JSONL: one line per forward()
+    // Example:
+    // {"pos":31,"batch":1,"nodes":[{"node":0,"stage":0,"execUs":123,"syncUs":45}, ...]}
+    const NnUint pos = perf.empty() ? 0u : perf[0].position;
+    const NnUint batch = perf.empty() ? 0u : perf[0].batchSize;
+
+    std::fprintf(f, "{\"pos\":%u,\"batch\":%u,\"nodes\":[", pos, batch);
+    for (size_t i = 0; i < perf.size(); ++i) {
+        const LlmPerfPacket &p = perf[i];
+        if (i) std::fputc(',', f);
+        std::fprintf(
+            f,
+            "{\"node\":%u,\"stage\":%u,\"execUs\":%u,\"syncUs\":%u}",
+            p.nodeIndex,
+            p.stageIndex,
+            p.execUs,
+            p.syncUs);
+    }
+    std::fprintf(f, "]}\n");
+    std::fclose(f);
+}
+
+// ---------------------------------------------------------
+// Startup cost instrumentation (time + memory)
+// Measures: from uneven plan creation start -> inference ready
+// Memory is read from /proc/self/status on Linux.
+// ---------------------------------------------------------
+
+typedef struct {
+    long vmRssKb;
+    long vmHwmKb;
+    long vmSizeKb;
+} ProcMemKb;
+
+static inline ProcMemKb readProcMemKb() {
+    ProcMemKb m;
+    m.vmRssKb = -1;
+    m.vmHwmKb = -1;
+    m.vmSizeKb = -1;
+
+#if defined(__linux__)
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        auto parseKb = [&](const char* key, long& out) {
+            const size_t klen = std::strlen(key);
+            if (line.size() < klen) return;
+            if (line.compare(0, klen, key) != 0) return;
+            std::stringstream ss(line.substr(klen));
+            long v = -1;
+            ss >> v;
+            if (v >= 0) out = v;
+        };
+        parseKb("VmRSS:", m.vmRssKb);
+        parseKb("VmHWM:", m.vmHwmKb);
+        parseKb("VmSize:", m.vmSizeKb);
+        if (m.vmRssKb >= 0 && m.vmHwmKb >= 0 && m.vmSizeKb >= 0) break;
+    }
+#endif
+    return m;
+}
+
+static inline void printStartupCost(
+    const char* role,
+    NnUint nodeIndex,
+    double elapsedMs,
+    const ProcMemKb& mem0,
+    const ProcMemKb& mem1
+) {
+    auto delta = [](long a, long b) -> long {
+        if (a < 0 || b < 0) return -1;
+        return b - a;
+    };
+    const long dRss = delta(mem0.vmRssKb, mem1.vmRssKb);
+    const long dHwm = delta(mem0.vmHwmKb, mem1.vmHwmKb);
+    const long dSize = delta(mem0.vmSizeKb, mem1.vmSizeKb);
+
+    printf("⏱️  [StartupCost] %s Node %u: uneven-plan->inference-ready %.2f ms | ",
+           role ? role : "Node", nodeIndex, elapsedMs);
+
+    if (mem0.vmRssKb >= 0 && mem1.vmRssKb >= 0) {
+        printf("VmRSS %ld->%ldkB (Δ%+ld) | ", mem0.vmRssKb, mem1.vmRssKb, dRss);
+    } else {
+        printf("VmRSS n/a | ");
+    }
+    if (mem0.vmHwmKb >= 0 && mem1.vmHwmKb >= 0) {
+        printf("VmHWM %ld->%ldkB (Δ%+ld) | ", mem0.vmHwmKb, mem1.vmHwmKb, dHwm);
+    } else {
+        printf("VmHWM n/a | ");
+    }
+    if (mem0.vmSizeKb >= 0 && mem1.vmSizeKb >= 0) {
+        printf("VmSize %ld->%ldkB (Δ%+ld)\n", mem0.vmSizeKb, mem1.vmSizeKb, dSize);
+    } else {
+        printf("VmSize n/a\n");
+    }
+}
 
 // ---------------------------------------------------------
 // Root control-packet logging (default OFF)
@@ -586,7 +695,7 @@ void printPartitionPlanDebug(const NnUnevenPartitionPlan* plan) {
     printf("===================================================\n\n");
 }
 
-static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr) {
+static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr, NnLayerShardingTable *layerSharding = nullptr) {
     std::vector<NnExecutorDevice> devices;
 
     if (args->gpuIndex >= 0) {
@@ -602,7 +711,7 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     }
 
     if (args->gpuIndex < 0 || (args->gpuSegmentFrom >= 0 && args->gpuSegmentTo >= 0)) {
-        devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan), -1, -1));
+        devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan, layerSharding), -1, -1));
     }
     return devices;
 }
@@ -689,6 +798,10 @@ void RootLlmInference::forward() {
         }
         network->readMany(nWorkers, &ios[0]);
     }
+
+    // Optional structured perf stream for external schedulers.
+    // Enable by setting: DLLAMA_PERF_STREAM_FILE=/tmp/dllama_perf.jsonl
+    maybeAppendPerfJsonl(lastPerf);
 }
 
 void RootLlmInference::finish() {
@@ -743,6 +856,14 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::unique_ptr<NnUnevenPartitionPlan> planPtr;
     std::vector<float> ratios;
 
+    const bool unevenEnabled = (args->ratiosStr != nullptr);
+    std::chrono::steady_clock::time_point startupT0;
+    ProcMemKb startupMem0;
+    if (unevenEnabled) {
+        startupT0 = std::chrono::steady_clock::now();
+        startupMem0 = readProcMemKb();
+    }
+
     if(args->ratiosStr != nullptr){
         printf("nNodes=%d\n", nNodes);
         std::vector<NnStageDef> stageDefs = parseStageDefs(args->ratiosStr, nNodes, header.nLayers);
@@ -776,6 +897,11 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     NnNetExecution execution(args->nThreads, &net.netConfig);
 
+    std::unique_ptr<NnLayerShardingTable> layerSharding;
+    if (net.netConfig.nNodes > 0u && header.nLayers > 0u) {
+        layerSharding.reset(new NnLayerShardingTable(header.nLayers, net.netConfig.nNodes));
+    }
+
     std::unique_ptr<NnNodeSynchronizer> synchronizer(nullptr);
     std::unique_ptr<NnNetwork> networkPtr(nullptr);
     NnNetwork *network = nullptr;
@@ -793,13 +919,13 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         }
 
         // 初始化 Synchronizer (传入 Plan)
-        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get()));
+        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get(), layerSharding.get()));
 
         NnRootConfigWriter configWriter(network);
         configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
     }
 
-    std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
+    std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get(), layerSharding.get());
     const bool profileEnabled = args->benchmark;
     NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), profileEnabled);
 
@@ -838,6 +964,13 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     context.network = network;
     context.executor = &executor;
 
+    if (unevenEnabled) {
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - startupT0).count() / 1000.0;
+        const ProcMemKb mem1 = readProcMemKb();
+        printStartupCost("Root", 0, ms, startupMem0, mem1);
+    }
+
     handler(&context);
 
     inference.finish();
@@ -871,10 +1004,28 @@ void runWorkerApp(AppCliArgs *args) {
 
         NnNetExecution execution(args->nThreads, &netConfig);
 
+        // Runtime sharding table (optional): allows OP_UPDATE_SHARDING to apply updates and matmul to read epoch/start/len.
+        // We size it using the boot header so it matches the global layer count.
+        std::unique_ptr<NnLayerShardingTable> layerSharding;
+        if (!bootModelPath.empty()) {
+            LlmHeader shardingHeader = loadLlmHeader((char*)bootModelPath.c_str(), bootMaxSeqLen, bootSyncType);
+            if (shardingHeader.nLayers > 0u && netConfig.nNodes > 0u) {
+                layerSharding.reset(new NnLayerShardingTable(shardingHeader.nLayers, netConfig.nNodes));
+            }
+        }
+
            // 1. Initialize Plan Pointer (Worker Side)
            std::unique_ptr<NnUnevenPartitionPlan> planPtr;
         
+        std::chrono::steady_clock::time_point startupT0;
+        ProcMemKb startupMem0;
+        bool unevenEnabled = false;
+
            if (useLocalLoading) {
+               unevenEnabled = true;
+               startupT0 = std::chrono::steady_clock::now();
+               startupMem0 = readProcMemKb();
+
                // Worker 需要重新加载 Header 和 Plan 以确定加载逻辑和切分
                LlmHeader header = loadLlmHeader((char*)bootModelPath.c_str(), bootMaxSeqLen, bootSyncType);
              
@@ -892,10 +1043,10 @@ void runWorkerApp(AppCliArgs *args) {
              ));
         }
 
-        std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
+        std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get(), layerSharding.get());
         
         // Initialize Synchronizer with Plan
-        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get());
+        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get(), layerSharding.get());
         
         // Benchmark flag is provided by root to keep all nodes consistent.
         // Worker CLI --benchmark is no longer required.
@@ -931,6 +1082,14 @@ void runWorkerApp(AppCliArgs *args) {
         }
 
         WorkerLlmInference inference(&execution, network);
+
+        if (unevenEnabled) {
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - startupT0).count() / 1000.0;
+            const ProcMemKb mem1 = readProcMemKb();
+            printStartupCost("Worker", nodeConfig.nodeIndex, ms, startupMem0, mem1);
+        }
+
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;

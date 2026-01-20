@@ -23,6 +23,13 @@ public:
     NnSize loadColMatmulSlicesUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex, 
                                      std::function<NnColMatmulSliceUneven(NnUint)> slicer, NnByte *weight);
 
+    // Stage-local weight replication: load slices for all nodes in the given stage,
+    // packing them sequentially into this op's weight buffer (per expert).
+    NnSize loadRowMatmulSlicesUnevenReplicated(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                              std::function<NnRowMatmulSliceUneven(NnUint)> slicer, const NnStageConfig *stage, NnByte *weight);
+    NnSize loadColMatmulSlicesUnevenReplicated(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                              std::function<NnColMatmulSliceUneven(NnUint)> slicer, const NnStageConfig *stage, NnByte *weight);
+
     void finish(); // 空实现
 
 private:

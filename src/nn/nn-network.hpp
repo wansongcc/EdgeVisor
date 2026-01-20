@@ -4,6 +4,10 @@
 #include "nn-executor.hpp"
 #include "nn-core.hpp"
 
+#include <atomic>
+#include <ctime>
+#include <vector>
+
 #define ROOT_SOCKET_INDEX 0
 
 void initSockets();
@@ -81,10 +85,45 @@ private:
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
     const NnUnevenPartitionPlan *plan;
+    const NnLayerShardingTable *layerSharding;
     const NnStageConfig* myStage = nullptr;
+
+    // Local barrier for multi-threaded sync implementation.
+    std::atomic_uint localBarrierCount {0u};
+    std::atomic_uint localBarrierPhase {0u};
+    
+
+    // Root-only bookkeeping: env-trigger emits at most one update per layer.
+    std::vector<NnByte> envLayerUpdated;
+
+    // Root-only: file-trigger polling state.
+    // NOTE: runtime sharding update file is gated by last command line content (hash), not mtime.
+    uint64_t shardingUpdateLastLineHash {0ull};
+    std::time_t shardingUpdateFileMtime {0};
+    std::atomic_uint shardingEpoch {0u};
+    bool pendingShardingUpdate {false};
+    bool pendingShardingUpdateHasPos {false};
+    NnUint pendingShardingUpdateLayer {0u};
+    NnUint pendingShardingUpdatePos {0u};
+    bool pendingShardingUpdateHasHeadLens {false};
+    std::vector<NnUint> pendingShardingUpdateStageNodes;
+    std::vector<NnUint> pendingShardingUpdateHeadLens;
+
+    // Debug/validation: allow a one-shot forced sharding override without an external scheduler.
+    bool forcedShardingOnceArmed {false};
+    bool forcedShardingOnceDone {false};
+
+    // When true, the pending update is "locked" (e.g. forced override) and cannot be overwritten by file polling.
+    bool pendingShardingUpdateLocked {false};
+
+    // Per-node logging/diagnostics: track the latest sharding epoch we've observed.
+    NnUint lastSeenShardingEpoch {0u};
 public:
-    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr);
+    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr, const NnLayerShardingTable *layerSharding = nullptr);
     ~NnNetworkNodeSynchronizer() override {};
+
+    void localBarrier(NnUint nThreads, NnUint threadIndex);
+    
     void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override;
 };
 

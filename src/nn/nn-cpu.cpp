@@ -1,9 +1,17 @@
 #include "nn-cpu.hpp"
 #include "nn-cpu-ops.hpp"
+
+#ifndef NN_LOGITS_COMM_DATA_LOG
+#define NN_LOGITS_COMM_DATA_LOG 0
+#endif
+
 #include "nn-core.hpp"
 #include <cassert>
 #include <iostream> 
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <cmath>
 #include <stdexcept>
 #include <thread>
 #ifdef _WIN32
@@ -18,6 +26,7 @@
 
 #define BUFFER_ALIGNMENT 64
 
+
 static NnByte *allocAlignedBuffer(NnSize size) {
     NnByte *buffer;
 #ifdef _WIN32
@@ -31,6 +40,32 @@ static NnByte *allocAlignedBuffer(NnSize size) {
 #endif
     return buffer;
 }
+
+#if NN_LOGITS_COMM_DATA_LOG
+static inline std::uint64_t hashBytes(const void *data, NnSize size) {
+    const std::uint8_t *p = (const std::uint8_t *)data;
+    std::uint64_t h = 1469598103934665603ull;
+    for (NnSize i = 0; i < size; ++i) {
+        h ^= (std::uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void logF32Stats(const char *tag, const float *data, NnUint n) {
+    if (data == nullptr || n == 0u) return;
+    float minv = data[0];
+    float maxv = data[0];
+    NnUint nnz = 0u;
+    for (NnUint i = 0u; i < n; ++i) {
+        const float v = data[i];
+        if (v != 0.0f) nnz++;
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+    }
+    printf("%s n=%u min=%g max=%g nnz=%u\n", tag, n, minv, maxv, nnz);
+}
+#endif
 
 static void releaseAlignedBuffer(NnByte *buffer) {
 #ifdef _WIN32
@@ -76,11 +111,12 @@ static NnUint getSplitTotalForStage(const NnDimSplit* split, const NnStageConfig
 }
 
 
-NnCpuDevice::NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan) {
+NnCpuDevice::NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan, NnLayerShardingTable *layerSharding) {
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
     this->netExecution = netExecution;
     this->partitionPlan = partitionPlan;
+    this->layerSharding = layerSharding;
 
     printCpuInstructionSet();
 
@@ -94,6 +130,10 @@ NnCpuDevice::NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNet
 
     bufferFlags = new NnByte[nBuffers];
     std::memset(bufferFlags, 0, nBuffers * sizeof(NnByte));
+    
+    #ifndef NN_LOGITS_COMM_DATA_LOG
+    #define NN_LOGITS_COMM_DATA_LOG 0
+    #endif
 }
 
 NnCpuDevice::~NnCpuDevice() {
@@ -168,14 +208,41 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
         NnCpuOpContext *opContext = &opContexts[opIndex];
         NnCpuOpForwardInit opInit = getCpuOpForwardInit(opConfig->code, opQuants[opIndex]);
         opContext->name = opConfig->name;
+        opContext->nodeIndex = nodeConfig->nodeIndex;
         opContext->opConfig = opConfig->config;
+        opContext->opCode = (NnUint)opConfig->code;
+        opContext->opIndex = opIndex;
+        opContext->opConfigSize = opConfig->configSize;
         opContext->weightSize = opConfig->weightSize;
+
+        // NOTE: In distributed mode, NnOpConfig is received over the wire and may not carry
+        // newer fields (or those fields may be uninitialized). Never trust opConfig->weightAllocBytes.
+        // Instead, derive the allocation size from stable metadata:
+        // - Default: weightSize.nBytes
+        // - Replicated matmul: replicateExpertStrideBytes * nExperts
+        NnSize weightAllocBytes = opConfig->weightSize.nBytes;
+        if (opConfig->code == OP_MATMUL && opConfig->configSize >= sizeof(NnMatmulOpConfig)) {
+            const NnMatmulOpConfig *cfg = (const NnMatmulOpConfig *)opConfig->config;
+            if (cfg != nullptr && cfg->replicateMode != 0u) {
+                if (cfg->replicateExpertStrideBytes > 0) {
+                    // For non-MoE matmul, cfg->nExperts is 0 but we still have one matrix.
+                    const size_t nExpertsOr1 = (cfg->nExperts == 0u) ? 1u : (size_t)cfg->nExperts;
+                    const size_t total = (size_t)cfg->replicateExpertStrideBytes * nExpertsOr1;
+                    weightAllocBytes = (NnSize)total;
+                }
+            }
+        }
+        if (weightAllocBytes < opConfig->weightSize.nBytes)
+            weightAllocBytes = opConfig->weightSize.nBytes;
+        opContext->weightAllocBytes = weightAllocBytes;
         opContext->nBatches = netConfig->nBatches;
         opContext->pipes = netExecution->pipes;
         opContext->pipeConfigs = netConfig->pipes;
+        opContext->nPipes = netConfig->nPipes;
         opContext->buffers = buffers;
         opContext->bufferConfigs = nodeConfig->buffers;
         opContext->bufferFlags = bufferFlags;
+        opContext->layerSharding = this->layerSharding;
 
         opContext->input = new NnByte *[inputsPtr[opIndex].size()];
         opContext->inputSize = inputSizes[opIndex];
@@ -188,11 +255,37 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
         std::memcpy(opContext->output, outputsPtr[opIndex].data(), outputsPtr[opIndex].size() * sizeof(NnByte *));
 
 #if not(DEBUG_USE_MMAP_FOR_WEIGHTS)
-        if (opContext->weightSize.nBytes > 0)
-            opContext->weight = allocAlignedBuffer(opContext->weightSize.nBytes);
+        if (opContext->weightAllocBytes > 0)
+            opContext->weight = allocAlignedBuffer(opContext->weightAllocBytes);
         else
             opContext->weight = nullptr;
 #endif
+
+        // Debug: confirm stage-local replicated weight packing is active.
+        // Printed at segment creation time.
+        bool replicationEnabled = true;
+        const char *rep = std::getenv("DLLAMA_STAGE_REPLICATE_WEIGHTS");
+        if (rep != nullptr) {
+            if (std::strcmp(rep, "0") == 0 || std::strcmp(rep, "false") == 0 || std::strcmp(rep, "FALSE") == 0 ||
+                std::strcmp(rep, "no") == 0 || std::strcmp(rep, "NO") == 0) {
+                replicationEnabled = false;
+            }
+        }
+        if (opConfig->code == OP_MATMUL && replicationEnabled) {
+            const NnMatmulOpConfig *cfg = (const NnMatmulOpConfig *)opContext->opConfig;
+            if (cfg != nullptr && cfg->replicateMode != 0u) {
+                std::printf(
+                    "🧩 ReplicateWeights node=%u op=%s[%u] alloc=%zu slice=%zu myOff=%zu stride=%zu nExperts=%u\n",
+                    nodeConfig->nodeIndex,
+                    opConfig->name,
+                    opConfig->index,
+                    (size_t)opContext->weightAllocBytes,
+                    (size_t)opContext->weightSize.nBytes,
+                    (size_t)cfg->replicateMyOffsetBytes,
+                    (size_t)cfg->replicateExpertStrideBytes,
+                    cfg->nExperts);
+            }
+        }
 
         if (opInit != nullptr)
             opInit(opContext);
@@ -207,7 +300,7 @@ NnCpuDeviceSegment::~NnCpuDeviceSegment() {
         delete[] context->input;
         delete[] context->output;
 #if not(DEBUG_USE_MMAP_FOR_WEIGHTS)
-        if (context->weightSize.nBytes > 0)
+    if (context->weightAllocBytes > 0)
             releaseAlignedBuffer(context->weight);
 #endif
     }
@@ -378,17 +471,17 @@ void NnCpuDeviceSegment::loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes
     assert(opIndex >= 0u);
     assert(opIndex < nOps);
     NnCpuOpContext *context = &opContexts[opIndex];
-    if (offset + nBytes > context->weightSize.nBytes) {
+    if (offset + nBytes > context->weightAllocBytes) {
         std::cerr << "🚨 CRITICAL ERROR in loadWeight:" << std::endl;
         std::cerr << "   Op Name: " << (context->name ? context->name : "Unknown") << std::endl;
         std::cerr << "   Op Index: " << opIndex << std::endl;
         std::cerr << "   Offset: " << offset << std::endl;
         std::cerr << "   Write Bytes: " << nBytes << std::endl;
         std::cerr << "   Required (Offset + Bytes): " << (offset + nBytes) << std::endl;
-        std::cerr << "   Allocated Size: " << context->weightSize.nBytes << std::endl;
-        std::cerr << "   Diff: " << (long long)(offset + nBytes) - (long long)context->weightSize.nBytes << std::endl;
+        std::cerr << "   Allocated Size: " << context->weightAllocBytes << std::endl;
+        std::cerr << "   Diff: " << (long long)(offset + nBytes) - (long long)context->weightAllocBytes << std::endl;
     }
-    assert(offset + nBytes <= context->weightSize.nBytes);
+    assert(offset + nBytes <= context->weightAllocBytes);
 #if DEBUG_USE_MMAP_FOR_WEIGHTS
     assert(offset == 0u);
     context->weight = weight;
@@ -402,4 +495,112 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     // printf("forward: %d %s (%d/%d)\n", opIndex, context->name, threadIndex + 1, nThreads); fflush(stdout);
 
     opForward[opIndex](nThreads, threadIndex, batchSize, context);
+
+#if NN_LOGITS_COMM_DATA_LOG
+    if (threadIndex == 0u && context->name != nullptr) {
+        if (std::strncmp(context->name, "final_", 6) == 0) {
+            printf("[LOGITS][OP] node=%u op=%s[%u] inPtr=%p outPtr=%p inX=%u outX=%u inFt=%d outFt=%d\n",
+                context->nodeIndex,
+                context->name,
+                context->opIndex,
+                (context->input && context->input[0]) ? (void *)context->input[0] : nullptr,
+                (context->output && context->output[0]) ? (void *)context->output[0] : nullptr,
+                context->inputSize.x,
+                context->outputSize.x,
+                (int)context->inputSize.floatType,
+                (int)context->outputSize.floatType);
+        }
+        if (std::strcmp(context->name, "final_norm") == 0) {
+            printf("[LOGITS][OP] node=%u op=%s[%u] outPtr=%p outX=%u outFt=%d\n",
+                context->nodeIndex,
+                context->name,
+                context->opIndex,
+                (context->output && context->output[0]) ? (void *)context->output[0] : nullptr,
+                context->outputSize.x,
+                (int)context->outputSize.floatType);
+            if (context->output && context->output[0] && context->outputSize.floatType == F_32) {
+                logF32Stats("[LOGITS][NORM]", (const float *)context->output[0], context->outputSize.x);
+            }
+        }
+
+        if (std::strcmp(context->name, "final_cast_y") == 0) {
+            printf("[LOGITS][OP] node=%u op=%s[%u] inPtr=%p outPtr=%p inX=%u outX=%u inFt=%d outFt=%d\n",
+                context->nodeIndex,
+                context->name,
+                context->opIndex,
+                (context->input && context->input[0]) ? (void *)context->input[0] : nullptr,
+                (context->output && context->output[0]) ? (void *)context->output[0] : nullptr,
+                context->inputSize.x,
+                context->outputSize.x,
+                (int)context->inputSize.floatType,
+                (int)context->outputSize.floatType);
+            if (context->input && context->input[0] && context->inputSize.floatType == F_32) {
+                logF32Stats("[LOGITS][CAST_IN ]", (const float *)context->input[0], context->inputSize.x);
+            }
+            if (context->output && context->output[0]) {
+                const NnSize bytes = getBytes(context->outputSize.floatType, context->outputSize.x);
+                const NnSize hashLen = std::min(bytes, (NnSize)65536);
+                const std::uint64_t h = hashBytes(context->output[0], hashLen);
+                printf("[LOGITS][CAST_OUT] bytes=%zu hashLen=%zu hash=0x%016llx\n",
+                    (size_t)bytes, (size_t)hashLen, (unsigned long long)h);
+            }
+        }
+
+        if (std::strcmp(context->name, "final_matmul_logits") == 0 || std::strcmp(context->name, "final_cast_logits") == 0) {
+            printf("[LOGITS][OP] node=%u op=%s[%u] inPtr=%p outPtr=%p inX=%u outX=%u inFt=%d outFt=%d\n",
+                context->nodeIndex,
+                context->name,
+                context->opIndex,
+                (context->input && context->input[0]) ? (void *)context->input[0] : nullptr,
+                (context->output && context->output[0]) ? (void *)context->output[0] : nullptr,
+                context->inputSize.x,
+                context->outputSize.x,
+                (int)context->inputSize.floatType,
+                (int)context->outputSize.floatType);
+
+            if (context->input && context->input[0] && context->inputSize.floatType == F_32) {
+                logF32Stats("[LOGITS][IN ]", (const float *)context->input[0], context->inputSize.x);
+            } else if (context->input && context->input[0]) {
+                const NnSize bytes = getBytes(context->inputSize.floatType, context->inputSize.x);
+                const NnSize hashLen = std::min(bytes, (NnSize)65536);
+                const std::uint64_t h = hashBytes(context->input[0], hashLen);
+                printf("[LOGITS][INQ] bytes=%zu hashLen=%zu hash=0x%016llx\n",
+                    (size_t)bytes, (size_t)hashLen, (unsigned long long)h);
+            }
+            if (context->output && context->output[0] && context->outputSize.floatType == F_32) {
+                logF32Stats("[LOGITS][OUT]", (const float *)context->output[0], context->outputSize.x);
+            }
+            if (std::strcmp(context->name, "final_matmul_logits") == 0 && context->weight != nullptr) {
+                const NnSize wBytes = context->weightAllocBytes;
+                const NnSize hashLen = std::min(wBytes, (NnSize)65536);
+                const std::uint64_t h = hashBytes(context->weight, hashLen);
+                printf("[LOGITS][W] bytes=%zu hashLen=%zu hash=0x%016llx\n",
+                    (size_t)wBytes, (size_t)hashLen, (unsigned long long)h);
+            }
+        }
+    }
+
+    if (threadIndex == 0u && context->output != nullptr && context->output[0] != nullptr) {
+        NnByte *out0 = context->output[0];
+        if (context->pipes != nullptr && context->pipeConfigs != nullptr && context->nPipes > 0u) {
+            for (NnUint pi = 0u; pi < context->nPipes; ++pi) {
+                NnByte *base = context->pipes[pi];
+                const NnSize pipeBytes = context->pipeConfigs[pi].size.nBytes;
+                if (base != nullptr && out0 >= base && out0 < (base + pipeBytes)) {
+                    const NnSize off = (NnSize)(out0 - base);
+                    printf("[PIPE][WRITE] node=%u op=%s[%u] pipe=%u outPtr=%p off=%zu pipeBytes=%zu\n",
+                        context->nodeIndex,
+                        context->name ? context->name : "(null)",
+                        context->opIndex,
+                        pi,
+                        (void *)out0,
+                        (size_t)off,
+                        (size_t)pipeBytes);
+                    break;
+                }
+            }
+        }
+    }
+#endif
+
 }

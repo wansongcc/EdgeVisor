@@ -103,3 +103,34 @@ NnSize NnLocalWeightLoader::loadColMatmulSlicesUneven(const char *opName, const 
     // 5. 关键：返回 Tensor 的【全局大小】
     return slice.size.nBytes;
 }
+
+NnSize NnLocalWeightLoader::loadRowMatmulSlicesUnevenReplicated(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                                                std::function<NnRowMatmulSliceUneven(NnUint)> slicer, const NnStageConfig *stage, NnByte *weight) {
+    if (stage == nullptr || stage->nNodes == 0 || stage->nodeIndices == nullptr)
+        return loadRowMatmulSlicesUneven(opName, opIndex, expertIndex, slicer, weight);
+
+    // Replicated stage-weights mode:
+    // Load the full global tensor as-is. Compute will select its shard by row-offset.
+    const NnRowMatmulSliceUneven globalSlice = slicer(stage->nodeIndices[0]);
+    const NnSize expertStrideBytes = globalSlice.size.nBytes;
+    const NnSize deviceOffset = (NnSize)expertIndex * expertStrideBytes;
+    executor->loadWeight(opName, opIndex, deviceOffset, globalSlice.size.nBytes, weight);
+    return globalSlice.size.nBytes;
+}
+
+NnSize NnLocalWeightLoader::loadColMatmulSlicesUnevenReplicated(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                                                std::function<NnColMatmulSliceUneven(NnUint)> slicer, const NnStageConfig *stage, NnByte *weight) {
+    if (stage == nullptr || stage->nNodes == 0 || stage->nodeIndices == nullptr)
+        return loadColMatmulSlicesUneven(opName, opIndex, expertIndex, slicer, weight);
+
+    // Replicated stage-weights mode:
+    // Instead of packing per-node slices back-to-back (which makes dynamic IN_COLS selection hard),
+    // load the full global tensor as-is. Compute will use a strided kernel to select its shard.
+    //
+    // slice.size.nBytes is the full global tensor byte-size.
+    const NnColMatmulSliceUneven globalSlice = slicer(stage->nodeIndices[0]);
+    const NnSize expertStrideBytes = globalSlice.size.nBytes;
+    const NnSize deviceOffset = (NnSize)expertIndex * expertStrideBytes;
+    executor->loadWeight(opName, opIndex, deviceOffset, globalSlice.size.nBytes, weight);
+    return globalSlice.size.nBytes;
+}

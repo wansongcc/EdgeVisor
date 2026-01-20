@@ -11,19 +11,40 @@ typedef SSIZE_T ssize_t;
 #include <netdb.h>  // for getaddrinfo
 #endif
 #include "nn-network.hpp"
+
+#include <sys/stat.h>
 #include "nn-core.hpp"
 #include <cassert>
+#include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 #include <chrono>
 #include <fcntl.h>
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 #define SOCKET_LAST_ERRCODE errno
 #define SOCKET_LAST_ERROR strerror(errno)
 
 #define ACK 23571114
 #define MAX_CHUNK_SIZE 65536
+
+// ---------------------------------------------------------
+// Optional readMany timeout for debugging hangs.
+// Default 0 (disabled; preserves legacy blocking behavior).
+// Enable with: -DNN_NETWORK_READ_MANY_TIMEOUT_MS=5000
+// ---------------------------------------------------------
+#ifndef NN_NETWORK_READ_MANY_TIMEOUT_MS
+#define NN_NETWORK_READ_MANY_TIMEOUT_MS 0
+#endif
+
+// Optional diagnostics for readMany timeout.
+#ifndef NN_NETWORK_READ_MANY_DIAG
+#define NN_NETWORK_READ_MANY_DIAG 1
+#endif
 
 static inline bool isEagainError() {
     #ifdef _WIN32
@@ -47,6 +68,16 @@ static NnUint getGroupRootIndex(const NnStageConfig* stage) {
     }
     // 如果是全局同步，Root 是全局 Node 0
     return 0;
+}
+
+static inline bool shardingUpdateDebugEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_SHARDING_UPDATE");
+    return v != nullptr && v[0] == '1';
+}
+
+static inline bool shardingMatmulDebugEnabledOnRoot() {
+    const char *v = std::getenv("DLLAMA_DEBUG_SHARDING_MATMUL");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
 static inline void setNonBlocking(int socket, bool enabled) {
@@ -143,6 +174,122 @@ static NnUint getSplitTotalForStageNodes(const NnDimSplit& split, const NnStageC
         sum += split.lengths[stage->nodeIndices[i]];
     }
     return sum;
+}
+
+static NnUint getSplitTotalForStageNodesRuntime(const NnDimSplit *split, const NnStageConfig* stage, NnUint nNodes) {
+    if (split == nullptr || split->lengths == nullptr) return 0u;
+    if (!stage) {
+        NnUint sum = 0u;
+        for (NnUint i = 0u; i < nNodes; ++i) sum += split->lengths[i];
+        return sum;
+    }
+    NnUint sum = 0u;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        sum += split->lengths[stage->nodeIndices[i]];
+    }
+    return sum;
+}
+
+static bool fillRuntimeSlicesFromSharding(
+    const NnLayerShardingTable *layerSharding,
+    NnUint layerIndex,
+    NnUint nNodes,
+    NnSize totalBytes,
+    std::vector<NnSize>& offsets,
+    std::vector<NnSize>& sizes,
+    NnFloatType floatType,
+    const NnStageConfig* stageForSplit,
+    NnUint totalElements
+) {
+    if (layerSharding == nullptr) return false;
+    const NnUint epoch = layerSharding->epoch.load(std::memory_order_acquire);
+    if (epoch == 0u) return false;
+    if (layerIndex >= layerSharding->nLayers) return false;
+
+    bool matchFound = false;
+    bool stackedByNode = false;
+
+    for (NnUint i = 0; i < nNodes; ++i) {
+        offsets[i] = 0;
+        sizes[i] = 0;
+    }
+
+    const NnLayerSplits &ls = layerSharding->layers[layerIndex];
+
+    if (stageForSplit != nullptr && totalElements > 0) {
+        const NnUint dimTotal = getSplitTotalForStageNodesRuntime(&ls.dimSplit, stageForSplit, nNodes);
+        if (dimTotal > 0 && totalElements == dimTotal * nNodes) {
+            stackedByNode = true;
+        }
+    }
+
+    if (stackedByNode) {
+        if (totalBytes % nNodes == 0) {
+            const NnSize slotBytes = totalBytes / nNodes;
+            for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                const NnUint node = stageForSplit->nodeIndices[k];
+                offsets[node] = (NnSize)node * slotBytes;
+                sizes[node] = slotBytes;
+            }
+            matchFound = true;
+        }
+    }
+
+    auto tryMatch = [&](const NnDimSplit &split, bool allowMultiplier) -> bool {
+        if (stackedByNode) return false;
+        const NnUint totalUnits = getSplitTotalForStageNodesRuntime(&split, stageForSplit, nNodes);
+        if (totalUnits == 0u) return false;
+
+        if (totalElements > 0) {
+            if (totalElements % totalUnits == 0u) {
+                const NnUint multiplier = totalElements / totalUnits;
+                if (!allowMultiplier && multiplier != 1u) return false;
+                if (stageForSplit) {
+                    for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                        const NnUint node = stageForSplit->nodeIndices[k];
+                        const NnUint offElems = split.starts[node] * multiplier;
+                        const NnUint lenElems = split.lengths[node] * multiplier;
+                        offsets[node] = getBytes(floatType, offElems);
+                        sizes[node] = getBytes(floatType, lenElems);
+                    }
+                } else {
+                    for (NnUint node = 0; node < nNodes; ++node) {
+                        const NnUint offElems = split.starts[node] * multiplier;
+                        const NnUint lenElems = split.lengths[node] * multiplier;
+                        offsets[node] = getBytes(floatType, offElems);
+                        sizes[node] = getBytes(floatType, lenElems);
+                    }
+                }
+                return true;
+            }
+        }
+
+        if (totalBytes % totalUnits == 0u) {
+            const NnSize bytesPerUnit = totalBytes / totalUnits;
+            if (stageForSplit) {
+                for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                    const NnUint node = stageForSplit->nodeIndices[k];
+                    offsets[node] = (NnSize)split.starts[node] * bytesPerUnit;
+                    sizes[node] = (NnSize)split.lengths[node] * bytesPerUnit;
+                }
+            } else {
+                for (NnUint node = 0; node < nNodes; ++node) {
+                    offsets[node] = (NnSize)split.starts[node] * bytesPerUnit;
+                    sizes[node] = (NnSize)split.lengths[node] * bytesPerUnit;
+                }
+            }
+            return true;
+        }
+        return false;
+    };
+
+    if (!matchFound) matchFound = tryMatch(ls.vocabSplit, false);
+    if (!matchFound) matchFound = tryMatch(ls.ffnSplit, false);
+    if (!matchFound) matchFound = tryMatch(ls.dimSplit, false);
+    if (!matchFound) matchFound = tryMatch(ls.headSplit, true);
+    if (!matchFound) matchFound = tryMatch(ls.kvHeadSplit, true);
+
+    return matchFound;
 }
 
 static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, NnSize totalBytes, 
@@ -750,6 +897,13 @@ void NnNetwork::writeAll(void *data, NnSize size) {
 }
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
+#if NN_NETWORK_READ_MANY_TIMEOUT_MS > 0 && !defined(_WIN32)
+    // Use poll() to avoid indefinite blocking when a peer never sends.
+    // This is especially useful for diagnosing deadlocks / missing replies.
+    const auto start = std::chrono::steady_clock::now();
+    const int timeoutMs = (int)NN_NETWORK_READ_MANY_TIMEOUT_MS;
+#endif
+
     bool isReading;
     NnSize nBytes = 0;
     for (NnUint i = 0; i < n; i++) {
@@ -759,6 +913,47 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     }
     do {
         isReading = false;
+
+#if NN_NETWORK_READ_MANY_TIMEOUT_MS > 0 && !defined(_WIN32)
+        // Build pollfd list for sockets that still need data.
+        std::vector<pollfd> fds;
+        fds.reserve(n);
+        std::vector<NnUint> idxMap;
+        idxMap.reserve(n);
+        for (NnUint i = 0; i < n; i++) {
+            NnSocketIo *io = &ios[i];
+            if (io->size == 0) continue;
+            pollfd pfd;
+            pfd.fd = sockets[io->socketIndex];
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            fds.push_back(pfd);
+            idxMap.push_back(i);
+        }
+
+        if (!fds.empty()) {
+            int pr = ::poll(fds.data(), fds.size(), timeoutMs);
+            if (pr == 0) {
+                // Timeout: print pending sockets and remaining bytes.
+#if NN_NETWORK_READ_MANY_DIAG
+                const auto now = std::chrono::steady_clock::now();
+                const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                fprintf(stderr, "🚨 readMany timeout after %lldms (want=%u) pending=", (long long)elapsedMs, n);
+                for (NnUint i = 0; i < n; i++) {
+                    NnSocketIo *io = &ios[i];
+                    if (io->size == 0) continue;
+                    fprintf(stderr, "[%u sockIndex=%u fd=%d remaining=%zu] ", i, io->socketIndex, sockets[io->socketIndex], (size_t)io->size);
+                }
+                fprintf(stderr, "\n");
+#endif
+                throw NnTransferSocketException(ETIMEDOUT, "readMany timeout (peer did not send)");
+            }
+            if (pr < 0) {
+                throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
+            }
+        }
+#endif
+
         for (NnUint i = 0; i < n; i++) {
             NnSocketIo *io = &ios[i];
             if (io->size > 0) {
@@ -912,6 +1107,474 @@ static void syncWithRoot(
     }
 }
 
+// =====================================================================================
+// Stage-root sharding update decision + packed message
+// =====================================================================================
+
+static bool tryParseEnvUint(const char *name, NnUint *out) {
+    const char *env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0')
+        return false;
+    char *end = nullptr;
+    unsigned long v = std::strtoul(env, &end, 10);
+    if (end == env)
+        return false;
+    if (v > 0xfffffffful)
+        return false;
+    *out = (NnUint)v;
+    return true;
+}
+
+static bool tryReadFileToBuffer(const char *path, char *buf, size_t bufSize) {
+    if (path == nullptr || path[0] == '\0' || buf == nullptr || bufSize == 0)
+        return false;
+    FILE *f = std::fopen(path, "rb");
+    if (!f)
+        return false;
+    const size_t n = std::fread(buf, 1, bufSize - 1, f);
+    std::fclose(f);
+    buf[n] = '\0';
+    return n > 0;
+}
+
+static const char *getShardingUpdateRequestFilePath() {
+    // Default request file path for runtime sharding updates.
+    // Can be overridden by setting DLLAMA_SHARDING_UPDATE_FILE.
+    const char *p = std::getenv("DLLAMA_SHARDING_UPDATE_FILE");
+    if (p != nullptr && p[0] != '\0')
+        return p;
+    return "/tmp/dllama_sharding_update.req";
+}
+
+static bool parseUintList(const char *s, std::vector<NnUint> &out) {
+    out.clear();
+    if (s == nullptr) return false;
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+        if (*p == '\0') break;
+
+        // Stop list when the next token isn't a number (e.g. next key like "head_lens=").
+        if (*p < '0' || *p > '9')
+            break;
+
+        char *end = nullptr;
+        unsigned long v = std::strtoul(p, &end, 10);
+        if (end == p)
+            break;
+        out.push_back((NnUint)v);
+        p = end;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == ',') {
+            ++p;
+            continue;
+        }
+        // Otherwise, next loop will skip whitespace and either parse another number
+        // (if there's a comma-separated continuation) or stop on a non-number token.
+    }
+    return !out.empty();
+}
+
+static uint64_t fnv1a64(const char *s) {
+    // FNV-1a 64-bit
+    uint64_t h = 1469598103934665603ull;
+    if (s == nullptr)
+        return h;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static bool extractLastNonEmptyLine(const char *buf, char *out, size_t outCap) {
+    if (out == nullptr || outCap == 0)
+        return false;
+    out[0] = '\0';
+    if (buf == nullptr)
+        return false;
+
+    // Find end
+    const char *end = buf;
+    while (*end)
+        ++end;
+
+    // Trim trailing whitespace/newlines
+    const char *p = end;
+    while (p > buf) {
+        const char c = p[-1];
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            --p;
+            continue;
+        }
+        break;
+    }
+    if (p <= buf)
+        return false;
+
+    // Find start of the last line
+    const char *lineEnd = p;
+    const char *lineStart = lineEnd;
+    while (lineStart > buf && lineStart[-1] != '\n' && lineStart[-1] != '\r')
+        --lineStart;
+
+    // Trim leading whitespace
+    while (lineStart < lineEnd && (*lineStart == ' ' || *lineStart == '\t' || *lineStart == '\r' || *lineStart == '\n'))
+        ++lineStart;
+    if (lineStart >= lineEnd)
+        return false;
+
+    const size_t n = (size_t)(lineEnd - lineStart);
+    const size_t copyN = (n + 1 < outCap) ? n : (outCap - 1);
+    std::memcpy(out, lineStart, copyN);
+    out[copyN] = '\0';
+    return true;
+}
+
+static bool pollShardingUpdateFile(
+    const char *path,
+    uint64_t *inoutLastLineHash,
+    NnUint *outLayer,
+    bool *outHasPos,
+    NnUint *outPos,
+    bool *outHasHeadLens,
+    std::vector<NnUint> *outStageNodes,
+    std::vector<NnUint> *outHeadLens
+) {
+    if (path == nullptr || path[0] == '\0') {
+        return false;
+    }
+
+    char buf[1024];
+    if (!tryReadFileToBuffer(path, buf, sizeof(buf))) {
+        return false;
+    }
+
+    // Only the last non-empty line is treated as the command.
+    char line[1024];
+    if (!extractLastNonEmptyLine(buf, line, sizeof(line))) {
+        return false;
+    }
+
+    // Gate by last line content (not mtime) to avoid re-triggering the same command.
+    const uint64_t h = fnv1a64(line);
+    if (inoutLastLineHash != nullptr && *inoutLastLineHash == h) {
+        return false;
+    }
+
+    // Supported formats (single line):
+    //   "layer=21 pos=4"  or  "21 4"  or  "layer=21"  or  "21"
+    // Optional override (stage-local):
+    //   "layer=21 pos=4 stage_nodes=2,3 head_lens=6,10"
+    // Whitespace / newlines are ignored.
+    NnUint layer = 0u;
+    NnUint pos = 0u;
+    bool hasLayer = false;
+    bool hasPos = false;
+    bool hasHeadLens = false;
+    std::vector<NnUint> stageNodes;
+    std::vector<NnUint> headLens;
+
+    // Key-value parse (robust): locate each key via substring search.
+    // This avoids relying on ASCII whitespace/token boundaries (e.g., non-breaking spaces).
+    if (const char *p = std::strstr(line, "layer=")) {
+        p += 6;
+        char *end = nullptr;
+        unsigned long v = std::strtoul(p, &end, 10);
+        if (end != p) {
+            layer = (NnUint)v;
+            hasLayer = true;
+        }
+    }
+    if (const char *p = std::strstr(line, "pos=")) {
+        p += 4;
+        char *end = nullptr;
+        unsigned long v = std::strtoul(p, &end, 10);
+        if (end != p) {
+            pos = (NnUint)v;
+            hasPos = true;
+        }
+    }
+    if (const char *p = std::strstr(line, "stage_nodes=")) {
+        p += 12;
+        if (!parseUintList(p, stageNodes))
+            stageNodes.clear();
+    }
+    if (const char *p = std::strstr(line, "head_lens=")) {
+        p += 9;
+        if (parseUintList(p, headLens)) {
+            hasHeadLens = true;
+        } else {
+            headLens.clear();
+        }
+    }
+
+    // Fallback positional parse
+    if (!hasLayer) {
+        unsigned long a = 0, b = 0;
+        int n = std::sscanf(line, "%lu %lu", &a, &b);
+        if (n >= 1) {
+            layer = (NnUint)a;
+            hasLayer = true;
+        }
+        if (n >= 2) {
+            pos = (NnUint)b;
+            hasPos = true;
+        }
+    }
+
+    if (!hasLayer)
+        return false;
+
+    if (hasHeadLens) {
+        if (stageNodes.empty() || headLens.empty() || stageNodes.size() != headLens.size()) {
+            // Invalid override: ignore it, but still allow layer/pos update.
+            hasHeadLens = false;
+            stageNodes.clear();
+            headLens.clear();
+        }
+    }
+
+    if (inoutLastLineHash != nullptr)
+        *inoutLastLineHash = h;
+    if (outLayer) *outLayer = layer;
+    if (outHasPos) *outHasPos = hasPos;
+    if (outPos) *outPos = pos;
+    if (outHasHeadLens) *outHasHeadLens = hasHeadLens;
+    if (outStageNodes) *outStageNodes = stageNodes;
+    if (outHeadLens) *outHeadLens = headLens;
+    return true;
+}
+
+static NnUint getBasePositionFromExecution(const NnNetExecution *execution) {
+    // Convention in this codebase: pipe 0 holds positions as float (see WorkerLlmInference).
+    if (execution == nullptr || execution->pipes == nullptr || execution->nPipes == 0u)
+        return 0u;
+    const float *positions = (const float *)execution->pipes[0];
+    if (positions == nullptr)
+        return 0u;
+    // Positions are small (<= seqLen), safe to round-tripping through float.
+    return (NnUint)positions[0];
+}
+
+static bool shouldEmitEnvShardingUpdate(NnUint currentLayerInGraph, NnUint basePosition) {
+    NnUint targetLayer = 0u;
+    if (!tryParseEnvUint("DLLAMA_SHARDING_UPDATE_LAYER", &targetLayer))
+        return false;
+    if (currentLayerInGraph != targetLayer)
+        return false;
+
+    NnUint targetPos = 0u;
+    if (tryParseEnvUint("DLLAMA_SHARDING_UPDATE_POS", &targetPos)) {
+        return basePosition == targetPos;
+    }
+    return true;
+}
+
+static void computeStartsFromLengths(NnUint nNodes, const NnUint *lengths, NnUint *starts) {
+    if (nNodes == 0u) return;
+    starts[0] = 0u;
+    for (NnUint i = 1u; i < nNodes; ++i) {
+        starts[i] = starts[i - 1u] + lengths[i - 1u];
+    }
+}
+
+static void writeNoShardingUpdate(NnByte *buffer, NnSize nBytes) {
+    if (nBytes < sizeof(NnShardingUpdateHeader))
+        return;
+    NnShardingUpdateHeader hdr;
+    hdr.magic = 0u;
+    hdr.version = NN_SHARDING_UPDATE_VERSION;
+    hdr.epoch = 0u;
+    hdr.layerIndex = 0u;
+    hdr.nNodes = 0u;
+    hdr.flags = shardingMatmulDebugEnabledOnRoot() ? NN_SHARDING_UPDATE_FLAG_DEBUG_MATMUL : 0u;
+    hdr.applyStartLayer = 0u;
+    hdr.applyEndLayerExclusive = 0u;
+    std::memcpy(buffer, &hdr, sizeof(hdr));
+}
+
+
+
+static void maybePrepareStageShardingUpdate(
+    const NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage,
+    NnUint targetLayerIndex,
+    bool hasOverrideHeadLens,
+    const std::vector<NnUint> &overrideStageNodes,
+    const std::vector<NnUint> &overrideHeadLens,
+    NnByte *buffer,
+    NnSize nBytes,
+    std::atomic_uint *epochCounter,
+    NnUint *outEpoch
+) {
+    // Default: no-op update (workers will ignore)
+    writeNoShardingUpdate(buffer, nBytes);
+
+    if (plan == nullptr || stage == nullptr)
+        return;
+    if (targetLayerIndex < stage->startLayer || targetLayerIndex >= stage->endLayer)
+        return;
+    if (outEpoch) *outEpoch = 0u;
+
+    const NnUint nNodes = plan->nNodes;
+    const NnSize required = sizeof(NnShardingUpdateHeader) + (NnSize)(N_SPLIT_KINDS * 2u * nNodes * sizeof(NnUint));
+    if (nBytes < required)
+        return;
+
+    // Build new splits by defaulting to plan splits.
+    std::vector<NnUint> headLen(nNodes), headStart(nNodes);
+    std::vector<NnUint> kvHeadLen(nNodes), kvHeadStart(nNodes);
+    std::vector<NnUint> vocabLen(nNodes), vocabStart(nNodes);
+    std::vector<NnUint> ffnLen(nNodes), ffnStart(nNodes);
+    std::vector<NnUint> dimLen(nNodes), dimStart(nNodes);
+
+    for (NnUint i = 0u; i < nNodes; ++i) {
+        headLen[i] = plan->headSplit.lengths ? plan->headSplit.lengths[i] : 0u;
+        kvHeadLen[i] = plan->kvHeadSplit.lengths ? plan->kvHeadSplit.lengths[i] : 0u;
+        vocabLen[i] = plan->vocabSplit.lengths ? plan->vocabSplit.lengths[i] : 0u;
+        ffnLen[i] = plan->ffnSplit.lengths ? plan->ffnSplit.lengths[i] : 0u;
+        dimLen[i] = plan->dimSplit.lengths ? plan->dimSplit.lengths[i] : 0u;
+    }
+
+
+
+    // Option A (new): explicit override from request file.
+    // We only allow overriding exactly this stage's nodes.
+    if (hasOverrideHeadLens && overrideStageNodes.size() == stage->nNodes && overrideHeadLens.size() == stage->nNodes) {
+        bool matchesStage = true;
+        for (NnUint i = 0u; i < stage->nNodes; ++i) {
+            bool found = false;
+            for (NnUint j = 0u; j < overrideStageNodes.size(); ++j) {
+                if (overrideStageNodes[j] == stage->nodeIndices[i]) { found = true; break; }
+            }
+            if (!found) { matchesStage = false; break; }
+        }
+
+
+
+        if (matchesStage) {
+            // Preserve total heads within this stage.
+            NnUint stageSumPlan = 0u;
+            for (NnUint i = 0u; i < stage->nNodes; ++i)
+                stageSumPlan += headLen[stage->nodeIndices[i]];
+
+            unsigned long long desiredSum = 0ull;
+            for (NnUint i = 0u; i < stage->nNodes; ++i)
+                desiredSum += (unsigned long long)overrideHeadLens[i];
+
+            if (stageSumPlan > 0u && desiredSum > 0ull) {
+                // Normalize overrideHeadLens to sum==stageSumPlan using largest remainder.
+                std::vector<unsigned long long> rema(stage->nNodes);
+                std::vector<NnUint> norm(stage->nNodes);
+                NnUint sumNorm = 0u;
+                for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                    const unsigned long long num = (unsigned long long)overrideHeadLens[i] * (unsigned long long)stageSumPlan;
+                    const unsigned long long q = num / desiredSum;
+                    const unsigned long long r = num % desiredSum;
+                    norm[i] = (NnUint)q;
+                    rema[i] = r;
+                    sumNorm += norm[i];
+                }
+                while (sumNorm < stageSumPlan) {
+                    NnUint best = 0u;
+                    for (NnUint i = 1u; i < stage->nNodes; ++i) {
+                        if (rema[i] > rema[best]) best = i;
+                    }
+                    norm[best] += 1u;
+                    rema[best] = 0u;
+                    sumNorm += 1u;
+                }
+                while (sumNorm > stageSumPlan) {
+                    NnUint best = 0u;
+                    for (NnUint i = 1u; i < stage->nNodes; ++i) {
+                        if (norm[i] > norm[best]) best = i;
+                    }
+                    if (norm[best] == 0u) break;
+                    norm[best] -= 1u;
+                    sumNorm -= 1u;
+                }
+
+                // Apply mapping: overrideStageNodes may be permuted.
+                for (NnUint j = 0u; j < stage->nNodes; ++j) {
+                    const NnUint node = overrideStageNodes[j];
+                    // Find corresponding normalized entry by same index in override arrays.
+                    // (Scheduler should align stage_nodes and head_lens.)
+                    headLen[node] = norm[j];
+                }
+            }
+        }
+    } else {
+        // Option B (legacy): rotate head lengths among nodes in this stage.
+        // This changes distribution while keeping totals constant.
+        if (stage->nNodes >= 2u && plan->headSplit.lengths != nullptr) {
+            std::vector<NnUint> oldStage(stage->nNodes);
+            for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                oldStage[i] = headLen[stage->nodeIndices[i]];
+            }
+            for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                NnUint src = (i + 1u) % stage->nNodes;
+                headLen[stage->nodeIndices[i]] = oldStage[src];
+            }
+        }
+    }
+
+    if (shardingUpdateDebugEnabled()) {
+        printf("[SHARD][NET][UPDATE][PREP] layer=%u stage=%u nNodes=%u stageNodes=%u ",
+            targetLayerIndex,
+            stage->stageIndex,
+            stage->nNodes,
+            stage->nNodes);
+        for (NnUint i = 0u; i < stage->nNodes; ++i) {
+            const NnUint node = stage->nodeIndices[i];
+            printf("%u:%u%s", node, headLen[node], (i + 1u == stage->nNodes) ? "" : ",");
+        }
+        printf("\n");
+    }
+
+    computeStartsFromLengths(nNodes, headLen.data(), headStart.data());
+    computeStartsFromLengths(nNodes, kvHeadLen.data(), kvHeadStart.data());
+    computeStartsFromLengths(nNodes, vocabLen.data(), vocabStart.data());
+    computeStartsFromLengths(nNodes, ffnLen.data(), ffnStart.data());
+    computeStartsFromLengths(nNodes, dimLen.data(), dimStart.data());
+
+    // Write header + payload.
+    NnShardingUpdateHeader hdr;
+    hdr.magic = NN_SHARDING_UPDATE_MAGIC;
+    hdr.version = NN_SHARDING_UPDATE_VERSION;
+    // Monotonic epoch: only bumps when we actually emit an update.
+    hdr.epoch = (epochCounter != nullptr)
+        ? (epochCounter->fetch_add(1u, std::memory_order_acq_rel) + 1u)
+        : 1u;
+    hdr.layerIndex = targetLayerIndex;
+    hdr.nNodes = nNodes;
+    hdr.flags = shardingMatmulDebugEnabledOnRoot() ? NN_SHARDING_UPDATE_FLAG_DEBUG_MATMUL : 0u;
+    // Apply this update to the entire stage.
+    // Note: this cannot retroactively change layers that have already executed in the
+    // current forward pass; it takes effect for those layers on the next step.
+    hdr.applyStartLayer = stage->startLayer;
+    hdr.applyEndLayerExclusive = stage->endLayer;
+    std::memcpy(buffer, &hdr, sizeof(hdr));
+
+    if (outEpoch) *outEpoch = hdr.epoch;
+
+    NnUint *payload = (NnUint *)(buffer + sizeof(hdr));
+    auto writeKind = [&](const std::vector<NnUint> &starts, const std::vector<NnUint> &lens) {
+        std::memcpy(payload, starts.data(), nNodes * sizeof(NnUint));
+        payload += nNodes;
+        std::memcpy(payload, lens.data(), nNodes * sizeof(NnUint));
+        payload += nNodes;
+    };
+
+    writeKind(headStart, headLen);
+    writeKind(kvHeadStart, kvHeadLen);
+    writeKind(vocabStart, vocabLen);
+    writeKind(ffnStart, ffnLen);
+    writeKind(dimStart, dimLen);
+
+    (void)outEpoch;
+}
+
 static void syncNodeSlices(
     bool onlyFromWorkerToRoot, 
     NnNetwork *network, 
@@ -924,6 +1587,8 @@ static void syncNodeSlices(
     NnUint threadIndex, 
     const NnUnevenPartitionPlan *plan,
     const NnStageConfig *stage, // 指定同步组
+    const NnLayerShardingTable *layerSharding,
+    NnUint layerIndex,
     NnUint totalElements = 0 // [New] Total elements for Q80 matching
 ) {
     // ---------------------------------------------------------
@@ -1016,8 +1681,20 @@ static void syncNodeSlices(
         stageForSplit = &plan->stages[plan->nStages - 1];
     }
 
-    // [Fix] Pass floatType + total elements for accurate matching (incl. Q80)
-    fillUnevenSlices(plan, nTotalNodes, nBytes, sliceOffsets, sliceSizes, floatType, stageForSplit, totalElements);
+    const NnUint shardingEpoch = (layerSharding != nullptr)
+        ? layerSharding->epoch.load(std::memory_order_acquire)
+        : 0u;
+    bool runtimeMatched = fillRuntimeSlicesFromSharding(layerSharding, layerIndex, nTotalNodes, nBytes,
+        sliceOffsets, sliceSizes, floatType, stageForSplit, totalElements);
+    if (!runtimeMatched) {
+        // [Fix] Pass floatType + total elements for accurate matching (incl. Q80)
+        fillUnevenSlices(plan, nTotalNodes, nBytes, sliceOffsets, sliceSizes, floatType, stageForSplit, totalElements);
+    }
+
+    if (onlyFromWorkerToRoot && shardingUpdateDebugEnabled() && threadIndex == 0u && shardingEpoch > 0u) {
+        printf("[SHARD][SYNC][LOGITS] layer=%u epoch=%u runtime=%s\n",
+            layerIndex, shardingEpoch, runtimeMatched ? "matched" : "fallback");
+    }
 
 
 
@@ -1221,12 +1898,26 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
     }
 }
 
-NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan) {
+NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan, const NnLayerShardingTable *layerSharding) {
     this->network = network;
     this->execution = execution;
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
     this->plan = plan;
+    this->layerSharding = layerSharding;
+
+    // Root-only bookkeeping: env-trigger emits at most one update per layer.
+    // Total layer count is derived from the partition plan (max endLayer).
+    if (plan != nullptr) {
+        NnUint totalLayers = 0u;
+        for (NnUint s = 0; s < plan->nStages; ++s) {
+            if (plan->stages[s].endLayer > totalLayers)
+                totalLayers = plan->stages[s].endLayer;
+        }
+        if (totalLayers > 0u) {
+            envLayerUpdated.assign(totalLayers, (NnByte)0);
+        }
+    }
     // [新增] 构造时缓存 myStage，避免运行时重复查找
     this->myStage = nullptr;
     if (plan) {
@@ -1242,8 +1933,26 @@ NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetEx
 stage_found:;
 }
 
+void NnNetworkNodeSynchronizer::localBarrier(NnUint nThreads, NnUint threadIndex) {
+    (void)threadIndex;
+    const NnUint phase = localBarrierPhase.load(std::memory_order_acquire);
+    const NnUint arrived = localBarrierCount.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    if (arrived == nThreads) {
+        localBarrierCount.store(0u, std::memory_order_release);
+        localBarrierPhase.fetch_add(1u, std::memory_order_release);
+        return;
+    }
+    while (localBarrierPhase.load(std::memory_order_acquire) == phase) {
+        // spin
+    }
+}
+
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
+    NnUint segmentLayerIndex = 0u;
+    if (segmentConfig->nOps > 0u) {
+        segmentLayerIndex = segmentConfig->ops[0].index;
+    }
 
     for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
         NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
@@ -1270,10 +1979,228 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeStr = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, totalElements);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, this->layerSharding, segmentLayerIndex, totalElements);
+            } else if (syncConfig->syncType == SYNC_KV_ALLGATHER) {
+                syncTypeStr = "SYNC_KV_ALLGATHER";
+                // Stage-local all-gather of KV cache slices.
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, this->layerSharding, segmentLayerIndex, totalElements);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeStr = "SYNC_LOGITS";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, totalElements);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, this->layerSharding, segmentLayerIndex, totalElements);
+            } else if (syncConfig->syncType == SYNC_STAGE_SHARDING_UPDATE) {
+                syncTypeStr = "SYNC_STAGE_SHARDING_UPDATE";
+
+                const NnStageConfig *stage = this->myStage;
+                const NnUint groupRootIndex = getGroupRootIndex(stage);
+                const bool amIRoot = (nodeConfig->nodeIndex == groupRootIndex);
+
+                // Convention: the graph should write the intended layerIndex into the first NnUint of this pipe.
+                // Root will overwrite the buffer with a packed sharding update (or a no-op header).
+                NnUint layerIndex = 0u;
+                if (batchBytes >= sizeof(NnUint)) {
+                    std::memcpy(&layerIndex, pipeBatch, sizeof(layerIndex));
+                }
+
+                const NnUint basePos = getBasePositionFromExecution(execution);
+
+                if (amIRoot && threadIndex == 0) {
+                    // 0) Optional: one-shot forced sharding override for validation without a scheduler.
+                    // Set `DLLAMA_FORCE_SHARDING_ONCE=1` to enable.
+                    // Optional:
+                    //   - DLLAMA_FORCE_SHARDING_LAYER=<uint>   (target layer index; default=current atLayer)
+                    //   - DLLAMA_FORCE_SHARDING_POS=<uint>     (gate by basePos; default=emit ASAP)
+                    bool installedForcedNow = false;
+                    if (!this->forcedShardingOnceArmed && !this->forcedShardingOnceDone) {
+                        const char *forceOnce = std::getenv("DLLAMA_FORCE_SHARDING_ONCE");
+                        if (forceOnce != nullptr && forceOnce[0] == '1') {
+                            this->forcedShardingOnceArmed = true;
+
+                            NnUint forceLayer = layerIndex;
+                            bool forceHasPos = false;
+                            NnUint forcePos = 0u;
+
+                            const char *layerEnv = std::getenv("DLLAMA_FORCE_SHARDING_LAYER");
+                            if (layerEnv == nullptr || layerEnv[0] == '\0')
+                                layerEnv = std::getenv("DLLAMA_FORCE_SHARDING_TARGET_LAYER");
+                            if (layerEnv != nullptr && layerEnv[0] != '\0') {
+                                char *end = nullptr;
+                                unsigned long v = std::strtoul(layerEnv, &end, 10);
+                                if (end != layerEnv)
+                                    forceLayer = (NnUint)v;
+                            }
+
+                            const char *posEnv = std::getenv("DLLAMA_FORCE_SHARDING_POS");
+                            if (posEnv == nullptr || posEnv[0] == '\0')
+                                posEnv = std::getenv("DLLAMA_FORCE_SHARDING_TARGET_POS");
+                            if (posEnv != nullptr && posEnv[0] != '\0') {
+                                char *end = nullptr;
+                                unsigned long v = std::strtoul(posEnv, &end, 10);
+                                if (end != posEnv) {
+                                    forceHasPos = true;
+                                    forcePos = (NnUint)v;
+                                }
+                            }
+
+                            // Prepare an override for this stage's HEAD split only.
+                            // Use current plan head lengths as a baseline, then apply a small deterministic tweak
+                            // that preserves the total heads within this stage.
+                            std::vector<NnUint> stageNodes;
+                            std::vector<NnUint> headLens;
+                            stageNodes.reserve(stage->nNodes);
+                            headLens.reserve(stage->nNodes);
+
+                            for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                                const NnUint nodeIndex = stage->nodeIndices[i];
+                                stageNodes.push_back(nodeIndex);
+                                const NnUint baseLen = (plan && plan->headSplit.lengths) ? plan->headSplit.lengths[nodeIndex] : 0u;
+                                headLens.push_back(baseLen);
+                            }
+
+                            // For validation: nudge the HEAD split by 1 head while preserving the total.
+                            // Default behavior: move 1 head from the first stage node to the last stage node.
+                            // Example: 8:8 -> 7:9 for a 2-node stage.
+                            if (stage->nNodes >= 2u) {
+                                const size_t last = (size_t)stage->nNodes - 1u;
+                                if (headLens[0] > 0u) {
+                                    headLens[0] -= 1u;
+                                    headLens[last] += 1u;
+                                }
+                            }
+
+                            if (shardingUpdateDebugEnabled()) {
+                                printf("[SHARD][NET][FORCE] armed=1 layer=%u hasPos=%u pos=%u stage=%u nodes=",
+                                    forceLayer,
+                                    forceHasPos ? 1u : 0u,
+                                    forcePos,
+                                    stage->stageIndex);
+                                for (NnUint i = 0u; i < stageNodes.size(); ++i) {
+                                    printf("%u:%u%s", stageNodes[i], headLens[i], (i + 1u == stageNodes.size()) ? "" : ",");
+                                }
+                                printf("\n");
+                            }
+
+                            // Install as a pending file-style override (no pos gate => emit ASAP).
+                            this->pendingShardingUpdate = true;
+                            this->pendingShardingUpdateHasPos = forceHasPos;
+                            this->pendingShardingUpdateLayer = forceLayer;
+                            this->pendingShardingUpdatePos = forcePos;
+                            this->pendingShardingUpdateHasHeadLens = true;
+                            this->pendingShardingUpdateStageNodes = stageNodes;
+                            this->pendingShardingUpdateHeadLens = headLens;
+                            this->pendingShardingUpdateLocked = true;
+                            installedForcedNow = true;
+                        }
+                    }
+
+                    // 1) Poll runtime request file (optional). This lets root trigger updates at any time.
+                    // const char *reqPath = getShardingUpdateRequestFilePath();
+                    // NnUint fileLayer = 0u;
+                    // NnUint filePos = 0u;
+                    // bool fileHasPos = false;
+                    // bool fileHasHeadLens = false;
+                    // std::vector<NnUint> fileStageNodes;
+                    // std::vector<NnUint> fileHeadLens;
+                    // const bool lockedPending = (this->pendingShardingUpdate && this->pendingShardingUpdateLocked);
+                    // if (!installedForcedNow && !lockedPending) {
+                    //     if (pollShardingUpdateFile(reqPath, &this->shardingUpdateLastLineHash, &fileLayer, &fileHasPos, &filePos,
+                    //             &fileHasHeadLens, &fileStageNodes, &fileHeadLens)) {
+                    //         this->pendingShardingUpdate = true;
+                    //         this->pendingShardingUpdateHasPos = fileHasPos;
+                    //         this->pendingShardingUpdateLayer = fileLayer;
+                    //         this->pendingShardingUpdatePos = filePos;
+
+                    //         this->pendingShardingUpdateHasHeadLens = fileHasHeadLens;
+                    //         this->pendingShardingUpdateStageNodes = fileStageNodes;
+                    //         this->pendingShardingUpdateHeadLens = fileHeadLens;
+                    //         this->pendingShardingUpdateLocked = false;
+                    //     }
+                    // }
+
+                    // 2) Decide whether to emit an update now.
+                    bool emit = false;
+                    NnUint targetLayerIndex = layerIndex;
+
+                    // File-trigger has priority.
+                    if (this->pendingShardingUpdate) {
+                        if (!this->pendingShardingUpdateHasPos || this->pendingShardingUpdatePos == basePos) {
+                            emit = true;
+                            targetLayerIndex = this->pendingShardingUpdateLayer;
+                        }
+                    } else {
+                        // Env-trigger fallback (one-shot per layer).
+                        if (shouldEmitEnvShardingUpdate(layerIndex, basePos)) {
+                            const bool already = (layerIndex < envLayerUpdated.size())
+                                ? (envLayerUpdated[layerIndex] != (NnByte)0)
+                                : false;
+                            if (!already) {
+                                emit = true;
+                                targetLayerIndex = layerIndex;
+                                if (layerIndex < envLayerUpdated.size()) {
+                                    envLayerUpdated[layerIndex] = (NnByte)1;
+                                }
+                            }
+                        }
+                    }
+
+                    NnUint emittedEpoch = 0u;
+                    if (emit) {
+                        const bool hasOverride = this->pendingShardingUpdate && this->pendingShardingUpdateHasHeadLens;
+                        maybePrepareStageShardingUpdate(
+                            plan,
+                            stage,
+                            targetLayerIndex,
+                            hasOverride,
+                            this->pendingShardingUpdateStageNodes,
+                            this->pendingShardingUpdateHeadLens,
+                            pipeBatch,
+                            batchBytes,
+                            &this->shardingEpoch,
+                            &emittedEpoch);
+                        // Consume file-trigger request once emitted.
+                        if (this->pendingShardingUpdate) {
+                            if (this->pendingShardingUpdateLocked) {
+                                this->forcedShardingOnceDone = true;
+                            }
+                            this->pendingShardingUpdate = false;
+                            this->pendingShardingUpdateHasHeadLens = false;
+                            this->pendingShardingUpdateLocked = false;
+                            this->pendingShardingUpdateStageNodes.clear();
+                            this->pendingShardingUpdateHeadLens.clear();
+                        }
+                    } else {
+                        writeNoShardingUpdate(pipeBatch, batchBytes);
+                    }
+                }
+
+                localBarrier(nThreads, threadIndex);
+                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, stage);
+
+#if DLLAMA_CONTROL_LOG
+                // Log whether an online sharding update actually changed the split (epoch advanced).
+                // To avoid log spam, print once per sync (batch 0) on thread 0.
+                if (threadIndex == 0u && batchIndex == 0u && batchBytes >= sizeof(NnShardingUpdateHeader)) {
+                    NnShardingUpdateHeader hdr;
+                    std::memcpy(&hdr, pipeBatch, sizeof(hdr));
+
+                    const bool isValidUpdate = (hdr.magic == NN_SHARDING_UPDATE_MAGIC && hdr.version == NN_SHARDING_UPDATE_VERSION);
+                    const NnUint prevEpoch = this->lastSeenShardingEpoch;
+                    const bool changed = isValidUpdate && (hdr.epoch > prevEpoch);
+                    if (changed) {
+                        this->lastSeenShardingEpoch = hdr.epoch;
+                    }
+
+                    const NnUint stageIndex = (stage != nullptr) ? stage->stageIndex : 0u;
+                    const NnUint msgLayer = isValidUpdate ? hdr.layerIndex : layerIndex;
+                    printf("🔧 [ShardingUpdate] node=%u stage=%u layer=%u pos=%u changed=%s epoch=%u prev=%u\n",
+                        nodeConfig->nodeIndex,
+                        stageIndex,
+                        msgLayer,
+                        basePos,
+                        changed ? "YES" : "NO",
+                        isValidUpdate ? hdr.epoch : 0u,
+                        prevEpoch);
+                }
+#endif
             } 
             else if (syncConfig->syncType == SYNC_PP_SEND) {
                 syncTypeStr = "PP_SEND";

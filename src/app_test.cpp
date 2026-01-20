@@ -182,7 +182,7 @@ AppCliArgs::~AppCliArgs() {
 
 // --- Device Resolution ---
 
-static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr) {
+static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr, NnLayerShardingTable *layerSharding = nullptr) {
     std::vector<NnExecutorDevice> devices;
 
     if (args->gpuIndex >= 0) {
@@ -199,7 +199,7 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
 
     if (args->gpuIndex < 0 || (args->gpuSegmentFrom >= 0 && args->gpuSegmentTo >= 0)) {
         // 传入 plan 以支持非均匀切分时的稳定性检查和指针计算
-        devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan), -1, -1));
+        devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan, layerSharding), -1, -1));
     }
     return devices;
 }

@@ -98,10 +98,12 @@ private:
 
 public:
     template <typename T>
-    void addOp(NnOpCode code, const char *name, NnUint index, NnPointerConfig input, NnPointerConfig output, NnSize3D weightSize, T config) {
+    void addOp(NnOpCode code, const char *name, NnUint index, NnPointerConfig input, NnPointerConfig output, NnSize3D weightSize, T config, NnSize weightAllocBytes = 0) {
         NnUint configSize = sizeof(T);
         NnByte *configCopy = new NnByte[configSize];
         std::memcpy(configCopy, &config, configSize);
+        if (weightAllocBytes == 0)
+            weightAllocBytes = weightSize.nBytes;
         ops.push_back({
             code,
             cloneString(name),
@@ -109,6 +111,7 @@ public:
             input,
             output,
             weightSize,
+            weightAllocBytes,
             configCopy,
             configSize
         });

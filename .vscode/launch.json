@@ -20,7 +20,8 @@
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb",
       "environment": [
-        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" }
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" },
+        { "name": "DLLAMA_DEBUG_SHARDING_MATMUL", "value": "1" }
       ],
       "setupCommands": [
         { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
@@ -34,7 +35,7 @@
       "program": "/workspace/dllama/distributed-llama/dllama",
       "args": [
         "inference",
-        "--prompt", "You are a helpful assistant.introduce yourself",
+        "--prompt", "You are a helpful assistant introduce yourself",
         "--steps", "32",
         "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
         "--tokenizer", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_tokenizer_qwen3_0.6b_q40.t",
@@ -42,7 +43,7 @@
         "--nthreads", "2",
         "--max-seq-len", "2048",
         "--benchmark",
-        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie4:9999",
+        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie6:9999",
         "--ratios", "1:2*1:1*2:3"
       ],
       "cwd": "/workspace/distributed-llama",
@@ -51,7 +52,8 @@
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb",
       "environment": [
-        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" }
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" },
+        { "name": "DLLAMA_DEBUG_SHARDING_MATMUL", "value": "1" }
       ],
       "setupCommands": [
         { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },

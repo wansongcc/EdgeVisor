@@ -11,12 +11,14 @@
 
 typedef struct {
     const char *name;
+    NnUint nodeIndex;
     NnByte nBatches;
     NnByte *bufferFlags;
     NnByte **buffers;
     NnBufferConfig *bufferConfigs;
     NnByte **pipes;
     NnPipeConfig *pipeConfigs;
+    NnUint nPipes;
     void *opConfig;
 
     NnByte **input;
@@ -29,6 +31,15 @@ typedef struct {
 
     NnByte *weight;
     NnSize3D weightSize;
+    NnSize weightAllocBytes;
+
+    // Optional runtime sharding state (for dynamic, layer-level splits).
+    NnLayerShardingTable *layerSharding;
+
+    // Op identity (for compute logging / debugging).
+    NnUint opCode;        // NnOpCode
+    NnUint opIndex;       // segment-local op index
+    NnUint opConfigSize;  // bytes of opConfig
 } NnCpuOpContext;
 
 typedef void (*NnCpuOpForwardInit)(NnCpuOpContext *context);

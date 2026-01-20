@@ -91,6 +91,10 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_SHIFT) return "SHIFT";
     if (code == OP_SOFTMAX) return "SOFTMAX";
     if (code == OP_MOE_GATE) return "MOE_GATE";
+    if (code == OP_PP_RECV) return "PP_RECV";
+    if (code == OP_PP_SEND) return "PP_SEND";
+    if (code == OP_WRITE_U32) return "OP_WRITE_U32";
+    if (code == OP_UPDATE_SHARDING) return "UPDATE_SHARDING";
     throw std::invalid_argument("Unknown op code: " + std::to_string(code));
 }
 
@@ -804,7 +808,7 @@ static inline void fullfillRopeLlamaCache(const NnRopeOpConfig *config, float *c
     assert((config->slice.qDimEnd - config->slice.kvDimStart) % 2 == 0);
 
     const bool applyScaling = config->ropeScalingFactor != 1.0f;
-    float theta = 1000000.0f;
+    float theta = config->slice.ropeTheta;
     for (NnUint pos = 0; pos < config->slice.seqLen; pos++) {
         for (NnUint i = config->slice.kvDimStart; i < config->slice.qDimEnd; i += 2) {
             const NnUint h = i % config->slice.headDim;

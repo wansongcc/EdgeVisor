@@ -5,9 +5,11 @@
 #include <list>
 #include <memory>
 #include <cstdint>
+#include <cassert>
 #include <vector>
 #include <cstring> // for std::memset
 #include <utility> // for std::move
+#include <atomic>
 #include "nn-quants.hpp"
 #include "nn-core.hpp"
 
@@ -134,6 +136,156 @@ private:
         split.lengths = nullptr;
     }
 };
+
+// ======================================================================================
+// Runtime Layer-Level Sharding (Dynamic)
+// ======================================================================================
+
+enum NnSplitKind : NnUint {
+    SPLIT_HEAD = 0,
+    SPLIT_KV_HEAD = 1,
+    SPLIT_VOCAB = 2,
+    SPLIT_FFN = 3,
+    SPLIT_DIM = 4,
+    N_SPLIT_KINDS = 5,
+};
+
+struct NnLayerSplits {
+    NnDimSplit headSplit;
+    NnDimSplit kvHeadSplit;
+    NnDimSplit vocabSplit;
+    NnDimSplit ffnSplit;
+    NnDimSplit dimSplit;
+
+    // Optional: per-unit owner mapping for KV migration.
+    // headOwners size = nHeadUnits (heads); kvHeadOwners size = nKvHeadUnits (kv heads)
+    NnUint nHeadUnits = 0;
+    NnUint nKvHeadUnits = 0;
+    NnUint *headOwners = nullptr;
+    NnUint *kvHeadOwners = nullptr;
+
+    NnLayerSplits() {
+        std::memset(&headSplit, 0, sizeof(headSplit));
+        std::memset(&kvHeadSplit, 0, sizeof(kvHeadSplit));
+        std::memset(&vocabSplit, 0, sizeof(vocabSplit));
+        std::memset(&ffnSplit, 0, sizeof(ffnSplit));
+        std::memset(&dimSplit, 0, sizeof(dimSplit));
+        nHeadUnits = 0;
+        nKvHeadUnits = 0;
+        headOwners = nullptr;
+        kvHeadOwners = nullptr;
+    }
+};
+
+struct NnLayerShardingTable {
+    NnUint nLayers = 0;
+    NnUint nNodes = 0;
+    std::atomic_uint epoch{0u};
+    NnLayerSplits *layers = nullptr; // [nLayers]
+
+    NnLayerShardingTable() = default;
+
+    NnLayerShardingTable(NnUint nLayers, NnUint nNodes) {
+        init(nLayers, nNodes);
+    }
+
+    ~NnLayerShardingTable() {
+        reset();
+    }
+
+    void init(NnUint nLayers_, NnUint nNodes_) {
+        reset();
+        nLayers = nLayers_;
+        nNodes = nNodes_;
+        epoch.store(0u);
+        layers = new NnLayerSplits[nLayers];
+    }
+
+    void reset() {
+        if (layers != nullptr) {
+            for (NnUint i = 0; i < nLayers; ++i) {
+                freeSplit(layers[i].headSplit);
+                freeSplit(layers[i].kvHeadSplit);
+                freeSplit(layers[i].vocabSplit);
+                freeSplit(layers[i].ffnSplit);
+                freeSplit(layers[i].dimSplit);
+                freeOwners(layers[i]);
+            }
+            delete[] layers;
+            layers = nullptr;
+        }
+        nLayers = 0;
+        nNodes = 0;
+        epoch.store(0u);
+    }
+
+    void setLayerSplit(NnUint layerIndex, NnSplitKind kind, const NnUint *starts, const NnUint *lengths) {
+        if (layers == nullptr) return;
+        assert(layerIndex < nLayers);
+        assert(starts != nullptr);
+        assert(lengths != nullptr);
+
+        NnDimSplit *dst = nullptr;
+        switch (kind) {
+            case SPLIT_HEAD: dst = &layers[layerIndex].headSplit; break;
+            case SPLIT_KV_HEAD: dst = &layers[layerIndex].kvHeadSplit; break;
+            case SPLIT_VOCAB: dst = &layers[layerIndex].vocabSplit; break;
+            case SPLIT_FFN: dst = &layers[layerIndex].ffnSplit; break;
+            case SPLIT_DIM: dst = &layers[layerIndex].dimSplit; break;
+            default: return;
+        }
+
+        ensureAllocated(*dst);
+        std::memcpy(dst->starts, starts, nNodes * sizeof(NnUint));
+        std::memcpy(dst->lengths, lengths, nNodes * sizeof(NnUint));
+    }
+
+private:
+    void freeSplit(NnDimSplit &split) {
+        if (split.starts) { delete[] split.starts; split.starts = nullptr; }
+        if (split.lengths) { delete[] split.lengths; split.lengths = nullptr; }
+    }
+
+    void freeOwners(NnLayerSplits &splits) {
+        if (splits.headOwners) {
+            delete[] splits.headOwners;
+            splits.headOwners = nullptr;
+        }
+        if (splits.kvHeadOwners) {
+            delete[] splits.kvHeadOwners;
+            splits.kvHeadOwners = nullptr;
+        }
+        splits.nHeadUnits = 0;
+        splits.nKvHeadUnits = 0;
+    }
+
+    void ensureAllocated(NnDimSplit &split) {
+        if (split.starts == nullptr) split.starts = new NnUint[nNodes];
+        if (split.lengths == nullptr) split.lengths = new NnUint[nNodes];
+    }
+};
+
+// Packed sharding update message (typically broadcast within a stage).
+// Payload layout: for each split kind in order (HEAD, KV_HEAD, VOCAB, FFN, DIM)
+//   starts[nNodes] then lengths[nNodes]
+typedef struct {
+    NnUint magic;      // 'DLSH'
+    NnUint version;    // schema version
+    NnUint epoch;      // monotonically increasing
+    NnUint layerIndex; // global layer index
+    NnUint nNodes;     // number of nodes in split arrays
+    NnUint flags;      // reserved
+    // Apply range: update the splits for layers in [applyStartLayer, applyEndLayerExclusive).
+    // This enables "one change affects the rest of the stage" semantics.
+    NnUint applyStartLayer;
+    NnUint applyEndLayerExclusive;
+} NnShardingUpdateHeader;
+
+static constexpr NnUint NN_SHARDING_UPDATE_MAGIC = 0x48534c44u; // 'DLSH' little-endian
+static constexpr NnUint NN_SHARDING_UPDATE_VERSION = 2u;
+
+// NnShardingUpdateHeader::flags
+static constexpr NnUint NN_SHARDING_UPDATE_FLAG_DEBUG_MATMUL = 1u << 0;
 
 // ======================================================================================
 // Slices (Original & Uneven)
@@ -270,6 +422,8 @@ enum NnOpCode {
     OP_MOE_GATE,
     OP_PP_RECV,
     OP_PP_SEND,
+    OP_WRITE_U32,
+    OP_UPDATE_SHARDING,
 };
 
 enum NnOpQuantType {
@@ -284,7 +438,7 @@ enum NnOpQuantType {
     Q80_F32_F32,
 };
 
-#define N_OP_CODES (OP_SHIFT + 1)
+#define N_OP_CODES (OP_UPDATE_SHARDING + 1)
 #define N_OP_QUANTS (Q80_F32_F32 + 1)
 
 enum NnPointerSource {
@@ -302,8 +456,13 @@ enum NnSyncType {
     SYNC_WITH_ROOT, // whole pipe to all nodes
     SYNC_NODE_SLICES, // my slice of pipe to all nodes
     SYNC_NODE_SLICES_EXCEPT_ROOT, // only workers send slices to root, root does not send
+    SYNC_KV_ALLGATHER, // stage-local all-gather for KV cache slices
     SYNC_PP_SEND,                     // PP: 当前 Stage 发送给 Next Stage
-    SYNC_PP_RECV                      // PP: 当前 Stage 从 Prev Stage 接收
+    SYNC_PP_RECV,                      // PP: 当前 Stage 从 Prev Stage 接收
+
+    // Control-plane: stage root may broadcast a packed sharding update message.
+    // If root decides "no update" for this layer, it broadcasts a header with magic=0.
+    SYNC_STAGE_SHARDING_UPDATE,
 };
 
 enum NnRopeType {
@@ -339,6 +498,9 @@ typedef struct {
     NnPointerConfig input;
     NnPointerConfig output;
     NnSize3D weightSize;
+    // Optional: allocate more bytes than weightSize.nBytes (e.g., stage-local weight replication).
+    // When 0, runtime should treat it as weightSize.nBytes.
+    NnSize weightAllocBytes;
     NnByte *config;
     NnUint configSize;
 } NnOpConfig;
@@ -386,6 +548,10 @@ typedef struct {
 } NnEmbeddingOpConfig;
 
 typedef struct {
+    NnUint value;
+} NnWriteU32OpConfig;
+
+typedef struct {
     float epsilon;
     NnUint nColumns;
 } NnInvRmsOpConfig;
@@ -399,6 +565,25 @@ typedef struct {
     NnUint nExperts;
     NnUint nActiveExperts;
     NnUint activeExpertIndexesBufferIndex;
+
+    // Optional: stage-local weight replication.
+    // When enabled, the weight buffer packs all stage-node slices for each expert.
+    // Compute uses only the current node's slice at (expertStrideBytes * activeExpert + myOffsetBytes).
+    NnUint replicateMode; // 0/1
+    NnUint _pad0;
+    NnSize replicateExpertStrideBytes;
+    NnSize replicateMyOffsetBytes;
+
+    // Runtime sharding (optional): when replicateMode!=0, compute can select
+    // which shard to execute based on NnLayerShardingTable for this layer.
+    // These fields are all zero by default and are safe to leave unset.
+    NnUint layerIndex;          // global layer index for sharding lookup
+    NnUint splitKind;           // NnSplitKind, or >=N_SPLIT_KINDS to disable
+    NnUint splitAxis;           // 0=none, 1=OUT_ROWS, 2=IN_COLS
+    NnUint splitUnit;           // multiplier from split-units -> elements (e.g. headDim)
+    NnUint staticStartUnits;    // graph-time start (in split units)
+    NnUint staticLenUnits;      // graph-time len (in split units)
+    NnUint replicateGlobalInDim; // for IN_COLS mode: global input dim (elements) of full weight
 } NnMatmulOpConfig;
 
 typedef struct {
@@ -411,9 +596,21 @@ typedef struct {
     float ropeScalingHighFreqFactor;
     NnUint ropeScalingOrigMaxSeqLen;
     NnRopeSlice slice;
+
+    // Optional: runtime sharding length override for rope (treat input as a sharded vector).
+    // If splitKind is invalid or layerIndex==0, uses staticLenUnits (or full x when staticLenUnits==0).
+    NnUint layerIndex;
+    NnUint splitKind;
+    NnUint splitUnit;
+    NnUint staticLenUnits;
+    NnUint staticStartUnits;
 } NnRopeOpConfig;
 
 typedef struct {
+    // Identity for runtime sharding lookup/debug.
+    NnUint nodeIndex;
+    NnUint layerIndex;
+    NnUint headStart; // static head start (graph-time)
     NnUint nHeads;
     NnUint nHeads0;
     NnUint nKvHeads;
@@ -426,6 +623,11 @@ typedef struct {
     NnUint keyCacheBufferIndex;
     NnUint valueCacheBufferIndex;
     NnUint attBufferIndex;
+
+    // Optional: graph-time planned head len (in heads) for fallback when runtime sharding is disabled.
+    // If 0, defaults to nHeads0.
+    NnUint staticHeadLenUnits;
+    NnUint kvHeadStart;
 } NnMultiHeadAttOpConfig;
 
 typedef struct {
@@ -437,11 +639,20 @@ typedef struct {
 } NnMergeSumOpCodeConfig;
 
 typedef struct {
-    // empty
+    // Optional: runtime sharding length override for elementwise ops.
+    // If splitKind is invalid or layerIndex==0, uses staticLenUnits (or full x when staticLenUnits==0).
+    NnUint layerIndex;
+    NnUint splitKind;
+    NnUint splitUnit;
+    NnUint staticLenUnits;
 } NnSiluOpCodeConfig;
 
 typedef struct {
     NnUint multiplierBufferIndex;
+    NnUint layerIndex;
+    NnUint splitKind;
+    NnUint splitUnit;
+    NnUint staticLenUnits;
 } NnMulOpCodeConfig;
 
 typedef struct {
@@ -449,7 +660,11 @@ typedef struct {
 } NnScaleOpCodeConfig;
 
 typedef struct {
-    // empty
+    // Optional: runtime sharding length override for casts operating on sharded vectors.
+    NnUint layerIndex;
+    NnUint splitKind;
+    NnUint splitUnit;
+    NnUint staticLenUnits;
 } NnCastOpCodeConfig;
 
 typedef struct {
@@ -458,7 +673,18 @@ typedef struct {
 
 typedef struct {
     NnUint indexPipeIndex;
+
+    // Optional: runtime sharding length override for shift (treat input as a sharded vector).
+    // If splitKind is invalid or layerIndex==0, uses staticLenUnits (or full x when staticLenUnits==0).
+    NnUint layerIndex;
+    NnUint splitKind;
+    NnUint splitUnit;
+    NnUint staticLenUnits;
 } NnShiftOpCodeConfig;
+
+typedef struct {
+    // empty (reads packed update from input pipe; applies to runtime sharding table)
+} NnUpdateShardingOpConfig;
 
 typedef struct {
     // empty

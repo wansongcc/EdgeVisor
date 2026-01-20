@@ -11,6 +11,7 @@
 class NnCpuDevice : public NnDevice {
 public:
     NnByte **buffers;
+    NnLayerShardingTable *layerSharding;
 private:
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
@@ -19,7 +20,7 @@ private:
     NnUint nBuffers;
     NnByte *bufferFlags;
 public:
-    NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan = nullptr);
+    NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan = nullptr, NnLayerShardingTable *layerSharding = nullptr);
     ~NnCpuDevice() override;
     NnUint maxNThreads() override;
     NnDeviceSegment *createSegment(NnUint segmentIndex) override;

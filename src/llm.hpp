@@ -92,6 +92,9 @@ typedef struct {
     NnUint xPipeIndex;
     NnUint logitsPipeIndex;
     NnUint zqPipeIndex;
+    NnUint kPipeIndex;
+    NnUint vPipeIndex;
+    NnUint shardingPipeIndex;
     NnSize3D tokenEmbeddingSize;
     NnSize3D rmsNormSize;
     NnSize3D qkRmsNormSize;
@@ -129,6 +132,10 @@ typedef struct {
     NnUint tokenPipeIndex;
     NnUint xPipeIndex;
     NnUint logitsPipeIndex;
+
+    // KV all-gather pipes (stage-local)
+    NnUint kPipeIndex;
+    NnUint vPipeIndex;
 
     NnUint zqPipeIndex;
     NnSize3D tokenEmbeddingSize;

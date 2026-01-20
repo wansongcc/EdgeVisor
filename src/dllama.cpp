@@ -496,7 +496,7 @@ static void chat(AppInferenceContext *context) {
     printf("(end of context)\n");
 }
 
-int main(int argc, char **argv) {
+ int main(int argc, char **argv) {
     initQuants();
     initSockets();
 

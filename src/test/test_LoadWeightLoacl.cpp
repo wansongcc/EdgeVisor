@@ -9,11 +9,7 @@
 #include <cassert>
 #include <sstream>
 
-// --- 声明必要的外部函数 ---
-LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const std::vector<float>& ratios);
-void releaseLlmNet(LlmNet *net);
-NnUnevenPartitionPlan createPartitionPlan(NnUint nNodes, const std::vector<float>& ratios, NnUint globalNHeads, NnUint globalNKvHeads, NnUint globalVocabSize, NnUint globalFfnDim);
-void releasePartitionPlan(NnUnevenPartitionPlan* plan);
+// 依赖的符号均由已包含的头文件提供 (llm.hpp / nn-core.hpp)
 static NnUint getFfnDim(LlmHeader* h) { return (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim; }
 
 // 解析比例辅助函数
@@ -63,9 +59,22 @@ int main(int argc, char **argv) {
         header.qDim = header.nHeads * header.headDim;
         header.kvDim = header.nKvHeads * header.headDim;
 
-        // 3. 构建网络配置 (模拟 Root 发来的配置)
+        // 3. 创建非均匀切分计划 (Plan) - 单 stage (TP only)
+        NnUint ffDim = getFfnDim(&header);
+        std::vector<NnStageDef> stageDefs;
+        stageDefs.push_back(NnStageDef{header.nLayers, ratios});
+
+        NnUnevenPartitionPlan plan = createPartitionPlan(
+            stageDefs,
+            header.nHeads,
+            header.nKvHeads,
+            header.vocabSize,
+            ffDim,
+            header.dim);
+
+        // 4. 构建网络配置 (模拟 Root 发来的配置)
         std::cout << "构建网络配置..." << std::endl;
-        LlmNet net = buildLlmNetUneven(&header, nNodes, nBatches, ratios);
+        LlmNet net = buildLlmNetUneven(&header, nNodes, nBatches, &plan);
         std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
 
         // 获取属于本 Worker 的配置
@@ -82,15 +91,11 @@ int main(int argc, char **argv) {
         
         NnExecutor executor(&net.netConfig, myNodeConfig, &devices, &execution, &fakeSync, false);
 
-        // 5. 准备非均匀切分计划 (Plan)
-        NnUint ffDim = getFfnDim(&header);
-        NnUnevenPartitionPlan plan = createPartitionPlan(nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim);
-
-        // 6. [核心测试] 执行本地加载
+        // 5. [核心测试] 执行本地加载
         std::cout << "🚀 开始执行 loadLlmNetWeightUneven (Local)..." << std::endl;
         
         NnLocalWeightLoader localLoader(&executor, myNodeIndex);
-        loadLlmNetWeightUneven(modelPath, &net, &localLoader, &plan);
+        loadLlmNetWeightUneven(modelPath, &net, &localLoader, &plan, myNodeIndex);
 
         // 7. 简单的验证
         // 我们可以检查 Executor 中的某些权重是否非空。

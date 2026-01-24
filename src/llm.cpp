@@ -6,6 +6,7 @@
 #include "mmap.hpp"
 #include "llm.hpp"
 #include <cerrno>
+#include <cstdlib>
 #include <stdexcept>
 #include <functional>
 
@@ -226,6 +227,22 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
         nInvBufferColumns = std::max(nQNormColumns, nKNormColumns);
     }
 
+    // Opt-in: force all OP_MATMUL ops to take the view-aware code path.
+    // This is useful for distributed A/B checks while keeping buffer layouts unchanged (offset=0).
+    // NOTE: This will likely disable some fast paths (e.g. llamafile sgemm) when enabled.
+    const bool forceMatmulViews = (std::getenv("DLLAMA_FORCE_MATMUL_VIEWS") != nullptr);
+    auto makeMatmulCfg = [&](NnUint nExperts, NnUint nActiveExperts, NnUint activeExpertIndexesBufferIndex, NnUint inLen, NnUint outLen) -> NnMatmulOpConfig {
+        NnMatmulOpConfig cfg{};
+        cfg.nExperts = nExperts;
+        cfg.nActiveExperts = nActiveExperts;
+        cfg.activeExpertIndexesBufferIndex = activeExpertIndexesBufferIndex;
+        if (forceMatmulViews) {
+            cfg.aView = NnTensorView{0u, 0u, inLen, 0u, 0u};
+            cfg.cView = NnTensorView{0u, 0u, outLen, 0u, 0u};
+        }
+        return cfg;
+    };
+
     NnNetConfigBuilder netBuilder(nNodes, nBatches);
 
     n.positionPipeIndex = netBuilder.addPipe("POS", size2D(F_32, nBatches, 1));
@@ -345,19 +362,19 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                 pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, qBufferIndex),
                 size2D(h->weightType, n.qSlice.n, n.qSlice.d0),
-                NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, n.qSlice.n, n.qSlice.d0));
             att.addOp(
                 OP_MATMUL, "block_matmul_k", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, kTempBufferIndex),
                 size2D(h->weightType, n.kSlice.n, n.kSlice.d0),
-                NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, n.kSlice.n, n.kSlice.d0));
             att.addOp(
                 OP_MATMUL, "block_matmul_v", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, vTempBufferIndex),
                 size2D(h->weightType, n.vSlice.n, n.vSlice.d0),
-                NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, n.vSlice.n, n.vSlice.d0));
 
             if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
                 att.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex,
@@ -421,6 +438,8 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                 NnMultiHeadAttOpConfig{
                     multiHeadAttSlice.nHeads, multiHeadAttSlice.nHeads0,
                     h->nKvHeads, h->headDim, h->seqLen, n.qSlice.d0, kvCacheSlice.kvDim0,
+                    0u, n.qSlice.d0,
+                    0u, kvCacheSlice.kvDim0,
                     n.positionPipeIndex, qBufferIndex, kBufferIndex, vBufferIndex, attBufferIndex});
             att.addOp(
                 OP_CAST, "block_cast_y2", layerIndex,
@@ -433,7 +452,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                 pointerBatchConfig(SRC_BUFFER, zqSliceBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
                 size2D(h->weightType, n.woSlice.n0, n.woSlice.d),
-                NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, n.woSlice.n0, n.woSlice.d));
             att.addOp(
                 OP_CAST, "block_cast_d", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
@@ -474,7 +493,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                     pointerBatchConfig(SRC_BUFFER, yBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex),
                     n.moeGateSize,
-                    NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                    makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, h->dim, nExpertsOr1));
                 ff.addOp(
                     OP_SOFTMAX, "block_moe_softmax", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex),
@@ -492,25 +511,34 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                     pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
                     size3D(h->weightType, h->nExperts, n.w1Slice.n, n.w1Slice.d0),
-                    NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
+                    makeMatmulCfg(h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex, n.w1Slice.n, n.w1Slice.d0));
                 ff.addOp(
                     OP_MATMUL, "block_matmul_w3", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, moeLBufferIndex),
                     size3D(h->weightType, h->nExperts, n.w3Slice.n, n.w3Slice.d0),
-                    NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
-                ff.addOp(
-                    OP_SILU, "block_act", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
-                    size0(),
-                    NnSiluOpCodeConfig{});
+                    makeMatmulCfg(h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex, n.w3Slice.n, n.w3Slice.d0));
+                if (h->hiddenAct == HIDDEN_ACT_GELU) {
+                    ff.addOp(
+                        OP_GELU, "block_act", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
+                        size0(),
+                        NnGeluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                } else {
+                    ff.addOp(
+                        OP_SILU, "block_act", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
+                        size0(),
+                        NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                }
                 ff.addOp(
                     OP_MUL, "block_mul", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
                     size0(),
-                    NnMulOpCodeConfig{moeLBufferIndex});
+                    NnMulOpCodeConfig{moeLBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
                 if (moeDBufferIndex != moeDQBufferIndex) {
                     ff.addOp(
                         OP_CAST, "block_cast_d2", layerIndex,
@@ -524,13 +552,13 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                     pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, moeYBufferIndex),
                     size3D(h->weightType, h->nExperts, n.w2Slice.n0, n.w2Slice.d),
-                    NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
+                    makeMatmulCfg(h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex, n.w2Slice.n0, n.w2Slice.d));
                 ff.addOp(
                     OP_SCALE, "block_moe_scale", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, moeYBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, moeYBufferIndex),
                     size0(),
-                    NnScaleOpCodeConfig{moeSBufferIndex});
+                    NnScaleOpCodeConfig{moeSBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
                 ff.addOp(
                     OP_MERGE_SUM, "block_moe_merge_sum", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, moeYBufferIndex),
@@ -551,25 +579,34 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                     pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, dBufferIndex),
                     size2D(h->weightType, n.w1Slice.n, n.w1Slice.d0),
-                    NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                    makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, n.w1Slice.n, n.w1Slice.d0));
                 ff.addOp(
                     OP_MATMUL, "block_matmul_w3", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, lBufferIndex),
                     size2D(h->weightType, n.w3Slice.n, n.w3Slice.d0),
-                    NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
-                ff.addOp(
-                    OP_SILU, "block_act", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    size0(),
-                    NnSiluOpCodeConfig{});
+                    makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, n.w3Slice.n, n.w3Slice.d0));
+                if (h->hiddenAct == HIDDEN_ACT_GELU) {
+                    ff.addOp(
+                        OP_GELU, "block_act", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        size0(),
+                        NnGeluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                } else {
+                    ff.addOp(
+                        OP_SILU, "block_act", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        size0(),
+                        NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                }
                 ff.addOp(
                     OP_MUL, "block_mul", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, dBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, dBufferIndex),
                     size0(),
-                    NnMulOpCodeConfig{lBufferIndex});
+                    NnMulOpCodeConfig{lBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
                 if (dBufferIndex != dqBufferIndex) {
                     ff.addOp(
                         OP_CAST, "block_cast_d2", layerIndex,
@@ -583,7 +620,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                     pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, yBufferIndex),
                     size2D(h->weightType, n.w2Slice.n0, n.w2Slice.d),
-                    NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                    makeMatmulCfg(0u, 0u, moeExpertIndexesBufferIndex, n.w2Slice.n0, n.w2Slice.d));
             }
             ff.addOp(
                 OP_CAST, "block_cast_d3", layerIndex,
@@ -629,7 +666,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
             pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
             size2D(h->weightType, n.wclsSlice.n, n.wclsSlice.d0),
-            NnMatmulOpConfig{});
+            makeMatmulCfg(0u, 0u, 0u, n.wclsSlice.n, n.wclsSlice.d0));
         end.addOp(
             OP_CAST, "final_cast_logits", 0,
             pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
@@ -659,6 +696,9 @@ static NnNodeConfig buildLlmNodeInternal(
     NnUint nExpertsOr1 = std::max(h->nExperts, 1u);
     NnUint nActiveExpertsOr1 = std::max(h->nActiveExperts, 1u);
     NnUint ffDim = (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim;
+
+    const NnStageConfig* myStage = getStageForNode(plan, nodeIndex);
+    const bool stageFullWeights = (std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr) && (myStage != nullptr);
 
     // 2. 计算切分 (Slicing)
     NnKvCacheSliceUneven kvCacheSlice = sliceKvCacheUneven(h->seqLen, h->headDim, plan, nodeIndex);
@@ -734,6 +774,57 @@ static NnNodeConfig buildLlmNodeInternal(
     const NnUint moeLBufferIndex = nodeBuilder.addBuffer("moe_l", size3D(F_32, nActiveExpertsOr1, nBatches, w3Slice.inLen));
     const NnUint moeSBufferIndex = nodeBuilder.addBuffer("moe_s", size3D(F_32, nActiveExpertsOr1, nBatches, 1));
 
+    // Opt-in: force all OP_MATMUL ops to take the view-aware code path.
+    // This is useful for distributed A/B checks while keeping buffer layouts unchanged (offset=0).
+    const bool forceMatmulViews = (std::getenv("DLLAMA_FORCE_MATMUL_VIEWS") != nullptr);
+
+    auto makeRowMatmulCfg = [&](NnUint inLen, NnUint outLen, NnUint outStart) -> NnMatmulOpConfig {
+        NnMatmulOpConfig cfg{};
+        cfg.activeExpertIndexesBufferIndex = moeExpertIndexesBufferIndex;
+        if (stageFullWeights) {
+            cfg.view = 1u;
+            cfg.outStart = outStart;
+        }
+        // In the current uneven path, buffers are still allocated as packed local slices.
+        // We keep filling C view to maintain existing plumbing behavior.
+        if (forceMatmulViews) {
+            cfg.aView = NnTensorView{0u, 0u, inLen, 0u, 0u};
+            cfg.cView = NnTensorView{0u, 0u, outLen, 0u, 0u};
+        } else {
+            cfg.cView = NnTensorView{0u, 0u, outLen, 0u, 1u};
+        }
+        return cfg;
+    };
+
+    auto makeMoeRowMatmulCfg = [&](NnUint inLen, NnUint outLen, NnUint outStart) -> NnMatmulOpConfig {
+        NnMatmulOpConfig cfg = makeRowMatmulCfg(inLen, outLen, outStart);
+        cfg.nExperts = h->nExperts;
+        cfg.nActiveExperts = h->nActiveExperts;
+        return cfg;
+    };
+
+    auto makeColMatmulCfg = [&](NnUint inLen, NnUint outLen, NnUint inStart) -> NnMatmulOpConfig {
+        NnMatmulOpConfig cfg{};
+        cfg.activeExpertIndexesBufferIndex = moeExpertIndexesBufferIndex;
+        if (stageFullWeights) {
+            cfg.view = 2u;
+            cfg.inStart = inStart;
+            cfg.outStart = 0u;
+        }
+        if (forceMatmulViews) {
+            cfg.aView = NnTensorView{0u, 0u, inLen, 0u, 0u};
+            cfg.cView = NnTensorView{0u, 0u, outLen, 0u, 0u};
+        }
+        return cfg;
+    };
+
+    auto makeMoeColMatmulCfg = [&](NnUint inLen, NnUint outLen, NnUint inStart) -> NnMatmulOpConfig {
+        NnMatmulOpConfig cfg = makeColMatmulCfg(inLen, outLen, inStart);
+        cfg.nExperts = h->nExperts;
+        cfg.nActiveExperts = h->nActiveExperts;
+        return cfg;
+    };
+
     // 4. Start Segment (Embedding)
     NnSegmentConfigBuilder start;
     if (isFirstStage) {
@@ -808,9 +899,9 @@ static NnNodeConfig buildLlmNodeInternal(
             att.addOp(OP_CAST, "block_cast_y", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
         }
 
-        att.addOp(OP_MATMUL, "block_matmul_q", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), qSlice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
-        att.addOp(OP_MATMUL, "block_matmul_k", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), kSlice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
-        att.addOp(OP_MATMUL, "block_matmul_v", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, vTempBufferIndex), vSlice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+        att.addOp(OP_MATMUL, "block_matmul_q", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), stageFullWeights ? qSlice.size : qSlice.sliceSize, makeRowMatmulCfg(qSlice.n, qSlice.inLen, qSlice.inStart));
+        att.addOp(OP_MATMUL, "block_matmul_k", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), stageFullWeights ? kSlice.size : kSlice.sliceSize, makeRowMatmulCfg(kSlice.n, kSlice.inLen, kSlice.inStart));
+        att.addOp(OP_MATMUL, "block_matmul_v", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, vTempBufferIndex), stageFullWeights ? vSlice.size : vSlice.sliceSize, makeRowMatmulCfg(vSlice.n, vSlice.inLen, vSlice.inStart));
 
         if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
             att.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex, pointerBatchConfig(SRC_BUFFER, qBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nQNormColumns});
@@ -824,13 +915,13 @@ static NnNodeConfig buildLlmNodeInternal(
         att.addOp(OP_SHIFT, "block_shift_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerRawConfig(SRC_BUFFER, kBufferIndex), size0(), NnShiftOpCodeConfig{n->positionPipeIndex});
         att.addOp(OP_SHIFT, "block_shift_v", layerIndex, pointerBatchConfig(SRC_BUFFER, vTempBufferIndex), pointerRawConfig(SRC_BUFFER, vBufferIndex), size0(), NnShiftOpCodeConfig{n->positionPipeIndex});
 
-        att.addOp(OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), size0(), NnMultiHeadAttOpConfig{multiHeadAttSlice.nHeads, multiHeadAttSlice.nHeads0, h->nKvHeads, h->headDim, h->seqLen, qSlice.inLen, kvCacheSlice.kvLen, n->positionPipeIndex, qBufferIndex, kBufferIndex, vBufferIndex, attBufferIndex});
+        att.addOp(OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), size0(), NnMultiHeadAttOpConfig{multiHeadAttSlice.nHeads, multiHeadAttSlice.nHeads0, h->nKvHeads, h->headDim, h->seqLen, qSlice.inLen, kvCacheSlice.kvLen, 0u, qSlice.inLen, 0u, kvCacheSlice.kvLen, n->positionPipeIndex, qBufferIndex, kBufferIndex, vBufferIndex, attBufferIndex});
         printf("🔍 [Node %u DEBUG] MHA: nHeads=%u, nHeads0=%u\n", nodeIndex, multiHeadAttSlice.nHeads, multiHeadAttSlice.nHeads0);
 
         if (mhaOutBufferIndex != mhaOutQBufferIndex) {
              att.addOp(OP_CAST, "block_cast_y2", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex), size0(), NnCastOpCodeConfig{});
         }
-        att.addOp(OP_MATMUL, "block_matmul_wo", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), woSlice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+        att.addOp(OP_MATMUL, "block_matmul_wo", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), stageFullWeights ? woSlice.size : woSlice.sliceSize, makeColMatmulCfg(woSlice.n0, woSlice.d, woSlice.outStart));
         att.addOp(OP_CAST, "block_cast_d", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfig(SRC_PIPE, n->zqPipeIndex), size0(), NnCastOpCodeConfig{});
         att.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
 
@@ -841,36 +932,62 @@ static NnNodeConfig buildLlmNodeInternal(
 
         if (h->archType == QWEN3_MOE) {
             ff.addOp(OP_REPEAT_Z, "block_moe_y_repeat", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), size0(), NnRepeatZOpCodeConfig{});
-            ff.addOp(OP_MATMUL, "block_moe_gate", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), n->moeGateSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+            ff.addOp(OP_MATMUL, "block_moe_gate", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), n->moeGateSize, makeRowMatmulCfg(n->moeGateSize.x, nExpertsOr1, 0u));
             ff.addOp(OP_SOFTMAX, "block_moe_softmax", layerIndex, pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), size0(), NnSoftmaxOpCodeConfig{});
             ff.addOp(OP_MOE_GATE, "block_moe_gate2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), pointerBatchConfig(SRC_BUFFER, moeSBufferIndex), size0(), NnMoeGateOpCodeConfig{h->nActiveExperts, 1u, moeExpertIndexesBufferIndex});
             
-            NnSize3D w1ExpertSliceSize = size3D(h->weightType, h->nExperts, w1Slice.n, w1Slice.inLen);
-            NnSize3D w3ExpertSliceSize = size3D(h->weightType, h->nExperts, w3Slice.n, w3Slice.inLen);
-            NnSize3D w2ExpertSliceSize = size3D(h->weightType, h->nExperts, w2Slice.n0, w2Slice.d);
+            NnSize3D w1ExpertSliceSize = stageFullWeights
+                ? size3D(h->weightType, h->nExperts, w1Slice.n, ffDim)
+                : size3D(h->weightType, h->nExperts, w1Slice.n, w1Slice.inLen);
+            NnSize3D w3ExpertSliceSize = stageFullWeights
+                ? size3D(h->weightType, h->nExperts, w3Slice.n, ffDim)
+                : size3D(h->weightType, h->nExperts, w3Slice.n, w3Slice.inLen);
+            NnSize3D w2ExpertSliceSize = stageFullWeights
+                ? size3D(h->weightType, h->nExperts, w2Slice.n, w2Slice.d)
+                : size3D(h->weightType, h->nExperts, w2Slice.n0, w2Slice.d);
 
-            ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), w1ExpertSliceSize, NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
-            ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeLBufferIndex), w3ExpertSliceSize, NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
-            ff.addOp(OP_SILU, "block_act", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), size0(), NnSiluOpCodeConfig{});
+            ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), w1ExpertSliceSize, makeMoeRowMatmulCfg(w1Slice.n, w1Slice.inLen, w1Slice.inStart));
+            ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeLBufferIndex), w3ExpertSliceSize, makeMoeRowMatmulCfg(w3Slice.n, w3Slice.inLen, w3Slice.inStart));
+            {
+                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+                const NnUint actDim = w1Slice.inLen;
+                if (testSplit && layerIndex == 0u && actDim >= 2u) {
+                    const NnUint half = actDim / 2u;
+                    ff.addOp(OP_SILU, "block_act_v0", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
+                    ff.addOp(OP_SILU, "block_act_v1", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
+                } else {
+                    ff.addOp(OP_SILU, "block_act", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                }
+            }
             ff.addOp(OP_MUL, "block_mul", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), size0(), NnMulOpCodeConfig{moeLBufferIndex});
             if (moeDBufferIndex != moeDQBufferIndex) {
                 ff.addOp(OP_CAST, "block_cast_d2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), size0(), NnCastOpCodeConfig{});
             }
-            ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), w2ExpertSliceSize, NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
+            ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), w2ExpertSliceSize, makeMoeColMatmulCfg(w2Slice.n0, w2Slice.d, w2Slice.outStart));
             ff.addOp(OP_SCALE, "block_moe_scale", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), size0(), NnScaleOpCodeConfig{moeSBufferIndex});
             ff.addOp(OP_MERGE_SUM, "block_moe_merge_sum", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), size0(), NnMergeSumOpCodeConfig{});
         } else {
             if (yBufferIndex != yqBufferIndex) {
                 ff.addOp(OP_CAST, "block_cast_y3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
             }
-            ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), w1Slice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
-            ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, lBufferIndex), w3Slice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
-            ff.addOp(OP_SILU, "block_act", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{});
+            ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), stageFullWeights ? w1Slice.size : w1Slice.sliceSize, makeRowMatmulCfg(w1Slice.n, w1Slice.inLen, w1Slice.inStart));
+            ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, lBufferIndex), stageFullWeights ? w3Slice.size : w3Slice.sliceSize, makeRowMatmulCfg(w3Slice.n, w3Slice.inLen, w3Slice.inStart));
+            {
+                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+                const NnUint actDim = w1Slice.inLen;
+                if (testSplit && layerIndex == 0u && actDim >= 2u) {
+                    const NnUint half = actDim / 2u;
+                    ff.addOp(OP_SILU, "block_act_v0", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
+                    ff.addOp(OP_SILU, "block_act_v1", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
+                } else {
+                    ff.addOp(OP_SILU, "block_act", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                }
+            }
             ff.addOp(OP_MUL, "block_mul", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnMulOpCodeConfig{lBufferIndex});
             if (dBufferIndex != dqBufferIndex) {
                 ff.addOp(OP_CAST, "block_cast_d2", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dqBufferIndex), size0(), NnCastOpCodeConfig{});
             }
-            ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, dqBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), w2Slice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+            ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, dqBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), stageFullWeights ? w2Slice.size : w2Slice.sliceSize, makeColMatmulCfg(w2Slice.n0, w2Slice.d, w2Slice.outStart));
         }
         
         ff.addOp(OP_CAST, "block_cast_d3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfig(SRC_PIPE, n->zqPipeIndex), size0(), NnCastOpCodeConfig{});
@@ -913,7 +1030,7 @@ static NnNodeConfig buildLlmNodeInternal(
             end.addOp(OP_CAST, "final_cast_y", 0, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
         }
         
-        end.addOp(OP_MATMUL, "final_matmul_logits", 0, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex), wclsSlice.sliceSize, NnMatmulOpConfig{});
+        end.addOp(OP_MATMUL, "final_matmul_logits", 0, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex), stageFullWeights ? wclsSlice.size : wclsSlice.sliceSize, makeRowMatmulCfg(wclsSlice.n, wclsSlice.inLen, wclsSlice.inStart));
         
         end.addOp(OP_CAST, "final_cast_logits", 0, 
             pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex), 
@@ -1073,6 +1190,13 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         printf("   [PP] Node %u: No stage info found (assuming Full/TP mode)\n", nodeIndex);
     }
 
+    // Opt-in: stage 内全量加载本 stage 的模型权重（每个节点都持有本 stage 的全量 weight tensor）。
+    // 注意：这只改变“加载多少权重到本地”；要真正利用全量权重进行区间计算，还需要算子/建图侧用 view/outStart 等参数选择计算区间。
+    const bool stageFullWeights = (std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr) && (myStage != nullptr);
+    if (stageFullWeights) {
+        printf("   [PP] Node %u: Stage full-weight loading ENABLED (DLLAMA_STAGE_FULL_WEIGHTS)\n", nodeIndex);
+    }
+
     MmapFile file;
     openMmapFile(&file, path, net->header->fileSize);
     std::unique_ptr<MmapFile, void(*)(MmapFile *)> fdPtr(&file, closeMmapFile);
@@ -1103,34 +1227,63 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
             NnByte* layerStartPtr = b;
 
             // Attention
-            b += loader->loadRowMatmulSlicesUneven("block_matmul_q", layerIndex, 0, 
-                [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->headSplit, h->qDim, idx); }, b);
-            b += loader->loadRowMatmulSlicesUneven("block_matmul_k", layerIndex, 0, 
-                [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, idx); }, b);
-            b += loader->loadRowMatmulSlicesUneven("block_matmul_v", layerIndex, 0, 
-                [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, idx); }, b);
-            b += loader->loadColMatmulSlicesUneven("block_matmul_wo", layerIndex, 0, 
-                [&](NnUint idx) { return sliceColMatmulAttUneven(h->weightType, h->qDim, h->dim, h->headDim, plan, idx); }, b);
+            if (stageFullWeights) {
+                b += loader->loadRowMatmulFullUneven("block_matmul_q", layerIndex, 0,
+                    [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->headSplit, h->qDim, idx); }, b);
+                b += loader->loadRowMatmulFullUneven("block_matmul_k", layerIndex, 0,
+                    [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, idx); }, b);
+                b += loader->loadRowMatmulFullUneven("block_matmul_v", layerIndex, 0,
+                    [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, idx); }, b);
+                b += loader->loadColMatmulFullUneven("block_matmul_wo", layerIndex, 0,
+                    [&](NnUint idx) { return sliceColMatmulAttUneven(h->weightType, h->qDim, h->dim, h->headDim, plan, idx); }, b);
+            } else {
+                b += loader->loadRowMatmulSlicesUneven("block_matmul_q", layerIndex, 0,
+                    [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->headSplit, h->qDim, idx); }, b);
+                b += loader->loadRowMatmulSlicesUneven("block_matmul_k", layerIndex, 0,
+                    [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, idx); }, b);
+                b += loader->loadRowMatmulSlicesUneven("block_matmul_v", layerIndex, 0,
+                    [&](NnUint idx) { return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, idx); }, b);
+                b += loader->loadColMatmulSlicesUneven("block_matmul_wo", layerIndex, 0,
+                    [&](NnUint idx) { return sliceColMatmulAttUneven(h->weightType, h->qDim, h->dim, h->headDim, plan, idx); }, b);
+            }
 
             // FFN / MoE
             NnUint ffDim = (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim;
             if (h->nExperts > 0) {
                 b += loader->loadAll("block_moe_gate", layerIndex, net->moeGateSize.nBytes, b);
                 for (NnUint expertIndex = 0u; expertIndex < h->nExperts; expertIndex++) {
-                    b += loader->loadRowMatmulSlicesUneven("block_matmul_w1", layerIndex, expertIndex, 
-                        [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
-                    b += loader->loadColMatmulSlicesUneven("block_matmul_w2", layerIndex, expertIndex, 
-                        [&](NnUint idx) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, idx); }, b);
-                    b += loader->loadRowMatmulSlicesUneven("block_matmul_w3", layerIndex, expertIndex, 
-                        [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                    if (stageFullWeights) {
+                        b += loader->loadRowMatmulFullUneven("block_matmul_w1", layerIndex, expertIndex,
+                            [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                        b += loader->loadColMatmulFullUneven("block_matmul_w2", layerIndex, expertIndex,
+                            [&](NnUint idx) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, idx); }, b);
+                        b += loader->loadRowMatmulFullUneven("block_matmul_w3", layerIndex, expertIndex,
+                            [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                    } else {
+                        b += loader->loadRowMatmulSlicesUneven("block_matmul_w1", layerIndex, expertIndex,
+                            [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                        b += loader->loadColMatmulSlicesUneven("block_matmul_w2", layerIndex, expertIndex,
+                            [&](NnUint idx) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, idx); }, b);
+                        b += loader->loadRowMatmulSlicesUneven("block_matmul_w3", layerIndex, expertIndex,
+                            [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                    }
                 }
             } else {
-                b += loader->loadRowMatmulSlicesUneven("block_matmul_w1", layerIndex, 0, 
-                    [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
-                b += loader->loadColMatmulSlicesUneven("block_matmul_w2", layerIndex, 0, 
-                    [&](NnUint idx) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, idx); }, b);
-                b += loader->loadRowMatmulSlicesUneven("block_matmul_w3", layerIndex, 0, 
-                    [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                if (stageFullWeights) {
+                    b += loader->loadRowMatmulFullUneven("block_matmul_w1", layerIndex, 0,
+                        [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                    b += loader->loadColMatmulFullUneven("block_matmul_w2", layerIndex, 0,
+                        [&](NnUint idx) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, idx); }, b);
+                    b += loader->loadRowMatmulFullUneven("block_matmul_w3", layerIndex, 0,
+                        [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                } else {
+                    b += loader->loadRowMatmulSlicesUneven("block_matmul_w1", layerIndex, 0,
+                        [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                    b += loader->loadColMatmulSlicesUneven("block_matmul_w2", layerIndex, 0,
+                        [&](NnUint idx) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, idx); }, b);
+                    b += loader->loadRowMatmulSlicesUneven("block_matmul_w3", layerIndex, 0,
+                        [&](NnUint idx) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, idx); }, b);
+                }
             }
 
             // Norms
@@ -1173,10 +1326,17 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     if (isLastStage) {
         NnByte* finalStart = b;
         b += loader->loadAll("final_norm", 0u, net->rmsNormSize.nBytes, b);
-        b += loader->loadRowMatmulSlicesUneven("final_matmul_logits", 0u, 0u, 
-            [&](NnUint idx) { 
-                return sliceRowMatmulLogitsUneven(h->weightType, h->dim, h->vocabSize, plan, idx); 
-            }, b);
+        if (stageFullWeights) {
+            b += loader->loadRowMatmulFullUneven("final_matmul_logits", 0u, 0u,
+                [&](NnUint idx) {
+                    return sliceRowMatmulLogitsUneven(h->weightType, h->dim, h->vocabSize, plan, idx);
+                }, b);
+        } else {
+            b += loader->loadRowMatmulSlicesUneven("final_matmul_logits", 0u, 0u,
+                [&](NnUint idx) {
+                    return sliceRowMatmulLogitsUneven(h->weightType, h->dim, h->vocabSize, plan, idx);
+                }, b);
+        }
         
         if ((NnSize)(b - finalStart) != finalBlockBytes) {
              throw std::runtime_error("Final block size mismatch");

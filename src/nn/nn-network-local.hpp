@@ -23,6 +23,14 @@ public:
     NnSize loadColMatmulSlicesUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex, 
                                      std::function<NnColMatmulSliceUneven(NnUint)> slicer, NnByte *weight);
 
+    // 非均匀加载接口（全量权重）：忽略 slicer 的切分结果，直接把该 tensor 的全量权重加载到本地。
+    // 适用场景：stage 内所有节点都需要持有本 stage 的全量权重，运行时通过区间参数(view/offset)选择计算范围。
+    NnSize loadRowMatmulFullUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                  std::function<NnRowMatmulSliceUneven(NnUint)> slicer, NnByte *weight);
+
+    NnSize loadColMatmulFullUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                  std::function<NnColMatmulSliceUneven(NnUint)> slicer, NnByte *weight);
+
     void finish(); // 空实现
 
 private:

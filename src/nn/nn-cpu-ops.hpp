@@ -2,6 +2,7 @@
 #define NN_CPU_OPS_H
 
 #include "nn-core.hpp"
+#include <cstdint>
 
 #define ASSERT_EQ(a, b) \
     if (a != b) { \
@@ -11,6 +12,8 @@
 
 typedef struct {
     const char *name;
+    NnOpCode opCode;
+    NnUint opIndex;
     NnByte nBatches;
     NnByte *bufferFlags;
     NnByte **buffers;
@@ -29,6 +32,13 @@ typedef struct {
 
     NnByte *weight;
     NnSize3D weightSize;
+
+    // Debug: track loaded weight ranges (offsets in bytes within `weight`).
+    NnSize weightLoadedMin;     // inclusive
+    NnSize weightLoadedMax;     // exclusive
+    NnSize weightLoadedBytes;   // sum of loadWeight(nBytes)
+    NnUint weightLoadCalls;
+    NnByte weightReadPrinted;
 } NnCpuOpContext;
 
 typedef void (*NnCpuOpForwardInit)(NnCpuOpContext *context);

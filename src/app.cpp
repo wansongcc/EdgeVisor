@@ -837,6 +837,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     context.tokenizer = &tokenizer;
     context.network = network;
     context.executor = &executor;
+    context.nodeConfig = rootNodeConfig;
 
     handler(&context);
 

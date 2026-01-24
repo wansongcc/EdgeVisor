@@ -6,6 +6,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#include <cstdlib>
+#include <limits>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -17,6 +19,17 @@
 #define DEBUG_CPU_OP_QUANTS false
 
 #define BUFFER_ALIGNMENT 64
+
+static bool debugWeightRangesEnabled(const char *opName) {
+    if (std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES") == nullptr)
+        return false;
+    const char *filter = std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES_FILTER");
+    if (filter == nullptr || filter[0] == '\0')
+        return true;
+    if (opName == nullptr)
+        return false;
+    return (std::strstr(opName, filter) != nullptr);
+}
 
 static NnByte *allocAlignedBuffer(NnSize size) {
     NnByte *buffer;
@@ -168,6 +181,8 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
         NnCpuOpContext *opContext = &opContexts[opIndex];
         NnCpuOpForwardInit opInit = getCpuOpForwardInit(opConfig->code, opQuants[opIndex]);
         opContext->name = opConfig->name;
+        opContext->opCode = opConfig->code;
+        opContext->opIndex = opIndex;
         opContext->opConfig = opConfig->config;
         opContext->weightSize = opConfig->weightSize;
         opContext->nBatches = netConfig->nBatches;
@@ -187,12 +202,32 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
         opContext->hasOutputContinuousMemory = hasPointerContinuousMemory(&opConfig->output);
         std::memcpy(opContext->output, outputsPtr[opIndex].data(), outputsPtr[opIndex].size() * sizeof(NnByte *));
 
+        opContext->weightLoadedMin = std::numeric_limits<NnSize>::max();
+        opContext->weightLoadedMax = 0;
+        opContext->weightLoadedBytes = 0;
+        opContext->weightLoadCalls = 0u;
+        opContext->weightReadPrinted = 0u;
+
 #if not(DEBUG_USE_MMAP_FOR_WEIGHTS)
         if (opContext->weightSize.nBytes > 0)
             opContext->weight = allocAlignedBuffer(opContext->weightSize.nBytes);
         else
             opContext->weight = nullptr;
 #endif
+
+        if (opContext->weightSize.nBytes > 0 && debugWeightRangesEnabled(opContext->name)) {
+            printf("🧱 [weights][alloc] op=%s idx=%u code=%s weightBytes=%zu required=[0,%zu) dims(z,y,x)=(%u,%u,%u) type=%u\n",
+                opContext->name,
+                opIndex,
+                opCodeToString(opConfig->code),
+                (size_t)opContext->weightSize.nBytes,
+                (size_t)opContext->weightSize.nBytes,
+                opContext->weightSize.z,
+                opContext->weightSize.y,
+                opContext->weightSize.x,
+                (unsigned)opContext->weightSize.floatType);
+            std::fflush(stdout);
+        }
 
         if (opInit != nullptr)
             opInit(opContext);
@@ -378,6 +413,25 @@ void NnCpuDeviceSegment::loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes
     assert(opIndex >= 0u);
     assert(opIndex < nOps);
     NnCpuOpContext *context = &opContexts[opIndex];
+
+    if (context->weightSize.nBytes > 0 && debugWeightRangesEnabled(context->name)) {
+        const NnSize end = offset + nBytes;
+        context->weightLoadCalls += 1u;
+        context->weightLoadedBytes += nBytes;
+        if (offset < context->weightLoadedMin) context->weightLoadedMin = offset;
+        if (end > context->weightLoadedMax) context->weightLoadedMax = end;
+
+        printf("📥 [weights][load] op=%s idx=%u write=[%zu,%zu) bytes=%zu alloc=[0,%zu) calls=%u\n",
+            (context->name ? context->name : "Unknown"),
+            (unsigned)opIndex,
+            (size_t)offset,
+            (size_t)end,
+            (size_t)nBytes,
+            (size_t)context->weightSize.nBytes,
+            (unsigned)context->weightLoadCalls);
+        std::fflush(stdout);
+    }
+
     if (offset + nBytes > context->weightSize.nBytes) {
         std::cerr << "🚨 CRITICAL ERROR in loadWeight:" << std::endl;
         std::cerr << "   Op Name: " << (context->name ? context->name : "Unknown") << std::endl;
@@ -400,6 +454,27 @@ void NnCpuDeviceSegment::loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes
 void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) {
     NnCpuOpContext *context = &opContexts[opIndex];
     // printf("forward: %d %s (%d/%d)\n", opIndex, context->name, threadIndex + 1, nThreads); fflush(stdout);
+
+    if (threadIndex == 0u && context->weightSize.nBytes > 0 && context->weightReadPrinted == 0u && debugWeightRangesEnabled(context->name)) {
+        context->weightReadPrinted = 1u;
+        printf("📖 [weights][read-approx] op=%s idx=%u code=%s mayRead=[0,%zu) (matmul has detailed per-call ranges)\n",
+            (context->name ? context->name : "Unknown"),
+            (unsigned)opIndex,
+            opCodeToString(context->opCode),
+            (size_t)context->weightSize.nBytes);
+        if (context->weightLoadCalls > 0u) {
+            const NnSize min = (context->weightLoadedMin == std::numeric_limits<NnSize>::max()) ? 0u : context->weightLoadedMin;
+            const NnSize max = context->weightLoadedMax;
+            printf("📦 [weights][loaded] op=%s idx=%u loadedUnion=[%zu,%zu) loadedBytesSum=%zu calls=%u\n",
+                (context->name ? context->name : "Unknown"),
+                (unsigned)opIndex,
+                (size_t)min,
+                (size_t)max,
+                (size_t)context->weightLoadedBytes,
+                (unsigned)context->weightLoadCalls);
+        }
+        std::fflush(stdout);
+    }
 
     opForward[opIndex](nThreads, threadIndex, batchSize, context);
 }

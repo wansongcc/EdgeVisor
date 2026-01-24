@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 
 #ifndef DLLAMA_DEBUG_TOPK_LOGITS
 #define DLLAMA_DEBUG_TOPK_LOGITS 0
@@ -348,6 +349,214 @@ static void inference(AppInferenceContext *context) {
     }
 }
 
+// =====================================================================================
+// E2E Matmul-View Zero-Offset Check (Inference Mode)
+//
+// Enable via env var:
+//   DLLAMA_E2E_MATMUL_VIEW0_CHECK=1
+//
+// What it does:
+// - Run prompt eval stage twice in two independent runInferenceApp() invocations.
+// - Pass A: clears all OP_MATMUL a/b/c views (legacy behavior)
+// - Pass B: keeps current views (offset=0 plumbing path)
+// - Compares logits after each eval forward() call.
+// =====================================================================================
+
+static bool envFlagEnabled(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return false;
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "TRUE") == 0;
+}
+
+static void clearMatmulViews(NnNodeConfig* nodeConfig) {
+    if (nodeConfig == nullptr || nodeConfig->segments == nullptr) return;
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        NnSegmentConfig* seg = &nodeConfig->segments[s];
+        for (NnUint i = 0; i < seg->nOps; ++i) {
+            NnOpConfig* op = &seg->ops[i];
+            if (op->code != OP_MATMUL) continue;
+            if (op->config == nullptr) continue;
+            if (op->configSize < sizeof(NnMatmulOpConfig)) continue;
+            NnMatmulOpConfig* cfg = (NnMatmulOpConfig*)op->config;
+            std::memset(&cfg->aView, 0, sizeof(cfg->aView));
+            std::memset(&cfg->bView, 0, sizeof(cfg->bView));
+            std::memset(&cfg->cView, 0, sizeof(cfg->cView));
+        }
+    }
+}
+
+struct EvalLogitsCapture {
+    NnUint vocabSize = 0;
+    std::vector<std::vector<float>> logitsPerForward;
+};
+
+static EvalLogitsCapture g_evalCapture;
+static bool g_evalCaptureClearViews = false;
+static bool g_evalCompareClearViews = false;
+static bool g_evalCompareOk = true;
+
+static void evalOnlyCapture(AppInferenceContext* context) {
+    if (context == nullptr) throw std::runtime_error("Internal error: context is null");
+    if (context->args->prompt == nullptr) throw std::runtime_error("Prompt is required");
+    if (context->nodeConfig == nullptr) throw std::runtime_error("Internal error: nodeConfig is null");
+
+    if (g_evalCaptureClearViews) {
+        clearMatmulViews(context->nodeConfig);
+    }
+
+    std::vector<int> inputTokensVec(std::strlen(context->args->prompt) + 3);
+    int* inputTokens = inputTokensVec.data();
+    int nInputTokens = 0;
+    context->tokenizer->encode(context->args->prompt, inputTokens, &nInputTokens, true, true);
+    if (nInputTokens <= 1) throw std::runtime_error("Prompt produced too few tokens");
+    if ((NnUint)nInputTokens > context->header->seqLen) throw std::runtime_error("Prompt too long for model seqLen");
+
+    g_evalCapture = EvalLogitsCapture();
+    g_evalCapture.vocabSize = context->header->vocabSize;
+
+    {
+        const int evalTokens = nInputTokens - 1;
+        int expectedForwards = 0;
+        if (evalTokens > 0) {
+            const int nb = (int)std::max<NnUint>(1u, context->args->nBatches);
+            expectedForwards = (evalTokens + nb - 1) / nb;
+        }
+        printf("🧪 [E2E View0][Capture] promptTokens=%d evalTokens=%d nBatches=%u expectedForwards=%d clearMatmulViews=%s\n",
+            nInputTokens,
+            evalTokens,
+            context->args->nBatches,
+            expectedForwards,
+            g_evalCaptureClearViews ? "true" : "false");
+    }
+
+    NnUint pos = 0;
+    size_t forwardIndex = 0;
+    while ((int)pos < nInputTokens - 1) {
+        long remainingTokens = nInputTokens - 1 - (long)pos;
+        if (remainingTokens <= 0) break;
+        NnUint batchSize = remainingTokens < context->args->nBatches ? (NnUint)remainingTokens : context->args->nBatches;
+
+        printf("🧪 [E2E View0][Capture] forward=%zu pos=%u batch=%u\n", forwardIndex, pos, batchSize);
+
+        context->inference->setBatchSize(batchSize);
+        context->inference->setPosition(pos);
+        for (NnUint i = 0; i < batchSize; ++i) {
+            context->inference->setToken(i, (NnUint)inputTokens[pos + i]);
+        }
+        context->inference->forward();
+
+        const NnUint vocabSize = context->header->vocabSize;
+        std::vector<float> snapshot;
+        snapshot.resize(vocabSize);
+        std::memcpy(snapshot.data(), context->inference->logitsPipe, (size_t)vocabSize * sizeof(float));
+        g_evalCapture.logitsPerForward.push_back(std::move(snapshot));
+
+        pos += batchSize;
+        forwardIndex++;
+    }
+
+    printf("🧪 [E2E View0][Capture] done forwards=%zu\n", g_evalCapture.logitsPerForward.size());
+}
+
+static void evalOnlyCompare(AppInferenceContext* context) {
+    if (context == nullptr) throw std::runtime_error("Internal error: context is null");
+    if (context->args->prompt == nullptr) throw std::runtime_error("Prompt is required");
+    if (context->nodeConfig == nullptr) throw std::runtime_error("Internal error: nodeConfig is null");
+    if (g_evalCapture.vocabSize == 0 || g_evalCapture.logitsPerForward.empty())
+        throw std::runtime_error("Internal error: missing reference capture");
+
+    if (g_evalCompareClearViews) {
+        clearMatmulViews(context->nodeConfig);
+    }
+
+    std::vector<int> inputTokensVec(std::strlen(context->args->prompt) + 3);
+    int* inputTokens = inputTokensVec.data();
+    int nInputTokens = 0;
+    context->tokenizer->encode(context->args->prompt, inputTokens, &nInputTokens, true, true);
+    if (nInputTokens <= 1) throw std::runtime_error("Prompt produced too few tokens");
+    if ((NnUint)nInputTokens > context->header->seqLen) throw std::runtime_error("Prompt too long for model seqLen");
+
+    const NnUint vocabSize = context->header->vocabSize;
+    if (vocabSize != g_evalCapture.vocabSize)
+        throw std::runtime_error("Vocab size mismatch between runs");
+
+    {
+        const int evalTokens = nInputTokens - 1;
+        int expectedForwards = 0;
+        if (evalTokens > 0) {
+            const int nb = (int)std::max<NnUint>(1u, context->args->nBatches);
+            expectedForwards = (evalTokens + nb - 1) / nb;
+        }
+        printf("🧪 [E2E View0][Compare] promptTokens=%d evalTokens=%d nBatches=%u expectedForwards=%d capturedForwards=%zu clearMatmulViews=%s\n",
+            nInputTokens,
+            evalTokens,
+            context->args->nBatches,
+            expectedForwards,
+            g_evalCapture.logitsPerForward.size(),
+            g_evalCompareClearViews ? "true" : "false");
+    }
+
+    const float absEps = 1e-6f;
+    const float relEps = 1e-6f;
+
+    NnUint pos = 0;
+    size_t forwardIndex = 0;
+    while ((int)pos < nInputTokens - 1) {
+        long remainingTokens = nInputTokens - 1 - (long)pos;
+        if (remainingTokens <= 0) break;
+        NnUint batchSize = remainingTokens < context->args->nBatches ? (NnUint)remainingTokens : context->args->nBatches;
+
+        printf("🧪 [E2E View0][Compare] forward=%zu pos=%u batch=%u\n", forwardIndex, pos, batchSize);
+
+        context->inference->setBatchSize(batchSize);
+        context->inference->setPosition(pos);
+        for (NnUint i = 0; i < batchSize; ++i) {
+            context->inference->setToken(i, (NnUint)inputTokens[pos + i]);
+        }
+        context->inference->forward();
+
+        if (forwardIndex >= g_evalCapture.logitsPerForward.size()) {
+            g_evalCompareOk = false;
+            printf("❌ [E2E View0] Forward count mismatch: got extra forward at index=%zu\n", forwardIndex);
+            return;
+        }
+
+        const std::vector<float>& ref = g_evalCapture.logitsPerForward[forwardIndex];
+        const float* got = context->inference->logitsPipe;
+
+        float maxAbsDiff = 0.0f;
+        int maxIdx = -1;
+        for (NnUint i = 0; i < vocabSize; ++i) {
+            float a = ref[i];
+            float b = got[i];
+            float diff = std::fabs(a - b);
+            float tol = absEps + relEps * std::max(std::fabs(a), std::fabs(b));
+            if (diff > maxAbsDiff) { maxAbsDiff = diff; maxIdx = (int)i; }
+            if (diff > tol) {
+                g_evalCompareOk = false;
+                printf("❌ [E2E View0] Logits mismatch at forward=%zu pos=%u idx=%u ref=%+.9f got=%+.9f diff=%.9g tol=%.9g\n",
+                    forwardIndex, pos, i, a, b, diff, tol);
+                printf("❌ [E2E View0] MaxAbsDiff=%.9g at idx=%d (may be same as first mismatch)\n", maxAbsDiff, maxIdx);
+                return;
+            }
+        }
+
+        printf("✅ [E2E View0] forward=%zu pos=%u batch=%u maxAbsDiff=%.3g\n",
+            forwardIndex, pos, batchSize, maxAbsDiff);
+
+        pos += batchSize;
+        forwardIndex++;
+    }
+
+    if (forwardIndex != g_evalCapture.logitsPerForward.size()) {
+        g_evalCompareOk = false;
+        printf("❌ [E2E View0] Forward count mismatch: expected=%zu got=%zu\n",
+            g_evalCapture.logitsPerForward.size(), forwardIndex);
+    }
+
+    printf("🧪 [E2E View0][Compare] done forwards=%zu compareOk=%s\n", forwardIndex, g_evalCompareOk ? "true" : "false");
+}
+
 static NnUint readStdin(const char *guide, char *buffer, NnUint size) {
     std::fflush(stdin);
     std::printf("%s", guide);
@@ -505,7 +714,29 @@ int main(int argc, char **argv) {
         AppCliArgs args = AppCliArgs::parse(argc, argv, true);
         if (std::strcmp(args.mode, "inference") == 0) {
             printf("nNodes=%d\n", args.nWorkers);
-            runInferenceApp(&args, &inference);
+            if (envFlagEnabled("DLLAMA_E2E_MATMUL_VIEW0_CHECK")) {
+                if (args.nWorkers != 0) {
+                    throw std::runtime_error("DLLAMA_E2E_MATMUL_VIEW0_CHECK currently requires single-node run (--n-workers 0)");
+                }
+
+                printf("🧪 [E2E View0] Running prompt-eval twice: (A) clear matmul views, (B) keep matmul views\n");
+
+                g_evalCaptureClearViews = true;
+                runInferenceApp(&args, &evalOnlyCapture);
+
+                g_evalCompareOk = true;
+                g_evalCompareClearViews = false;
+                runInferenceApp(&args, &evalOnlyCompare);
+
+                if (!g_evalCompareOk) {
+                    printf("❌ [E2E View0] FAILED\n");
+                    returnCode = EXIT_FAILURE;
+                } else {
+                    printf("✅ [E2E View0] OK\n");
+                }
+            } else {
+                runInferenceApp(&args, &inference);
+            }
         } else if (std::strcmp(args.mode, "perplexity") == 0)
             runInferenceApp(&args, &perplexity);
         else if (std::strcmp(args.mode, "chat") == 0)

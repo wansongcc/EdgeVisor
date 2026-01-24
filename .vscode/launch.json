@@ -2,6 +2,35 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "dllama chat (matmul views)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/dllama",
+      "args": [
+        "chat",
+        "--model", "${workspaceFolder}/models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m",
+        "--tokenizer", "${workspaceFolder}/models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t",
+        "--buffer-float-type", "q80",
+        "--nthreads", "48",
+        "--max-seq-len", "4096"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "environment": [
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" },
+        { "name": "DLLAMA_DEBUG_MATMUL_VIEWS", "value": "1" },
+        { "name": "DLLAMA_DEBUG_MATMUL_VIEWS_LIMIT", "value": "50" },
+        { "name": "DLLAMA_DEBUG_MATMUL_VIEWS_FILTER", "value": "final_matmul_logits" }
+      ],
+      "setupCommands": [
+        { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
+        { "description": "Set disassembly flavor to intel", "text": "-gdb-set disassembly-flavor intel", "ignoreFailures": true }
+      ]
+    },
+    {
       "name": "dllama chat",
       "type": "cppdbg",
       "request": "launch",
@@ -20,7 +49,9 @@
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb",
       "environment": [
-        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" }
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" },
+        { "name": "DLLAMA_DEBUG_MATMUL_VIEWS", "value": "1" },
+        { "name": "DLLAMA_DEBUG_MATMUL_VIEWS_LIMIT", "value": "50" }
       ],
       "setupCommands": [
         { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
@@ -42,8 +73,8 @@
         "--nthreads", "2",
         "--max-seq-len", "2048",
         "--benchmark",
-        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie4:9999",
-        "--ratios", "1:2*1:1*2:3"
+        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie6:9999",
+        "--ratios", "1:1*1:1*1:1"
       ],
       "cwd": "/workspace/distributed-llama",
       "stopAtEntry": true,
@@ -51,7 +82,10 @@
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb",
       "environment": [
-        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" }
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" },
+        { "name": "DLLAMA_STAGE_FULL_WEIGHTS", "value": "1" },
+        { "name": "DLLAMA_DEBUG_WEIGHT_RANGES", "value": "1" },
+        
       ],
       "setupCommands": [
         { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },

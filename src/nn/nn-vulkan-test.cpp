@@ -162,7 +162,7 @@ void testMul_F32_F32() {
                 pointerBatchConfig(SRC_PIPE, xPipeIndex),
                 pointerBatchConfig(SRC_PIPE, xPipeIndex),
                 size0(),
-                NnMulOpCodeConfig{sBufferIndex});
+                NnMulOpCodeConfig{sBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             // arrange
@@ -837,7 +837,7 @@ void testScale_F32_F32() {
                 pointerBatchConfig(SRC_PIPE, xPipeIndex),
                 pointerBatchConfig(SRC_PIPE, xPipeIndex),
                 size0(),
-                NnScaleOpCodeConfig{scaleBufferIndex});
+                NnScaleOpCodeConfig{scaleBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             // arrange

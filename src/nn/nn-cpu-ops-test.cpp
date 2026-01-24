@@ -253,6 +253,263 @@ void testSilu() {
     compare_F32("silu_F32", y.data(), expectedOutput, 8, 0.001);
 }
 
+void testGeluViewSlice() {
+    const NnUint n = 16u;
+    const NnUint offset = 4u;
+    const NnUint len = 6u;
+
+    std::vector<float> y(n);
+    std::vector<float> expected(n);
+    for (NnUint i = 0; i < n; i++) {
+        // deterministic inputs, include negatives
+        y[i] = ((float)i - 8.0f) / 8.0f;
+        expected[i] = y[i];
+    }
+
+    // Apply GELU only to the view slice for expected output
+    gelu_F32(expected.data() + offset, len, 1u, 0u);
+
+    // Run geluForward with a view config
+    NnGeluOpCodeConfig cfg{NnTensorView{offset, 0u, len, 0u, 1u}};
+
+    NnByte *io0 = (NnByte *)y.data();
+    NnByte *io[1] = { io0 };
+
+    NnCpuOpContext ctx{};
+    ctx.name = "test_gelu_view";
+    ctx.nBatches = 1;
+    ctx.opConfig = &cfg;
+    ctx.input = io;
+    ctx.output = io;
+    ctx.inputSize = size2D(F_32, 1u, n);
+    ctx.outputSize = size2D(F_32, 1u, n);
+    ctx.weightSize = size0();
+
+    geluForward_F32_F32_F32(1u, 0u, 1u, &ctx);
+
+    compare_F32("geluForward_view_slice", y.data(), expected.data(), n, 1e-6f);
+}
+
+void testRopeViewSlice() {
+    const NnUint dim0 = 8u;
+    const NnUint offset = 2u;
+    const NnUint len = 4u;
+    const NnUint seqLen = 4u;
+    const NnUint pos = 1u;
+
+    std::vector<float> x(dim0);
+    std::vector<float> full(dim0);
+    std::vector<float> sliced(dim0);
+
+    for (NnUint i = 0; i < dim0; i++) {
+        x[i] = ((float)i - 4.0f) / 4.0f;
+        full[i] = x[i];
+        sliced[i] = x[i];
+    }
+
+    // Build rope cache
+    std::vector<float> cache(seqLen * dim0);
+    NnRopeSlice slice{};
+    slice.qDim0 = dim0;
+    slice.qDimStart = 0u;
+    slice.qDimEnd = dim0;
+    slice.qShift = 0u;
+    slice.kvDim = dim0;
+    slice.kvDim0 = dim0;
+    slice.kvDimStart = 0u;
+    slice.sliceDim = dim0;
+    slice.seqLen = seqLen;
+    slice.headDim = dim0;
+    slice.nKvHeads = 1u;
+    slice.ropeTheta = 1000000.0f;
+
+    float positionsVal[1] = { (float)pos };
+    NnByte *pipes[1] = { (NnByte *)positionsVal };
+    NnPipeConfig pipeCfgs[1] = {};
+    pipeCfgs[0].name = (char *)"pos";
+    pipeCfgs[0].size = size2D(F_32, 1u, 1u);
+
+    NnByte flag = 0;
+    NnByte *flags = &flag;
+    NnByte *bufs[1] = { (NnByte *)cache.data() };
+    NnBufferConfig bufCfgs[1] = {};
+    bufCfgs[0].name = (char *)"rope_cache";
+    bufCfgs[0].size = size2D(F_32, seqLen, dim0);
+
+    // full
+    NnRopeOpConfig fullCfg{};
+    fullCfg.type = ROPE_LLAMA;
+    fullCfg.isQ = 1u;
+    fullCfg.positionPipeIndex = 0u;
+    fullCfg.ropeCacheBufferIndex = 0u;
+    fullCfg.ropeScalingFactor = 1.0f;
+    fullCfg.ropeScalingLowFreqFactor = 1.0f;
+    fullCfg.ropeScalingHighFreqFactor = 1.0f;
+    fullCfg.ropeScalingOrigMaxSeqLen = 0u;
+    fullCfg.slice = slice;
+    fullCfg.view = NnTensorView{0u, 0u, 0u, 0u, 1u};
+
+    NnByte *fullIn[1] = { (NnByte *)full.data() };
+    NnCpuOpContext fullCtx{};
+    fullCtx.name = "test_rope_full";
+    fullCtx.nBatches = 1;
+    fullCtx.bufferFlags = flags;
+    fullCtx.buffers = bufs;
+    fullCtx.bufferConfigs = bufCfgs;
+    fullCtx.pipes = pipes;
+    fullCtx.pipeConfigs = pipeCfgs;
+    fullCtx.opConfig = &fullCfg;
+    fullCtx.input = fullIn;
+    fullCtx.inputSize = size2D(F_32, 1u, dim0);
+    fullCtx.outputSize = size2D(F_32, 1u, dim0);
+
+    initRopeForward_F32(&fullCtx);
+    ropeForward_F32_F32(1u, 0u, 1u, &fullCtx);
+
+    // slice
+    NnRopeOpConfig sliceCfg = fullCfg;
+    sliceCfg.view = NnTensorView{offset, 0u, len, 0u, 1u};
+
+    NnByte *sliceIn[1] = { (NnByte *)sliced.data() };
+    NnCpuOpContext sliceCtx = fullCtx;
+    sliceCtx.name = "test_rope_slice";
+    sliceCtx.opConfig = &sliceCfg;
+    sliceCtx.input = sliceIn;
+
+    // Expected: only slice region matches full; outside stays original.
+    std::vector<float> expected(dim0);
+    for (NnUint i = 0; i < dim0; i++) {
+        expected[i] = x[i];
+    }
+    for (NnUint i = offset; i < offset + len; i++) {
+        expected[i] = full[i];
+    }
+
+    ropeForward_F32_F32(1u, 0u, 1u, &sliceCtx);
+    compare_F32("ropeForward_view_slice", sliced.data(), expected.data(), dim0, 1e-6f);
+}
+
+
+void testCastViewSlice() {
+    // Case 1: F32 -> F32 (castForward_ANY) only overwrites slice
+    {
+        const NnUint n = 16u;
+        const NnUint offset = 5u;
+        const NnUint len = 7u;
+
+        std::vector<float> input(n);
+        std::vector<float> output(n);
+        std::vector<float> expected(n);
+        for (NnUint i = 0; i < n; i++) {
+            input[i] = ((float)i - 8.0f) / 8.0f;
+            output[i] = -123.0f;
+            expected[i] = -123.0f;
+        }
+        for (NnUint i = offset; i < offset + len; i++) {
+            expected[i] = input[i];
+        }
+
+        NnCastOpCodeConfig cfg{NnTensorView{offset, 0u, len, 0u, 1u}};
+        NnByte *inArr[1] = { (NnByte *)input.data() };
+        NnByte *outArr[1] = { (NnByte *)output.data() };
+
+        NnCpuOpContext ctx{};
+        ctx.name = "test_cast_f32_f32_view";
+        ctx.nBatches = 1;
+        ctx.opConfig = &cfg;
+        ctx.input = inArr;
+        ctx.output = outArr;
+        ctx.inputSize = size2D(F_32, 1u, n);
+        ctx.outputSize = size2D(F_32, 1u, n);
+        ctx.weightSize = size0();
+
+        castForward_ANY(1u, 0u, 1u, &ctx);
+        compare_F32("castForward_F32_F32_view_slice", output.data(), expected.data(), n, 0.0f);
+    }
+
+    // Case 2: F32 -> Q80 (castForward_F32_Q80) only overwrites slice (block-aligned)
+    {
+        const NnUint n = 64u;
+        const NnUint offset = 32u;
+        const NnUint len = 32u;
+
+        std::vector<float> input(n);
+        for (NnUint i = 0; i < n; i++)
+            input[i] = ((float)i - 32.0f) / 16.0f;
+
+        // Initialize output as quantized zeros so "unchanged" region is stable.
+        std::vector<float> zeros(n, 0.0f);
+        std::vector<NnBlockQ80> outQ(n / Q80_BLOCK_SIZE);
+        quantizeF32toQ80(zeros.data(), outQ.data(), n, 1u, 0u);
+
+        std::vector<NnBlockQ80> expectedQ = outQ;
+        std::vector<NnBlockQ80> sliceQ(len / Q80_BLOCK_SIZE);
+        quantizeF32toQ80(input.data() + offset, sliceQ.data(), len, 1u, 0u);
+        expectedQ[offset / Q80_BLOCK_SIZE] = sliceQ[0];
+
+        NnCastOpCodeConfig cfg{NnTensorView{offset, 0u, len, 0u, 1u}};
+        NnByte *inArr[1] = { (NnByte *)input.data() };
+        NnByte *outArr[1] = { (NnByte *)outQ.data() };
+
+        NnCpuOpContext ctx{};
+        ctx.name = "test_cast_f32_q80_view";
+        ctx.nBatches = 1;
+        ctx.opConfig = &cfg;
+        ctx.input = inArr;
+        ctx.output = outArr;
+        ctx.inputSize = size2D(F_32, 1u, n);
+        ctx.outputSize = size2D(F_Q80, 1u, n);
+        ctx.weightSize = size0();
+
+        castForward_F32_Q80(1u, 0u, 1u, &ctx);
+
+        std::vector<float> outF32(n);
+        std::vector<float> expectedF32(n);
+        dequantizeQ80toF32(outQ.data(), outF32.data(), n, 1u, 0u);
+        dequantizeQ80toF32(expectedQ.data(), expectedF32.data(), n, 1u, 0u);
+        compare_F32("castForward_F32_Q80_view_slice", outF32.data(), expectedF32.data(), n, 1e-6f);
+    }
+
+    // Case 3: Q80 -> F32 (castForward_Q80_F32) only overwrites slice (block-aligned)
+    {
+        const NnUint n = 64u;
+        const NnUint offset = 32u;
+        const NnUint len = 32u;
+
+        std::vector<float> inputF32(n);
+        for (NnUint i = 0; i < n; i++)
+            inputF32[i] = ((float)i - 32.0f) / 16.0f;
+
+        std::vector<NnBlockQ80> inputQ(n / Q80_BLOCK_SIZE);
+        quantizeF32toQ80(inputF32.data(), inputQ.data(), n, 1u, 0u);
+
+        std::vector<float> fullDeq(n);
+        dequantizeQ80toF32(inputQ.data(), fullDeq.data(), n, 1u, 0u);
+
+        std::vector<float> output(n, -321.0f);
+        std::vector<float> expected(n, -321.0f);
+        for (NnUint i = offset; i < offset + len; i++)
+            expected[i] = fullDeq[i];
+
+        NnCastOpCodeConfig cfg{NnTensorView{offset, 0u, len, 0u, 1u}};
+        NnByte *inArr[1] = { (NnByte *)inputQ.data() };
+        NnByte *outArr[1] = { (NnByte *)output.data() };
+
+        NnCpuOpContext ctx{};
+        ctx.name = "test_cast_q80_f32_view";
+        ctx.nBatches = 1;
+        ctx.opConfig = &cfg;
+        ctx.input = inArr;
+        ctx.output = outArr;
+        ctx.inputSize = size2D(F_Q80, 1u, n);
+        ctx.outputSize = size2D(F_32, 1u, n);
+        ctx.weightSize = size0();
+
+        castForward_Q80_F32(1u, 0u, 1u, &ctx);
+        compare_F32("castForward_Q80_F32_view_slice", output.data(), expected.data(), n, 1e-6f);
+    }
+}
+
 // matmul
 void testMatmul_F32_Q40_F32(const NnUint m = 2) {
     const NnUint n = Q80_BLOCK_SIZE * m;
@@ -327,6 +584,154 @@ void testLlamafileSgemm() {
 #endif
 }
 
+void testMatmulOpViewsZeroOffset() {
+    // This test ensures that when physical buffers == logical buffers and views have offset=0,
+    // the matmul op produces the same output as the reference kernels.
+
+    // Case 1: F32 input + F32 weight -> F32 output
+    {
+        const NnUint nBatches = 3u;
+        const NnUint n = 32u;
+        const NnUint d = 64u;
+
+        std::vector<float> x(nBatches * n);
+        std::vector<float> w(n * d);
+        std::vector<float> out(nBatches * d, 0.0f);
+        std::vector<float> expected(nBatches * d, 0.0f);
+        rand(x.data(), nBatches * n, 1001u);
+        rand(w.data(), n * d, 1002u);
+
+        for (NnUint b = 0; b < nBatches; b++) {
+            matmul_F32_F32_F32(
+                expected.data() + b * d,
+                x.data() + b * n,
+                w.data(),
+                n,
+                d,
+                1u,
+                0u);
+        }
+
+        NnMatmulOpConfig cfg{};
+        cfg.nExperts = 0u;
+        cfg.nActiveExperts = 0u;
+        cfg.activeExpertIndexesBufferIndex = 0u;
+        cfg.view = 0u;
+        cfg.inStart = 0u;
+        cfg.outStart = 0u;
+        cfg.aView = NnTensorView{0u, 0u, n, 0u, 1u};
+        cfg.cView = NnTensorView{0u, 0u, d, 0u, 1u};
+
+        float dummyIdx = 0.0f;
+        NnByte *buffers[1] = { (NnByte *)&dummyIdx };
+        NnBufferConfig bufferCfgs[1] = {};
+        bufferCfgs[0].name = (char *)"dummy";
+        bufferCfgs[0].size = size2D(F_32, 1u, 1u);
+
+        std::vector<NnByte *> inPtrs(nBatches);
+        std::vector<NnByte *> outPtrs(nBatches);
+        for (NnUint b = 0; b < nBatches; b++) {
+            inPtrs[b] = (NnByte *)(x.data() + b * n);
+            outPtrs[b] = (NnByte *)(out.data() + b * d);
+        }
+
+        NnCpuOpContext ctx{};
+        ctx.name = "test_matmul_op_view_zero_f32";
+        ctx.nBatches = nBatches;
+        ctx.opConfig = &cfg;
+        ctx.input = inPtrs.data();
+        ctx.output = outPtrs.data();
+        ctx.inputSize = size2D(F_32, nBatches, n);
+        ctx.outputSize = size2D(F_32, nBatches, d);
+        ctx.weight = (NnByte *)w.data();
+        ctx.weightSize = size2D(F_32, n, d);
+        ctx.buffers = buffers;
+        ctx.bufferConfigs = bufferCfgs;
+        ctx.hasInputContinuousMemory = true;
+        ctx.hasOutputContinuousMemory = true;
+
+        initMatmulForward(&ctx);
+        matmulForward_F32_F32_F32(1u, 0u, nBatches, &ctx);
+
+        compare_F32("matmulOp_view_zeroOffset_F32", out.data(), expected.data(), nBatches * d, 1e-6f);
+    }
+
+    // Case 2: Q80 input + Q40 weight -> F32 output
+    {
+        const NnUint nBatches = 2u;
+        const NnUint n = Q80_BLOCK_SIZE * 2u;
+        const NnUint d = Q80_BLOCK_SIZE * 1u;
+
+        std::vector<float> xF32(nBatches * n);
+        std::vector<float> wF32(n * d);
+        rand(xF32.data(), nBatches * n, 2001u);
+        rand(wF32.data(), n * d, 2002u);
+
+        std::vector<NnBlockQ80> xQ((nBatches * n) / Q80_BLOCK_SIZE);
+        quantizeF32toQ80(xF32.data(), xQ.data(), nBatches * n, 1u, 0u);
+
+        std::vector<NnBlockQ40> wQ((n * d) / Q40_BLOCK_SIZE);
+        quantizeF32toQ40(wF32.data(), wQ.data(), n * d, 1u, 0u);
+
+        std::vector<float> expected(nBatches * d, 0.0f);
+        for (NnUint b = 0; b < nBatches; b++) {
+            matmul_Q80_Q40_F32(
+                expected.data() + b * d,
+                xQ.data() + b * (n / Q80_BLOCK_SIZE),
+                wQ.data(),
+                n,
+                d,
+                1u,
+                0u);
+        }
+
+        std::vector<float> out(nBatches * d, 0.0f);
+
+        NnMatmulOpConfig cfg{};
+        cfg.nExperts = 0u;
+        cfg.nActiveExperts = 0u;
+        cfg.activeExpertIndexesBufferIndex = 0u;
+        cfg.view = 0u;
+        cfg.inStart = 0u;
+        cfg.outStart = 0u;
+        cfg.aView = NnTensorView{0u, 0u, n, 0u, 1u};
+        cfg.cView = NnTensorView{0u, 0u, d, 0u, 1u};
+
+        float dummyIdx = 0.0f;
+        NnByte *buffers[1] = { (NnByte *)&dummyIdx };
+        NnBufferConfig bufferCfgs[1] = {};
+        bufferCfgs[0].name = (char *)"dummy";
+        bufferCfgs[0].size = size2D(F_32, 1u, 1u);
+
+        std::vector<NnByte *> inPtrs(nBatches);
+        std::vector<NnByte *> outPtrs(nBatches);
+        for (NnUint b = 0; b < nBatches; b++) {
+            inPtrs[b] = (NnByte *)(xQ.data() + b * (n / Q80_BLOCK_SIZE));
+            outPtrs[b] = (NnByte *)(out.data() + b * d);
+        }
+
+        NnCpuOpContext ctx{};
+        ctx.name = "test_matmul_op_view_zero_q80q40";
+        ctx.nBatches = nBatches;
+        ctx.opConfig = &cfg;
+        ctx.input = inPtrs.data();
+        ctx.output = outPtrs.data();
+        ctx.inputSize = size2D(F_Q80, nBatches, n);
+        ctx.outputSize = size2D(F_32, nBatches, d);
+        ctx.weight = (NnByte *)wQ.data();
+        ctx.weightSize = size2D(F_Q40, n, d);
+        ctx.buffers = buffers;
+        ctx.bufferConfigs = bufferCfgs;
+        ctx.hasInputContinuousMemory = true;
+        ctx.hasOutputContinuousMemory = true;
+
+        initMatmulForward(&ctx);
+        matmulForward_Q80_Q40_F32(1u, 0u, nBatches, &ctx);
+
+        compare_F32("matmulOp_view_zeroOffset_Q80Q40", out.data(), expected.data(), nBatches * d, 5.0f);
+    }
+}
+
 void testScale() {
     float i[] = {1.0f, 2.0f, 3.0f, 4.0f};
     float o[4];
@@ -364,9 +769,13 @@ int main() {
     testMergeSum();
     testSoftmax();
     testSilu();
+    testGeluViewSlice();
+    testRopeViewSlice();
+    testCastViewSlice();
     testMatmul_F32_Q40_F32(32);
     testMatmul_F32_Q40_F32(2);
     testMatmul_F32_Q40_F32(1);
+    testMatmulOpViewsZeroOffset();
     testLlamafileSgemm();
     testScale();
     testTopk();

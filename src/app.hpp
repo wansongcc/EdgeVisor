@@ -137,6 +137,7 @@ typedef struct {
     Sampler *sampler;
     NnNetwork *network;
     NnExecutor *executor;
+    NnNodeConfig *nodeConfig;
 } AppInferenceContext;
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));

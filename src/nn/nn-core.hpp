@@ -332,6 +332,28 @@ typedef struct {
     NnPointerType type;
 } NnPointerConfig;
 
+// ======================================================================================
+// Tensor Views (for Non-Compact / Strided access)
+// ======================================================================================
+
+// A generic (up to 2D) tensor view into a base buffer.
+// All fields are in elements (not bytes).
+// When a field is 0, the op may fall back to legacy packed behavior.
+typedef struct {
+    // Element offset from the base pointer.
+    NnUint offset;
+
+    // Logical shape. sizeX==0 means "use context->{input,output}Size.x".
+    // sizeY is optional for ops that treat tensors as 2D; when 0, treat as 1 row.
+    NnUint sizeY;
+    NnUint sizeX;
+
+    // Physical strides (in elements). strideX==0 means contiguous (1).
+    // strideY==0 means row-major packed (strideY = sizeX).
+    NnUint strideY;
+    NnUint strideX;
+} NnTensorView;
+
 typedef struct {
     NnOpCode code;
     char *name;
@@ -388,17 +410,37 @@ typedef struct {
 typedef struct {
     float epsilon;
     NnUint nColumns;
+    NnTensorView view;
 } NnInvRmsOpConfig;
 
 typedef struct {
     NnUint invRmsBufferIndex;
     NnUint nColumns;
+    NnTensorView view;
 } NnRmsNormOpConfig;
 
 typedef struct {
     NnUint nExperts;
     NnUint nActiveExperts;
     NnUint activeExpertIndexesBufferIndex;
+    // Weight view mode:
+    // 0: legacy packed weight (weight matches local input/output sizes)
+    // 1: row-slice view (select output rows starting at outStart)
+    // 2: col-slice view (select input cols starting at inStart; weight rows are strided by global input dim)
+    NnUint view;
+    NnUint inStart;
+    NnUint outStart;
+
+    // Optional tensor views into A/B/C buffers.
+    // These are intended for the "pre-allocate full buffers" mode, where ops only
+    // read/write a local slice via offsets and logical sizes.
+    //
+    // Notes:
+    // - Currently CPU matmul only uses A/C views (1D offsets/lengths within each batch row).
+    // - B view is reserved for future use (full-weight + strided submatrix access).
+    NnTensorView aView;
+    NnTensorView bView;
+    NnTensorView cView;
 } NnMatmulOpConfig;
 
 typedef struct {
@@ -411,6 +453,7 @@ typedef struct {
     float ropeScalingHighFreqFactor;
     NnUint ropeScalingOrigMaxSeqLen;
     NnRopeSlice slice;
+    NnTensorView view;
 } NnRopeOpConfig;
 
 typedef struct {
@@ -421,6 +464,13 @@ typedef struct {
     NnUint seqLen;
     NnUint qSliceD0;
     NnUint kvDim0;
+    // When buffers are allocated as full (global) tensors, ops must apply
+    // offsets/strides to access the local slices.
+    // qStride = global qDim, kvStride = global kvDim.
+    NnUint qStart;
+    NnUint qStride;
+    NnUint kvStart;
+    NnUint kvStride;
     NnUint positionPipeIndex;
     NnUint queryBufferIndex;
     NnUint keyCacheBufferIndex;
@@ -437,19 +487,25 @@ typedef struct {
 } NnMergeSumOpCodeConfig;
 
 typedef struct {
-    // empty
+    NnTensorView view;
+} NnGeluOpCodeConfig;
+
+typedef struct {
+    NnTensorView view;
 } NnSiluOpCodeConfig;
 
 typedef struct {
     NnUint multiplierBufferIndex;
+    NnTensorView view;
 } NnMulOpCodeConfig;
 
 typedef struct {
     NnUint scaleBufferIndex;
+    NnTensorView view;
 } NnScaleOpCodeConfig;
 
 typedef struct {
-    // empty
+    NnTensorView view;
 } NnCastOpCodeConfig;
 
 typedef struct {
@@ -458,10 +514,16 @@ typedef struct {
 
 typedef struct {
     NnUint indexPipeIndex;
+    // Optional: strided destination view for KV cache and similar buffers.
+    // dstColStart: element offset within a row (e.g. kvStart)
+    // dstRowStride: elements per row in destination (e.g. global kvDim)
+    // When dstRowStride==0, fallback to legacy packed behavior.
+    NnUint dstColStart;
+    NnUint dstRowStride;
 } NnShiftOpCodeConfig;
 
 typedef struct {
-    // empty
+    NnTensorView view;
 } NnSoftmaxOpCodeConfig;
 
 typedef struct {

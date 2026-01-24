@@ -103,3 +103,26 @@ NnSize NnLocalWeightLoader::loadColMatmulSlicesUneven(const char *opName, const 
     // 5. 关键：返回 Tensor 的【全局大小】
     return slice.size.nBytes;
 }
+
+NnSize NnLocalWeightLoader::loadRowMatmulFullUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                                    std::function<NnRowMatmulSliceUneven(NnUint)> slicer, NnByte *weight) {
+    // 获取 slice 仅用于拿到 tensor 的全局尺寸与类型
+    NnRowMatmulSliceUneven slice = slicer(myNodeIndex);
+
+    // 每个 expert 在设备侧按【全量 tensor】叠放
+    const NnUint deviceOffset = expertIndex * slice.size.nBytes;
+
+    // 文件中 weight 指向该 expert 的 tensor 起始位置（上层循环每次都会把 b 指到正确位置）
+    executor->loadWeight(opName, opIndex, deviceOffset, slice.size.nBytes, weight);
+    return slice.size.nBytes;
+}
+
+NnSize NnLocalWeightLoader::loadColMatmulFullUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex,
+                                                    std::function<NnColMatmulSliceUneven(NnUint)> slicer, NnByte *weight) {
+    NnColMatmulSliceUneven slice = slicer(myNodeIndex);
+    const NnUint deviceOffset = expertIndex * slice.size.nBytes;
+
+    // 直接加载全量 tensor（不再抽取列切片/重排）
+    executor->loadWeight(opName, opIndex, deviceOffset, slice.size.nBytes, weight);
+    return slice.size.nBytes;
+}

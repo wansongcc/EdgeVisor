@@ -2,6 +2,9 @@
 #include <cassert>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
@@ -13,6 +16,8 @@
 #include "nn-cpu-ops.hpp"
 #include "nn-quants.hpp"
 #include "llamafile/sgemm.hpp"
+
+static float dotProduct_F32(const float *a, const float *b, const unsigned int size);
 
 #define DEBUG_OP_INPUT_OUTPUT false
 
@@ -142,6 +147,19 @@ static float invRms_F32(const float *x, const unsigned int size, const float eps
     return 1.0f / sqrtf(sum);
 }
 
+static float invRms_F32_any(const float *x, const NnUint size, const float epsilon) {
+    if (size == 0u)
+        return 0.0f;
+    float sum = 0.0f;
+    for (NnUint i = 0; i < size; i++) {
+        const float v = x[i];
+        sum += v * v;
+    }
+    sum /= (float)size;
+    sum += epsilon;
+    return 1.0f / sqrtf(sum);
+}
+
 static void rmsNorm_F32(float *output, const float *x, const float invRms, const float *w, const NnUint size, const NnUint nThreads, const NnUint threadIndex) {
     SPLIT_THREADS(start, end, size, nThreads, threadIndex);
     unsigned int i = start;
@@ -226,6 +244,26 @@ static void matmul_F32_F32_F32(float *output, const float *x, const float *w, co
         output[i] = val;
     }
 #endif
+}
+
+static void matmul_F32_F32_F32_colSlice(
+    float *output,
+    const float *x,
+    const float *wBase,
+    const NnUint nTotal,
+    const NnUint dLocal,
+    const NnUint inStart,
+    const NnUint nLocal,
+    const NnUint outStart,
+    const NnUint nThreads,
+    const NnUint threadIndex) {
+    // Computes local output rows [outStart, outStart + dLocal) against local input cols [inStart, inStart + nLocal).
+    SPLIT_THREADS(start, end, dLocal, nThreads, threadIndex);
+    for (NnUint i0 = start; i0 < end; i0++) {
+        const NnUint i = outStart + i0;
+        const float *wRow = &wBase[i * nTotal + inStart];
+        output[i0] = dotProduct_F32(x, wRow, nLocal);
+    }
 }
 
 static void matmul_Q80_Q40_F32(float *output, const NnBlockQ80 *x, const NnBlockQ40 *w, const NnUint n, const NnUint d, const NnUint nThreads, const NnUint threadIndex) {
@@ -448,6 +486,55 @@ static void matmul_Q80_Q40_F32(float *output, const NnBlockQ80 *x, const NnBlock
 #endif
 }
 
+static void matmul_Q80_Q40_F32_colSlice(
+    float *output,
+    const NnBlockQ80 *x,
+    const NnBlockQ40 *wBase,
+    const NnUint nTotal,
+    const NnUint dLocal,
+    const NnUint inStart,
+    const NnUint nLocal,
+    const NnUint outStart,
+    const NnUint nThreads,
+    const NnUint threadIndex) {
+    // Correctness-first strided col-slice matmul.
+    // Weight rows are length nTotal elements (quantized in Q40 blocks).
+    assert(nTotal % Q40_BLOCK_SIZE == 0);
+    assert(nLocal % Q40_BLOCK_SIZE == 0);
+    assert(inStart % Q40_BLOCK_SIZE == 0);
+
+    const NnUint nTotalBlocks = nTotal / Q40_BLOCK_SIZE;
+    const NnUint inStartBlock = inStart / Q40_BLOCK_SIZE;
+    const NnUint nLocalBlocks = nLocal / Q40_BLOCK_SIZE;
+
+    SPLIT_THREADS(start, end, dLocal, nThreads, threadIndex);
+    for (NnUint di0 = start; di0 < end; di0++) {
+        const NnUint di = outStart + di0;
+        const NnBlockQ40 *wRow = &wBase[di * nTotalBlocks + inStartBlock];
+
+        float sum = 0.0f;
+        for (NnUint bi = 0; bi < nLocalBlocks; bi++) {
+            const NnBlockQ80 *xb = &x[bi];
+            const NnBlockQ40 *wb = &wRow[bi];
+
+            const float dx = CONVERT_F16_TO_F32(xb->d);
+            const float dw = CONVERT_F16_TO_F32(wb->d);
+
+            int acc = 0;
+            for (NnUint j = 0; j < Q40_BLOCK_SIZE / 2; j++) {
+                const int w0 = (wb->qs[j] & 0x0F) - 8;
+                const int w1 = (wb->qs[j] >> 4) - 8;
+                acc += (int)xb->qs[j] * w0;
+                acc += (int)xb->qs[j + Q40_BLOCK_SIZE / 2] * w1;
+            }
+
+            sum += (dx * dw) * (float)acc;
+        }
+
+        output[di0] = sum;
+    }
+}
+
 #define SQRT_2_OVER_PI 0.79788456080286535587989211986876f
 #define GELU_COEF_A 0.044715f
 
@@ -456,6 +543,16 @@ static void gelu_F32(float *output, const unsigned int n, const NnUint nThreads,
     for (unsigned int i = start; i < end; i++) {
         float x = output[i];
         output[i] = 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
+    }
+}
+
+static void gelu_F32_strided(float *output, const NnUint n, const NnUint stride, const NnUint nThreads, const NnUint threadIndex) {
+    assert(stride > 0u);
+    SPLIT_THREADS(start, end, n, nThreads, threadIndex);
+    for (NnUint i = start; i < end; i++) {
+        float *p = &output[i * stride];
+        const float x = *p;
+        *p = 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
     }
 }
 
@@ -496,6 +593,16 @@ static void silu_F32(float *output, const unsigned int n, const NnUint nThreads,
     for (; i < end; i++) {
         float x = output[i];
         output[i] = x / (1.0f + expf(-x));
+    }
+}
+
+static void silu_F32_strided(float *output, const NnUint n, const NnUint stride, const NnUint nThreads, const NnUint threadIndex) {
+    assert(stride > 0u);
+    SPLIT_THREADS(start, end, n, nThreads, threadIndex);
+    for (NnUint i = start; i < end; i++) {
+        float *p = &output[i * stride];
+        const float x = *p;
+        *p = x / (1.0f + expf(-x));
     }
 }
 
@@ -719,6 +826,31 @@ void softmax_F32(float *x, const NnUint size) {
 #endif
 }
 
+static void softmax_F32_strided(float *x, const NnUint size, const NnUint stride) {
+    if (size == 0u)
+        return;
+    assert(stride > 0u);
+
+    float maxVal = x[0];
+    for (NnUint i = 1; i < size; i++) {
+        const float v = x[i * stride];
+        if (v > maxVal)
+            maxVal = v;
+    }
+
+    float sum = 0.0f;
+    for (NnUint i = 0; i < size; i++) {
+        float v = expf(x[i * stride] - maxVal);
+        x[i * stride] = v;
+        sum += v;
+    }
+    if (sum == 0.0f)
+        sum = 0.000001f;
+    const float invSum = 1.0f / sum;
+    for (NnUint i = 0; i < size; i++)
+        x[i * stride] *= invSum;
+}
+
 static float dotProduct_F32(const float *a, const float *b, const unsigned int size) {
 #if defined(__ARM_NEON)
     assert(size % 4 == 0);
@@ -752,7 +884,9 @@ static float dotProduct_F32(const float *a, const float *b, const unsigned int s
 
 static void multiheadAtt_F32(
     float *y, const float *q, float *att, float *keyCache, float *valueCache,
-    const NnUint pos, const NnUint nHeads, const NnUint nHeads0, const NnUint nKvHeads, const NnUint kvDim0, const NnUint headDim, const NnUint seqLen,
+    const NnUint pos, const NnUint nHeads, const NnUint nHeads0, const NnUint nKvHeads,
+    const NnUint kvDim0, const NnUint kvStart, const NnUint kvStride,
+    const NnUint headDim, const NnUint seqLen,
     const NnUint nThreads, const NnUint threadIndex) 
 {
     SPLIT_THREADS(h0Start, h0End, nHeads0, nThreads, threadIndex);
@@ -762,12 +896,12 @@ static void multiheadAtt_F32(
     for (NnUint h0 = h0Start; h0 < h0End; h0++) {
         const float *hQ = &q[h0 * headDim];
         const NnUint headIndex = h0 / kvMul;
-        const float *hKc = &keyCache[headIndex * headDim];
-        const float *hVc = &valueCache[headIndex * headDim];
+        const float *hKc = &keyCache[kvStart + headIndex * headDim];
+        const float *hVc = &valueCache[kvStart + headIndex * headDim];
         float *hAtt = &att[h0 * seqLen];
 
         for (NnUint t = 0; t <= pos; t++) {
-            const float *posK = &hKc[t * kvDim0];
+            const float *posK = &hKc[t * kvStride];
             const float score = dotProduct_F32(hQ, posK, headDim) / headDimRoot;
             hAtt[t] = score;
         }
@@ -778,7 +912,7 @@ static void multiheadAtt_F32(
         std::memset(hY, 0, headDim * sizeof(float));
 
         for (NnUint t = 0; t <= pos; t++) {
-            const float *posV = &hVc[t * kvDim0];
+            const float *posV = &hVc[t * kvStride];
             const float posA = hAtt[t];
             for (int i = 0; i < headDim; i++) {
                 hY[i] += posA * posV[i];
@@ -814,9 +948,27 @@ static void mul_F32(float *y, const float *x, const float *m, const NnUint n, co
         y[i] = x[i] * m[i];
 }
 
+static void mul_F32_strided(float *y, const float *x, const float *m, const NnUint n, const NnUint stride, const NnUint nThreads, const NnUint threadIndex) {
+    assert(stride > 0u);
+    SPLIT_THREADS(start, end, n, nThreads, threadIndex);
+    for (NnUint i = start; i < end; i++) {
+        const NnUint k = i * stride;
+        y[k] = x[k] * m[k];
+    }
+}
+
 static void scale_F32(const float *i, float *o, const float s, NnSize size, NnUint nThreads, NnUint threadIndex) {
     for (NnUint x = threadIndex; x < size; x += nThreads)
         o[x] = i[x] * s;
+}
+
+static void scale_F32_strided(const float *i, float *o, const float s, const NnUint n, const NnUint stride, const NnUint nThreads, const NnUint threadIndex) {
+    assert(stride > 0u);
+    SPLIT_THREADS(start, end, n, nThreads, threadIndex);
+    for (NnUint t = start; t < end; t++) {
+        const NnUint k = t * stride;
+        o[k] = i[k] * s;
+    }
 }
 
 static void mul_Q80_F32(float *y, const float *x, const NnBlockQ80 *m, const NnUint n, const NnUint nThreads, const NnUint threadIndex) {
@@ -1008,25 +1160,28 @@ static void embeddingForward_F32_F32_Q80(NnUint nThreads, NnUint threadIndex, Nn
 }
 
 static void initInvRmsForward(NnCpuOpContext *context) {
-    NnRmsNormOpConfig *config = (NnRmsNormOpConfig *)context->opConfig;
+    const NnInvRmsOpConfig *config = (const NnInvRmsOpConfig *)context->opConfig;
     assert(context->outputSize.x >= config->nColumns);
     ASSERT_EQ(context->inputSize.y, context->nBatches);
     ASSERT_EQ(context->outputSize.y, context->nBatches);
+    assert(context->inputSize.x % config->nColumns == 0u);
 }
 
 static void invRmsForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnInvRmsOpConfig *config = (NnInvRmsOpConfig *)context->opConfig;
     const NnUint colSize = context->inputSize.x / config->nColumns;
 
+    // INV_RMS is a reduction. In this engine it is always computed over the full global
+    // hidden size for each column (no view slicing).
+
     for (NnUint batchIndex = threadIndex; batchIndex < batchSize; batchIndex += nThreads) {
-        float *input = (float *)context->input[batchIndex];
+        const float *input = (const float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
         DEBUG_VECTOR(context, "input", input);
         for (NnUint colIndex = 0; colIndex < config->nColumns; colIndex++) {
-            float rms = invRms_F32(
-                &input[colIndex * colSize],
-                colSize,
-                config->epsilon);
+            const NnUint colStart = colIndex * colSize;
+
+            const float rms = invRms_F32(&input[colStart], colSize, config->epsilon);
             output[colIndex] = rms;
             DEBUG_SCALAR(context, "output", rms);
         }
@@ -1051,6 +1206,8 @@ static void initRmsNormForward_ANY_F32_F32(NnCpuOpContext *context) {
 
 static void rmsNormForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.z, 1u);
+    ASSERT_EQ(context->outputSize.z, 1u);
 
     const NnRmsNormOpConfig *config = (NnRmsNormOpConfig *)context->opConfig;
     const float *weight = (float *)context->weight;
@@ -1059,31 +1216,39 @@ static void rmsNormForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUi
 
     const NnUint colSize = context->weightSize.x;
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
-        float *input = (float *)context->input[batchIndex];
+        const float *input = (const float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
         DEBUG_VECTOR(context, "input", input);
-        for (NnUint colIndex = 0; colIndex < config->nColumns; colIndex++) {
-            rmsNorm_F32(
-                &output[colIndex * colSize],
-                &input[colIndex * colSize],
-                invRms[batchIndex * invRmsBatchSize + colIndex],
-                weight,
-                colSize,
-                nThreads,
-                threadIndex);
+
+        // Always write the full global hidden size.
+        for (NnUint xIndex = threadIndex; xIndex < context->outputSize.x; xIndex += nThreads) {
+            const NnUint colIndex = xIndex / colSize;
+            const NnUint local = xIndex - colIndex * colSize;
+            assert(colIndex < config->nColumns);
+            const float r = invRms[batchIndex * invRmsBatchSize + colIndex];
+            output[xIndex] = weight[local] * (r * input[xIndex]);
         }
+
         DEBUG_VECTOR(context, "output", output);
     }
 }
 
 static void rmsNormForward_Q80_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.floatType, F_Q80);
+    ASSERT_EQ(context->inputSize.z, 1u);
+    ASSERT_EQ(context->outputSize.z, 1u);
 
     const NnRmsNormOpConfig *config = (NnRmsNormOpConfig *)context->opConfig;
     ASSERT_EQ(config->nColumns, 1); // TODO: add support multiple columns
 
     const float *weight = (float *)context->weight;
+    const NnUint invRmsBatchSize = context->bufferConfigs[config->invRmsBufferIndex].size.x;
     const float *invRms = (float *)context->buffers[config->invRmsBufferIndex];
+    assert(invRmsBatchSize >= 1u);
+
+    // Q80 path always writes the full global hidden size.
+    const NnUint len = context->outputSize.x;
+    assert((len % Q80_BLOCK_SIZE) == 0u);
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         NnBlockQ80 *input = (NnBlockQ80 *)context->input[batchIndex];
@@ -1091,9 +1256,9 @@ static void rmsNormForward_Q80_F32_F32(NnUint nThreads, NnUint threadIndex, NnUi
         rmsNorm_Q80_F32_F32(
             output,
             input,
-            invRms[batchIndex],
+            invRms[batchIndex * invRmsBatchSize],
             weight,
-            context->inputSize.x,
+            len,
             nThreads,
             threadIndex);
         DEBUG_VECTOR(context, "output", output);
@@ -1104,9 +1269,34 @@ static void initMatmulForward(NnCpuOpContext *context) {
     const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
     ASSERT_EQ(context->inputSize.y, context->nBatches);
     ASSERT_EQ(context->outputSize.y, context->nBatches);
-    ASSERT_EQ(context->inputSize.x, context->weightSize.y);
+
+    const NnTensorView *aView = &config->aView;
+    const NnTensorView *cView = &config->cView;
+
+    // For now, matmul only supports per-batch 1D slicing (within each row) for A/C.
+    assert(aView->sizeY == 0u);
+    assert(aView->strideY == 0u);
+    assert(cView->sizeY == 0u);
+    assert(cView->strideY == 0u);
+    assert(aView->strideX == 0u || aView->strideX == 1u);
+    assert(cView->strideX == 0u || cView->strideX == 1u);
+
+    const NnUint aLen = (aView->sizeX == 0u) ? context->inputSize.x : aView->sizeX;
+    const NnUint cLen = (cView->sizeX == 0u) ? context->outputSize.x : cView->sizeX;
+    assert(aView->offset + aLen <= context->inputSize.x);
+    assert(cView->offset + cLen <= context->outputSize.x);
+
+    if (config->view == 0u) {
+        ASSERT_EQ(aLen, context->weightSize.y);
+        ASSERT_EQ(cLen, context->weightSize.x);
+    } else {
+        // Legacy weight view mode: input/output can be slices into a full weight tensor.
+        assert(aLen <= context->weightSize.y);
+        assert(config->inStart + aLen <= context->weightSize.y);
+        assert(cLen <= context->weightSize.x);
+        assert(config->outStart + cLen <= context->weightSize.x);
+    }
     ASSERT_EQ(context->inputSize.z, std::max(config->nActiveExperts, 1u));
-    ASSERT_EQ(context->outputSize.x, context->weightSize.x);
     ASSERT_EQ(context->outputSize.z, std::max(config->nActiveExperts, 1u));
     ASSERT_EQ(context->weightSize.z, std::max(config->nExperts, 1u));
 
@@ -1117,9 +1307,100 @@ static void initMatmulForward(NnCpuOpContext *context) {
 
 }
 
+static inline bool debugWeightRangesEnabledForOp(const char *opName) {
+    if (std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES") == nullptr)
+        return false;
+    const char *filter = std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES_FILTER");
+    if (filter == nullptr || filter[0] == '\0')
+        return true;
+    if (opName == nullptr)
+        return false;
+    return (std::strstr(opName, filter) != nullptr);
+}
+
+static inline void debugMatmulWeightReadRangeOnce(
+    const NnCpuOpContext *context,
+    const NnMatmulOpConfig *config,
+    NnUint activeExpertIndex,
+    NnUint cLen) {
+    if (!debugWeightRangesEnabledForOp(context->name))
+        return;
+
+    static std::atomic<NnUint> printed{0u};
+    NnUint limit = 200u;
+    if (const char *limitEnv = std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES_LIMIT")) {
+        try { limit = (NnUint)std::stoul(limitEnv); } catch (...) {}
+    }
+    const NnUint idx = printed.fetch_add(1u);
+    if (idx >= limit)
+        return;
+
+    // Compute a conservative contiguous read range in bytes within context->weight.
+    // Weight storage uses columns of length `weightSize.y` (byte stride = bytes(weightSize.y)).
+    const NnSize expertBase = (NnSize)activeExpertIndex * context->weightSize.nBytesXY;
+    NnSize begin = expertBase;
+    NnSize end = expertBase + context->weightSize.nBytesXY;
+
+    const NnSize colStrideBytes = getBytes(context->weightSize.floatType, context->weightSize.y);
+    if (config->view == 1u || config->view == 2u) {
+        begin = expertBase + (NnSize)config->outStart * colStrideBytes;
+        end = begin + (NnSize)cLen * colStrideBytes;
+    }
+
+    printf("📖 [weights][matmul-read] op=%s view=%u expert=%u alloc=[0,%zu) read=[%zu,%zu) outStart=%u cLen=%u colStrideBytes=%zu\n",
+        (context->name ? context->name : "Unknown"),
+        (unsigned)config->view,
+        (unsigned)activeExpertIndex,
+        (size_t)context->weightSize.nBytes,
+        (size_t)begin,
+        (size_t)end,
+        (unsigned)config->outStart,
+        (unsigned)cLen,
+        (size_t)colStrideBytes);
+    std::fflush(stdout);
+}
+
 static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
+    if (config->view != 0u)
+        return false;
+    if (config->aView.offset != 0u || config->aView.sizeX != 0u)
+        return false;
+    if (config->cView.offset != 0u || config->cView.sizeX != 0u)
+        return false;
     if (batchSize == 1u || !context->hasInputContinuousMemory || !context->hasOutputContinuousMemory || context->inputSize.z != 1u)
         return false;
+
+    // Debug hook: confirm when the llamafile fast path is taken.
+    if (threadIndex == 0u && std::getenv("DLLAMA_DEBUG_MATMUL_VIEWS") != nullptr) {
+        const char *filter = std::getenv("DLLAMA_DEBUG_MATMUL_VIEWS_FILTER");
+        const bool passesFilter = (filter == nullptr) || (std::strstr(context->name, filter) != nullptr);
+        if (passesFilter) {
+            static std::atomic<NnUint> printed{0u};
+            NnUint limit = 50u;
+            if (const char *limitEnv = std::getenv("DLLAMA_DEBUG_MATMUL_VIEWS_LIMIT")) {
+                try { limit = (NnUint)std::stoul(limitEnv); } catch (...) {}
+            }
+            const NnUint idx = printed.fetch_add(1u);
+            if (idx < limit) {
+                const bool viewAware = (config->aView.offset != 0u || config->aView.sizeX != 0u || config->cView.offset != 0u || config->cView.sizeX != 0u);
+                const bool forceStyle = viewAware && (config->aView.strideX == 0u) && (config->cView.strideX == 0u);
+                const bool offsetActive = (config->aView.offset != 0u || config->cView.offset != 0u);
+                printf("🔎 [matmul][llamafile] op=%s viewMode=%u aView={off=%u sizeX=%u strideX=%u} cView={off=%u sizeX=%u strideX=%u} batch=%u nThreads=%u\n",
+                    context->name,
+                    config->view,
+                    config->aView.offset, config->aView.sizeX, config->aView.strideX,
+                    config->cView.offset, config->cView.sizeX, config->cView.strideX,
+                    batchSize, nThreads);
+                printf("🔎 [matmul][llamafile] op=%s viewAware=%u forceStyle=%u offsetActive=%u\n",
+                    context->name,
+                    viewAware ? 1u : 0u,
+                    forceStyle ? 1u : 0u,
+                    offsetActive ? 1u : 0u);
+                std::fflush(stdout);
+            }
+        }
+    }
 
     const NnUint n = context->weightSize.y / getBlockSize(context->inputSize.floatType);
     const NnUint d = context->weightSize.x;
@@ -1149,15 +1430,59 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
                 ? 0u
                 : (NnUint)activeExpertIndexes[y * config->nActiveExperts + e];
 
-            float *output = (float *)context->output[e * context->outputSize.y + y];
-            matmul_F32_F32_F32(
-                output,
-                (float *)context->input[e * context->inputSize.y + y],
-                (float *)&context->weight[activeExpertIndex * context->weightSize.nBytesXY],
-                context->weightSize.y,
-                context->weightSize.x,
-                nThreads,
-                threadIndex);
+            const NnTensorView *aView = &config->aView;
+            const NnTensorView *cView = &config->cView;
+            const NnUint aLen = (aView->sizeX == 0u) ? context->inputSize.x : aView->sizeX;
+            const NnUint cLen = (cView->sizeX == 0u) ? context->outputSize.x : cView->sizeX;
+
+            const bool viewAware = (aView->offset != 0u || aView->sizeX != 0u || cView->offset != 0u || cView->sizeX != 0u);
+            const bool forceStyle = viewAware && (aView->strideX == 0u) && (cView->strideX == 0u);
+            const bool offsetActive = (aView->offset != 0u || cView->offset != 0u);
+
+            float *outputBase = (float *)context->output[e * context->outputSize.y + y];
+            const float *xBase = (float *)context->input[e * context->inputSize.y + y];
+            float *output = outputBase + cView->offset;
+            const float *x = xBase + aView->offset;
+            const float *wBase = (const float *)&context->weight[activeExpertIndex * context->weightSize.nBytesXY];
+
+            if (threadIndex == 0u) {
+                debugMatmulWeightReadRangeOnce(context, config, activeExpertIndex, cLen);
+            }
+
+            if (config->view == 0u) {
+                matmul_F32_F32_F32(
+                    output,
+                    x,
+                    wBase,
+                    aLen,
+                    cLen,
+                    nThreads,
+                    threadIndex);
+            } else if (config->view == 1u) {
+                const float *w = &wBase[config->outStart * context->weightSize.y];
+                matmul_F32_F32_F32(
+                    output,
+                    x,
+                    w,
+                    context->weightSize.y,
+                    cLen,
+                    nThreads,
+                    threadIndex);
+            } else if (config->view == 2u) {
+                matmul_F32_F32_F32_colSlice(
+                    output,
+                    x,
+                    wBase,
+                    context->weightSize.y,
+                    cLen,
+                    config->inStart,
+                    aLen,
+                    config->outStart,
+                    nThreads,
+                    threadIndex);
+            } else {
+                throw std::runtime_error("Unsupported matmul view mode");
+            }
             DEBUG_VECTOR(context, "output", output);
         }
     }
@@ -1177,15 +1502,64 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
                 ? 0u
                 : (NnUint)activeExpertIndexes[y * config->nActiveExperts + e];
 
-            float *output = (float *)context->output[e * context->outputSize.y + y];
-            matmul_Q80_Q40_F32(
-                output,
-                (NnBlockQ80 *)context->input[e * context->inputSize.y + y],
-                (NnBlockQ40 *)&context->weight[activeExpertIndex * context->weightSize.nBytesXY],
-                context->weightSize.y,
-                context->weightSize.x,
-                nThreads,
-                threadIndex);
+            const NnTensorView *aView = &config->aView;
+            const NnTensorView *cView = &config->cView;
+            const NnUint aLen = (aView->sizeX == 0u) ? context->inputSize.x : aView->sizeX;
+            const NnUint cLen = (cView->sizeX == 0u) ? context->outputSize.x : cView->sizeX;
+
+            const bool viewAware = (aView->offset != 0u || aView->sizeX != 0u || cView->offset != 0u || cView->sizeX != 0u);
+            const bool forceStyle = viewAware && (aView->strideX == 0u) && (cView->strideX == 0u);
+            const bool offsetActive = (aView->offset != 0u || cView->offset != 0u);
+
+            // Quantized inputs slice in full blocks.
+            assert((aView->offset % Q80_BLOCK_SIZE) == 0u);
+            assert((aLen % Q80_BLOCK_SIZE) == 0u);
+
+            float *outputBase = (float *)context->output[e * context->outputSize.y + y];
+            const NnBlockQ80 *xBase = (NnBlockQ80 *)context->input[e * context->inputSize.y + y];
+            float *output = outputBase + cView->offset;
+            const NnBlockQ80 *x = xBase + (aView->offset / Q80_BLOCK_SIZE);
+            const NnBlockQ40 *wBase = (const NnBlockQ40 *)&context->weight[activeExpertIndex * context->weightSize.nBytesXY];
+
+            if (threadIndex == 0u) {
+                debugMatmulWeightReadRangeOnce(context, config, activeExpertIndex, cLen);
+            }
+
+            if (config->view == 0u) {
+                matmul_Q80_Q40_F32(
+                    output,
+                    x,
+                    wBase,
+                    aLen,
+                    cLen,
+                    nThreads,
+                    threadIndex);
+            } else if (config->view == 1u) {
+                const NnSize rowStrideBytes = getBytes(context->weightSize.floatType, context->weightSize.y);
+                const NnBlockQ40 *w = (const NnBlockQ40 *)((const NnByte *)wBase + (NnSize)config->outStart * rowStrideBytes);
+                matmul_Q80_Q40_F32(
+                    output,
+                    x,
+                    w,
+                    context->weightSize.y,
+                    cLen,
+                    nThreads,
+                    threadIndex);
+            } else if (config->view == 2u) {
+                matmul_Q80_Q40_F32_colSlice(
+                    output,
+                    x,
+                    wBase,
+                    context->weightSize.y,
+                    cLen,
+                    config->inStart,
+                    aLen,
+                    config->outStart,
+                    nThreads,
+                    threadIndex);
+            } else {
+                throw std::runtime_error("Unsupported matmul view mode");
+            }
             DEBUG_VECTOR(context, "output", output);
         }
     }
@@ -1196,10 +1570,29 @@ static void siluForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
     ASSERT_EQ(context->inputSize.x, context->outputSize.x);
     ASSERT_EQ(context->inputSize.y, context->outputSize.y);
 
+    const NnSiluOpCodeConfig *config = (const NnSiluOpCodeConfig *)context->opConfig;
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    if (strideX == 1u) {
+        assert(offset + len <= context->outputSize.x);
+    } else {
+        if (len > 0u)
+            assert(offset + (len - 1u) * strideX < context->outputSize.x);
+    }
+
     for (NnUint z = 0u; z < context->inputSize.z; z++) {
         for (NnUint y = 0u; y < batchSize; y++) {
             float *output = (float *)context->output[z * context->outputSize.y + y];
-            silu_F32(output, context->outputSize.x, nThreads, threadIndex);
+            float *base = &output[offset];
+            if (strideX == 1u) {
+                // silu_F32(base, len, nThreads, threadIndex);
+                silu_F32(output, context->outputSize.x, nThreads, threadIndex);
+            } else {
+                silu_F32_strided(base, len, strideX, nThreads, threadIndex);
+            }
         }
     }
 }
@@ -1209,9 +1602,27 @@ static void geluForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint 
     ASSERT_EQ(context->inputSize.x, context->outputSize.x);
     ASSERT_EQ(context->inputSize.y, context->outputSize.y);
 
+    const NnGeluOpCodeConfig *config = (const NnGeluOpCodeConfig *)context->opConfig;
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    if (strideX == 1u) {
+        assert(offset + len <= context->outputSize.x);
+    } else {
+        if (len > 0u)
+            assert(offset + (len - 1u) * strideX < context->outputSize.x);
+    }
+
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *output = (float *)context->output[batchIndex];
-        gelu_F32(output, context->outputSize.x, nThreads, threadIndex);
+        float *base = &output[offset];
+        if (strideX == 1u) {
+            gelu_F32(base, len, nThreads, threadIndex);
+        } else {
+            gelu_F32_strided(base, len, strideX, nThreads, threadIndex);
+        }
     }
 }
 
@@ -1225,6 +1636,38 @@ static void initRopeForward_F32(NnCpuOpContext *context) {
     fullfillRopeCache(config, cache);
 }
 
+static void ropeLlama_F32_view(
+    float *xBase,
+    const float *cache,
+    const bool isQ,
+    const NnUint pos,
+    const NnRopeSlice *slice,
+    const NnUint offset,
+    const NnUint len,
+    const NnUint nThreads,
+    const NnUint threadIndex)
+{
+    assert((offset % 2u) == 0u);
+    assert((len % 2u) == 0u);
+    const NnUint shift = (isQ ? slice->qShift : 0u);
+    const float *posCache = &cache[pos * slice->sliceDim + shift + offset];
+
+    const NnUint pairCount = len / 2u;
+    SPLIT_THREADS(s, e, pairCount, nThreads, threadIndex);
+    const NnUint iStart = s * 2u;
+    const NnUint iEnd = e * 2u;
+
+    for (NnUint i = iStart; i < iEnd; i += 2u) {
+        const float fcr = posCache[i];
+        const float fci = posCache[i + 1u];
+        const float v0 = xBase[i];
+        const float v1 = xBase[i + 1u];
+
+        xBase[i] = v0 * fcr - v1 * fci;
+        xBase[i + 1u] = v0 * fci + v1 * fcr;
+    }
+}
+
 static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnRopeOpConfig *config = (NnRopeOpConfig *)context->opConfig;
     const NnRopeSlice *slice = &config->slice;
@@ -1232,15 +1675,32 @@ static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
     const float *cache = (float *)context->buffers[config->ropeCacheBufferIndex];
     const bool isQ = config->isQ == 1;
 
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->inputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    assert(strideX == 1u);
+
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *x = (float *)context->input[batchIndex];
         const NnUint pos = (NnUint)positions[batchIndex];
-        if (config->type == ROPE_LLAMA || config->type == ROPE_LLAMA3_1)
-            ropeLlama_F32(x, cache, isQ, pos, slice, nThreads, threadIndex);
-        else if (config->type == ROPE_FALCON)
+
+        if (config->type == ROPE_LLAMA || config->type == ROPE_LLAMA3_1) {
+            const NnUint dim0 = isQ ? slice->qDim0 : slice->kvDim0;
+            assert(offset + len <= dim0);
+            if (offset == 0u && len == dim0) {
+                ropeLlama_F32(x, cache, isQ, pos, slice, nThreads, threadIndex);
+            } else {
+                ropeLlama_F32_view(x + offset, cache, isQ, pos, slice, offset, len, nThreads, threadIndex);
+            }
+        } else if (config->type == ROPE_FALCON) {
+            // Falcon RoPE view-slicing is not implemented yet.
+            assert(offset == 0u && len == (isQ ? slice->qDim0 : slice->kvDim0));
             ropeFalcon_F32(x, cache, isQ, pos, slice, nThreads, threadIndex);
-        else
+        } else {
             throw std::runtime_error("Unsupported rope type");
+        }
     }
 }
 
@@ -1251,7 +1711,8 @@ static void initMultiHeadAttForward(NnCpuOpContext *context) {
     ASSERT_EQ(context->outputSize.x, config->qSliceD0);
     ASSERT_EQ(context->outputSize.y, context->nBatches);
     NnSize3D *querySize = &context->bufferConfigs[config->queryBufferIndex].size;
-    ASSERT_EQ(querySize->x, config->qSliceD0);
+    const NnUint qStride = config->qStride == 0u ? config->qSliceD0 : config->qStride;
+    ASSERT_EQ(querySize->x, qStride);
     NnSize3D *posSize = &context->pipeConfigs[config->positionPipeIndex].size;
     ASSERT_EQ(posSize->x, 1);
     ASSERT_EQ(posSize->y, context->nBatches);
@@ -1268,9 +1729,12 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *y = (float *)context->output[batchIndex];
-        float *q = &query[batchIndex * config->qSliceD0];
+        const NnUint qStride = config->qStride == 0u ? config->qSliceD0 : config->qStride;
+        float *q = &query[batchIndex * qStride + config->qStart];
         NnUint pos = (NnUint)positions[batchIndex];
         assert(pos < config->seqLen);
+
+        const NnUint kvStride = config->kvStride == 0u ? config->kvDim0 : config->kvStride;
 
         DEBUG_VECTOR(context, "input", y);
         DEBUG_VECTOR(context, "q", q);
@@ -1279,7 +1743,9 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
             &att[batchIndex * config->nHeads0 * config->seqLen],
             keyCache, valueCache, pos,
             config->nHeads, config->nHeads0,
-            config->nKvHeads, config->kvDim0, config->headDim, config->seqLen, nThreads, threadIndex);
+            config->nKvHeads,
+            config->kvDim0, config->kvStart, kvStride,
+            config->headDim, config->seqLen, nThreads, threadIndex);
 
         DEBUG_VECTOR(context, "output", y);
     }
@@ -1290,22 +1756,49 @@ static void initMulForward(NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.x, context->outputSize.x);
     ASSERT_EQ(context->inputSize.y, context->outputSize.y);
     ASSERT_EQ(context->inputSize.z, context->outputSize.z);
+
+    const NnMulOpCodeConfig *config = (NnMulOpCodeConfig *)context->opConfig;
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    assert(view->sizeY == 0u);
+    assert(view->strideY == 0u);
+
+    if (strideX == 1u) {
+        assert(offset + len <= context->outputSize.x);
+    } else {
+        if (len > 0u)
+            assert(offset + (len - 1u) * strideX < context->outputSize.x);
+    }
 }
 
 static void mulForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnMulOpCodeConfig *config = (NnMulOpCodeConfig *)context->opConfig;
     const float *multiplier = (float *)context->buffers[config->multiplierBufferIndex];
 
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
     for (NnUint z = 0u; z < context->inputSize.z; z++) {
         const NnUint zOffset = z * context->inputSize.y;
         for (NnUint y = 0u; y < batchSize; y++) {
-            mul_F32(
-                (float *)context->output[zOffset + y],
-                (float *)context->input[zOffset + y],
-                &multiplier[context->outputSize.x * (zOffset + y)],
-                context->outputSize.x,
-                nThreads,
-                threadIndex);
+            float *outBase = (float *)context->output[zOffset + y];
+            const float *inBase = (float *)context->input[zOffset + y];
+            const float *mBase = &multiplier[context->outputSize.x * (zOffset + y)];
+
+            float *out = &outBase[offset];
+            const float *in = &inBase[offset];
+            const float *m = &mBase[offset];
+
+            if (strideX == 1u) {
+                mul_F32(out, in, m, len, nThreads, threadIndex);
+            } else {
+                mul_F32_strided(out, in, m, len, strideX, nThreads, threadIndex);
+            }
         }
     }
 }
@@ -1314,13 +1807,35 @@ static void scaleForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
     const NnScaleOpCodeConfig *config = (NnScaleOpCodeConfig *)context->opConfig;
     const float *scale = (float *)context->buffers[config->scaleBufferIndex];
 
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->inputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    assert(view->sizeY == 0u);
+    assert(view->strideY == 0u);
+
+    if (strideX == 1u) {
+        assert(offset + len <= context->inputSize.x);
+    } else {
+        if (len > 0u)
+            assert(offset + (len - 1u) * strideX < context->inputSize.x);
+    }
+
     for (NnUint z = 0u; z < context->inputSize.z; z++) {
         for (NnUint y = 0u; y < batchSize; y++) {
             const NnUint index = z * context->inputSize.y + y;
             const float s = scale[index];
             const float *i = (float *)context->input[index];
             float *o = (float *)context->output[index];
-            scale_F32(i, o, s, context->inputSize.x, nThreads, threadIndex);
+
+            const float *iBase = &i[offset];
+            float *oBase = &o[offset];
+            if (strideX == 1u) {
+                scale_F32(iBase, oBase, s, len, nThreads, threadIndex);
+            } else {
+                scale_F32_strided(iBase, oBase, s, len, strideX, nThreads, threadIndex);
+            }
         }
     }
 }
@@ -1332,17 +1847,74 @@ static void initCastForward(NnCpuOpContext *context) {
 }
 
 static void castForward_ANY(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
-    const NnUint rowBytes = context->outputSize.nBytes / context->outputSize.y;
+    const NnCastOpCodeConfig *config = (NnCastOpCodeConfig *)context->opConfig;
+
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    assert(view->sizeY == 0u);
+    assert(view->strideY == 0u);
+
+    const NnSize blockSize = getBlockSize(context->outputSize.floatType);
+    if (blockSize > 1u) {
+        // Quantized types must slice in full blocks.
+        assert(strideX == 1u);
+        assert((offset % blockSize) == 0u);
+        assert((len % blockSize) == 0u);
+        assert(offset + len <= context->outputSize.x);
+        assert(offset + len <= context->inputSize.x);
+    } else {
+        if (strideX == 1u) {
+            assert(offset + len <= context->outputSize.x);
+            assert(offset + len <= context->inputSize.x);
+        } else {
+            if (len > 0u) {
+                assert(offset + (len - 1u) * strideX < context->outputSize.x);
+                assert(offset + (len - 1u) * strideX < context->inputSize.x);
+            }
+        }
+    }
+
+    const NnSize offsetBytes = getBytes(context->outputSize.floatType, offset);
+    const NnSize dimBytes = getBytes(context->outputSize.floatType, len);
 
     for (NnUint z = 0u; z < context->inputSize.z; z++) {
         const NnUint zOffset = z * context->inputSize.y;
         for (NnUint y = 0u; y < batchSize; y++) {
-            copy_UNK(
-                context->output[zOffset + y],
-                context->input[zOffset + y],
-                rowBytes,
-                nThreads,
-                threadIndex);
+            NnByte *oBase = context->output[zOffset + y];
+            NnByte *iBase = context->input[zOffset + y];
+
+            if (blockSize > 1u || strideX == 1u) {
+                copy_UNK(
+                    oBase + offsetBytes,
+                    iBase + offsetBytes,
+                    dimBytes,
+                    nThreads,
+                    threadIndex);
+            } else {
+                // Correctness-first strided element-wise copy.
+                // Note: only meaningful for non-quantized types (blockSize==1).
+                if (context->outputSize.floatType == F_32) {
+                    float *o = (float *)oBase;
+                    const float *i = (const float *)iBase;
+                    for (NnUint t = threadIndex; t < len; t += nThreads) {
+                        const NnUint xIndex = offset + t * strideX;
+                        o[xIndex] = i[xIndex];
+                    }
+                } else if (context->outputSize.floatType == F_16) {
+                    NnFp16 *o = (NnFp16 *)oBase;
+                    const NnFp16 *i = (const NnFp16 *)iBase;
+                    for (NnUint t = threadIndex; t < len; t += nThreads) {
+                        const NnUint xIndex = offset + t * strideX;
+                        o[xIndex] = i[xIndex];
+                    }
+                } else {
+                    // Fallback: treat as bytes with element size 1 (should not happen).
+                    assert(false && "Unsupported float type for strided castForward_ANY");
+                }
+            }
         }
     }
 }
@@ -1351,13 +1923,29 @@ static void castForward_F32_Q80(NnUint nThreads, NnUint threadIndex, NnUint batc
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_Q80);
 
+    const NnCastOpCodeConfig *config = (NnCastOpCodeConfig *)context->opConfig;
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    assert(view->sizeY == 0u);
+    assert(view->strideY == 0u);
+
+    // For Q80, only support contiguous slicing aligned to block size.
+    assert(strideX == 1u);
+    assert((offset % Q80_BLOCK_SIZE) == 0u);
+    assert((len % Q80_BLOCK_SIZE) == 0u);
+    assert(offset + len <= context->outputSize.x);
+    assert(offset + len <= context->inputSize.x);
+
     for (NnUint z = 0u; z < context->inputSize.z; z++) {
         const NnUint zOffset = z * context->inputSize.y;
         for (NnUint y = 0u; y < batchSize; y++) {
             quantizeF32toQ80(
-                (float *)context->input[zOffset + y],
-                (NnBlockQ80 *)context->output[zOffset + y],
-                context->outputSize.x,
+                ((float *)context->input[zOffset + y]) + offset,
+                ((NnBlockQ80 *)context->output[zOffset + y]) + (offset / Q80_BLOCK_SIZE),
+                len,
                 nThreads,
                 threadIndex);
         }
@@ -1368,13 +1956,29 @@ static void castForward_Q80_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
     ASSERT_EQ(context->inputSize.floatType, F_Q80);
     ASSERT_EQ(context->outputSize.floatType, F_32);
 
+    const NnCastOpCodeConfig *config = (NnCastOpCodeConfig *)context->opConfig;
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    assert(view->sizeY == 0u);
+    assert(view->strideY == 0u);
+
+    // For Q80, only support contiguous slicing aligned to block size.
+    assert(strideX == 1u);
+    assert((offset % Q80_BLOCK_SIZE) == 0u);
+    assert((len % Q80_BLOCK_SIZE) == 0u);
+    assert(offset + len <= context->outputSize.x);
+    assert(offset + len <= context->inputSize.x);
+
     for (NnUint z = 0u; z < context->inputSize.z; z++) {
         const NnUint zOffset = z * context->inputSize.y;
         for (NnUint y = 0u; y < batchSize; y++) {
             dequantizeQ80toF32(
-                (NnBlockQ80 *)context->input[zOffset + y],
-                (float *)context->output[zOffset + y],
-                context->outputSize.x,
+                ((NnBlockQ80 *)context->input[zOffset + y]) + (offset / Q80_BLOCK_SIZE),
+                ((float *)context->output[zOffset + y]) + offset,
+                len,
                 nThreads,
                 threadIndex);
         }
@@ -1430,23 +2034,56 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         const NnSize index = (NnSize)indexes[batchIndex];
-        assert((index + 1) * context->inputSize.x <= context->outputSize.x);
-        copy_UNK(
-            &output[index * dimBytes],
-            context->input[batchIndex],
-            dimBytes,
-            nThreads,
-            threadIndex);
+        if (config->dstRowStride == 0u) {
+            assert((index + 1) * context->inputSize.x <= context->outputSize.x);
+            copy_UNK(
+                &output[index * dimBytes],
+                context->input[batchIndex],
+                dimBytes,
+                nThreads,
+                threadIndex);
+        } else {
+            const NnSize rowStrideBytes = getBytes(F_32, config->dstRowStride);
+            const NnSize colStartBytes = getBytes(F_32, config->dstColStart);
+            const NnSize totalRows = context->outputSize.x / config->dstRowStride;
+            assert(index < totalRows);
+            assert(config->dstColStart + context->inputSize.x <= config->dstRowStride);
+            copy_UNK(
+                &output[index * rowStrideBytes + colStartBytes],
+                context->input[batchIndex],
+                dimBytes,
+                nThreads,
+                threadIndex);
+        }
     }
 }
 
 static void softmaxForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     assert(*context->input == *context->output);
 
+    const NnSoftmaxOpCodeConfig *config = (const NnSoftmaxOpCodeConfig *)context->opConfig;
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    if (strideX == 1u) {
+        assert(offset + len <= context->outputSize.x);
+    } else {
+        if (len > 0u)
+            assert(offset + (len - 1u) * strideX < context->outputSize.x);
+    }
+
     for (NnUint y = threadIndex; y < batchSize; y += nThreads)
-        softmax_F32(
-            (float *)context->output[y],
-            context->outputSize.x);
+    {
+        float *out = (float *)context->output[y];
+        float *base = &out[offset];
+        if (strideX == 1u) {
+            softmax_F32(base, len);
+        } else {
+            softmax_F32_strided(base, len, strideX);
+        }
+    }
 }
 
 static void initMoeGateForward(NnCpuOpContext *context) {

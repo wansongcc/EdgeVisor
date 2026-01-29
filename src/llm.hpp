@@ -92,6 +92,12 @@ typedef struct {
     NnUint xPipeIndex;
     NnUint logitsPipeIndex;
     NnUint zqPipeIndex;
+    NnUint planPipeIndex;
+    // Optional: side-effect KV-cache aggregation (post-attention).
+    // When enabled, each node all-gathers per-node KV cache slices into these pipes.
+    // These pipes are not used by any compute ops.
+    NnUint kvAggKPipeIndex;
+    NnUint kvAggVPipeIndex;
     NnSize3D tokenEmbeddingSize;
     NnSize3D rmsNormSize;
     NnSize3D qkRmsNormSize;

@@ -91,6 +91,10 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_SHIFT) return "SHIFT";
     if (code == OP_SOFTMAX) return "SOFTMAX";
     if (code == OP_MOE_GATE) return "MOE_GATE";
+    if (code == OP_PP_RECV) return "PP_RECV";
+    if (code == OP_PP_SEND) return "PP_SEND";
+    if (code == OP_PLAN_BARRIER) return "PLAN_BARRIER";
+    if (code == OP_PLAN_APPLY) return "PLAN_APPLY";
     throw std::invalid_argument("Unknown op code: " + std::to_string(code));
 }
 
@@ -104,6 +108,19 @@ const char *opQuantTypeToString(NnOpQuantType type) {
     if (type == Q80_Q40_F32) return "Q80_Q40_F32";
     if (type == Q80_F32_F32) return "Q80_F32_F32";
     throw std::invalid_argument("Unknown op quant type");
+}
+
+const char *sliceTagToString(NnSliceTag tag) {
+    switch (tag) {
+        case NN_SLICE_AUTO: return "AUTO";
+        case NN_SLICE_VOCAB: return "VOCAB";
+        case NN_SLICE_FFN: return "FFN";
+        case NN_SLICE_DIM: return "DIM";
+        case NN_SLICE_HEAD: return "HEAD";
+        case NN_SLICE_KV_HEAD: return "KV_HEAD";
+        case NN_SLICE_STACKED_BY_NODE: return "STACKED_BY_NODE";
+        default: return "UNKNOWN";
+    }
 }
 
 NnSize3D size0() {
@@ -125,15 +142,21 @@ NnSize3D size3D(NnFloatType floatType, NnUint z, NnUint y, NnUint x) {
 }
 
 NnPointerConfig pointerBatchConfig(NnPointerSource source, NnUint index) {
-    return { source, index, PNTR_BATCH };
+    return { source, index, PNTR_BATCH, NN_SLICE_AUTO };
 }
 
 NnPointerConfig pointerBatchedSliceConfig(NnPointerSource source, NnUint index) {
-    return { source, index, PNTR_BATCHED_SLICE };
+    return { source, index, PNTR_BATCHED_SLICE, NN_SLICE_AUTO };
+}
+
+NnPointerConfig pointerBatchedSliceConfigTagged(NnPointerSource source, NnUint index, NnSliceTag sliceTag) {
+    NnPointerConfig cfg = pointerBatchedSliceConfig(source, index);
+    cfg.sliceTag = sliceTag;
+    return cfg;
 }
 
 NnPointerConfig pointerRawConfig(NnPointerSource source, NnUint index) {
-    return { source, index, PNTR_RAW };
+    return { source, index, PNTR_RAW, NN_SLICE_AUTO };
 }
 
 bool hasPointerContinuousMemory(NnPointerConfig *config) {
@@ -545,6 +568,92 @@ NnKvCacheSliceUneven sliceKvCacheUneven(NnUint seqLen, NnUint headDim,
     s.valueSize = size2D(F_32, seqLen, s.kvLen);
 
     return s;
+}
+
+NnKvCacheHeadMap buildKvCacheHeadMapUneven(
+    const NnUnevenPartitionPlan* plan,
+    const NnStageConfig* stage,
+    NnUint nKvHeads,
+    NnUint headDim)
+{
+    if (plan == nullptr || stage == nullptr)
+        throw std::invalid_argument("buildKvCacheHeadMapUneven: plan/stage is null");
+    if (nKvHeads == 0u || headDim == 0u)
+        throw std::invalid_argument("buildKvCacheHeadMapUneven: nKvHeads/headDim is zero");
+    if (stage->nNodes == 0u || stage->nodeIndices == nullptr)
+        throw std::invalid_argument("buildKvCacheHeadMapUneven: stage has no nodes");
+
+    NnKvCacheHeadMap m;
+    std::memset(&m, 0, sizeof(NnKvCacheHeadMap));
+    m.nNodes = stage->nNodes;
+    m.nKvHeads = nKvHeads;
+    m.headDim = headDim;
+    m.kvDim = nKvHeads * headDim;
+
+    m.nodeIndices = new NnUint[m.nNodes];
+    m.nodeKvHeadStarts = new NnUint[m.nNodes];
+    m.nodeKvHeadLens = new NnUint[m.nNodes];
+
+    m.headOwnerNode = new NnUint[m.nKvHeads];
+    m.headOwnerRank = new NnUint[m.nKvHeads];
+    m.headGlobalKvStart = new NnUint[m.nKvHeads];
+    m.headLocalKvStart = new NnUint[m.nKvHeads];
+
+    const NnUint UNASSIGNED = 0xFFFFFFFFu;
+    for (NnUint h = 0u; h < m.nKvHeads; h++) {
+        m.headOwnerNode[h] = UNASSIGNED;
+        m.headOwnerRank[h] = UNASSIGNED;
+        m.headGlobalKvStart[h] = h * m.headDim;
+        m.headLocalKvStart[h] = UNASSIGNED;
+    }
+
+    // Fill per-node head ranges and per-head ownership.
+    NnUint covered = 0u;
+    for (NnUint rank = 0u; rank < m.nNodes; rank++) {
+        const NnUint nodeIndex = stage->nodeIndices[rank];
+        m.nodeIndices[rank] = nodeIndex;
+
+        const NnUint headStart = plan->kvHeadSplit.starts[nodeIndex];
+        const NnUint headLen = plan->kvHeadSplit.lengths[nodeIndex];
+        m.nodeKvHeadStarts[rank] = headStart;
+        m.nodeKvHeadLens[rank] = headLen;
+        covered += headLen;
+
+        for (NnUint h = headStart; h < headStart + headLen; h++) {
+            if (h >= m.nKvHeads)
+                throw std::runtime_error("buildKvCacheHeadMapUneven: kvHeadSplit out of range");
+            if (m.headOwnerNode[h] != UNASSIGNED)
+                throw std::runtime_error("buildKvCacheHeadMapUneven: KV head assigned to multiple nodes");
+            m.headOwnerNode[h] = nodeIndex;
+            m.headOwnerRank[h] = rank;
+            m.headLocalKvStart[h] = (h - headStart) * m.headDim;
+        }
+    }
+
+    if (covered != m.nKvHeads) {
+        // Stage-local splits must cover all KV heads in that stage.
+        throw std::runtime_error("buildKvCacheHeadMapUneven: stage KV head coverage mismatch");
+    }
+
+    for (NnUint h = 0u; h < m.nKvHeads; h++) {
+        if (m.headOwnerNode[h] == UNASSIGNED)
+            throw std::runtime_error("buildKvCacheHeadMapUneven: KV head unassigned");
+    }
+
+    return m;
+}
+
+void freeKvCacheHeadMap(NnKvCacheHeadMap *map) {
+    if (map == nullptr)
+        return;
+    delete[] map->nodeIndices;
+    delete[] map->nodeKvHeadStarts;
+    delete[] map->nodeKvHeadLens;
+    delete[] map->headOwnerNode;
+    delete[] map->headOwnerRank;
+    delete[] map->headGlobalKvStart;
+    delete[] map->headLocalKvStart;
+    std::memset(map, 0, sizeof(NnKvCacheHeadMap));
 }
 
 NnMultiHeadAttSliceUneven sliceMultiHeadAttUneven(NnUint nBatches, NnUint globalNHeads, NnUint globalSeqLen,

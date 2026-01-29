@@ -31,6 +31,464 @@ static bool debugWeightRangesEnabled(const char *opName) {
     return (std::strstr(opName, filter) != nullptr);
 }
 
+static bool debugSliceParamsEnabled(const char *opName) {
+    if (std::getenv("DLLAMA_DEBUG_SLICE_PARAMS") == nullptr)
+        return false;
+    const char *filter = std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FILTER");
+    if (filter == nullptr || filter[0] == '\0')
+        return true;
+    if (opName == nullptr)
+        return false;
+    return (std::strstr(opName, filter) != nullptr);
+}
+
+static bool debugSliceParamsForwardEnabled(const char *opName) {
+    if (std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FWD") == nullptr)
+        return false;
+    const char *filter = std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FILTER");
+    if (filter == nullptr || filter[0] == '\0')
+        return true;
+    if (opName == nullptr)
+        return false;
+    return (std::strstr(opName, filter) != nullptr);
+}
+
+static bool debugSliceParamsForwardRepeat() {
+    const char *v = std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FWD_REPEAT");
+    if (v == nullptr)
+        return false;
+    // Treat "0" / "false" as disabled.
+    if (v[0] == '0')
+        return false;
+    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A'))
+        return false;
+    return true;
+}
+
+static inline int getenvIntOr(const char *name, int fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0')
+        return fallback;
+    try {
+        return std::stoi(std::string(v));
+    } catch (...) {
+        return fallback;
+    }
+}
+
+static inline bool tpRangeTargetEnabled() {
+    // Enable when either explicit debug env is present, or hard-migrate target is set.
+    if (std::getenv("DLLAMA_DEBUG_TP_RANGES") != nullptr)
+        return true;
+    const int p = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_POS", -1);
+    const int l = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER", -1);
+    if (p >= 0 && l >= 0)
+        return true;
+    // Fallback: if hard migration is configured, treat it as the debug target.
+    const int hp = getenvIntOr("DLLAMA_HARD_MIGRATE_POS", -1);
+    const int hl = getenvIntOr("DLLAMA_HARD_MIGRATE_LAYER", -1);
+    return (hp >= 0 && hl >= 0);
+}
+
+static inline bool tpRangeTargetMatch(NnUint layerIndex, NnUint pos) {
+    int targetPos = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_POS", -1);
+    int targetLayer = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER", -1);
+    int span = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER_SPAN", -1);
+    const bool explicitTarget = (targetPos >= 0 && targetLayer >= 0);
+    if (targetPos < 0 || targetLayer < 0) {
+        targetPos = getenvIntOr("DLLAMA_HARD_MIGRATE_POS", -1);
+        targetLayer = getenvIntOr("DLLAMA_HARD_MIGRATE_LAYER", -1);
+        // Default behavior: when using hard-migrate target as the debug anchor,
+        // print both (layer-1) and (layer) at the target pos so users can compare
+        // compute ranges before/after the migration point.
+        if (span < 0)
+            span = 1;
+    }
+    if (targetPos < 0 || targetLayer < 0)
+        return false;
+    if (span < 0)
+        span = 0;
+    if (pos != (NnUint)targetPos)
+        return false;
+    const int li = (int)layerIndex;
+    const int tl = (int)targetLayer;
+    const int d = (li >= tl) ? (li - tl) : (tl - li);
+    // If the user explicitly specifies DLLAMA_DEBUG_TP_RANGES_LAYER, respect it strictly unless span was set.
+    if (explicitTarget && getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER_SPAN", -1) < 0)
+        return li == tl;
+    return d <= span;
+}
+
+static inline NnUint loadPosFromPipe(const NnCpuOpContext *context, NnUint pipeIndex) {
+    if (context == nullptr || context->pipes == nullptr)
+        return 0xFFFFFFFFu;
+    const float posF = *(const float *)(context->pipes[pipeIndex]);
+    if (!(posF >= 0.0f))
+        return 0xFFFFFFFFu;
+    return (NnUint)posF;
+}
+
+static inline void printTpAffectedRange(
+    const NnCpuOpContext *context,
+    const NnSegmentConfig *segmentConfig,
+    NnUint opIndex,
+    NnUint layerIndex,
+    NnUint pos,
+    NnUint nodeIndex,
+    unsigned int epoch,
+    NnUint stageIndex,
+    NnUint stageRank,
+    NnUint ffnStart,
+    NnUint ffnLen) {
+    if (context == nullptr)
+        return;
+
+    printf("📐 [tp-range] node=%u stage=%u rank=%u epoch=%u layer=%u pos=%u op=%u name=%s code=%s inX=%u outX=%u\n",
+        (unsigned)nodeIndex,
+        (unsigned)stageIndex,
+        (unsigned)stageRank,
+        (unsigned)epoch,
+        (unsigned)layerIndex,
+        (unsigned)pos,
+        (unsigned)opIndex,
+        (context->name ? context->name : "Unknown"),
+        opCodeToString(context->opCode),
+        (unsigned)context->inputSize.x,
+        (unsigned)context->outputSize.x);
+
+    // Best-effort: unify qStart/kvStart so node0/node1 complement is easy to see.
+    // For non-attention ops these may be unknown.
+    NnUint qStart = 0xFFFFFFFFu;
+    NnUint kvStart = 0xFFFFFFFFu;
+    if (context->opCode == OP_MULTIHEAD_ATT) {
+        const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+        qStart = cfg->qStart;
+        kvStart = cfg->kvStart;
+    } else if (context->opCode == OP_ROPE) {
+        const auto *cfg = (const NnRopeOpConfig *)context->opConfig;
+        qStart = cfg->slice.qDimStart;
+        kvStart = cfg->slice.kvDimStart;
+    } else if (context->opCode == OP_SHIFT) {
+        const auto *cfg = (const NnShiftOpCodeConfig *)context->opConfig;
+        kvStart = cfg->dstColStart;
+    }
+    printf("    TP starts: qStart=%s kvStart=%s\n",
+        (qStart == 0xFFFFFFFFu) ? "?" : std::to_string((unsigned)qStart).c_str(),
+        (kvStart == 0xFFFFFFFFu) ? "?" : std::to_string((unsigned)kvStart).c_str());
+
+    // Print FFN split only when it's relevant to the op.
+    // Attention ops (e.g. block_matmul_wo) are driven by headSplit, not ffnSplit.
+    bool ffnRelevant = false;
+    if (context->opCode == OP_MUL || context->opCode == OP_SILU) {
+        ffnRelevant = true;
+    } else if (context->opCode == OP_MATMUL) {
+        const auto *cfg = (const NnMatmulOpConfig *)context->opConfig;
+        ffnRelevant = (cfg->inSliceTag == NN_SLICE_FFN) || (cfg->outSliceTag == NN_SLICE_FFN);
+    }
+    if (ffnRelevant && ffnStart != 0xFFFFFFFFu && ffnLen != 0xFFFFFFFFu) {
+        printf("    FFN split: start=%u len=%u\n", (unsigned)ffnStart, (unsigned)ffnLen);
+    }
+
+    switch (context->opCode) {
+    case OP_MULTIHEAD_ATT: {
+        const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+        printf("    MHA q:  start=%u len=%u stride=%u (nHeads=%u nHeads0=%u headDim=%u)\n",
+            (unsigned)cfg->qStart, (unsigned)cfg->qSliceD0, (unsigned)cfg->qStride,
+            (unsigned)cfg->nHeads, (unsigned)cfg->nHeads0, (unsigned)cfg->headDim);
+        printf("    MHA kv: start=%u len=%u stride=%u (nKvHeads=%u headDim=%u)\n",
+            (unsigned)cfg->kvStart, (unsigned)cfg->kvDim0, (unsigned)cfg->kvStride,
+            (unsigned)cfg->nKvHeads, (unsigned)cfg->headDim);
+        break;
+    }
+    case OP_MATMUL: {
+        const auto *cfg = (const NnMatmulOpConfig *)context->opConfig;
+        const NnUint aLen = (cfg->aView.sizeX == 0u) ? context->inputSize.x : cfg->aView.sizeX;
+        const NnUint cLen = (cfg->cView.sizeX == 0u) ? context->outputSize.x : cfg->cView.sizeX;
+        printf("    MATMUL view=%u inStart=%u outStart=%u aView={off=%u sizeX=%u strideX=%u} cView={off=%u sizeX=%u strideX=%u}\n",
+            (unsigned)cfg->view,
+            (unsigned)cfg->inStart,
+            (unsigned)cfg->outStart,
+            (unsigned)cfg->aView.offset,
+            (unsigned)cfg->aView.sizeX,
+            (unsigned)cfg->aView.strideX,
+            (unsigned)cfg->cView.offset,
+            (unsigned)cfg->cView.sizeX,
+            (unsigned)cfg->cView.strideX);
+        printf("    MATMUL A: start=%u len=%u | C: start=%u len=%u\n",
+            (unsigned)cfg->aView.offset,
+            (unsigned)aLen,
+            (unsigned)cfg->cView.offset,
+            (unsigned)cLen);
+        printf("    MATMUL tags: inTag=%s outTag=%s (units inStartUnit=%u outStartUnit=%u)\n",
+            sliceTagToString(cfg->inSliceTag),
+            sliceTagToString(cfg->outSliceTag),
+            (unsigned)cfg->inStartUnit,
+            (unsigned)cfg->outStartUnit);
+
+        // Weight layout note (matches matmulForward_* implementation):
+        // - weightSize.y is the global input dim (n)
+        // - weightSize.x is the global output dim (d)
+        // - row stride in bytes for one output row is getBytes(type, weightSize.y)
+        printf("    WEIGHT dims(z,y,x)=(%u,%u,%u) type=%u (n=weightSize.y d=weightSize.x)\n",
+            (unsigned)context->weightSize.z,
+            (unsigned)context->weightSize.y,
+            (unsigned)context->weightSize.x,
+            (unsigned)context->weightSize.floatType);
+
+        const NnSize rowStrideBytes = getBytes(context->weightSize.floatType, context->weightSize.y);
+        // We don't know the active expert here; for non-MoE models this is always 0.
+        const NnSize expertBase = 0u;
+        NnSize begin = expertBase;
+        NnSize end = expertBase + context->weightSize.nBytesXY;
+
+        if (cfg->view == 1u || cfg->view == 2u) {
+            begin = expertBase + (NnSize)cfg->outStart * rowStrideBytes;
+            end = begin + (NnSize)cLen * rowStrideBytes;
+        }
+        // For view=2, actual reads are a column slice [inStart, inStart+aLen) within each row.
+        if (cfg->view == 2u) {
+            const NnSize colBegin = getBytes(context->weightSize.floatType, cfg->inStart);
+            const NnSize colEnd = getBytes(context->weightSize.floatType, cfg->inStart + aLen);
+            printf("    WEIGHT read(view2): rows=[%u,%u) cols=[%u,%u) rowStrideBytes=%zu approxRowSpan=[%zu,%zu)\n",
+                (unsigned)cfg->outStart,
+                (unsigned)(cfg->outStart + cLen),
+                (unsigned)cfg->inStart,
+                (unsigned)(cfg->inStart + aLen),
+                (size_t)rowStrideBytes,
+                (size_t)(begin + colBegin),
+                (size_t)(begin + colEnd));
+        }
+        printf("    WEIGHT read: allocXY=[0,%zu) approxContig=[%zu,%zu) (expertBase=%zu)\n",
+            (size_t)context->weightSize.nBytesXY,
+            (size_t)begin,
+            (size_t)end,
+            (size_t)expertBase);
+        break;
+    }
+    case OP_MUL: {
+        const auto *cfg = (const NnMulOpCodeConfig *)context->opConfig;
+        const NnUint viewLen = (cfg->view.sizeX != 0u) ? cfg->view.sizeX : context->inputSize.x;
+        const NnUint strideX = (cfg->view.strideX != 0u) ? cfg->view.strideX : 1u;
+        printf("    MUL multBuf=%u view={start=%u len=%u stride=%u} (raw:off=%u sizeX=%u strideX=%u)\n",
+            (unsigned)cfg->multiplierBufferIndex,
+            (unsigned)cfg->view.offset,
+            (unsigned)viewLen,
+            (unsigned)strideX,
+            (unsigned)cfg->view.offset,
+            (unsigned)cfg->view.sizeX,
+            (unsigned)cfg->view.strideX);
+        break;
+    }
+    case OP_SILU: {
+        const auto *cfg = (const NnSiluOpCodeConfig *)context->opConfig;
+        const NnUint viewLen = (cfg->view.sizeX != 0u) ? cfg->view.sizeX : context->inputSize.x;
+        const NnUint strideX = (cfg->view.strideX != 0u) ? cfg->view.strideX : 1u;
+        printf("    SILU view={start=%u len=%u stride=%u} (raw:off=%u sizeX=%u strideX=%u)\n",
+            (unsigned)cfg->view.offset,
+            (unsigned)viewLen,
+            (unsigned)strideX,
+            (unsigned)cfg->view.offset,
+            (unsigned)cfg->view.sizeX,
+            (unsigned)cfg->view.strideX);
+        break;
+    }
+    case OP_CAST: {
+        const auto *cfg = (const NnCastOpCodeConfig *)context->opConfig;
+        const NnUint viewLen = (cfg->view.sizeX != 0u) ? cfg->view.sizeX : context->inputSize.x;
+        const NnUint strideX = (cfg->view.strideX != 0u) ? cfg->view.strideX : 1u;
+        printf("    CAST view={start=%u len=%u stride=%u} (raw:off=%u sizeX=%u strideX=%u)\n",
+            (unsigned)cfg->view.offset,
+            (unsigned)viewLen,
+            (unsigned)strideX,
+            (unsigned)cfg->view.offset,
+            (unsigned)cfg->view.sizeX,
+            (unsigned)cfg->view.strideX);
+        break;
+    }
+    case OP_ROPE: {
+        const auto *cfg = (const NnRopeOpConfig *)context->opConfig;
+        const NnUint viewLen = (cfg->view.sizeX != 0u) ? cfg->view.sizeX : context->inputSize.x;
+        printf("    ROPE isQ=%u view={off=%u len=%u strideX=%u} slice{qStart=%u qLen=%u kvStart=%u kvLen=%u headDim=%u}\n",
+            (unsigned)cfg->isQ,
+            (unsigned)cfg->view.offset,
+            (unsigned)viewLen,
+            (unsigned)cfg->view.strideX,
+            (unsigned)cfg->slice.qDimStart,
+            (unsigned)cfg->slice.qDim0,
+            (unsigned)cfg->slice.kvDimStart,
+            (unsigned)cfg->slice.kvDim0,
+            (unsigned)cfg->slice.headDim);
+        break;
+    }
+    case OP_SHIFT: {
+        const auto *cfg = (const NnShiftOpCodeConfig *)context->opConfig;
+        printf("    SHIFT dstColStart=%u dstRowStride=%u dstColStartUnit=%u indexPipe=%u\n",
+            (unsigned)cfg->dstColStart,
+            (unsigned)cfg->dstRowStride,
+            (unsigned)cfg->dstColStartUnit,
+            (unsigned)cfg->indexPipeIndex);
+        break;
+    }
+    case OP_INV_RMS: {
+        const auto *cfg = (const NnInvRmsOpConfig *)context->opConfig;
+        const NnUint viewLen = (cfg->view.sizeX != 0u) ? cfg->view.sizeX : context->inputSize.x;
+        printf("    INV_RMS nColumns=%u view={off=%u len=%u strideX=%u}\n",
+            (unsigned)cfg->nColumns,
+            (unsigned)cfg->view.offset,
+            (unsigned)viewLen,
+            (unsigned)cfg->view.strideX);
+        break;
+    }
+    case OP_RMS_NORM: {
+        const auto *cfg = (const NnRmsNormOpConfig *)context->opConfig;
+        const NnUint viewLen = (cfg->view.sizeX != 0u) ? cfg->view.sizeX : context->inputSize.x;
+        printf("    RMS_NORM nColumns=%u invRmsBuf=%u view={off=%u len=%u strideX=%u}\n",
+            (unsigned)cfg->nColumns,
+            (unsigned)cfg->invRmsBufferIndex,
+            (unsigned)cfg->view.offset,
+            (unsigned)viewLen,
+            (unsigned)cfg->view.strideX);
+        break;
+    }
+    default:
+        // Only print detailed ranges for TP-sensitive ops.
+        break;
+    }
+    (void)segmentConfig;
+}
+
+static inline void printPtrSampleDbg(const char *label, NnByte **ptrs, const NnSize3D &sz) {
+    if (ptrs == nullptr) {
+        printf("    %s=null\n", (label ? label : "ptr"));
+        return;
+    }
+    // Print first pointer for z=0,y=0 plus stride between batches to detect slot alignment.
+    NnByte *p00 = ptrs[0];
+    NnByte *p01 = (sz.y >= 2u) ? ptrs[1] : nullptr;
+    printf("    %s[0]=%p", (label ? label : "ptr"), (void *)p00);
+    if (p01 != nullptr) {
+        const ptrdiff_t delta = (ptrdiff_t)(p01 - p00);
+        bool hasExpect = false;
+        size_t expectRowBytes = 0;
+        if (sz.x > 0u) {
+            if (sz.floatType == F_Q80) {
+                // getBytes(F_Q80, n) requires n to be block-aligned.
+                if ((sz.x % Q80_BLOCK_SIZE) == 0u) {
+                    expectRowBytes = (size_t)getBytes(sz.floatType, sz.x);
+                    hasExpect = true;
+                }
+            } else {
+                expectRowBytes = (size_t)getBytes(sz.floatType, sz.x);
+                hasExpect = true;
+            }
+        }
+        if (hasExpect) {
+            printf(" %s[1]=%p deltaB=%td expectB=%zu", (label ? label : "ptr"), (void *)p01, delta, expectRowBytes);
+        } else {
+            printf(" %s[1]=%p deltaB=%td", (label ? label : "ptr"), (void *)p01, delta);
+        }
+    }
+    printf("\n");
+}
+
+static inline void printTensorViewDbg(const char *label, const NnTensorView &v, const NnUint fallbackSizeX) {
+    const NnUint sizeX = (v.sizeX != 0u) ? v.sizeX : fallbackSizeX;
+    const NnUint strideX = (v.strideX != 0u) ? v.strideX : 1u;
+    printf("    view[%s] start=%u len=%u stride=%u (raw:off=%u sizeX=%u strideX=%u)\n",
+        (label ? label : "?"),
+        (unsigned)v.offset,
+        (unsigned)sizeX,
+        (unsigned)strideX,
+        (unsigned)v.offset,
+        (unsigned)v.sizeX,
+        (unsigned)v.strideX);
+}
+
+static void printOpSliceParamsDbg(const char *opName, const NnOpCode opCode, const void *opConfig, const NnPointerConfig *inPtr, const NnPointerConfig *outPtr, const NnSize3D &inSize, const NnSize3D &outSize) {
+    // If caller provides pointer configs, gate by DLLAMA_DEBUG_SLICE_PARAMS (build-time).
+    // If pointer configs are null, allow forward-time logging gate to control output.
+    if (inPtr != nullptr || outPtr != nullptr) {
+        if (!debugSliceParamsEnabled(opName))
+            return;
+    }
+    printf("🧩 [slice] op=%s code=%s inTag=%s outTag=%s inX=%u outX=%u\n",
+        (opName ? opName : "Unknown"),
+        opCodeToString(opCode),
+        (inPtr ? sliceTagToString(inPtr->sliceTag) : "?"),
+        (outPtr ? sliceTagToString(outPtr->sliceTag) : "?"),
+        (unsigned)inSize.x,
+        (unsigned)outSize.x);
+
+    if (opCode == OP_MULTIHEAD_ATT) {
+        const auto *cfg = (const NnMultiHeadAttOpConfig *)opConfig;
+        printf("    q:   start=%u len=%u stride=%u (nHeads=%u nHeads0=%u headDim=%u qSliceD0=%u)\n",
+            (unsigned)cfg->qStart, (unsigned)cfg->qSliceD0, (unsigned)cfg->qStride,
+            (unsigned)cfg->nHeads, (unsigned)cfg->nHeads0, (unsigned)cfg->headDim, (unsigned)cfg->qSliceD0);
+        printf("    kv:  start=%u len=%u stride=%u (nKvHeads=%u headDim=%u kvDim0=%u)\n",
+            (unsigned)cfg->kvStart, (unsigned)cfg->kvDim0, (unsigned)cfg->kvStride,
+            (unsigned)cfg->nKvHeads, (unsigned)cfg->headDim, (unsigned)cfg->kvDim0);
+        return;
+    }
+
+    if (opCode == OP_SHIFT) {
+        const auto *cfg = (const NnShiftOpCodeConfig *)opConfig;
+        if (cfg->dstRowStride != 0u) {
+            printf("    dst: start=%u len=%u stride=%u (unit=%u)\n",
+                (unsigned)cfg->dstColStart, (unsigned)outSize.x, (unsigned)cfg->dstRowStride, (unsigned)cfg->dstColStartUnit);
+        } else {
+            printf("    dst: packed len=%u\n", (unsigned)outSize.x);
+        }
+        return;
+    }
+
+    if (opCode == OP_MATMUL) {
+        const auto *cfg = (const NnMatmulOpConfig *)opConfig;
+        printf("    matmul: view=%u inStart=%u outStart=%u inTag=%s outTag=%s\n",
+            (unsigned)cfg->view,
+            (unsigned)cfg->inStart,
+            (unsigned)cfg->outStart,
+            sliceTagToString(cfg->inSliceTag),
+            sliceTagToString(cfg->outSliceTag));
+        if (cfg->aView.offset != 0u || cfg->aView.sizeX != 0u || cfg->aView.strideX != 0u)
+            printTensorViewDbg("A", cfg->aView, inSize.x);
+        if (cfg->cView.offset != 0u || cfg->cView.sizeX != 0u || cfg->cView.strideX != 0u)
+            printTensorViewDbg("C", cfg->cView, outSize.x);
+        return;
+    }
+
+    if (opCode == OP_ROPE) {
+        const auto *cfg = (const NnRopeOpConfig *)opConfig;
+        printTensorViewDbg(cfg->isQ ? "Q" : "K", cfg->view, inSize.x);
+        return;
+    }
+
+    if (opCode == OP_SILU) {
+        const auto *cfg = (const NnSiluOpCodeConfig *)opConfig;
+        printTensorViewDbg("SILU", cfg->view, inSize.x);
+        return;
+    }
+    if (opCode == OP_GELU) {
+        const auto *cfg = (const NnGeluOpCodeConfig *)opConfig;
+        printTensorViewDbg("GELU", cfg->view, inSize.x);
+        return;
+    }
+    if (opCode == OP_MUL) {
+        const auto *cfg = (const NnMulOpCodeConfig *)opConfig;
+        printTensorViewDbg("MUL", cfg->view, inSize.x);
+        return;
+    }
+    if (opCode == OP_SCALE) {
+        const auto *cfg = (const NnScaleOpCodeConfig *)opConfig;
+        printTensorViewDbg("SCALE", cfg->view, inSize.x);
+        return;
+    }
+    if (opCode == OP_CAST) {
+        const auto *cfg = (const NnCastOpCodeConfig *)opConfig;
+        printTensorViewDbg("CAST", cfg->view, inSize.x);
+        return;
+    }
+}
+
 static NnByte *allocAlignedBuffer(NnSize size) {
     NnByte *buffer;
 #ifdef _WIN32
@@ -117,6 +575,13 @@ NnCpuDevice::~NnCpuDevice() {
     delete[] bufferFlags;
 }
 
+void NnCpuDevice::setPartitionPlan(const NnUnevenPartitionPlan *newPlan) {
+    this->partitionPlan = newPlan;
+    if (this->nodeConfig != nullptr) {
+        this->nodeConfig->partitionPlan = newPlan;
+    }
+}
+
 NnUint NnCpuDevice::maxNThreads() {
     return std::thread::hardware_concurrency();
 }
@@ -139,6 +604,9 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
         NnSize3D outputSize;
         inputsPtr[opIndex] = resolvePointer(&inputSize, &opConfig->input);
         outputsPtr[opIndex] = resolvePointer(&outputSize, &opConfig->output);
+
+        // Debug: print slice/view parameters for full-buffer + local-slice execution.
+        printOpSliceParamsDbg(opConfig->name, opConfig->code, opConfig->config, &opConfig->input, &opConfig->output, inputSize, outputSize);
 
         // [Patch Start] Logits Pipe 尺寸修正补丁
         // 在非均匀切分模式下，resolvePointer 可能会根据 Pipe 的总大小计算出一个“均匀”的 Output Slice。
@@ -233,7 +701,7 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
             opInit(opContext);
         opForward[opIndex] = opForwardLocal[opIndex];
     }
-    return new NnCpuDeviceSegment(opForward, opContexts, segmentConfig->nOps);
+    return new NnCpuDeviceSegment(this, segmentIndex, segmentConfig, opForward, opContexts, segmentConfig->nOps);
 }
 
 NnCpuDeviceSegment::~NnCpuDeviceSegment() {
@@ -291,7 +759,7 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
             NnUint myOffset = 0;
             NnUint myLength = 0;
             bool splitFound = false;
-            bool stackedByNode = false;
+            bool stackedByNode = (pointerConfig->sliceTag == NN_SLICE_STACKED_BY_NODE);
 
             // 1. 尝试查阅 Partition Plan 来获取精确的非均匀 Offset/Length
             if (partitionPlan != nullptr && netConfig->nNodes == partitionPlan->nNodes) {
@@ -299,15 +767,19 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
                 NnUint nodeIdx = nodeConfig->nodeIndex;
                 const NnStageConfig* myStage = (partitionPlan->nStages > 0) ? findStageForNode(partitionPlan, nodeIdx) : nullptr;
 
-                // ----------------------------------------------------
-                // [PP Fix] ZQ 等“按 node 堆叠”的 pipe：总维度 == dim * nNodes
-                // 这种 pipe 的每个 node slice 应该是固定长度 dim，且按【全局 nodeIndex】排布。
-                // 不能用 dim/head split 进行匹配，否则会把 offset 解释成 interleaved 布局，导致跨 stage 污染。
-                // ----------------------------------------------------
-                if (partitionPlan->nStages > 0 && myStage != nullptr) {
-                    NnUint dimTotal = getSplitTotalForStage(&partitionPlan->dimSplit, myStage);
-                    if (dimTotal > 0 && totalDim == dimTotal * netConfig->nNodes) {
-                        stackedByNode = true;
+                // If tag explicitly says stacked-by-node, do not attempt split matching.
+                // Otherwise, keep legacy stacked-by-node detection for backward compatibility.
+                if (!stackedByNode) {
+                    // ----------------------------------------------------
+                    // [PP Fix] ZQ 等“按 node 堆叠”的 pipe：总维度 == dim * nNodes
+                    // 这种 pipe 的每个 node slice 应该是固定长度 dim，且按【全局 nodeIndex】排布。
+                    // 不能用 dim/head split 进行匹配，否则会把 offset 解释成 interleaved 布局，导致跨 stage 污染。
+                    // ----------------------------------------------------
+                    if (partitionPlan->nStages > 0 && myStage != nullptr) {
+                        NnUint dimTotal = getSplitTotalForStage(&partitionPlan->dimSplit, myStage);
+                        if (dimTotal > 0 && totalDim == dimTotal * netConfig->nNodes) {
+                            stackedByNode = true;
+                        }
                     }
                 }
                 
@@ -334,20 +806,59 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
                         myOffset = split.starts[nodeIdx] * multiplier;
                         myLength = split.lengths[nodeIdx] * multiplier;
 
+                        // Q80 requires block-aligned offsets and lengths.
+                        // If we can't satisfy alignment, reject this split match.
+                        if (sourceSize->floatType == F_Q80) {
+                            if ((myOffset % Q80_BLOCK_SIZE) != 0 || (myLength % Q80_BLOCK_SIZE) != 0) {
+                                return false;
+                            }
+                        }
+
                         return true;
                     }
                     return false;
                 };
 
-                // 按优先级尝试匹配 (Vocab > FFN > Heads)
-                // Vocab, FFN, Dim should match exactly (multiplier 1) to avoid matching concatenated pipes like ZQ
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->vocabSplit, false, "vocab");
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->ffnSplit, false, "ffn");
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->dimSplit, false, "dim");
-                // Heads have headDim multiplier; but for Q80 activation pipes (e.g., ZQ) avoid head split to prevent misaligned offsets
-                if (sourceSize->floatType != F_Q80) {
-                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->headSplit, true, "head");
-                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->kvHeadSplit, true, "kvhead");
+                // If sliceTag is explicitly set, use it deterministically.
+                // Otherwise, fall back to legacy heuristic matching (Vocab > FFN > Dim > Heads).
+                if (!splitFound && pointerConfig->sliceTag != NN_SLICE_AUTO) {
+                    switch (pointerConfig->sliceTag) {
+                        case NN_SLICE_VOCAB:
+                            splitFound = tryApplySplit(partitionPlan->vocabSplit, false, "vocab");
+                            break;
+                        case NN_SLICE_FFN:
+                            splitFound = tryApplySplit(partitionPlan->ffnSplit, false, "ffn");
+                            break;
+                        case NN_SLICE_DIM:
+                            splitFound = tryApplySplit(partitionPlan->dimSplit, false, "dim");
+                            break;
+                        case NN_SLICE_HEAD:
+                            // Heads have headDim multiplier; explicit tag means the caller knows this buffer is head-sliced.
+                            splitFound = tryApplySplit(partitionPlan->headSplit, true, "head");
+                            break;
+                        case NN_SLICE_KV_HEAD:
+                            splitFound = tryApplySplit(partitionPlan->kvHeadSplit, true, "kvhead");
+                            break;
+                        case NN_SLICE_STACKED_BY_NODE:
+                            // handled by stackedByNode flag
+                            break;
+                        case NN_SLICE_AUTO:
+                        default:
+                            break;
+                    }
+                }
+
+                // Legacy heuristic matching (kept for backward compatibility).
+                if (!splitFound && pointerConfig->sliceTag == NN_SLICE_AUTO) {
+                    // Vocab, FFN, Dim should match exactly (multiplier 1) to avoid matching concatenated pipes like ZQ
+                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->vocabSplit, false, "vocab");
+                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->ffnSplit, false, "ffn");
+                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->dimSplit, false, "dim");
+                    // Heads have headDim multiplier; but for Q80 activation pipes (e.g., ZQ) avoid head split to prevent misaligned offsets
+                    if (sourceSize->floatType != F_Q80) {
+                        if (!splitFound) splitFound = tryApplySplit(partitionPlan->headSplit, true, "head");
+                        if (!splitFound) splitFound = tryApplySplit(partitionPlan->kvHeadSplit, true, "kvhead");
+                    }
                 }
             }
 
@@ -373,17 +884,8 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
             }
 
             // 3. 应用偏移量 (带越界保护)
-            // [Fix] For Q80, getBytes(F_Q80, offset) assumes offset is block-aligned.
-            // If offset is NOT block aligned (e.g. 1024 elements, block 32 -> aligned), it works.
-            // But if offset is not aligned, getBytes might throw or return wrong value?
-            // getBytes implementation: assert(n % Q80_BLOCK_SIZE == 0);
-            // So we MUST ensure myOffset is block aligned for Q80.
-            
-            if (sourceSize->floatType == F_Q80 && myOffset % Q80_BLOCK_SIZE != 0) {
-                 // This is bad. Q80 requires block alignment.
-                 // But usually dim splits are aligned to 32 or more.
-                 // Let's hope it is aligned.
-            }
+              // For Q80, getBytes(F_Q80, n) requires n to be block-aligned.
+              // tryApplySplit() enforces alignment for explicit matches; legacy fallback must also be aligned.
 
             NnSize offsetBytes = getBytes(sourceSize->floatType, myOffset);
             NnSize totalBytes = getBytes(sourceSize->floatType, sourceSize->x);
@@ -455,6 +957,393 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     NnCpuOpContext *context = &opContexts[opIndex];
     // printf("forward: %d %s (%d/%d)\n", opIndex, context->name, threadIndex + 1, nThreads); fflush(stdout);
 
+    // If the partition plan was updated (epoch bumped), refresh this segment's pointers/configs
+    // before executing the next op.
+    if (device != nullptr) {
+        const unsigned int deviceEpoch = device->getPlanEpoch();
+        const unsigned int readyEpoch = planEpochReady.load(std::memory_order_acquire);
+        if (readyEpoch != deviceEpoch) {
+            if (threadIndex == 0u) {
+                refreshPointers();
+                planEpochReady.store(deviceEpoch, std::memory_order_release);
+            } else {
+                while (planEpochReady.load(std::memory_order_acquire) != deviceEpoch) {
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // CPU-only: plan barrier/apply ops (test hook for hard migrations)
+    // ------------------------------------------------------------------
+    if (context->opCode == OP_PLAN_BARRIER) {
+        if (threadIndex == 0u && device != nullptr && context->input != nullptr && context->output != nullptr) {
+            const auto *cfg = (const NnPlanBarrierOpCodeConfig *)context->opConfig;
+            const NnUnevenPartitionPlan *planConst = device->getPartitionPlan();
+
+            // Disabled sentinel
+            const bool enabled = (cfg->triggerPos != 0xFFFFFFFFu) && (cfg->triggerLayer != 0xFFFFFFFFu);
+
+            const NnUint layerIndex = (segmentConfig != nullptr) ? segmentConfig->ops[opIndex].index : 0u;
+            const float posF = *(const float *)(context->input[0]);
+            const NnUint pos = (posF >= 0.0f) ? (NnUint)posF : 0u;
+
+            // Determine my stage/root.
+            const NnUint myNode = device->getNodeIndex();
+            const NnStageConfig *myStage = (planConst != nullptr && planConst->nStages > 0)
+                ? findStageForNode(planConst, myNode)
+                : nullptr;
+
+            const bool stageMatches = (myStage != nullptr) && (myStage->stageIndex == cfg->onlyStageIndex);
+            const bool isStageRoot = stageMatches && (myStage->rootNodeIndex == myNode);
+
+            const unsigned int curEpoch = device->getPlanEpoch();
+            unsigned int emitEpoch = curEpoch;
+            unsigned int cmd = 0u;
+            unsigned int headMove = 0u;
+            unsigned int ffnMove = 0u;
+
+            if (enabled && isStageRoot && stageMatches && layerIndex == cfg->triggerLayer && pos == cfg->triggerPos) {
+                emitEpoch = curEpoch + 1u;
+                cmd = cfg->cmdKind;
+                headMove = cfg->nHeadsToMove;
+                ffnMove = cfg->nFfnToMove;
+                const char *kind = (cmd == 1u) ? "head" : (cmd == 2u ? "ffn" : (cmd == 3u ? "both" : "unknown"));
+                if (cmd == 3u) {
+                    printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=%s headMove=%u ffnMove=%u from=%u to=%u\n",
+                        (unsigned)myNode,
+                        (unsigned)cfg->onlyStageIndex,
+                        (unsigned)layerIndex,
+                        (unsigned)pos,
+                        (unsigned)emitEpoch,
+                        kind,
+                        (unsigned)headMove,
+                        (unsigned)ffnMove,
+                        (unsigned)cfg->fromNodeIndex,
+                        (unsigned)cfg->toNodeIndex);
+                } else {
+                    const unsigned int move = (cmd == 2u) ? ffnMove : headMove;
+                    printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=%s move=%u from=%u to=%u\n",
+                    (unsigned)myNode,
+                    (unsigned)cfg->onlyStageIndex,
+                    (unsigned)layerIndex,
+                    (unsigned)pos,
+                    (unsigned)emitEpoch,
+                    kind,
+                    (unsigned)move,
+                    (unsigned)cfg->fromNodeIndex,
+                    (unsigned)cfg->toNodeIndex);
+                }
+                std::fflush(stdout);
+            }
+
+            // Write control packet into the plan pipe for all batches.
+            for (NnUint b = 0; b < batchSize; ++b) {
+                float *out = (float *)context->output[b];
+                out[0] = (float)emitEpoch;
+                out[1] = (float)cmd;
+                out[2] = (float)cfg->fromNodeIndex;
+                out[3] = (float)cfg->toNodeIndex;
+                // Always encode both moves; cmdKind decides what to apply.
+                out[4] = (float)headMove;
+                out[5] = (float)layerIndex;
+                out[6] = (float)pos;
+                out[7] = (float)ffnMove;
+            }
+        }
+        return;
+    }
+
+    if (context->opCode == OP_PLAN_APPLY) {
+        if (threadIndex == 0u && device != nullptr && context->input != nullptr) {
+            const auto *cfg = (const NnPlanApplyOpCodeConfig *)context->opConfig;
+            (void)cfg;
+
+            // Debug toggles for online migration behavior.
+            // These environment variables let you independently enable/disable each kind of plan mutation.
+            // - DLLAMA_MIGRATE_APPLY_HEAD=0 disables headSplit migration.
+            // - DLLAMA_MIGRATE_APPLY_FFN=0 disables ffnSplit migration.
+            // - DLLAMA_MIGRATE_APPLY_DRYRUN=1 computes/logs but does NOT mutate the plan or bump epoch.
+            const bool allowHead = (std::getenv("DLLAMA_MIGRATE_APPLY_HEAD") == nullptr)
+                ? true
+                : (std::atoi(std::getenv("DLLAMA_MIGRATE_APPLY_HEAD")) != 0);
+            const bool allowFfn = (std::getenv("DLLAMA_MIGRATE_APPLY_FFN") == nullptr)
+                ? true
+                : (std::atoi(std::getenv("DLLAMA_MIGRATE_APPLY_FFN")) != 0);
+            const bool dryRun = (std::getenv("DLLAMA_MIGRATE_APPLY_DRYRUN") != nullptr)
+                && (std::atoi(std::getenv("DLLAMA_MIGRATE_APPLY_DRYRUN")) != 0);
+
+            const unsigned int curEpoch = device->getPlanEpoch();
+            const float *in0 = (const float *)context->input[0];
+            const unsigned int msgEpoch = (in0[0] >= 0.0f) ? (unsigned int)in0[0] : 0u;
+            const unsigned int cmd = (in0[1] >= 0.0f) ? (unsigned int)in0[1] : 0u;
+            const unsigned int fromNode = (in0[2] >= 0.0f) ? (unsigned int)in0[2] : 0u;
+            const unsigned int toNode = (in0[3] >= 0.0f) ? (unsigned int)in0[3] : 0u;
+            const unsigned int headMove = (in0[4] >= 0.0f) ? (unsigned int)in0[4] : 0u;
+            const unsigned int layerIndex = (in0[5] >= 0.0f) ? (unsigned int)in0[5] : 0u;
+            const unsigned int pos = (in0[6] >= 0.0f) ? (unsigned int)in0[6] : 0u;
+            const unsigned int ffnMove = (in0[7] >= 0.0f) ? (unsigned int)in0[7] : 0u;
+
+            if ((cmd == 1u || cmd == 2u || cmd == 3u) && msgEpoch > curEpoch) {
+                auto *plan = const_cast<NnUnevenPartitionPlan *>(device->getPartitionPlan());
+                if (plan != nullptr && plan->nStages > 0) {
+                    const NnUint myNode = device->getNodeIndex();
+                    const NnStageConfig *myStage = findStageForNode(plan, myNode);
+                    if (myStage != nullptr && myStage->stageIndex == ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex) {
+                        const NnStageConfig *st = &plan->stages[((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex];
+
+                        auto inStage = [&](NnUint node) -> bool {
+                            for (NnUint i = 0; i < st->nNodes; ++i) {
+                                if (st->nodeIndices[i] == node) return true;
+                            }
+                            return false;
+                        };
+
+                        if (inStage(fromNode) && inStage(toNode)) {
+                            bool changed = false;
+
+                            auto applyHead = [&]() {
+                                if (!allowHead) {
+                                    printf("🧭 [plan][skip] node=%u stage=%u epoch=%u layer=%u pos=%u head migration disabled by DLLAMA_MIGRATE_APPLY_HEAD=0\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos);
+                                    std::fflush(stdout);
+                                    return;
+                                }
+                                if (headMove == 0u) return;
+                                if (!plan->headSplit.starts || !plan->headSplit.lengths) return;
+                                if (plan->headSplit.lengths[fromNode] < headMove) return;
+                                const NnUint beforeFrom = plan->headSplit.lengths[fromNode];
+                                const NnUint beforeTo = plan->headSplit.lengths[toNode];
+
+                                if (dryRun) {
+                                    printf("🧭 [plan][dryrun] node=%u stage=%u epoch=%u layer=%u pos=%u headLen[%u]:%u->%u headLen[%u]:%u->%u\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos,
+                                        (unsigned)fromNode,
+                                        (unsigned)beforeFrom,
+                                        (unsigned)(beforeFrom - headMove),
+                                        (unsigned)toNode,
+                                        (unsigned)beforeTo,
+                                        (unsigned)(beforeTo + headMove));
+                                    std::fflush(stdout);
+                                    return;
+                                }
+
+                                plan->headSplit.lengths[fromNode] -= headMove;
+                                plan->headSplit.lengths[toNode] += headMove;
+
+                                // Recompute contiguous starts within the stage.
+                                NnUint run = 0u;
+                                for (NnUint i = 0; i < st->nNodes; ++i) {
+                                    const NnUint n = st->nodeIndices[i];
+                                    plan->headSplit.starts[n] = run;
+                                    run += plan->headSplit.lengths[n];
+                                }
+
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u headLen[%u]:%u->%u headLen[%u]:%u->%u\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    (unsigned)fromNode,
+                                    (unsigned)beforeFrom,
+                                    (unsigned)plan->headSplit.lengths[fromNode],
+                                    (unsigned)toNode,
+                                    (unsigned)beforeTo,
+                                    (unsigned)plan->headSplit.lengths[toNode]);
+                                std::fflush(stdout);
+                                changed = true;
+                            };
+
+                            auto applyFfn = [&]() {
+                                if (!allowFfn) {
+                                    printf("🧭 [plan][skip] node=%u stage=%u epoch=%u layer=%u pos=%u ffn migration disabled by DLLAMA_MIGRATE_APPLY_FFN=0\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos);
+                                    std::fflush(stdout);
+                                    return;
+                                }
+                                if (ffnMove == 0u) return;
+                                if (!plan->ffnSplit.starts || !plan->ffnSplit.lengths) return;
+                                if (plan->ffnSplit.lengths[fromNode] < ffnMove) return;
+                                const NnUint beforeFrom = plan->ffnSplit.lengths[fromNode];
+                                const NnUint beforeTo = plan->ffnSplit.lengths[toNode];
+
+                                if (dryRun) {
+                                    printf("🧭 [plan][dryrun] node=%u stage=%u epoch=%u layer=%u pos=%u ffnLen[%u]:%u->%u ffnLen[%u]:%u->%u\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos,
+                                        (unsigned)fromNode,
+                                        (unsigned)beforeFrom,
+                                        (unsigned)(beforeFrom - ffnMove),
+                                        (unsigned)toNode,
+                                        (unsigned)beforeTo,
+                                        (unsigned)(beforeTo + ffnMove));
+                                    std::fflush(stdout);
+                                    return;
+                                }
+
+                                plan->ffnSplit.lengths[fromNode] -= ffnMove;
+                                plan->ffnSplit.lengths[toNode] += ffnMove;
+
+                                // Recompute contiguous starts within the stage.
+                                NnUint run = 0u;
+                                for (NnUint i = 0; i < st->nNodes; ++i) {
+                                    const NnUint n = st->nodeIndices[i];
+                                    plan->ffnSplit.starts[n] = run;
+                                    run += plan->ffnSplit.lengths[n];
+                                }
+
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u ffnLen[%u]:%u->%u ffnLen[%u]:%u->%u\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    (unsigned)fromNode,
+                                    (unsigned)beforeFrom,
+                                    (unsigned)plan->ffnSplit.lengths[fromNode],
+                                    (unsigned)toNode,
+                                    (unsigned)beforeTo,
+                                    (unsigned)plan->ffnSplit.lengths[toNode]);
+                                std::fflush(stdout);
+                                changed = true;
+                            };
+
+                            if (cmd == 1u) {
+                                applyHead();
+                            } else if (cmd == 2u) {
+                                applyFfn();
+                            } else if (cmd == 3u) {
+                                applyHead();
+                                applyFfn();
+                            }
+
+                            if (dryRun) {
+                                // Intentionally do not bump epoch in dry-run mode.
+                            } else if (changed) {
+                                device->setPlanEpoch(msgEpoch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // Targeted TP-range logging at a specific (pos, layer).
+    // Uses per-op config fields (start/len/view) to prove that online repartition affects compute.
+    // ------------------------------------------------------------------
+    if (threadIndex == 0u && device != nullptr && tpRangeTargetEnabled()) {
+        const NnUint nodeIndex = device->getNodeIndex();
+        const unsigned int epoch = device->getPlanEpoch();
+        const NnUint layerIndex = (segmentConfig != nullptr) ? segmentConfig->ops[opIndex].index : 0u;
+
+        // Stage metadata (if a partition plan exists): stage index and stage-local rank.
+        NnUint stageIndex = 0xFFFFFFFFu;
+        NnUint stageRank = 0xFFFFFFFFu;
+        if (const NnUnevenPartitionPlan *plan = device->getPartitionPlan()) {
+            if (const NnStageConfig *st = (plan->nStages > 0) ? findStageForNode(plan, nodeIndex) : nullptr) {
+                stageIndex = st->stageIndex;
+                for (NnUint i = 0; i < st->nNodes; ++i) {
+                    if (st->nodeIndices[i] == nodeIndex) {
+                        stageRank = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Try to determine pos for this op.
+        NnUint pos = 0xFFFFFFFFu;
+        if (context->opCode == OP_MULTIHEAD_ATT) {
+            const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+            pos = loadPosFromPipe(context, cfg->positionPipeIndex);
+        } else if (context->opCode == OP_ROPE) {
+            const auto *cfg = (const NnRopeOpConfig *)context->opConfig;
+            pos = loadPosFromPipe(context, cfg->positionPipeIndex);
+        } else if (context->opCode == OP_SHIFT) {
+            const auto *cfg = (const NnShiftOpCodeConfig *)context->opConfig;
+            pos = loadPosFromPipe(context, cfg->indexPipeIndex);
+        }
+
+        if (pos != 0xFFFFFFFFu) {
+            lastPos.store(pos, std::memory_order_release);
+            if (device != nullptr) {
+                device->setLastPos(pos);
+            }
+        } else {
+            pos = lastPos.load(std::memory_order_acquire);
+            if (pos == 0xFFFFFFFFu && device != nullptr) {
+                pos = device->getLastPos();
+            }
+        }
+
+        const bool isTpSensitive = (context->opCode == OP_MULTIHEAD_ATT) || (context->opCode == OP_MATMUL) ||
+            (context->opCode == OP_SHIFT) || (context->opCode == OP_ROPE) || (context->opCode == OP_INV_RMS) || (context->opCode == OP_RMS_NORM) ||
+            (context->opCode == OP_MUL) || (context->opCode == OP_SILU) || (context->opCode == OP_CAST);
+
+        if (isTpSensitive && pos != 0xFFFFFFFFu && tpRangeTargetMatch(layerIndex, pos)) {
+            if (opIndex < tpRangePrintedEpoch.size() && tpRangePrintedEpoch[opIndex] != epoch) {
+                tpRangePrintedEpoch[opIndex] = epoch;
+                NnUint ffnStart = 0xFFFFFFFFu;
+                NnUint ffnLen = 0xFFFFFFFFu;
+                if (const NnUnevenPartitionPlan *plan = device->getPartitionPlan()) {
+                    if (plan->ffnSplit.starts && plan->ffnSplit.lengths) {
+                        ffnStart = plan->ffnSplit.starts[nodeIndex];
+                        ffnLen = plan->ffnSplit.lengths[nodeIndex];
+                    }
+                }
+                printTpAffectedRange(context, segmentConfig, opIndex, layerIndex, pos, nodeIndex, epoch, stageIndex, stageRank, ffnStart, ffnLen);
+                std::fflush(stdout);
+            }
+        }
+    }
+
+    // Forward-time slice logging (prints once per op per segment).
+    // This validates that each device/node sees the expected start/len/stride AND that
+    // the resolved base pointers match the intended physical slots.
+    if (threadIndex == 0u && debugSliceParamsForwardEnabled(context->name)) {
+        const bool repeat = debugSliceParamsForwardRepeat();
+        if (repeat || (opIndex < sliceFwdPrintedOnce.size() && sliceFwdPrintedOnce[opIndex] == 0u)) {
+            if (!repeat && opIndex < sliceFwdPrintedOnce.size())
+                sliceFwdPrintedOnce[opIndex] = 1u;
+            const NnUint nodeIndex = (device != nullptr) ? device->getNodeIndex() : 0u;
+            printf("🧩 [slice][fwd] node=%u seg=%u op=%u name=%s code=%s inX=%u outX=%u\n",
+                (unsigned)nodeIndex,
+                (unsigned)this->segmentIndex,
+                (unsigned)opIndex,
+                (context->name ? context->name : "Unknown"),
+                opCodeToString(context->opCode),
+                (unsigned)context->inputSize.x,
+                (unsigned)context->outputSize.x);
+
+            // Print opConfig-derived ranges (same helper as build-time).
+            // Note: pointerConfig tags aren't directly available here; opConfig fields are the authority.
+            printOpSliceParamsDbg(context->name, context->opCode, context->opConfig, nullptr, nullptr, context->inputSize, context->outputSize);
+            // Print pointer samples to confirm physical slot alignment.
+            printPtrSampleDbg("in", context->input, context->inputSize);
+            printPtrSampleDbg("out", context->output, context->outputSize);
+            std::fflush(stdout);
+        }
+    }
+
     if (threadIndex == 0u && context->weightSize.nBytes > 0 && context->weightReadPrinted == 0u && debugWeightRangesEnabled(context->name)) {
         context->weightReadPrinted = 1u;
         printf("📖 [weights][read-approx] op=%s idx=%u code=%s mayRead=[0,%zu) (matmul has detailed per-call ranges)\n",
@@ -477,4 +1366,178 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     }
 
     opForward[opIndex](nThreads, threadIndex, batchSize, context);
+}
+
+void NnCpuDeviceSegment::refreshPointers() {
+    assert(device != nullptr);
+    assert(segmentConfig != nullptr);
+    assert(segmentConfig->nOps == nOps);
+
+    const NnUnevenPartitionPlan *plan = device->getPartitionPlan();
+    const NnUint nodeIndex = device->getNodeIndex();
+
+    auto getSplitStart = [&](NnSliceTag tag, NnUint *outStart) -> bool {
+        if (plan == nullptr || outStart == nullptr) return false;
+        switch (tag) {
+            case NN_SLICE_VOCAB:
+                if (plan->vocabSplit.starts) { *outStart = plan->vocabSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_FFN:
+                if (plan->ffnSplit.starts) { *outStart = plan->ffnSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_DIM:
+                if (plan->dimSplit.starts) { *outStart = plan->dimSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_HEAD:
+                if (plan->headSplit.starts) { *outStart = plan->headSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_KV_HEAD:
+                if (plan->kvHeadSplit.starts) { *outStart = plan->kvHeadSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_STACKED_BY_NODE:
+            case NN_SLICE_AUTO:
+            default:
+                return false;
+        }
+    };
+
+    auto findRmsNormColSize = [&](NnUint fromOpIndex, const NnSize3D &inputSizeNow) -> NnUint {
+        // Heuristic: the corresponding RMS_NORM usually comes right after INV_RMS.
+        for (NnUint j = fromOpIndex + 1u; j < nOps && j < fromOpIndex + 8u; ++j) {
+            NnCpuOpContext *c = &opContexts[j];
+            if (c->opCode != OP_RMS_NORM) continue;
+            if (c->weightSize.x == 0u) continue;
+            if (inputSizeNow.x % c->weightSize.x != 0u) continue;
+            return c->weightSize.x;
+        }
+        return 0u;
+    };
+
+    for (NnUint opIndex = 0; opIndex < nOps; opIndex++) {
+        NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
+        NnCpuOpContext *opContext = &opContexts[opIndex];
+
+        NnSize3D inputSize;
+        NnSize3D outputSize;
+        std::vector<NnByte *> inputsPtr = device->resolvePointer(&inputSize, &opConfig->input);
+        std::vector<NnByte *> outputsPtr = device->resolvePointer(&outputSize, &opConfig->output);
+
+        // Keep the same logits pipe size fix as createSegment().
+        if (opConfig->code == OP_CAST &&
+            opConfig->output.type == PNTR_BATCHED_SLICE &&
+            inputSize.x != outputSize.x) {
+            outputSize = size3D(outputSize.floatType, outputSize.z, outputSize.y, inputSize.x);
+        }
+
+        // Update pointers in-place (pointer counts are stable: z*y for batch/slice, 1 for raw).
+        std::memcpy(opContext->input, inputsPtr.data(), inputsPtr.size() * sizeof(NnByte *));
+        std::memcpy(opContext->output, outputsPtr.data(), outputsPtr.size() * sizeof(NnByte *));
+        opContext->inputSize = inputSize;
+        opContext->outputSize = outputSize;
+
+        // Refresh KV-related op configs for online repartition (CPU-only).
+        // We only touch configs when plan data is available.
+        if (plan != nullptr) {
+            if (opContext->opCode == OP_MULTIHEAD_ATT) {
+                auto *cfg = (NnMultiHeadAttOpConfig *)opContext->opConfig;
+                if (plan->headSplit.starts && plan->headSplit.lengths) {
+                    cfg->nHeads0 = plan->headSplit.lengths[nodeIndex];
+                    cfg->qStart = plan->headSplit.starts[nodeIndex] * cfg->headDim;
+                    cfg->qSliceD0 = cfg->nHeads0 * cfg->headDim;
+                    cfg->qStride = cfg->nHeads * cfg->headDim;
+                }
+                if (plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths) {
+                    const NnUint kvHeads0 = plan->kvHeadSplit.lengths[nodeIndex];
+                    cfg->kvStart = plan->kvHeadSplit.starts[nodeIndex] * cfg->headDim;
+                    cfg->kvDim0 = kvHeads0 * cfg->headDim;
+                    cfg->kvStride = cfg->nKvHeads * cfg->headDim;
+                }
+            } else if (opContext->opCode == OP_SHIFT) {
+                auto *cfg = (NnShiftOpCodeConfig *)opContext->opConfig;
+                // Only update when this SHIFT is using strided destination mode (KV cache full-buffer mode).
+                if (cfg->dstRowStride != 0u && cfg->dstColStartUnit != 0u &&
+                    plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths) {
+                    cfg->dstColStart = plan->kvHeadSplit.starts[nodeIndex] * cfg->dstColStartUnit;
+                }
+            } else if (opContext->opCode == OP_MATMUL) {
+                auto *cfg = (NnMatmulOpConfig *)opContext->opConfig;
+                if (cfg->view == 1u && cfg->outSliceTag != NN_SLICE_AUTO && cfg->outStartUnit != 0u) {
+                    NnUint s = 0u;
+                    if (getSplitStart(cfg->outSliceTag, &s)) {
+                        cfg->outStart = s * cfg->outStartUnit;
+                    }
+                }
+                if (cfg->view == 2u && cfg->inSliceTag != NN_SLICE_AUTO && cfg->inStartUnit != 0u) {
+                    NnUint s = 0u;
+                    if (getSplitStart(cfg->inSliceTag, &s)) {
+                        cfg->inStart = s * cfg->inStartUnit;
+                    }
+                }
+
+                // Keep A/C view logical sizes aligned with refreshed tensor sizes when views are used.
+                if (cfg->aView.sizeX != 0u) {
+                    cfg->aView.sizeX = inputSize.x;
+                }
+                if (cfg->cView.sizeX != 0u) {
+                    cfg->cView.sizeX = outputSize.x;
+                }
+            } else if (opContext->opCode == OP_MUL) {
+                auto *cfg = (NnMulOpCodeConfig *)opContext->opConfig;
+                // When full FFN buffers are enabled, OP_MUL relies on view(offset/len)
+                // to align the multiplier slice. Make it refreshable for online ffnSplit.
+                if (plan->ffnSplit.starts && plan->ffnSplit.lengths && cfg->view.sizeX != 0u) {
+                    cfg->view.offset = plan->ffnSplit.starts[nodeIndex];
+                    cfg->view.sizeX = plan->ffnSplit.lengths[nodeIndex];
+                    cfg->view.strideX = 1u;
+                }
+            } else if (opContext->opCode == OP_INV_RMS) {
+                // QWEN3 Q/K pre-norm uses nColumns = nHeads0 (or nKvHeads0).
+                // After head migration, recompute nColumns from current inputSize.x and the
+                // per-column size (headDim), inferred from the subsequent RMS_NORM weight size.
+                auto *cfg = (NnInvRmsOpConfig *)opContext->opConfig;
+                const NnUint colSize = findRmsNormColSize(opIndex, inputSize);
+                if (colSize != 0u && inputSize.x % colSize == 0u) {
+                    const NnUint newCols = inputSize.x / colSize;
+                    // Ensure output buffer can hold it.
+                    if (outputSize.x >= newCols && newCols != 0u) {
+                        cfg->nColumns = newCols;
+                    }
+                }
+            } else if (opContext->opCode == OP_RMS_NORM) {
+                // Recompute nColumns when weights are per-head (colSize = headDim).
+                auto *cfg = (NnRmsNormOpConfig *)opContext->opConfig;
+                const NnUint colSize = opContext->weightSize.x;
+                if (colSize != 0u && inputSize.x % colSize == 0u) {
+                    const NnUint newCols = inputSize.x / colSize;
+                    // invRms buffer must have at least newCols columns; it is allocated with a safe upper bound.
+                    if (newCols != 0u) {
+                        cfg->nColumns = newCols;
+                    }
+                }
+            } else if (opContext->opCode == OP_ROPE) {
+                // RoPE config caches per-node slice dimensions (qDim0/kvDim0).
+                // With online head migration and PNTR_BATCHED_SLICE, the local slice len changes.
+                // Update dim0 so Falcon/Llama assertions stay valid.
+                auto *cfg = (NnRopeOpConfig *)opContext->opConfig;
+                if (cfg->isQ == 1u) {
+                    cfg->slice.qDim0 = inputSize.x;
+                } else {
+                    cfg->slice.kvDim0 = inputSize.x;
+                }
+            }
+        }
+
+        // Debug: after refresh, print updated params.
+        printOpSliceParamsDbg(opContext->name, opContext->opCode, opContext->opConfig, &opConfig->input, &opConfig->output, opContext->inputSize, opContext->outputSize);
+    }
+
+    // If we changed pointers/configs, allow forward-time logs to print again on next run.
+    if (!sliceFwdPrintedOnce.empty()) {
+        std::fill(sliceFwdPrintedOnce.begin(), sliceFwdPrintedOnce.end(), 0u);
+    }
+
+    // Mark this segment as up-to-date with current plan epoch.
+    if (device != nullptr) {
+        planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+    }
 }

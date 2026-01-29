@@ -17,6 +17,13 @@
 #include "nn-quants.hpp"
 #include "llamafile/sgemm.hpp"
 
+static void noopForward(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    (void)nThreads;
+    (void)threadIndex;
+    (void)batchSize;
+    (void)context;
+}
+
 static float dotProduct_F32(const float *a, const float *b, const unsigned int size);
 
 #define DEBUG_OP_INPUT_OUTPUT false
@@ -1275,9 +1282,8 @@ static void initMatmulForward(NnCpuOpContext *context) {
 
     // For now, matmul only supports per-batch 1D slicing (within each row) for A/C.
     assert(aView->sizeY == 0u);
-    assert(aView->strideY == 0u);
     assert(cView->sizeY == 0u);
-    assert(cView->strideY == 0u);
+    // When sizeY==0, strideY is unused in the current CPU matmul implementation.
     assert(aView->strideX == 0u || aView->strideX == 1u);
     assert(cView->strideX == 0u || cView->strideX == 1u);
 
@@ -1588,8 +1594,7 @@ static void siluForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
             float *output = (float *)context->output[z * context->outputSize.y + y];
             float *base = &output[offset];
             if (strideX == 1u) {
-                // silu_F32(base, len, nThreads, threadIndex);
-                silu_F32(output, context->outputSize.x, nThreads, threadIndex);
+                silu_F32(base, len, nThreads, threadIndex);
             } else {
                 silu_F32_strided(base, len, strideX, nThreads, threadIndex);
             }
@@ -1766,17 +1771,32 @@ static void initMulForward(NnCpuOpContext *context) {
     assert(view->sizeY == 0u);
     assert(view->strideY == 0u);
 
+    // Output buffer bounds (sliced output is allowed).
     if (strideX == 1u) {
         assert(offset + len <= context->outputSize.x);
     } else {
         if (len > 0u)
             assert(offset + (len - 1u) * strideX < context->outputSize.x);
     }
+
+    // Multiplier buffer uses its own per-row stride (often the full global FFN dim).
+    // In full-buffer residency mode, outputSize.x may be a local slice length; using it
+    // as the multiplier row stride would read the wrong region and silently corrupt results.
+    const NnUint multRowStride = context->bufferConfigs[config->multiplierBufferIndex].size.x;
+    assert(multRowStride > 0u);
+    if (strideX == 1u) {
+        assert(offset + len <= multRowStride);
+    } else {
+        if (len > 0u)
+            assert(offset + (len - 1u) * strideX < multRowStride);
+    }
 }
 
 static void mulForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnMulOpCodeConfig *config = (NnMulOpCodeConfig *)context->opConfig;
     const float *multiplier = (float *)context->buffers[config->multiplierBufferIndex];
+
+    const NnUint multRowStride = context->bufferConfigs[config->multiplierBufferIndex].size.x;
 
     const NnTensorView *view = &config->view;
     const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
@@ -1788,7 +1808,7 @@ static void mulForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batch
         for (NnUint y = 0u; y < batchSize; y++) {
             float *outBase = (float *)context->output[zOffset + y];
             const float *inBase = (float *)context->input[zOffset + y];
-            const float *mBase = &multiplier[context->outputSize.x * (zOffset + y)];
+            const float *mBase = &multiplier[multRowStride * (zOffset + y)];
 
             float *out = &outBase[offset];
             const float *in = &inBase[offset];
@@ -2021,8 +2041,9 @@ static void repeatZForward_F32_Q80(NnUint nThreads, NnUint threadIndex, NnUint b
 }
 
 static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
-    ASSERT_EQ(context->hasInputContinuousMemory, true);
-    ASSERT_EQ(context->hasOutputContinuousMemory, true);
+    // OP_SHIFT is often used to write per-step K/V into a KV cache.
+    // In full-buffer + per-node-slice mode, the input pointer may be PNTR_BATCHED_SLICE
+    // (non-contiguous), which is fine because we already copy per batchIndex.
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.y, 1);
@@ -2175,6 +2196,9 @@ NnCpuOpForwardInit getCpuOpForwardInit(NnOpCode code, NnOpQuantType quantType) {
 }
 
 NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
+    if (code == OP_PLAN_BARRIER || code == OP_PLAN_APPLY) {
+        return noopForward;
+    }
     if (code == OP_MERGE_ADD) {
         if (quantType == F32_F32_F32) return mergeAddForward_F32_F32;
         if (quantType == Q80_Q80_F32) return mergeAddForward_Q80_F32;

@@ -250,6 +250,18 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     n.xPipeIndex = netBuilder.addPipe("X", size2D(F_32, nBatches, h->dim));
     n.logitsPipeIndex = netBuilder.addPipe("LG", size2D(F_32, nBatches, h->vocabSize));
     const NnUint zqPipeIndex = netBuilder.addPipe("ZQ", size2D(h->syncType, nBatches, h->dim * nNodes));
+    n.zqPipeIndex = zqPipeIndex;
+    // Keep the same control pipe layout as the uneven build (unused in uniform mode).
+    n.planPipeIndex = netBuilder.addPipe("PLN", size2D(F_32, nBatches, 8));
+
+    n.kvAggKPipeIndex = (NnUint)-1;
+    n.kvAggVPipeIndex = (NnUint)-1;
+    if (std::getenv("DLLAMA_KV_AGGREGATE") != nullptr) {
+        // KC/VC holds the per-token KV vectors for the current batch window.
+        // Each row corresponds to POS[batchIndex] (position + batchIndex).
+        n.kvAggKPipeIndex = netBuilder.addPipe("KC", size2D(F_32, nBatches, h->kvDim));
+        n.kvAggVPipeIndex = netBuilder.addPipe("VC", size2D(F_32, nBatches, h->kvDim));
+    }
 
     netBuilder.addPreSync(n.positionPipeIndex);
 
@@ -456,7 +468,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             att.addOp(
                 OP_CAST, "block_cast_d", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchedSliceConfigTagged(SRC_PIPE, zqPipeIndex, NN_SLICE_STACKED_BY_NODE),
                 size0(),
                 NnCastOpCodeConfig{});
             att.addSync(zqPipeIndex, SYNC_NODE_SLICES);
@@ -625,7 +637,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             ff.addOp(
                 OP_CAST, "block_cast_d3", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchedSliceConfigTagged(SRC_PIPE, zqPipeIndex, NN_SLICE_STACKED_BY_NODE),
                 size0(),
                 NnCastOpCodeConfig{});
             ff.addSync(zqPipeIndex, SYNC_NODE_SLICES);
@@ -670,7 +682,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
         end.addOp(
             OP_CAST, "final_cast_logits", 0,
             pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
-            pointerBatchedSliceConfig(SRC_PIPE, n.logitsPipeIndex),
+            pointerBatchedSliceConfigTagged(SRC_PIPE, n.logitsPipeIndex, NN_SLICE_VOCAB),
             size0(),
             NnCastOpCodeConfig{});
         end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
@@ -699,6 +711,33 @@ static NnNodeConfig buildLlmNodeInternal(
 
     const NnStageConfig* myStage = getStageForNode(plan, nodeIndex);
     const bool stageFullWeights = (std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr) && (myStage != nullptr);
+    // When stageFullWeights is enabled, we treat this as the single “full residency” mode toggle:
+    // - stage-local weights are loaded in full
+    // - attention/ffn/logits activations are allocated as full buffers
+    // - ops run on per-node slices via PNTR_BATCHED_SLICE (and explicit start/stride when needed)
+    const bool fullAttBuffers = stageFullWeights && (plan != nullptr);
+    const bool fullFfnBuffers = stageFullWeights && (plan != nullptr);
+    const bool fullLogitsBuffers = stageFullWeights && (plan != nullptr);
+
+    auto getenvIntOr = [](const char *name, int fallback) -> int {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') return fallback;
+        char *end = nullptr;
+        long x = std::strtol(v, &end, 10);
+        if (end == v) return fallback;
+        return (int)x;
+    };
+
+    // Hard migration trigger (CPU-only test hook).
+    // Enable by setting:
+    //   DLLAMA_HARD_MIGRATE_POS=<pos> DLLAMA_HARD_MIGRATE_LAYER=<layer>
+    // Defaults (-1) disable the hook.
+    const int hardMigratePos = getenvIntOr("DLLAMA_HARD_MIGRATE_POS", -1);
+    const int hardMigrateLayer = getenvIntOr("DLLAMA_HARD_MIGRATE_LAYER", -1);
+    // Migration kind: 1=headSplit, 2=ffnSplit, 3=both
+    const int hardMigrateKind = getenvIntOr("DLLAMA_HARD_MIGRATE_KIND", 1);
+    const int hardMigrateHeadMove = getenvIntOr("DLLAMA_HARD_MIGRATE_HEAD_MOVE", 1);
+    const int hardMigrateFfnMove = getenvIntOr("DLLAMA_HARD_MIGRATE_FFN_MOVE", 256);
 
     // 2. 计算切分 (Slicing)
     NnKvCacheSliceUneven kvCacheSlice = sliceKvCacheUneven(h->seqLen, h->headDim, plan, nodeIndex);
@@ -739,7 +778,14 @@ static NnNodeConfig buildLlmNodeInternal(
     if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
         nQNormColumns = qSlice.inLen / h->headDim;
         nKNormColumns = kSlice.inLen / h->headDim;
-        nInvBufferColumns = std::max(nQNormColumns, nKNormColumns);
+        // Online head migration may change per-node q/k slice lengths.
+        // Allocate inv_rms buffer for the worst case (up to full head counts) so refresh-time
+        // recomputation of nColumns stays within bounds.
+        if (plan != nullptr && myStage != nullptr) {
+            nInvBufferColumns = std::max(h->nHeads, h->nKvHeads);
+        } else {
+            nInvBufferColumns = std::max(nQNormColumns, nKNormColumns);
+        }
     }
 
     // 3. 构建 Node Config
@@ -750,20 +796,42 @@ static NnNodeConfig buildLlmNodeInternal(
     const NnUint yBufferIndex = nodeBuilder.addBuffer("y", size2D(F_32, nBatches, h->dim));
     const NnUint yqBufferIndex = (h->syncType == F_32) ? yBufferIndex : nodeBuilder.addBuffer("q_y", size2D(h->syncType, nBatches, h->dim));
     
-    const NnUint mhaOutBufferIndex = nodeBuilder.addBuffer("mha_out", size2D(F_32, nBatches, qSlice.inLen));
-    const NnUint mhaOutQBufferIndex = (h->syncType == F_32) ? mhaOutBufferIndex : nodeBuilder.addBuffer("q_mha_out", size2D(h->syncType, nBatches, qSlice.inLen));
-    
-    const NnUint qBufferIndex = nodeBuilder.addBuffer("q", size2D(F_32, nBatches, qSlice.inLen));
-    const NnUint kTempBufferIndex = nodeBuilder.addBuffer("k_temp", size2D(F_32, nBatches, kSlice.inLen));
-    const NnUint vTempBufferIndex = nodeBuilder.addBuffer("v_temp", size2D(F_32, nBatches, vSlice.inLen));
+    const NnUint mhaOutBufferIndex = nodeBuilder.addBuffer(
+        "mha_out",
+        size2D(F_32, nBatches, fullAttBuffers ? h->qDim : qSlice.inLen));
+    const NnUint mhaOutQBufferIndex = (h->syncType == F_32)
+        ? mhaOutBufferIndex
+        : nodeBuilder.addBuffer(
+            "q_mha_out",
+            size2D(h->syncType, nBatches, fullAttBuffers ? h->qDim : qSlice.inLen));
+
+    const NnUint qBufferIndex = nodeBuilder.addBuffer(
+        "q",
+        size2D(F_32, nBatches, fullAttBuffers ? h->qDim : qSlice.inLen));
+    const NnUint kTempBufferIndex = nodeBuilder.addBuffer(
+        "k_temp",
+        size2D(F_32, nBatches, fullAttBuffers ? h->kvDim : kSlice.inLen));
+    const NnUint vTempBufferIndex = nodeBuilder.addBuffer(
+        "v_temp",
+        size2D(F_32, nBatches, fullAttBuffers ? h->kvDim : vSlice.inLen));
     const NnUint invRmsBufferIndex = nodeBuilder.addBuffer("inv_rms", size2D(F_32, nBatches, nInvBufferColumns));
     const NnUint ropeCacheBufferIndex = nodeBuilder.addBuffer("rope_cache", ropeSlice.cacheSize);
     const NnUint attBufferIndex = nodeBuilder.addBuffer("att", multiHeadAttSlice.attSize);
-    const NnUint logitsSliceBufferIndex = nodeBuilder.addBuffer("lg", size2D(F_32, nBatches, wclsSlice.inLen));
+    const NnUint logitsSliceBufferIndex = nodeBuilder.addBuffer(
+        "lg",
+        size2D(F_32, nBatches, fullLogitsBuffers ? h->vocabSize : wclsSlice.inLen));
 
-    const NnUint dBufferIndex = nodeBuilder.addBuffer("d", size2D(F_32, nBatches, w1Slice.inLen));
-    const NnUint dqBufferIndex = (h->syncType == F_32) ? dBufferIndex : nodeBuilder.addBuffer("q_d", size2D(h->syncType, nBatches, w1Slice.inLen));
-    const NnUint lBufferIndex = nodeBuilder.addBuffer("l", size2D(F_32, nBatches, w3Slice.inLen));
+    const NnUint dBufferIndex = nodeBuilder.addBuffer(
+        "d",
+        size2D(F_32, nBatches, fullFfnBuffers ? ffDim : w1Slice.inLen));
+    const NnUint dqBufferIndex = (h->syncType == F_32)
+        ? dBufferIndex
+        : nodeBuilder.addBuffer(
+            "q_d",
+            size2D(h->syncType, nBatches, fullFfnBuffers ? ffDim : w1Slice.inLen));
+    const NnUint lBufferIndex = nodeBuilder.addBuffer(
+        "l",
+        size2D(F_32, nBatches, fullFfnBuffers ? ffDim : w3Slice.inLen));
 
     const NnUint moeGtBufferIndex = nodeBuilder.addBuffer("gt", size2D(F_32, nBatches, nExpertsOr1));
     const NnUint moeExpertIndexesBufferIndex = nodeBuilder.addBuffer("act_exp_ix", size2D(F_32, nBatches, nActiveExpertsOr1));
@@ -796,6 +864,13 @@ static NnNodeConfig buildLlmNodeInternal(
         return cfg;
     };
 
+    auto makeRowMatmulCfgTagged = [&](NnSliceTag outTag, NnUint outUnit, NnUint inLen, NnUint outLen, NnUint outStart) -> NnMatmulOpConfig {
+        NnMatmulOpConfig cfg = makeRowMatmulCfg(inLen, outLen, outStart);
+        cfg.outSliceTag = outTag;
+        cfg.outStartUnit = outUnit;
+        return cfg;
+    };
+
     auto makeMoeRowMatmulCfg = [&](NnUint inLen, NnUint outLen, NnUint outStart) -> NnMatmulOpConfig {
         NnMatmulOpConfig cfg = makeRowMatmulCfg(inLen, outLen, outStart);
         cfg.nExperts = h->nExperts;
@@ -815,6 +890,13 @@ static NnNodeConfig buildLlmNodeInternal(
             cfg.aView = NnTensorView{0u, 0u, inLen, 0u, 0u};
             cfg.cView = NnTensorView{0u, 0u, outLen, 0u, 0u};
         }
+        return cfg;
+    };
+
+    auto makeColMatmulCfgTagged = [&](NnSliceTag inTag, NnUint inUnit, NnUint inLen, NnUint outLen, NnUint inStart) -> NnMatmulOpConfig {
+        NnMatmulOpConfig cfg = makeColMatmulCfg(inLen, outLen, inStart);
+        cfg.inSliceTag = inTag;
+        cfg.inStartUnit = inUnit;
         return cfg;
     };
 
@@ -863,8 +945,12 @@ static NnNodeConfig buildLlmNodeInternal(
     // 5. Layers Loop (PP: 只构建负责的层)
     for (NnUint layerIndex = startLayer; layerIndex < endLayer; layerIndex++) {
         // ... (这里的 K/V Buffer 是 Layer Local 的，需要 Slice 信息) ...
-        const NnUint kBufferIndex = nodeBuilder.addBuffer("k", kvCacheSlice.keySize);
-        const NnUint vBufferIndex = nodeBuilder.addBuffer("v", kvCacheSlice.valueSize);
+        const NnUint kBufferIndex = nodeBuilder.addBuffer(
+            "k",
+            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.keySize);
+        const NnUint vBufferIndex = nodeBuilder.addBuffer(
+            "v",
+            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.valueSize);
 
         NnSegmentConfigBuilder att;
         NnSegmentConfigBuilder ff;
@@ -899,31 +985,99 @@ static NnNodeConfig buildLlmNodeInternal(
             att.addOp(OP_CAST, "block_cast_y", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
         }
 
-        att.addOp(OP_MATMUL, "block_matmul_q", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), stageFullWeights ? qSlice.size : qSlice.sliceSize, makeRowMatmulCfg(qSlice.n, qSlice.inLen, qSlice.inStart));
-        att.addOp(OP_MATMUL, "block_matmul_k", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), stageFullWeights ? kSlice.size : kSlice.sliceSize, makeRowMatmulCfg(kSlice.n, kSlice.inLen, kSlice.inStart));
-        att.addOp(OP_MATMUL, "block_matmul_v", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, vTempBufferIndex), stageFullWeights ? vSlice.size : vSlice.sliceSize, makeRowMatmulCfg(vSlice.n, vSlice.inLen, vSlice.inStart));
+        const NnPointerConfig qSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfig(SRC_BUFFER, qBufferIndex)
+            : pointerBatchConfig(SRC_BUFFER, qBufferIndex);
+        const NnPointerConfig kTempSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfig(SRC_BUFFER, kTempBufferIndex)
+            : pointerBatchConfig(SRC_BUFFER, kTempBufferIndex);
+        const NnPointerConfig vTempSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfig(SRC_BUFFER, vTempBufferIndex)
+            : pointerBatchConfig(SRC_BUFFER, vTempBufferIndex);
+        const NnPointerConfig mhaOutSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfig(SRC_BUFFER, mhaOutBufferIndex)
+            : pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex);
+        const NnPointerConfig mhaOutQSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutQBufferIndex, NN_SLICE_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex);
+
+        att.addOp(OP_MATMUL, "block_matmul_q", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), qSlicePtr, stageFullWeights ? qSlice.size : qSlice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_HEAD, h->headDim, qSlice.n, qSlice.inLen, qSlice.inStart));
+        att.addOp(OP_MATMUL, "block_matmul_k", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), kTempSlicePtr, stageFullWeights ? kSlice.size : kSlice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, kSlice.n, kSlice.inLen, kSlice.inStart));
+        att.addOp(OP_MATMUL, "block_matmul_v", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), vTempSlicePtr, stageFullWeights ? vSlice.size : vSlice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, vSlice.n, vSlice.inLen, vSlice.inStart));
 
         if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
-            att.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex, pointerBatchConfig(SRC_BUFFER, qBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nQNormColumns});
-            att.addOp(OP_RMS_NORM, "block_norm_q", layerIndex, pointerBatchConfig(SRC_BUFFER, qBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nQNormColumns});
-            att.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
-            att.addOp(OP_RMS_NORM, "block_norm_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
+            att.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex, qSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nQNormColumns});
+            att.addOp(OP_RMS_NORM, "block_norm_q", layerIndex, qSlicePtr, qSlicePtr, size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nQNormColumns});
+            att.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex, kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
+            att.addOp(OP_RMS_NORM, "block_norm_k", layerIndex, kTempSlicePtr, kTempSlicePtr, size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
         }
 
-        att.addOp(OP_ROPE, "block_rope_q", layerIndex, pointerBatchConfig(SRC_BUFFER, qBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), size0(), NnRopeOpConfig{h->ropeType, 1, n->positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
-        att.addOp(OP_ROPE, "block_rope_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), size0(), NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
-        att.addOp(OP_SHIFT, "block_shift_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerRawConfig(SRC_BUFFER, kBufferIndex), size0(), NnShiftOpCodeConfig{n->positionPipeIndex});
-        att.addOp(OP_SHIFT, "block_shift_v", layerIndex, pointerBatchConfig(SRC_BUFFER, vTempBufferIndex), pointerRawConfig(SRC_BUFFER, vBufferIndex), size0(), NnShiftOpCodeConfig{n->positionPipeIndex});
+        att.addOp(OP_ROPE, "block_rope_q", layerIndex, qSlicePtr, qSlicePtr, size0(), NnRopeOpConfig{h->ropeType, 1, n->positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
+        att.addOp(OP_ROPE, "block_rope_k", layerIndex, kTempSlicePtr, kTempSlicePtr, size0(), NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
 
-        att.addOp(OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), size0(), NnMultiHeadAttOpConfig{multiHeadAttSlice.nHeads, multiHeadAttSlice.nHeads0, h->nKvHeads, h->headDim, h->seqLen, qSlice.inLen, kvCacheSlice.kvLen, 0u, qSlice.inLen, 0u, kvCacheSlice.kvLen, n->positionPipeIndex, qBufferIndex, kBufferIndex, vBufferIndex, attBufferIndex});
+        const NnShiftOpCodeConfig shiftKCfg = fullAttBuffers
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, kvCacheSlice.kvStart, h->kvDim, h->headDim}
+            : NnShiftOpCodeConfig{n->positionPipeIndex};
+        const NnShiftOpCodeConfig shiftVCfg = fullAttBuffers
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, kvCacheSlice.kvStart, h->kvDim, h->headDim}
+            : NnShiftOpCodeConfig{n->positionPipeIndex};
+        att.addOp(OP_SHIFT, "block_shift_k", layerIndex, kTempSlicePtr, pointerRawConfig(SRC_BUFFER, kBufferIndex), size0(), shiftKCfg);
+        att.addOp(OP_SHIFT, "block_shift_v", layerIndex, vTempSlicePtr, pointerRawConfig(SRC_BUFFER, vBufferIndex), size0(), shiftVCfg);
+
+        const NnUint qStart = fullAttBuffers ? qSlice.inStart : 0u;
+        const NnUint qStride = fullAttBuffers ? h->qDim : qSlice.inLen;
+        const NnUint kvStart = fullAttBuffers ? kvCacheSlice.kvStart : 0u;
+        const NnUint kvStride = fullAttBuffers ? h->kvDim : kvCacheSlice.kvLen;
+        att.addOp(OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex, mhaOutSlicePtr, mhaOutSlicePtr, size0(),
+            NnMultiHeadAttOpConfig{
+                multiHeadAttSlice.nHeads,
+                multiHeadAttSlice.nHeads0,
+                h->nKvHeads,
+                h->headDim,
+                h->seqLen,
+                qSlice.inLen,
+                kvCacheSlice.kvLen,
+                qStart,
+                qStride,
+                kvStart,
+                kvStride,
+                n->positionPipeIndex,
+                qBufferIndex,
+                kBufferIndex,
+                vBufferIndex,
+                attBufferIndex});
         printf("🔍 [Node %u DEBUG] MHA: nHeads=%u, nHeads0=%u\n", nodeIndex, multiHeadAttSlice.nHeads, multiHeadAttSlice.nHeads0);
 
         if (mhaOutBufferIndex != mhaOutQBufferIndex) {
-             att.addOp(OP_CAST, "block_cast_y2", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex), size0(), NnCastOpCodeConfig{});
+             att.addOp(OP_CAST, "block_cast_y2", layerIndex, mhaOutSlicePtr, mhaOutQSlicePtr, size0(), NnCastOpCodeConfig{});
         }
-        att.addOp(OP_MATMUL, "block_matmul_wo", layerIndex, pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), stageFullWeights ? woSlice.size : woSlice.sliceSize, makeColMatmulCfg(woSlice.n0, woSlice.d, woSlice.outStart));
-        att.addOp(OP_CAST, "block_cast_d", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfig(SRC_PIPE, n->zqPipeIndex), size0(), NnCastOpCodeConfig{});
+        att.addOp(OP_MATMUL, "block_matmul_wo", layerIndex, mhaOutQSlicePtr, pointerBatchConfig(SRC_BUFFER, yBufferIndex), stageFullWeights ? woSlice.size : woSlice.sliceSize, makeColMatmulCfgTagged(NN_SLICE_HEAD, h->headDim, woSlice.n0, woSlice.d, woSlice.outStart));
+        att.addOp(OP_CAST, "block_cast_d", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfigTagged(SRC_PIPE, n->zqPipeIndex, NN_SLICE_STACKED_BY_NODE), size0(), NnCastOpCodeConfig{});
         att.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
+
+        // Side-effect only: aggregate full KV-cache (all nodes get a full copy).
+        // This does NOT change any downstream compute (no ops read KC/VC).
+        // NOTE: KV cache buffers are laid out as (seqLen, kvDimLocal) and are not batch-major.
+        // Using PNTR_BATCH on them will trip ASSERT_EQ(sourceSize->y, nBatches).
+        // Instead, aggregate the per-token KV vectors that were just written (kTemp/vTemp),
+        // which are batch-major and correspond to the current POS window.
+        if (n->kvAggKPipeIndex != (NnUint)-1 && n->kvAggVPipeIndex != (NnUint)-1) {
+            att.addOp(
+                OP_CAST, "kvagg_cast_k", layerIndex,
+                kTempSlicePtr,
+                pointerBatchedSliceConfigTagged(SRC_PIPE, n->kvAggKPipeIndex, NN_SLICE_KV_HEAD),
+                size0(),
+                NnCastOpCodeConfig{});
+            att.addSync(n->kvAggKPipeIndex, SYNC_NODE_SLICES);
+
+            att.addOp(
+                OP_CAST, "kvagg_cast_v", layerIndex,
+                vTempSlicePtr,
+                pointerBatchedSliceConfigTagged(SRC_PIPE, n->kvAggVPipeIndex, NN_SLICE_KV_HEAD),
+                size0(),
+                NnCastOpCodeConfig{});
+            att.addSync(n->kvAggVPipeIndex, SYNC_NODE_SLICES);
+        }
 
         // --- FFN Ops ---
         ff.addOp(OP_MERGE_ADD, "block_merge_add2", layerIndex, pointerBatchConfig(SRC_PIPE, n->zqPipeIndex), pointerBatchConfig(SRC_BUFFER, xBufferIndex), size0(), NnMergeAddOpCodeConfig{});
@@ -946,8 +1100,18 @@ static NnNodeConfig buildLlmNodeInternal(
                 ? size3D(h->weightType, h->nExperts, w2Slice.n, w2Slice.d)
                 : size3D(h->weightType, h->nExperts, w2Slice.n0, w2Slice.d);
 
-            ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), w1ExpertSliceSize, makeMoeRowMatmulCfg(w1Slice.n, w1Slice.inLen, w1Slice.inStart));
-            ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeLBufferIndex), w3ExpertSliceSize, makeMoeRowMatmulCfg(w3Slice.n, w3Slice.inLen, w3Slice.inStart));
+            {
+                NnMatmulOpConfig w1Cfg = makeMoeRowMatmulCfg(w1Slice.n, w1Slice.inLen, w1Slice.inStart);
+                w1Cfg.outSliceTag = NN_SLICE_FFN;
+                w1Cfg.outStartUnit = 1u;
+                ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), w1ExpertSliceSize, w1Cfg);
+            }
+            {
+                NnMatmulOpConfig w3Cfg = makeMoeRowMatmulCfg(w3Slice.n, w3Slice.inLen, w3Slice.inStart);
+                w3Cfg.outSliceTag = NN_SLICE_FFN;
+                w3Cfg.outStartUnit = 1u;
+                ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeLBufferIndex), w3ExpertSliceSize, w3Cfg);
+            }
             {
                 const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
                 const NnUint actDim = w1Slice.inLen;
@@ -963,38 +1127,111 @@ static NnNodeConfig buildLlmNodeInternal(
             if (moeDBufferIndex != moeDQBufferIndex) {
                 ff.addOp(OP_CAST, "block_cast_d2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), size0(), NnCastOpCodeConfig{});
             }
-            ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), w2ExpertSliceSize, makeMoeColMatmulCfg(w2Slice.n0, w2Slice.d, w2Slice.outStart));
+            {
+                NnMatmulOpConfig w2Cfg = makeMoeColMatmulCfg(w2Slice.n0, w2Slice.d, w2Slice.outStart);
+                w2Cfg.inSliceTag = NN_SLICE_FFN;
+                w2Cfg.inStartUnit = 1u;
+                ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), w2ExpertSliceSize, w2Cfg);
+            }
             ff.addOp(OP_SCALE, "block_moe_scale", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), size0(), NnScaleOpCodeConfig{moeSBufferIndex});
             ff.addOp(OP_MERGE_SUM, "block_moe_merge_sum", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), size0(), NnMergeSumOpCodeConfig{});
         } else {
             if (yBufferIndex != yqBufferIndex) {
                 ff.addOp(OP_CAST, "block_cast_y3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
             }
-            ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), stageFullWeights ? w1Slice.size : w1Slice.sliceSize, makeRowMatmulCfg(w1Slice.n, w1Slice.inLen, w1Slice.inStart));
-            ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, lBufferIndex), stageFullWeights ? w3Slice.size : w3Slice.sliceSize, makeRowMatmulCfg(w3Slice.n, w3Slice.inLen, w3Slice.inStart));
+            const NnPointerConfig dSlicePtr = fullFfnBuffers
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, dBufferIndex, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, dBufferIndex);
+            const NnPointerConfig dqSlicePtr = fullFfnBuffers
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, dqBufferIndex, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, dqBufferIndex);
+            const NnPointerConfig lSlicePtr = fullFfnBuffers
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, lBufferIndex, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, lBufferIndex);
+
+            ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), dSlicePtr, stageFullWeights ? w1Slice.size : w1Slice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w1Slice.n, w1Slice.inLen, w1Slice.inStart));
+            ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), lSlicePtr, stageFullWeights ? w3Slice.size : w3Slice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w3Slice.n, w3Slice.inLen, w3Slice.inStart));
             {
                 const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
                 const NnUint actDim = w1Slice.inLen;
                 if (testSplit && layerIndex == 0u && actDim >= 2u) {
                     const NnUint half = actDim / 2u;
-                    ff.addOp(OP_SILU, "block_act_v0", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
-                    ff.addOp(OP_SILU, "block_act_v1", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
+                    ff.addOp(OP_SILU, "block_act_v0", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
+                    ff.addOp(OP_SILU, "block_act_v1", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
                 } else {
-                    ff.addOp(OP_SILU, "block_act", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                    ff.addOp(OP_SILU, "block_act", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
                 }
             }
-            ff.addOp(OP_MUL, "block_mul", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnMulOpCodeConfig{lBufferIndex});
-            if (dBufferIndex != dqBufferIndex) {
-                ff.addOp(OP_CAST, "block_cast_d2", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dqBufferIndex), size0(), NnCastOpCodeConfig{});
+            // OP_MUL reads multiplier from a buffer index (not via pointer config),
+            // so when using full buffers we must use view(offset/len) to align d and l slices.
+            // NOTE:
+            // - We intentionally keep input/output pointer configs as pointerBatchConfig() so they point
+            //   to the *base* of the full D buffer (offset=0).
+            // - The slice selection is applied via mulCfg.view.offset/sizeX, which is also used to index
+            //   into the multiplier buffer L (which is addressed by buffer index, not via pointer slicing).
+            // If we instead used dSlicePtr here, we'd need a separate multiplier offset field to avoid
+            // double-applying the offset.
+            NnMulOpCodeConfig mulCfg = NnMulOpCodeConfig{lBufferIndex};
+            if (fullFfnBuffers) {
+                const NnUint ffnStart0 = (plan && plan->ffnSplit.starts) ? plan->ffnSplit.starts[nodeIndex] : 0u;
+                const NnUint ffnLen0 = (plan && plan->ffnSplit.lengths) ? plan->ffnSplit.lengths[nodeIndex] : w1Slice.inLen;
+                mulCfg.view = NnTensorView{ffnStart0, 0u, ffnLen0, 0u, 1u};
             }
-            ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, dqBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), stageFullWeights ? w2Slice.size : w2Slice.sliceSize, makeColMatmulCfg(w2Slice.n0, w2Slice.d, w2Slice.outStart));
+            ff.addOp(OP_MUL, "block_mul", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                size0(), mulCfg);
+            if (dBufferIndex != dqBufferIndex) {
+                ff.addOp(OP_CAST, "block_cast_d2", layerIndex, dSlicePtr, dqSlicePtr, size0(), NnCastOpCodeConfig{});
+            }
+            ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, dqSlicePtr, pointerBatchConfig(SRC_BUFFER, yBufferIndex), stageFullWeights ? w2Slice.size : w2Slice.sliceSize, makeColMatmulCfgTagged(NN_SLICE_FFN, 1u, w2Slice.n0, w2Slice.d, w2Slice.outStart));
         }
         
-        ff.addOp(OP_CAST, "block_cast_d3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfig(SRC_PIPE, n->zqPipeIndex), size0(), NnCastOpCodeConfig{});
+        ff.addOp(OP_CAST, "block_cast_d3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfigTagged(SRC_PIPE, n->zqPipeIndex, NN_SLICE_STACKED_BY_NODE), size0(), NnCastOpCodeConfig{});
         ff.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
 
         nodeBuilder.addSegment(att.build());
         nodeBuilder.addSegment(ff.build());
+
+        // ----------------------------------------------------------------------
+        // Per-layer barrier: stage-local sync + optional hardcoded head migration
+        // ----------------------------------------------------------------------
+        {
+            NnSegmentConfigBuilder planBarrier;
+            planBarrier.addOp(
+                OP_PLAN_BARRIER,
+                "plan_barrier",
+                layerIndex,
+                pointerBatchConfig(SRC_PIPE, n->positionPipeIndex),
+                pointerBatchConfig(SRC_PIPE, n->planPipeIndex),
+                size0(),
+                NnPlanBarrierOpCodeConfig{
+                    n->positionPipeIndex,
+                    n->planPipeIndex,
+                    (hardMigratePos < 0 ? 0xFFFFFFFFu : (NnUint)hardMigratePos),
+                    (hardMigrateLayer < 0 ? 0xFFFFFFFFu : (NnUint)hardMigrateLayer),
+                    0u, // fromNodeIndex: node0
+                    1u, // toNodeIndex: node1
+                    (hardMigrateHeadMove < 0 ? 0u : (NnUint)hardMigrateHeadMove),
+                    (hardMigrateKind < 0 ? 1u : (NnUint)hardMigrateKind),
+                    (hardMigrateFfnMove < 0 ? 0u : (NnUint)hardMigrateFfnMove),
+                    0u  // onlyStageIndex: stage0
+                });
+            // Broadcast the control packet within the current stage.
+            planBarrier.addSync(n->planPipeIndex, SYNC_WITH_ROOT);
+            nodeBuilder.addSegment(planBarrier.build());
+
+            NnSegmentConfigBuilder planApply;
+            planApply.addOp(
+                OP_PLAN_APPLY,
+                "plan_apply",
+                layerIndex,
+                pointerBatchConfig(SRC_PIPE, n->planPipeIndex),
+                pointerBatchConfig(SRC_PIPE, n->planPipeIndex),
+                size0(),
+                NnPlanApplyOpCodeConfig{n->planPipeIndex, 0u});
+            nodeBuilder.addSegment(planApply.build());
+        }
     }
 
     if (!isLastStage) {
@@ -1030,11 +1267,19 @@ static NnNodeConfig buildLlmNodeInternal(
             end.addOp(OP_CAST, "final_cast_y", 0, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
         }
         
-        end.addOp(OP_MATMUL, "final_matmul_logits", 0, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex), stageFullWeights ? wclsSlice.size : wclsSlice.sliceSize, makeRowMatmulCfg(wclsSlice.n, wclsSlice.inLen, wclsSlice.inStart));
+        const NnPointerConfig logitsBufSlicePtr = fullLogitsBuffers
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, logitsSliceBufferIndex, NN_SLICE_VOCAB)
+            : pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex);
+
+        end.addOp(OP_MATMUL, "final_matmul_logits", 0,
+            pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+            logitsBufSlicePtr,
+            stageFullWeights ? wclsSlice.size : wclsSlice.sliceSize,
+            makeRowMatmulCfgTagged(NN_SLICE_VOCAB, 1u, wclsSlice.n, wclsSlice.inLen, wclsSlice.inStart));
         
         end.addOp(OP_CAST, "final_cast_logits", 0, 
-            pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex), 
-            pointerBatchedSliceConfig(SRC_PIPE, n->logitsPipeIndex), // <--- 改回这个！
+            logitsBufSlicePtr, 
+            pointerBatchedSliceConfigTagged(SRC_PIPE, n->logitsPipeIndex, NN_SLICE_VOCAB), // <--- 改回这个！
             size0(), NnCastOpCodeConfig{});
         
         end.addSync(n->logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
@@ -1072,6 +1317,15 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
     n.xPipeIndex = netBuilder.addPipe("X", size2D(F_32, nBatches, h->dim));
     n.logitsPipeIndex = netBuilder.addPipe("LG", size2D(F_32, nBatches, h->vocabSize));
     n.zqPipeIndex = netBuilder.addPipe("ZQ", size2D(h->syncType, nBatches, h->dim * nNodes)); // Safe size
+    // Control pipe for hard migration barrier/apply (CPU-only test hook)
+    n.planPipeIndex = netBuilder.addPipe("PLN", size2D(F_32, nBatches, 8));
+
+    n.kvAggKPipeIndex = (NnUint)-1;
+    n.kvAggVPipeIndex = (NnUint)-1;
+    if (std::getenv("DLLAMA_KV_AGGREGATE") != nullptr) {
+        n.kvAggKPipeIndex = netBuilder.addPipe("KC", size2D(F_32, nBatches, h->kvDim));
+        n.kvAggVPipeIndex = netBuilder.addPipe("VC", size2D(F_32, nBatches, h->kvDim));
+    }
 
     netBuilder.addPreSync(n.positionPipeIndex);
     n.netConfig = netBuilder.build();

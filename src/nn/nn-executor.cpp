@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cstring>
 #include "nn-executor.hpp"
+#include "nn-cpu.hpp"
 
 void NnFakeNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     // Nothing
@@ -210,6 +211,41 @@ void NnExecutor::forward() {
 
     if (!context.isAlive.load())
         throw NnExecutorException("Execution failed in one of the threads");
+}
+
+void NnExecutor::refreshPointers() {
+    if (context.isAlive.load()) {
+        throw std::runtime_error("Cannot refresh pointers while executor is running");
+    }
+    for (NnUint segmentIndex = 0; segmentIndex < nodeConfig->nSegments; segmentIndex++) {
+        NnDeviceSegment *segment = segments[segmentIndex].get();
+        if (segment == nullptr)
+            continue;
+        if (auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(segment)) {
+            cpuSeg->refreshPointers();
+        }
+    }
+}
+
+void NnExecutor::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
+    if (context.isAlive.load()) {
+        throw std::runtime_error("Cannot update partition plan while executor is running");
+    }
+    for (NnUint segmentIndex = 0; segmentIndex < nodeConfig->nSegments; segmentIndex++) {
+        NnDeviceSegment *segment = segments[segmentIndex].get();
+        if (segment == nullptr)
+            continue;
+        if (auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(segment)) {
+            if (cpuSeg->device != nullptr) {
+                cpuSeg->device->setPartitionPlan(plan);
+            }
+        }
+    }
+}
+
+void NnExecutor::applyPartitionPlan(const NnUnevenPartitionPlan *plan) {
+    setPartitionPlan(plan);
+    refreshPointers();
 }
 
 NnUint NnExecutor::getTotalTime(NnExecutorStepType type) {

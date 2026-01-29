@@ -217,9 +217,11 @@ static void inference(AppInferenceContext *context) {
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
         // 只在 eval 阶段前几步打印，避免刷屏
-        if (pos < 4) {
-            debugTopKLogits(context, logits, vocabSize, 10, "eval");
-            debugVocabCoverage(logits, vocabSize, "eval");
+        {
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "eval pos=%u batch=%u", (unsigned)pos, (unsigned)batchSize);
+            debugTopKLogits(context, logits, vocabSize, 10, tag);
+            debugVocabCoverage(logits, vocabSize, tag);
         }
 #endif
 
@@ -276,9 +278,11 @@ static void inference(AppInferenceContext *context) {
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
         // 预测阶段：前若干步打印 topK，快速判断 logits 是否“像正常语言模型”
-        if (pos < 16) {
-            debugTopKLogits(context, context->inference->logitsPipe, context->header->vocabSize, 10, "pred");
-            if (pos < 4) debugVocabCoverage(context->inference->logitsPipe, context->header->vocabSize, "pred");
+        {
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "pred pos=%u", (unsigned)pos);
+            debugTopKLogits(context, context->inference->logitsPipe, context->header->vocabSize, 10, tag);
+            debugVocabCoverage(context->inference->logitsPipe, context->header->vocabSize, tag);
         }
 #endif
         token = context->sampler->sample(context->inference->logitsPipe);

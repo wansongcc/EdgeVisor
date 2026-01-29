@@ -14,8 +14,11 @@ typedef SSIZE_T ssize_t;
 #include "nn-core.hpp"
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
+#include <string>
+#include <set>
 #include <chrono>
 #include <fcntl.h>
 
@@ -149,6 +152,7 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
                              std::vector<NnSize>& offsets, std::vector<NnSize>& sizes,
                              NnFloatType floatType,
                              const NnStageConfig* stageForSplit,
+                             NnSliceTag forcedTag,
                              NnUint totalElements = 0) {
     bool matchFound = false;
     bool stackedByNode = false;
@@ -254,16 +258,31 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
             return false;
         };
 
+        // Forced matching (used to disambiguate headSplit vs kvHeadSplit for kvDim-sized pipes)
+        if (!matchFound && forcedTag != NN_SLICE_AUTO) {
+            if (forcedTag == NN_SLICE_HEAD) {
+                matchFound = tryMatch(plan->headSplit, true, "head(forced)");
+            } else if (forcedTag == NN_SLICE_KV_HEAD) {
+                matchFound = tryMatch(plan->kvHeadSplit, true, "kvhead(forced)");
+            } else if (forcedTag == NN_SLICE_FFN) {
+                matchFound = tryMatch(plan->ffnSplit, false, "ffn(forced)");
+            } else if (forcedTag == NN_SLICE_DIM) {
+                matchFound = tryMatch(plan->dimSplit, false, "dim(forced)");
+            } else if (forcedTag == NN_SLICE_VOCAB) {
+                matchFound = tryMatch(plan->vocabSplit, false, "vocab(forced)");
+            }
+        }
+
         // Priority order for matching:
-        // 1. Vocab (Logits) - Largest, usually most critical for the "degeneration" bug
+        // 1. Vocab (Logits)
         if (!matchFound) matchFound = tryMatch(plan->vocabSplit, false, "vocab");
-        // 2. FFN - Intermediate layers
+        // 2. FFN
         if (!matchFound) matchFound = tryMatch(plan->ffnSplit, false, "ffn");
-        // 3. Dim - General dimension splits
+        // 3. Dim
         if (!matchFound) matchFound = tryMatch(plan->dimSplit, false, "dim");
-        // 4. Heads - Attention Q
+        // 4. Heads
         if (!matchFound) matchFound = tryMatch(plan->headSplit, true, "head");
-        // 5. KV Heads - Attention K/V
+        // 5. KV Heads
         if (!matchFound) matchFound = tryMatch(plan->kvHeadSplit, true, "kvhead");
     }
 
@@ -924,6 +943,7 @@ static void syncNodeSlices(
     NnUint threadIndex, 
     const NnUnevenPartitionPlan *plan,
     const NnStageConfig *stage, // 指定同步组
+    NnSliceTag forcedTag, // disambiguate split kind when needed
     NnUint totalElements = 0 // [New] Total elements for Q80 matching
 ) {
     // ---------------------------------------------------------
@@ -1017,7 +1037,7 @@ static void syncNodeSlices(
     }
 
     // [Fix] Pass floatType + total elements for accurate matching (incl. Q80)
-    fillUnevenSlices(plan, nTotalNodes, nBytes, sliceOffsets, sliceSizes, floatType, stageForSplit, totalElements);
+    fillUnevenSlices(plan, nTotalNodes, nBytes, sliceOffsets, sliceSizes, floatType, stageForSplit, forcedTag, totalElements);
 
 
 
@@ -1245,12 +1265,61 @@ stage_found:;
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
 
+    const bool kvAggProof = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF") != nullptr);
+    const bool kvAggProofAllBatches = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES") != nullptr);
+    const bool syncTrace = (std::getenv("DLLAMA_SYNC_TRACE") != nullptr);
+
+    auto findPipeIndexByName = [&](const char *name) -> int {
+        for (NnUint i = 0; i < netConfig->nPipes; i++) {
+            if (netConfig->pipes[i].name && std::strcmp(netConfig->pipes[i].name, name) == 0) return (int)i;
+        }
+        return -1;
+    };
+
+    const int posPipeIndex = kvAggProof ? findPipeIndexByName("POS") : -1;
+
     for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
         NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
         NnByte *pipe = execution->pipes[syncConfig->pipeIndex];
         NnPipeConfig *pipeConfig = &netConfig->pipes[syncConfig->pipeIndex];
         NnSize batchBytes = getBytes(pipeConfig->size.floatType, pipeConfig->size.x);
         NnUint totalElements = pipeConfig->size.x; // [New] Get total elements
+
+        auto printHeadTail16 = [&](const char *pipeName, NnUint pipeIndex, NnUint batchIndex, const NnByte *data, NnSize nBytes) {
+            if (pipeName == nullptr) pipeName = "(null)";
+            if (nBytes < 32) {
+                printf("🧪 [kvagg][%s] node=%u seg=%u sync=%u batch=%u bytes=%zu (too small)\n",
+                       pipeName, nodeConfig->nodeIndex, segmentIndex, syncIndex, batchIndex, (size_t)nBytes);
+                return;
+            }
+
+            int posI = -1;
+            if (posPipeIndex >= 0) {
+                const NnPipeConfig *posCfg = &netConfig->pipes[(NnUint)posPipeIndex];
+                const NnSize posBatchBytes = getBytes(posCfg->size.floatType, posCfg->size.x);
+                const NnByte *posPipe = execution->pipes[(NnUint)posPipeIndex];
+                float posF = 0.0f;
+                std::memcpy(&posF, &posPipe[batchIndex * posBatchBytes], sizeof(float));
+                posI = (int)posF;
+            }
+
+            printf("🧪 [kvagg][%s] node=%u seg=%u sync=%u pipe=%u batch=%u bytes=%zu pos=%d head=",
+                   pipeName, nodeConfig->nodeIndex, segmentIndex, syncIndex, pipeIndex, batchIndex, (size_t)nBytes, posI);
+            for (int i = 0; i < 16; ++i) printf("%02x", (unsigned)(unsigned char)data[i]);
+            printf(" tail=");
+            for (int i = 0; i < 16; ++i) printf("%02x", (unsigned)(unsigned char)data[(size_t)nBytes - 16 + (size_t)i]);
+            printf("\n");
+        };
+
+        // Force KV-head slicing for KV aggregation pipes.
+        // This avoids ambiguous AUTO matching and ensures slices are derived from kvHeadSplit
+        // (including the multiplier = seqLen * headDim when totalElements == seqLen * kvDim).
+        NnSliceTag forcedTag = NN_SLICE_AUTO;
+        if (pipeConfig->name != nullptr) {
+            if (std::strcmp(pipeConfig->name, "KC") == 0 || std::strcmp(pipeConfig->name, "VC") == 0) {
+                forcedTag = NN_SLICE_KV_HEAD;
+            }
+        }
 
         // (Debug) Uncomment if you need per-sync pipe size info
         // if (threadIndex == 0) {
@@ -1265,15 +1334,32 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
 
+            if (syncTrace && threadIndex == 0 && batchIndex == 0) {
+                const char *pipeName = pipeConfig->name ? pipeConfig->name : "(null)";
+                printf(
+                    "⏱️ [sync] enter node=%u seg=%u sync=%u type=%u pipe=%u name=%s bytes=%zu stageRoot=%u stageNodes=%u\n",
+                    nodeConfig->nodeIndex,
+                    segmentIndex,
+                    syncIndex,
+                    (unsigned)syncConfig->syncType,
+                    (unsigned)syncConfig->pipeIndex,
+                    pipeName,
+                    (size_t)batchBytes,
+                    myStage ? (unsigned)myStage->rootNodeIndex : 0u,
+                    myStage ? (unsigned)myStage->nNodes : (unsigned)netConfig->nNodes
+                );
+                std::fflush(stdout);
+            }
+
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
                 syncTypeStr = "SYNC_WITH_ROOT";
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeStr = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, totalElements);
-            } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements);
+            }else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeStr = "SYNC_LOGITS";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, totalElements);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements);
             } 
             else if (syncConfig->syncType == SYNC_PP_SEND) {
                 syncTypeStr = "PP_SEND";
@@ -1291,10 +1377,35 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
             }else {
                 throw std::invalid_argument("Unknown sync type");
             }
+
+            if (syncTrace && threadIndex == 0 && batchIndex == 0) {
+                const char *pipeName = pipeConfig->name ? pipeConfig->name : "(null)";
+                printf(
+                    "⏱️ [sync] exit  node=%u seg=%u sync=%u type=%u pipe=%u name=%s\n",
+                    nodeConfig->nodeIndex,
+                    segmentIndex,
+                    syncIndex,
+                    (unsigned)syncConfig->syncType,
+                    (unsigned)syncConfig->pipeIndex,
+                    pipeName
+                );
+                std::fflush(stdout);
+            }
+
             if (threadIndex == 0) {
-            auto end = std::chrono::high_resolution_clock::now();
-            double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
-        }
+                // Proof: after KV aggregation all-gather, dump head/tail bytes.
+                if (kvAggProof && syncConfig->syncType == SYNC_NODE_SLICES && pipeConfig->name != nullptr &&
+                    (std::strcmp(pipeConfig->name, "KC") == 0 || std::strcmp(pipeConfig->name, "VC") == 0)) {
+                    if (kvAggProofAllBatches || batchIndex == 0u) {
+                        printHeadTail16(pipeConfig->name, syncConfig->pipeIndex, batchIndex, pipeBatch, batchBytes);
+                    }
+                }
+
+                auto end = std::chrono::high_resolution_clock::now();
+                (void)end;
+                // double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+                // (void)elapsedMs;
+            }
         }
     }
 }
@@ -1311,6 +1422,106 @@ static char *readString(NnNetwork *network, NnUint socketIndex) {
     char *str = new char[bytes];
     network->read(socketIndex, str, bytes);
     return str;
+}
+
+static inline void setEnvPortable(const char *name, const char *value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    setenv(name, value ? value : "", 1);
+#endif
+}
+
+static inline void unsetEnvPortable(const char *name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+static std::vector<std::string> buildEnvSyncList() {
+    // Default whitelist (debug/migration switches). Extend at runtime via:
+    //   DLLAMA_SYNC_ENV_VARS="FOO,BAR,BAZ"
+    static const char *kDefaults[] = {
+        "DLLAMA_STAGE_FULL_WEIGHTS",
+        "DLLAMA_FORCE_MATMUL_VIEWS",
+        "DLLAMA_MIGRATE_APPLY_HEAD",
+        "DLLAMA_MIGRATE_APPLY_FFN",
+        "DLLAMA_MIGRATE_APPLY_DRYRUN",
+        "DLLAMA_KV_AGGREGATE",
+        "DLLAMA_KV_AGGREGATE_PROOF",
+        "DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES",
+        "DLLAMA_SYNC_TRACE",
+        "DLLAMA_CONTROL_LOG",
+        "DLLAMA_HARD_MIGRATE_POS",
+        "DLLAMA_HARD_MIGRATE_LAYER",
+        "DLLAMA_HARD_MIGRATE_KIND",
+        "DLLAMA_HARD_MIGRATE_HEAD_MOVE",
+        "DLLAMA_HARD_MIGRATE_FFN_MOVE",
+    };
+
+    std::set<std::string> names;
+    for (size_t i = 0; i < sizeof(kDefaults) / sizeof(kDefaults[0]); ++i) {
+        names.insert(std::string(kDefaults[i]));
+    }
+
+    const char *extra = std::getenv("DLLAMA_SYNC_ENV_VARS");
+    if (extra != nullptr && extra[0] != '\0') {
+        std::string s(extra);
+        size_t start = 0;
+        while (start < s.size()) {
+            size_t end = s.find(',', start);
+            if (end == std::string::npos) end = s.size();
+            std::string token = s.substr(start, end - start);
+            // trim spaces
+            size_t l = 0;
+            while (l < token.size() && (token[l] == ' ' || token[l] == '\t' || token[l] == '\n' || token[l] == '\r')) l++;
+            size_t r = token.size();
+            while (r > l && (token[r - 1] == ' ' || token[r - 1] == '\t' || token[r - 1] == '\n' || token[r - 1] == '\r')) r--;
+            if (r > l) names.insert(token.substr(l, r - l));
+            start = end + 1;
+        }
+    }
+
+    std::vector<std::string> out;
+    out.reserve(names.size());
+    for (const auto &n : names) out.push_back(n);
+    return out;
+}
+
+static void writeSyncedEnvVars(NnNetwork *network, NnUint socketIndex) {
+    const std::vector<std::string> names = buildEnvSyncList();
+    const NnUint n = (NnUint)names.size();
+    network->write(socketIndex, &n, sizeof(n));
+    for (const auto &name : names) {
+        const char *cname = name.c_str();
+        writeString(network, socketIndex, const_cast<char *>(cname));
+        const char *val = std::getenv(cname);
+        const NnUint present = (val != nullptr) ? 1u : 0u;
+        network->write(socketIndex, &present, sizeof(present));
+        if (present) {
+            writeString(network, socketIndex, const_cast<char *>(val));
+        }
+    }
+}
+
+static void readAndApplySyncedEnvVars(NnNetwork *network, NnUint socketIndex) {
+    NnUint n = 0;
+    network->read(socketIndex, &n, sizeof(n));
+    for (NnUint i = 0; i < n; ++i) {
+        char *name = readString(network, socketIndex);
+        NnUint present = 0;
+        network->read(socketIndex, &present, sizeof(present));
+        if (present) {
+            char *val = readString(network, socketIndex);
+            setEnvPortable(name, val);
+            delete[] val;
+        } else {
+            unsetEnvPortable(name);
+        }
+        delete[] name;
+    }
 }
 
 NnRootConfigWriter::NnRootConfigWriter(NnNetwork *network) {
@@ -1332,6 +1543,11 @@ void NnRootConfigWriter::writeNet(NnUint socketIndex, NnNetConfig *config) {
         NnPreSyncConfig *preSyncConfig = &config->preSyncs[preSyncIndex];
         network->write(socketIndex, &preSyncConfig->pipeIndex, sizeof(preSyncConfig->pipeIndex));
     }
+
+    // Sync a whitelist of environment-variable switches from root to workers.
+    // This runs during communication initialization, before any execution begins.
+    writeSyncedEnvVars(network, socketIndex);
+
     network->readAck(socketIndex);
 }
 
@@ -1403,6 +1619,10 @@ NnNetConfig NnWorkerConfigReader::readNet() {
         NnPreSyncConfig *preSyncConfig = &config.preSyncs[preSyncIndex];
         network->read(ROOT_SOCKET_INDEX, &preSyncConfig->pipeIndex, sizeof(preSyncConfig->pipeIndex));
     }
+
+    // Apply env switches synced from root.
+    readAndApplySyncedEnvVars(network, ROOT_SOCKET_INDEX);
+
     network->writeAck(ROOT_SOCKET_INDEX);
     return config;
 }

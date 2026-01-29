@@ -198,6 +198,31 @@ typedef struct {
     NnSize3D valueSize;
 } NnKvCacheSliceUneven;
 
+// KV cache head ownership mapping for online TP re-partition.
+// Maps each KV head to its owner node (within a TP stage) and to the
+// corresponding KV column range in both global(full) and local(packed) layouts.
+typedef struct {
+    // Stage-local TP group size
+    NnUint nNodes;
+    // Global node indices for each stage rank [nNodes]
+    NnUint *nodeIndices;
+
+    // KV heads metadata
+    NnUint nKvHeads;
+    NnUint headDim;
+    NnUint kvDim; // nKvHeads * headDim
+
+    // Per stage rank [nNodes]
+    NnUint *nodeKvHeadStarts;
+    NnUint *nodeKvHeadLens;
+
+    // Per KV head [nKvHeads]
+    NnUint *headOwnerNode;     // global node index
+    NnUint *headOwnerRank;     // stage rank (0..nNodes-1)
+    NnUint *headGlobalKvStart; // headIndex * headDim
+    NnUint *headLocalKvStart;  // (headIndex - nodeKvHeadStarts[rank]) * headDim
+} NnKvCacheHeadMap;
+
 typedef struct {
     NnFloatType type;
     NnUint inStart;   // 输入维度起点 (Global Row Start)
@@ -270,6 +295,9 @@ enum NnOpCode {
     OP_MOE_GATE,
     OP_PP_RECV,
     OP_PP_SEND,
+    // CPU-only: plan migration barrier/apply (used for testing online repartition)
+    OP_PLAN_BARRIER,
+    OP_PLAN_APPLY,
 };
 
 enum NnOpQuantType {
@@ -296,6 +324,25 @@ enum NnPointerType {
     PNTR_RAW,
     PNTR_BATCH,
     PNTR_BATCHED_SLICE
+};
+
+// ======================================================================================
+// Slice Tags (disambiguate PNTR_BATCHED_SLICE semantics)
+// ======================================================================================
+
+// NOTE:
+// - Only meaningful when pointerConfig.type == PNTR_BATCHED_SLICE.
+// - AUTO keeps legacy heuristic behavior (dimension matching / fallbacks).
+// - STACKED_BY_NODE means the X dimension is laid out as [node0][node1]...[nodeN-1],
+//   so each node owns a fixed slot determined by global node index.
+enum NnSliceTag : NnUint {
+    NN_SLICE_AUTO = 0,
+    NN_SLICE_VOCAB,
+    NN_SLICE_FFN,
+    NN_SLICE_DIM,
+    NN_SLICE_HEAD,
+    NN_SLICE_KV_HEAD,
+    NN_SLICE_STACKED_BY_NODE,
 };
 
 enum NnSyncType {
@@ -330,6 +377,7 @@ typedef struct {
     NnPointerSource source;
     NnUint pointerIndex;
     NnPointerType type;
+    NnSliceTag sliceTag;
 } NnPointerConfig;
 
 // ======================================================================================
@@ -431,6 +479,14 @@ typedef struct {
     NnUint inStart;
     NnUint outStart;
 
+    // Optional: semantic tags for online repartition refresh.
+    // When set (non-AUTO), refresh code may recompute inStart/outStart from the
+    // corresponding plan split: start = split.starts[node] * unit.
+    NnSliceTag inSliceTag;
+    NnUint inStartUnit;
+    NnSliceTag outSliceTag;
+    NnUint outStartUnit;
+
     // Optional tensor views into A/B/C buffers.
     // These are intended for the "pre-allocate full buffers" mode, where ops only
     // read/write a local slice via offsets and logical sizes.
@@ -520,11 +576,42 @@ typedef struct {
     // When dstRowStride==0, fallback to legacy packed behavior.
     NnUint dstColStart;
     NnUint dstRowStride;
+    // Optional: when online TP repartition changes kvHeadSplit, dstColStart must be recomputed.
+    // If dstColStartUnit!=0, refresh code may set dstColStart = kvHeadSplit.starts[node] * dstColStartUnit.
+    // For KV cache this is typically headDim.
+    NnUint dstColStartUnit;
 } NnShiftOpCodeConfig;
 
 typedef struct {
     NnTensorView view;
 } NnSoftmaxOpCodeConfig;
+
+// ======================================================================================
+// Plan Barrier Ops (CPU-only)
+// ======================================================================================
+
+// Emits a small control packet (into a pipe) when a (pos, layer) trigger matches.
+// The control packet is then broadcast within the current stage via SYNC_WITH_ROOT.
+typedef struct {
+    NnUint positionPipeIndex;
+    NnUint planPipeIndex;
+    NnUint triggerPos;
+    NnUint triggerLayer;
+    NnUint fromNodeIndex;
+    NnUint toNodeIndex;
+    NnUint nHeadsToMove;
+    // cmdKind: 1=headSplit migration, 2=ffnSplit migration, 3=both
+    NnUint cmdKind;
+    // Only used when cmdKind==2 (ffnSplit). Units are FFN hidden units.
+    NnUint nFfnToMove;
+    NnUint onlyStageIndex;
+} NnPlanBarrierOpCodeConfig;
+
+// Applies the previously broadcast control packet by mutating the in-memory plan.
+typedef struct {
+    NnUint planPipeIndex;
+    NnUint onlyStageIndex;
+} NnPlanApplyOpCodeConfig;
 
 typedef struct {
     NnUint k;
@@ -538,6 +625,7 @@ typedef struct {
 
 const char *opCodeToString(NnOpCode code);
 const char *opQuantTypeToString(NnOpQuantType type);
+const char *sliceTagToString(NnSliceTag tag);
 
 NnSize getBytes(NnFloatType floatType, NnSize n);
 NnSize getBlockSize(NnFloatType floatType);
@@ -548,6 +636,7 @@ NnSize3D size2D(NnFloatType floatType, NnUint y, NnUint x);
 NnSize3D size3D(NnFloatType floatType, NnUint z, NnUint y, NnUint x);
 NnPointerConfig pointerBatchConfig(NnPointerSource source, NnUint index);
 NnPointerConfig pointerBatchedSliceConfig(NnPointerSource source, NnUint index);
+NnPointerConfig pointerBatchedSliceConfigTagged(NnPointerSource source, NnUint index, NnSliceTag sliceTag);
 NnPointerConfig pointerRawConfig(NnPointerSource source, NnUint index);
 bool hasPointerContinuousMemory(NnPointerConfig *config);
 
@@ -604,6 +693,17 @@ void releasePartitionPlan(NnUnevenPartitionPlan* plan);
 
 NnKvCacheSliceUneven sliceKvCacheUneven(NnUint seqLen, NnUint headDim,
     const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+
+// Build KV head ownership map for a specific TP stage.
+// - `stage` must be a stage from `plan->stages`.
+// - Uses `plan->kvHeadSplit` to assign each KV head to exactly one stage node.
+NnKvCacheHeadMap buildKvCacheHeadMapUneven(
+    const NnUnevenPartitionPlan* plan,
+    const NnStageConfig* stage,
+    NnUint nKvHeads,
+    NnUint headDim);
+
+void freeKvCacheHeadMap(NnKvCacheHeadMap *map);
 
 NnMultiHeadAttSliceUneven sliceMultiHeadAttUneven(NnUint nBatches, NnUint globalNHeads, NnUint globalSeqLen,
     const NnUnevenPartitionPlan* plan, NnUint nodeIndex);

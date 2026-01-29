@@ -104,6 +104,12 @@ public:
     ~NnExecutor();
     void loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight);
     void forward();
+    // CPU-only today: update partition plan used for PNTR_BATCHED_SLICE resolution.
+    void setPartitionPlan(const NnUnevenPartitionPlan *plan);
+    // CPU-only today: re-resolve segment pointers after updating partition plan.
+    void refreshPointers();
+    // Convenience: set plan + refresh pointers/configs as one atomic reconfigure step.
+    void applyPartitionPlan(const NnUnevenPartitionPlan *plan);
     NnUint getTotalTime(NnExecutorStepType type);
 };
 

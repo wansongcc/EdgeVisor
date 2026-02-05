@@ -12,6 +12,8 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <string>
+#include <iostream>
 
 static void computeLogitsStats(const float* logits, NnUint vocabSize,
                               bool &hasNaN, bool &hasInf,
@@ -151,18 +153,18 @@ static void debugVocabCoverage(const float* logits, NnUint vocabSize, const char
 }
 #endif
 
-static void inference(AppInferenceContext *context) {
-    if (context->args->prompt == nullptr)
+static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, NnUint steps) {
+    if (prompt == nullptr)
         throw std::runtime_error("Prompt is required");
-    if (context->args->steps == 0)
+    if (steps == 0)
         throw std::runtime_error("Number of steps is required");
 
-    std::vector<int> inputTokensVec(std::strlen(context->args->prompt) + 3);
+    std::vector<int> inputTokensVec(std::strlen(prompt) + 3);
     int *inputTokens = inputTokensVec.data();
 
     NnUint pos = 0;
     int nInputTokens;
-    context->tokenizer->encode(context->args->prompt, inputTokens, &nInputTokens, true, true);
+    context->tokenizer->encode(const_cast<char*>(prompt), inputTokens, &nInputTokens, true, true);
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
     if (context->tokenizer->vocabSize != context->header->vocabSize) {
@@ -187,7 +189,7 @@ static void inference(AppInferenceContext *context) {
 
     if (nInputTokens > context->header->seqLen)
         throw std::runtime_error("The number of prompt tokens is greater than the sequence length");
-    if (nInputTokens > context->args->steps)
+    if ((NnUint)nInputTokens > steps)
         throw std::runtime_error("The number of prompt tokens is greater than the number of steps");
 
     NnSize sentBytes = 0;
@@ -211,7 +213,7 @@ static void inference(AppInferenceContext *context) {
     }
 
     int token = inputTokens[pos];
-    printf("%s\n", context->args->prompt);
+    printf("%s\n", prompt);
     for (;;) {
         long remainingTokens = nInputTokens - 1 - (long)pos;
         if (remainingTokens <= 0)
@@ -320,7 +322,7 @@ static void inference(AppInferenceContext *context) {
     context->inference->setBatchSize(1);
     context->tokenizer->resetDecoder();
 
-    const NnUint maxPos = std::min(context->header->seqLen, context->args->steps);
+    const NnUint maxPos = std::min(context->header->seqLen, steps);
     for (; pos < maxPos; pos++) {
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
@@ -442,6 +444,82 @@ static void inference(AppInferenceContext *context) {
         }
         printf("\n");
         printf("Hint: prompt eval uses batchSize>1, so per-token is usually the meaningful metric for rebalancing.\n");
+    }
+}
+
+static bool isInteractiveQuitLine(const std::string& s) {
+    return s == ":q" || s == ":quit" || s == "q" || s == "quit" || s == "exit";
+}
+
+static bool parseStepsCommand(const std::string& line, NnUint& outSteps) {
+    // Accept: ":s 128" or ":steps 128"
+    const char* prefixes[] = {":s", ":steps"};
+    for (const char* p : prefixes) {
+        if (line.rfind(p, 0) != 0) continue;
+        size_t i = std::strlen(p);
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (i >= line.size()) return false;
+        char* end = nullptr;
+        unsigned long v = std::strtoul(line.c_str() + i, &end, 10);
+        if (end == nullptr || end == (line.c_str() + i)) return false;
+        if (v == 0ul) return false;
+        outSteps = (NnUint)v;
+        return true;
+    }
+    return false;
+}
+
+static void inference(AppInferenceContext *context) {
+    if (!context->args->interactive) {
+        inferenceRunOnce(context, context->args->prompt, context->args->steps);
+        return;
+    }
+
+    // Keep stdio/iostreams in sync since we mix printf() and std::getline().
+    std::ios::sync_with_stdio(true);
+
+    std::string curPrompt = (context->args->prompt != nullptr) ? std::string(context->args->prompt) : std::string();
+    NnUint curSteps = context->args->steps;
+
+    for (;;) {
+        // Ask for missing inputs (so --interactive can be used standalone).
+        while (curPrompt.empty() || curSteps == 0u) {
+            printf("🕹️  [interactive] 请输入 prompt（或 :q 退出；:s <steps> 设置 steps）\n> ");
+            fflush(stdout);
+            std::string line;
+            if (!std::getline(std::cin, line)) return;
+            if (isInteractiveQuitLine(line)) return;
+            NnUint newSteps = curSteps;
+            if (parseStepsCommand(line, newSteps)) {
+                curSteps = newSteps;
+                printf("🕹️  [interactive] steps=%u\n", curSteps);
+                continue;
+            }
+            if (!line.empty()) curPrompt = line;
+        }
+
+        inferenceRunOnce(context, curPrompt.c_str(), curSteps);
+
+        printf("\n🕹️  [interactive] 回车复用上次 prompt 继续；直接输入新 prompt；:s <steps> 修改 steps；:q 退出\n> ");
+        fflush(stdout);
+
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            // EOF (e.g. Ctrl-D) => exit
+            break;
+        }
+        if (isInteractiveQuitLine(line)) break;
+
+        NnUint newSteps = curSteps;
+        if (parseStepsCommand(line, newSteps)) {
+            curSteps = newSteps;
+            printf("🕹️  [interactive] steps=%u\n", curSteps);
+            continue;
+        }
+
+        if (!line.empty()) {
+            curPrompt = line;
+        }
     }
 }
 

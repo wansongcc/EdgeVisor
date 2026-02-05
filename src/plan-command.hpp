@@ -11,7 +11,12 @@
 // - Consumed by OP_PLAN_BARRIER on stage-root, then broadcast via plan pipe.
 
 static constexpr uint32_t DLLAMA_PLAN_CMD_MAGIC = 0x44434e50u; // 'PNCD' little-endian
-static constexpr uint32_t DLLAMA_PLAN_CMD_VERSION = 1u;
+static constexpr uint32_t DLLAMA_PLAN_CMD_VERSION_V1 = 1u;
+static constexpr uint32_t DLLAMA_PLAN_CMD_VERSION_V2 = 2u;
+
+// Fixed-capacity move list for PlanCommand v2.
+// Runtime validation should still cap to <= 2 * stageNodes.
+static constexpr uint32_t DLLAMA_PLAN_CMD_MAX_MOVES = 64u;
 
 enum PlanCommandMode : uint32_t {
     PLAN_CMD_MODE_NONE = 0u,
@@ -28,9 +33,22 @@ enum PlanCommandKind : uint32_t {
 };
 
 #pragma pack(push, 1)
+struct PlanMove {
+    uint32_t fromNodeIndex;
+    uint32_t toNodeIndex;
+
+    // Units:
+    // - headMove: heads (non-GQA) OR KV heads (GQA lockstep)
+    // - ffnMove: FFN hidden units
+    uint32_t headMove;
+    uint32_t ffnMove;
+
+    uint32_t cmdKind; // PlanCommandKind; optional hint
+};
+
 struct PlanCommand {
     uint32_t magic;   // DLLAMA_PLAN_CMD_MAGIC
-    uint32_t version; // DLLAMA_PLAN_CMD_VERSION
+    uint32_t version; // DLLAMA_PLAN_CMD_VERSION_V1 or _V2
 
     uint32_t seq;     // monotonic id assigned by issuer
     uint32_t mode;    // PlanCommandMode
@@ -46,6 +64,11 @@ struct PlanCommand {
     uint32_t nHeadsToMove; // units: heads
     uint32_t nFfnToMove;   // units: FFN hidden units
 
+    // v2 extension: move list.
+    // If version==V2 and nMoves>0, prefer moves[] over the legacy single-edge fields above.
+    uint32_t nMoves;
+    PlanMove moves[DLLAMA_PLAN_CMD_MAX_MOVES];
+
     uint32_t reserved0;
 };
 #pragma pack(pop)
@@ -54,7 +77,7 @@ static inline PlanCommand makeEmptyPlanCommand() {
     PlanCommand c;
     std::memset(&c, 0, sizeof(c));
     c.magic = DLLAMA_PLAN_CMD_MAGIC;
-    c.version = DLLAMA_PLAN_CMD_VERSION;
+    c.version = DLLAMA_PLAN_CMD_VERSION_V2;
     c.seq = 0u;
     c.mode = PLAN_CMD_MODE_NONE;
     c.stageIndex = 0xFFFFFFFFu;
@@ -65,8 +88,19 @@ static inline PlanCommand makeEmptyPlanCommand() {
     c.cmdKind = 0u;
     c.nHeadsToMove = 0u;
     c.nFfnToMove = 0u;
+    c.nMoves = 0u;
     c.reserved0 = 0u;
     return c;
+}
+
+static inline bool isValidPlanCommandHeader(const PlanCommand &pc) {
+    if (pc.magic != DLLAMA_PLAN_CMD_MAGIC) return false;
+    if (pc.version != DLLAMA_PLAN_CMD_VERSION_V1 && pc.version != DLLAMA_PLAN_CMD_VERSION_V2) return false;
+    return true;
+}
+
+static inline bool planCommandHasMoveList(const PlanCommand &pc) {
+    return (pc.version == DLLAMA_PLAN_CMD_VERSION_V2) && (pc.nMoves != 0u);
 }
 
 struct PlanCommandSnapshot {

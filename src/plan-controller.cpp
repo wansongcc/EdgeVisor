@@ -72,7 +72,7 @@ static std::string modeToStr(uint32_t mode) {
 }
 
 static json cmdToJson(const PlanCommand &c) {
-    return json{
+    json out = json{
         {"seq", c.seq},
         {"mode", modeToStr(c.mode)},
         {"stageIndex", c.stageIndex},
@@ -84,6 +84,23 @@ static json cmdToJson(const PlanCommand &c) {
         {"nHeadsToMove", c.nHeadsToMove},
         {"nFfnToMove", c.nFfnToMove}
     };
+
+    if (c.version == DLLAMA_PLAN_CMD_VERSION_V2 && c.nMoves != 0u) {
+        json arr = json::array();
+        const uint32_t n = c.nMoves;
+        for (uint32_t i = 0; i < n && i < DLLAMA_PLAN_CMD_MAX_MOVES; ++i) {
+            const PlanMove &m = c.moves[i];
+            arr.push_back(json{
+                {"fromNodeIndex", m.fromNodeIndex},
+                {"toNodeIndex", m.toNodeIndex},
+                {"cmdKind", m.cmdKind},
+                {"headMove", m.headMove},
+                {"ffnMove", m.ffnMove}
+            });
+        }
+        out["moves"] = arr;
+    }
+    return out;
 }
 
 static bool parseMode(const std::string &s, uint32_t &out) {
@@ -195,7 +212,7 @@ void PlanUdsController::run() {
 
                 PlanCommand cmd = makeEmptyPlanCommand();
                 cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
-                cmd.version = DLLAMA_PLAN_CMD_VERSION;
+                cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
                 cmd.seq = parseU32(jcmd, "seq", 0u);
 
                 const std::string modeStr = jcmd.value("mode", "");
@@ -204,11 +221,38 @@ void PlanUdsController::run() {
                 }
 
                 cmd.stageIndex = parseU32(jcmd, "stageIndex", 0u);
+
+                // Legacy single-edge fields (used when moves[] is not provided).
                 cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
                 cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 1u);
                 cmd.cmdKind = parseU32(jcmd, "cmdKind", PLAN_CMD_KIND_BOTH);
                 cmd.nHeadsToMove = parseU32(jcmd, "nHeadsToMove", 1u);
                 cmd.nFfnToMove = parseU32(jcmd, "nFfnToMove", 256u);
+
+                // Optional v2 move list: moves=[{fromNodeIndex,toNodeIndex,cmdKind,headMove,ffnMove}, ...]
+                cmd.nMoves = 0u;
+                if (jcmd.contains("moves")) {
+                    const json &jmoves = jcmd.at("moves");
+                    if (!jmoves.is_array()) {
+                        throw std::runtime_error("moves must be an array");
+                    }
+                    const size_t count = jmoves.size();
+                    if (count > (size_t)DLLAMA_PLAN_CMD_MAX_MOVES) {
+                        throw std::runtime_error("too many moves (exceeds DLLAMA_PLAN_CMD_MAX_MOVES)");
+                    }
+                    cmd.nMoves = (uint32_t)count;
+                    for (size_t i = 0; i < count; ++i) {
+                        const json &m = jmoves.at(i);
+                        PlanMove pm;
+                        std::memset(&pm, 0, sizeof(pm));
+                        pm.fromNodeIndex = parseU32(m, "fromNodeIndex", 0u);
+                        pm.toNodeIndex = parseU32(m, "toNodeIndex", 0u);
+                        pm.cmdKind = parseU32(m, "cmdKind", PLAN_CMD_KIND_BOTH);
+                        pm.headMove = parseU32(m, "headMove", 0u);
+                        pm.ffnMove = parseU32(m, "ffnMove", 0u);
+                        cmd.moves[i] = pm;
+                    }
+                }
 
                 if (cmd.mode == PLAN_CMD_MODE_EXACT) {
                     if (!jcmd.contains("triggerPos") || !jcmd.contains("triggerLayer")) {

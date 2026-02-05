@@ -521,7 +521,7 @@ NnUnevenPartitionPlan createPartitionPlan(
             // KV Compute Heads (with redundancy padding)
             // This range is used to optionally compute extra KV heads for online migrations.
             // Ownership (and default KV cache layout) is still defined by kvHeadSplit.
-            const NnUint kvPad = 2u;
+            const NnUint kvPad = NN_KV_REDUNDANCY_PAD_HEADS;
             for (NnUint i = 0; i < config.nNodes; i++) {
                 const NnUint globalIdx = currentNodeOffset + i;
                 const NnUint start0 = plan.kvHeadSplit.starts[globalIdx];

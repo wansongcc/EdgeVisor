@@ -27,6 +27,11 @@
 // Primitives
 // ======================================================================================
 
+// KV redundancy padding (in KV heads) used by kvHeadComputeSplit.
+// Online KV-head migration without explicit KV cache transfer is only safe when the moved
+// KV heads stay within this precomputed overlap.
+static constexpr NnUint NN_KV_REDUNDANCY_PAD_HEADS = 2u;
+
 typedef struct {
     NnFloatType floatType;
     NnUint z;

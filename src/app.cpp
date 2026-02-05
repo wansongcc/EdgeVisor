@@ -158,6 +158,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.modelPath = nullptr;
     args.tokenizerPath = nullptr;
     args.prompt = nullptr;
+    args.interactive = false;
     args.syncType = F_32;
     args.nWorkers = 0;
     args.workerHosts = nullptr;
@@ -203,6 +204,18 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.benchmark = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--interactive") == 0) {
+            // Support both: "--interactive" and "--interactive 1|0".
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.interactive = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.interactive = true;
                 i += 1;
             }
             continue;
@@ -804,7 +817,7 @@ bool WorkerLlmInference::tryReadControlPacket() {
     if ((controlPacket.flags & LLM_CTRL_HAS_PLAN_CMD) != 0u) {
         PlanCommand cmd;
         network->read(ROOT_SOCKET_INDEX, &cmd, sizeof(cmd));
-        if (cmd.magic == DLLAMA_PLAN_CMD_MAGIC && cmd.version == DLLAMA_PLAN_CMD_VERSION) {
+        if (cmd.magic == DLLAMA_PLAN_CMD_MAGIC && (cmd.version == DLLAMA_PLAN_CMD_VERSION_V1 || cmd.version == DLLAMA_PLAN_CMD_VERSION_V2)) {
             // Avoid redundant stores when multiple forwards share the same seq.
             if (controlPacket.planCmdSeq != lastPlanCmdSeqRecv) {
                 planCommandCache().store(cmd);

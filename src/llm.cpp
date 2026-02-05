@@ -757,12 +757,18 @@ static NnNodeConfig buildLlmNodeInternal(
     bool enableKvRedundancy = fullAttBuffers && plan != nullptr &&
         plan->kvHeadComputeSplit.starts != nullptr && plan->kvHeadComputeSplit.lengths != nullptr;
 
-    // Online migration test hook: by default we keep the older, correctness-first behavior and
-    // disable KV redundancy when plan barrier/migration is enabled.
-    // If you want redundancy to provide a "no extra comm" migration experiment, opt-in via:
-    //   DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=1
-    if (enablePlanBarrier && std::getenv("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION") == nullptr) {
-        enableKvRedundancy = false;
+    // Online migration hook: KV redundancy is now enabled by default during migration.
+    // This relies on kvHeadComputeSplit padding (see NN_KV_REDUNDANCY_PAD_HEADS).
+    // You can still disable it by setting:
+    //   DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=0
+    if (enablePlanBarrier) {
+        const char *v = std::getenv("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION");
+        if (v != nullptr) {
+            // Treat "0" / "false" as disabled; anything else enables.
+            if (v[0] == '0' || ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A'))) {
+                enableKvRedundancy = false;
+            }
+        }
     }
 
     NnRowMatmulSliceUneven kSlice = enableKvRedundancy

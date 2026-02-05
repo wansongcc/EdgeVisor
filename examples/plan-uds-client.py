@@ -31,12 +31,37 @@ def cmd_set_plan(args: argparse.Namespace) -> Dict[str, Any]:
         "seq": args.seq,
         "mode": args.mode,
         "stageIndex": args.stage,
-        "fromNodeIndex": args.from_node,
-        "toNodeIndex": args.to_node,
-        "cmdKind": args.kind,
-        "nHeadsToMove": args.heads,
-        "nFfnToMove": args.ffn,
     }
+
+    # v2 multi-move mode: --move FROM,TO,KIND,HEADS,FFN (repeatable)
+    # Examples:
+    #   --move 0,1,3,1,256 --move 2,1,3,1,256 --move 3,2,3,1,256
+    if args.move:
+        moves = []
+        for spec in args.move:
+            parts = [p.strip() for p in spec.split(",") if p.strip() != ""]
+            if len(parts) not in (2, 3, 4, 5):
+                raise SystemExit("--move expects FROM,TO[,KIND[,HEADS[,FFN]]]")
+            frm = int(parts[0])
+            to = int(parts[1])
+            kind = int(parts[2]) if len(parts) >= 3 else int(args.kind)
+            heads = int(parts[3]) if len(parts) >= 4 else int(args.heads)
+            ffn = int(parts[4]) if len(parts) >= 5 else int(args.ffn)
+            moves.append({
+                "fromNodeIndex": frm,
+                "toNodeIndex": to,
+                "cmdKind": kind,
+                "headMove": heads,
+                "ffnMove": ffn,
+            })
+        cmd["moves"] = moves
+    else:
+        # Legacy single-edge mode
+        cmd["fromNodeIndex"] = args.from_node
+        cmd["toNodeIndex"] = args.to_node
+        cmd["cmdKind"] = args.kind
+        cmd["nHeadsToMove"] = args.heads
+        cmd["nFfnToMove"] = args.ffn
     if args.mode == "exact":
         if args.trigger_pos is None or args.trigger_layer is None:
             raise SystemExit("exact mode requires --trigger-pos and --trigger-layer")
@@ -65,6 +90,12 @@ def main() -> int:
     sp.add_argument("--kind", type=int, default=3, help="1=headSplit 2=ffnSplit 3=both")
     sp.add_argument("--heads", type=int, default=1)
     sp.add_argument("--ffn", type=int, default=256)
+    sp.add_argument(
+        "--move",
+        action="append",
+        default=None,
+        help="repeatable: FROM,TO[,KIND[,HEADS[,FFN]]] (uses v2 moves[]; overrides --from/--to)",
+    )
     sp.add_argument("--trigger-pos", type=int, default=None)
     sp.add_argument("--trigger-layer", type=int, default=None)
 

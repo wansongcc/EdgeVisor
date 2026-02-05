@@ -63,6 +63,7 @@
       "program": "/workspace/dllama/distributed-llama/dllama",
       "args": [
         "inference",
+        "--interactive",
         "--prompt", "The capital of France is",
         "--steps", "64",
         "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
@@ -92,32 +93,32 @@
         { "name": "DLLAMA_DEBUG_TP_RANGES_LAYER_SPAN", "value": "2" },
         { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT", "value": "1" },
         { "name": "DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION", "value": "1" },
-        { "name": "DLLAMA_DEBUG_ATT", "value": "1" },
-        { "name": "DLLAMA_DEBUG_ATT_FILTER", "value": "block_multihead_att"},
-        { "name": "DLLAMA_DEBUG_ATT_HEAD", "value": "-1" },
-        { "name": "DLLAMA_DEBUG_ATT_QK", "value": "1" },
-        { "name": "DLLAMA_DEBUG_ATT_QK_DIMS", "value": "16" },
-        { "name": "DLLAMA_DEBUG_ATT_QK_TOPK", "value": "5" },
+        // { "name": "DLLAMA_DEBUG_ATT", "value": "1" },
+        // { "name": "DLLAMA_DEBUG_ATT_FILTER", "value": "block_multihead_att"},
+        // { "name": "DLLAMA_DEBUG_ATT_HEAD", "value": "-1" },
+        // { "name": "DLLAMA_DEBUG_ATT_QK", "value": "1" },
+        // { "name": "DLLAMA_DEBUG_ATT_QK_DIMS", "value": "16" },
+        // { "name": "DLLAMA_DEBUG_ATT_QK_TOPK", "value": "5" },
 
-        // Matmul IO debug: verify whether Q head6/7 slice [768..1024) is produced.
-        { "name": "DLLAMA_DEBUG_MATMUL_IO", "value": "1" },
-        { "name": "DLLAMA_DEBUG_MATMUL_IO_FILTER", "value": "block_matmul_q" },
-        { "name": "DLLAMA_DEBUG_MATMUL_IO_LIMIT", "value": "0" },
-        { "name": "DLLAMA_DEBUG_MATMUL_IO_OUT_OFFSET", "value": "768" },
-        { "name": "DLLAMA_DEBUG_MATMUL_IO_OUT_LEN", "value": "256" },
+        // // Matmul IO debug: verify whether Q head6/7 slice [768..1024) is produced.
+        // { "name": "DLLAMA_DEBUG_MATMUL_IO", "value": "1" },
+        // { "name": "DLLAMA_DEBUG_MATMUL_IO_FILTER", "value": "block_matmul_q" },
+        // { "name": "DLLAMA_DEBUG_MATMUL_IO_LIMIT", "value": "0" },
+        // { "name": "DLLAMA_DEBUG_MATMUL_IO_OUT_OFFSET", "value": "768" },
+        // { "name": "DLLAMA_DEBUG_MATMUL_IO_OUT_LEN", "value": "256" },
 
-        // Print KV cache values per KV-head owned by each node (CPU attention only)
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD", "value": "1" },
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_FILTER", "value": "block_multihead_att" },
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_DIMS", "value": "8" },
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_LIMIT", "value": "64" },
-        // Print redundant heads too (global kvHead numbering)
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_GLOBAL", "value": "1" },
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEADS", "value": "2-3" },
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_POS", "value": "32" },
-        // Needed for SHIFT logging when redundancy sets dstColStartUnit=0
-        { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_HEADDIM", "value": "128" },
-        { "name": "DLLAMA_DEBUG_ATT_SCORES", "value": "1" },
+        // // Print KV cache values per KV-head owned by each node (CPU attention only)
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD", "value": "1" },
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_FILTER", "value": "block_multihead_att" },
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_DIMS", "value": "8" },
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_LIMIT", "value": "64" },
+        // // Print redundant heads too (global kvHead numbering)
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_GLOBAL", "value": "1" },
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEADS", "value": "2-3" },
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_POS", "value": "32" },
+        // // Needed for SHIFT logging when redundancy sets dstColStartUnit=0
+        // { "name": "DLLAMA_DEBUG_KVCACHE_PER_HEAD_HEADDIM", "value": "128" },
+        // { "name": "DLLAMA_DEBUG_ATT_SCORES", "value": "1" },
         // { "name": "kvcache_debug", "value": "1" },
         // { "name": "DLLAMA_KV_AGGREGATE", "value": "1" },
         // { "name": "DLLAMA_KV_AGGREGATE_IN_FULL", "value": "1" },

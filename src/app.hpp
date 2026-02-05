@@ -24,6 +24,7 @@ public:
     char *modelPath;
     char *tokenizerPath;
     char *prompt;
+    bool interactive;
     NnFloatType syncType;
     NnUint nWorkers;
     char **workerHosts;

@@ -18,6 +18,10 @@ private:
     NnNetExecution *netExecution;
     const NnUnevenPartitionPlan *partitionPlan;
     std::atomic_uint planEpoch{0u};
+    // One-shot trigger guard for PlanCommand MODE_NEXT_BARRIER and repeated forwards.
+    // We intentionally do NOT consume the global planCommandCache in barrier, so apply can
+    // still read the full move list (v2). This seq guards against repeated emits.
+    std::atomic_uint lastPlanCmdSeqEmitted{0u};
     // Cached position for tp-range logging across segments.
     // Attention/RoPE ops read POS pipe, but FFN ops usually don't.
     std::atomic_uint lastPos{0xFFFFFFFFu};
@@ -39,6 +43,9 @@ public:
     unsigned int getPlanEpoch() const { return planEpoch.load(std::memory_order_acquire); }
     void setPlanEpoch(unsigned int e) { planEpoch.store(e, std::memory_order_release); }
     NnUint getNodeIndex() const { return nodeConfig ? nodeConfig->nodeIndex : 0u; }
+
+    unsigned int getLastPlanCmdSeqEmitted() const { return lastPlanCmdSeqEmitted.load(std::memory_order_acquire); }
+    void setLastPlanCmdSeqEmitted(unsigned int s) { lastPlanCmdSeqEmitted.store(s, std::memory_order_release); }
 
     NnUint getLastPos() const { return lastPos.load(std::memory_order_acquire); }
     void setLastPos(NnUint p) { lastPos.store(p, std::memory_order_release); }

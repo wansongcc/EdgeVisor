@@ -17,6 +17,542 @@
 #include "nn-quants.hpp"
 #include "llamafile/sgemm.hpp"
 
+#ifndef DLLAMA_DEBUG_ATTN
+#define DLLAMA_DEBUG_ATTN 0
+#endif
+
+#if DLLAMA_DEBUG_ATTN
+
+static inline bool kvCacheDebugEnabled() {
+    // Primary switch requested by users.
+    if (std::getenv("kvcache_debug") != nullptr) return true;
+    // Legacy alias used by existing tracing in nn-cpu.cpp.
+    if (std::getenv("DLLAMA_DEBUG_KV_RANGE") != nullptr) return true;
+    return false;
+}
+
+static inline bool kvCachePerHeadEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD");
+    if (v == nullptr) return false;
+    return std::atoi(v) != 0;
+}
+
+static inline bool kvCachePerHeadPassesFilter(const char *opName) {
+    const char *filter = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_FILTER");
+    if (filter == nullptr || filter[0] == '\0') return true;
+    if (opName == nullptr) return false;
+    return std::strstr(opName, filter) != nullptr;
+}
+
+static inline NnUint kvCachePerHeadLimit() {
+    // 0 means unlimited.
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_LIMIT");
+    if (v == nullptr) return 32u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline NnUint kvCachePerHeadBatch() {
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_BATCH");
+    if (v == nullptr) return 0u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n < 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline long kvCachePerHeadSelectKvHead() {
+    // >=0: only print that global kvHead; -1: print all owned kvHeads.
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEAD");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline const char *kvCachePerHeadSelectKvHeadsSpec() {
+    // Optional: comma-separated list / ranges of global kvHeads to print, e.g. "4,5" or "4-7".
+    // When set, this overrides DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEAD.
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEADS");
+    if (v == nullptr || v[0] == '\0') return nullptr;
+    return v;
+}
+
+static inline bool kvCachePerHeadGlobalEnabled() {
+    // When enabled, printing in MHA uses global kvHead numbering directly (0..nKvHeads),
+    // and can print heads outside the owned kvStart/kvDim0 slice (e.g. redundant compute heads),
+    // as long as the KV cache buffers are allocated as full global tensors.
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_GLOBAL");
+    if (v == nullptr) return false;
+    return std::atoi(v) != 0;
+}
+
+static inline bool kvHeadMatchesSelection(NnUint globalKvHead, const char *spec, long singleSel) {
+    if (spec == nullptr || spec[0] == '\0') {
+        return (singleSel < 0) ? true : ((NnUint)singleSel == globalKvHead);
+    }
+
+    // Parse tokens like: "4", "4-7", separated by comma or whitespace.
+    const char *p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (*p == '\0') break;
+
+        char *end = nullptr;
+        long a = std::strtol(p, &end, 10);
+        if (end == p) {
+            // Skip invalid token.
+            while (*p && *p != ',' && *p != ' ' && *p != '\t') ++p;
+            continue;
+        }
+        p = end;
+
+        long b = a;
+        if (*p == '-') {
+            ++p;
+            char *end2 = nullptr;
+            b = std::strtol(p, &end2, 10);
+            if (end2 != p) {
+                p = end2;
+            } else {
+                // Trailing '-', treat as single.
+                b = a;
+            }
+        }
+
+        if (a < 0) a = 0;
+        if (b < 0) b = 0;
+        if (a > b) std::swap(a, b);
+        if ((long)globalKvHead >= a && (long)globalKvHead <= b) return true;
+
+        while (*p && *p != ',' && *p != ' ' && *p != '\t') ++p;
+    }
+    return false;
+}
+
+static inline long kvCachePerHeadSelectPos() {
+    // >=0: only print at that position; -1: print all positions.
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_POS");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline NnUint kvCachePerHeadDims() {
+    // Number of dims to print per head. 0 means "print full headDim".
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_DIMS");
+    if (v == nullptr) return 8u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 4096) return 4096u;
+    return (NnUint)n;
+}
+
+static inline bool kvCachePerHeadShiftEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT");
+    if (v == nullptr) return false;
+    return std::atoi(v) != 0;
+}
+
+static inline NnUint kvCachePerHeadHeadDimOverride() {
+    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_HEADDIM");
+    if (v == nullptr) return 0u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 4096) return 4096u;
+    return (NnUint)n;
+}
+
+static inline bool attDebugEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT");
+    if (v == nullptr) return false;
+    return std::atoi(v) != 0;
+}
+
+static inline bool attDebugPassesFilter(const char *opName) {
+    const char *filter = std::getenv("DLLAMA_DEBUG_ATT_FILTER");
+    if (filter == nullptr || filter[0] == '\0') return true;
+    if (opName == nullptr) return false;
+    return std::strstr(opName, filter) != nullptr;
+}
+
+static inline NnUint attDebugLimit() {
+    // 0 means unlimited.
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_LIMIT");
+    if (v == nullptr) return 0u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline NnUint attDebugBatch() {
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_BATCH");
+    if (v == nullptr) return 0u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n < 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline long attDebugHead() {
+    // >=0: print only that local q-head; -1: print all local q-heads.
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_HEAD");
+    if (v == nullptr) return 0;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline bool attQkEnabled() {
+    // Print attention inputs Q/K and dot(q,k) for the selected head.
+    // Enable with: DLLAMA_DEBUG_ATT_QK=1
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK");
+    if (v == nullptr) return false;
+    return std::atoi(v) != 0;
+}
+
+static inline NnUint attQkDims() {
+    // Number of dims to print from Q/K vectors.
+    // 0 means full headDim (capped).
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK_DIMS");
+    if (v == nullptr) return 16u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 4096) return 4096u;
+    return (NnUint)n;
+}
+
+static inline NnUint attQkTopK() {
+    // Print K vectors for the top-K attention weights (after softmax).
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK_TOPK");
+    if (v == nullptr) return 5u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 256) return 256u;
+    return (NnUint)n;
+}
+
+static inline long attQkForcePos() {
+    // If set to >=0, print only this position index (within [0,len)).
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK_POS");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline bool attScoresEnabled() {
+    // Print per-head attention scores/weights (the softmax row) as a list.
+    // Enable with: DLLAMA_DEBUG_ATT_SCORES=1
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_SCORES");
+    if (v == nullptr) return false;
+    return std::atoi(v) != 0;
+}
+
+static inline NnUint attScoresMaxLen() {
+    // Max number of positions to print from the attention row.
+    // 0 means print full length (capped).
+    const char *v = std::getenv("DLLAMA_DEBUG_ATT_SCORES_MAXLEN");
+    if (v == nullptr) return 64u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 8192) return 8192u;
+    return (NnUint)n;
+}
+
+static void printAttRowValues(const float *attRow, NnUint len, NnUint maxLen) {
+    if (attRow == nullptr || len == 0u) return;
+    const NnUint cap = 8192u;
+    const NnUint n = (maxLen == 0u) ? std::min(len, cap) : std::min(len, std::min(maxLen, cap));
+    printf("🧪 [att][scores] len=%u printing=%u:", (unsigned)len, (unsigned)n);
+    for (NnUint i = 0u; i < n; ++i) {
+        printf(" %u:%.6f", (unsigned)i, (double)attRow[i]);
+    }
+    if (n < len) printf(" ...");
+    printf("\n");
+}
+
+static void selectTopKIndices(const float *row, NnUint len, NnUint k, std::vector<NnUint> &outIdx) {
+    outIdx.clear();
+    if (row == nullptr || len == 0u || k == 0u) return;
+    k = std::min(k, len);
+    struct Item { float v; NnUint i; };
+    std::vector<Item> items;
+    items.reserve(len);
+    for (NnUint i = 0u; i < len; ++i) items.push_back(Item{row[i], i});
+    const auto cmp = [](const Item &a, const Item &b) { return a.v > b.v; };
+    if (len > k) {
+        std::nth_element(items.begin(), items.begin() + k, items.end(), cmp);
+        items.resize(k);
+    }
+    std::sort(items.begin(), items.end(), cmp);
+    outIdx.reserve(k);
+    for (const auto &it : items) outIdx.push_back(it.i);
+}
+
+static void printVecDims(const char *tag, const float *v, NnUint n, NnUint maxPrint) {
+    if (tag == nullptr) tag = "vec";
+    if (v == nullptr || n == 0u) {
+        printf("%s=[]", tag);
+        return;
+    }
+    const NnUint cap = 256u;
+    const NnUint dims = (maxPrint == 0u) ? std::min(n, cap) : std::min(n, std::min(maxPrint, cap));
+    printf("%s=[", tag);
+    for (NnUint i = 0u; i < dims; ++i) {
+        if (i) printf(",");
+        printf("%.6f", (double)v[i]);
+    }
+    if (dims < n) printf(",...");
+    printf("]");
+}
+
+static double l2NormSq_F32(const float *v, NnUint n) {
+    if (v == nullptr || n == 0u) return 0.0;
+    double s = 0.0;
+    for (NnUint i = 0u; i < n; ++i) {
+        const double x = (double)v[i];
+        s += x * x;
+    }
+    return s;
+}
+
+static inline bool matmulIoDebugEnabledForOp(const char *opName) {
+    if (std::getenv("DLLAMA_DEBUG_MATMUL_IO") == nullptr) return false;
+    const char *filter = std::getenv("DLLAMA_DEBUG_MATMUL_IO_FILTER");
+    if (filter == nullptr || filter[0] == '\0') return true;
+    if (opName == nullptr) return false;
+    return (std::strstr(opName, filter) != nullptr);
+}
+
+static inline NnUint matmulIoDebugLimit() {
+    const char *v = std::getenv("DLLAMA_DEBUG_MATMUL_IO_LIMIT");
+    if (v == nullptr) return 20u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 100000) return 100000u;
+    return (NnUint)n;
+}
+
+static inline NnUint matmulIoOutOffset() {
+    const char *v = std::getenv("DLLAMA_DEBUG_MATMUL_IO_OUT_OFFSET");
+    if (v == nullptr) return 0u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline NnUint matmulIoOutLen() {
+    const char *v = std::getenv("DLLAMA_DEBUG_MATMUL_IO_OUT_LEN");
+    if (v == nullptr) return 64u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static void printMatmulOutSummaryF32(
+    const char *opName,
+    NnUint opIndex,
+    NnUint y,
+    NnUint e,
+    const float *outBase,
+    NnUint outLen,
+    NnUint cViewOffset,
+    NnUint cLen,
+    NnUint sliceOffset,
+    NnUint sliceLen)
+{
+    if (outBase == nullptr || outLen == 0u) return;
+    sliceOffset = std::min(sliceOffset, outLen);
+    const NnUint maxSlice = outLen - sliceOffset;
+    const NnUint n = (sliceLen == 0u) ? std::min(outLen, 256u) : std::min(sliceLen, maxSlice);
+    const float *p = outBase + sliceOffset;
+
+    float minV = p[0], maxV = p[0];
+    double normSq = 0.0;
+    NnUint zeros = 0u;
+    for (NnUint i = 0u; i < n; ++i) {
+        const float v = p[i];
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+        normSq += (double)v * (double)v;
+        if (v == 0.0f) ++zeros;
+    }
+
+    printf("🔬 [matmul][io] op=%s opIndex=%u y=%u e=%u outBase=%p outLen=%u cViewOff=%u cLen=%u outSlice=[%u,%u) min=%.6f max=%.6f norm=%.6f zeros=%u/%u head=" ,
+        (opName ? opName : "Unknown"),
+        (unsigned)opIndex,
+        (unsigned)y,
+        (unsigned)e,
+        (const void *)outBase,
+        (unsigned)outLen,
+        (unsigned)cViewOffset,
+        (unsigned)cLen,
+        (unsigned)sliceOffset,
+        (unsigned)(sliceOffset + n),
+        (double)minV,
+        (double)maxV,
+        (double)std::sqrt(normSq),
+        (unsigned)zeros,
+        (unsigned)n);
+    const NnUint headN = std::min(n, 16u);
+    for (NnUint i = 0u; i < headN; ++i) {
+        printf("%s%.6f", (i == 0u ? "[" : ","), (double)p[i]);
+    }
+    printf("]\n");
+}
+
+static void printMatmulInSummaryQ80(
+    const char *opName,
+    NnUint opIndex,
+    NnUint y,
+    NnUint e,
+    const NnBlockQ80 *x,
+    NnUint aLen)
+{
+    if (x == nullptr || aLen == 0u) return;
+    const NnUint blocks = aLen / Q80_BLOCK_SIZE;
+    const NnUint scanBlocks = std::min(blocks, 16u);
+    NnUint nonZero = 0u;
+    for (NnUint b = 0u; b < scanBlocks; ++b) {
+        for (NnUint i = 0u; i < Q80_BLOCK_SIZE; ++i) {
+            if (x[b].qs[i] != 0) { ++nonZero; break; }
+        }
+    }
+    printf("🔬 [matmul][io] op=%s opIndex=%u y=%u e=%u inType=Q80 x=%p aLen=%u blocks=%u scanBlocks=%u nonZeroBlocks=%u\n",
+        (opName ? opName : "Unknown"),
+        (unsigned)opIndex,
+        (unsigned)y,
+        (unsigned)e,
+        (const void *)x,
+        (unsigned)aLen,
+        (unsigned)blocks,
+        (unsigned)scanBlocks,
+        (unsigned)nonZero);
+}
+
+static inline bool ropeIoDebugEnabledForOp(const char *opName) {
+    if (std::getenv("DLLAMA_DEBUG_ROPE_IO") == nullptr) return false;
+    const char *filter = std::getenv("DLLAMA_DEBUG_ROPE_IO_FILTER");
+    if (filter == nullptr || filter[0] == '\0') return true;
+    if (opName == nullptr) return false;
+    return (std::strstr(opName, filter) != nullptr);
+}
+
+static inline NnUint ropeIoDebugLimit() {
+    const char *v = std::getenv("DLLAMA_DEBUG_ROPE_IO_LIMIT");
+    if (v == nullptr) return 50u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 100000) return 100000u;
+    return (NnUint)n;
+}
+
+static inline NnUint ropeIoOffset() {
+    const char *v = std::getenv("DLLAMA_DEBUG_ROPE_IO_OFFSET");
+    if (v == nullptr) return 0u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline NnUint ropeIoLen() {
+    const char *v = std::getenv("DLLAMA_DEBUG_ROPE_IO_LEN");
+    if (v == nullptr) return 256u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static void printFloatSliceStats(const char *prefix, const char *opName, NnUint opIndex, const float *base, NnUint baseLen, NnUint sliceOff, NnUint sliceLen) {
+    if (base == nullptr || baseLen == 0u) return;
+    sliceOff = std::min(sliceOff, baseLen);
+    const NnUint maxSlice = baseLen - sliceOff;
+    const NnUint n = (sliceLen == 0u) ? std::min(maxSlice, 256u) : std::min(sliceLen, maxSlice);
+    const float *p = base + sliceOff;
+
+    float minV = p[0], maxV = p[0];
+    double normSq = 0.0;
+    NnUint zeros = 0u;
+    for (NnUint i = 0u; i < n; ++i) {
+        const float v = p[i];
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+        normSq += (double)v * (double)v;
+        if (v == 0.0f) ++zeros;
+    }
+    printf("🔁 [%s][io] op=%s opIndex=%u base=%p baseLen=%u slice=[%u,%u) min=%.6f max=%.6f norm=%.6f zeros=%u/%u head=",
+        (prefix ? prefix : "buf"),
+        (opName ? opName : "Unknown"),
+        (unsigned)opIndex,
+        (const void *)base,
+        (unsigned)baseLen,
+        (unsigned)sliceOff,
+        (unsigned)(sliceOff + n),
+        (double)minV,
+        (double)maxV,
+        (double)std::sqrt(normSq),
+        (unsigned)zeros,
+        (unsigned)n);
+    const NnUint headN = std::min(n, 16u);
+    for (NnUint i = 0u; i < headN; ++i) {
+        printf("%s%.6f", (i == 0u ? "[" : ","), (double)p[i]);
+    }
+    printf("]\n");
+}
+
+static inline NnUint kvCacheDebugLimit() {
+    // Default: keep logs bounded.
+    const char *v = std::getenv("kvcache_debug_limit");
+    if (v == nullptr) return 8u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 100000) return 100000u;
+    return (NnUint)n;
+}
+
+static void printAttRowSummary(const float *attRow, NnUint len, NnUint globalQHead, NnUint globalKvHead) {
+    if (attRow == nullptr || len == 0u) return;
+
+    // Compute top-5 entries and a simple entropy metric.
+    struct Top { float v; NnUint i; };
+    Top top[5];
+    for (int k = 0; k < 5; ++k) top[k] = Top{-1.0f, 0u};
+
+    float maxV = -1.0f;
+    NnUint maxI = 0u;
+    double entropy = 0.0;
+
+    for (NnUint i = 0; i < len; ++i) {
+        const float p = attRow[i];
+        if (p > maxV) { maxV = p; maxI = i; }
+        if (p > 0.0f) entropy += -(double)p * std::log((double)p);
+
+        for (int k = 0; k < 5; ++k) {
+            if (p > top[k].v) {
+                for (int s = 4; s > k; --s) top[s] = top[s - 1];
+                top[k] = Top{p, i};
+                break;
+            }
+        }
+    }
+
+    printf("🧪 [att] qHead=%u kvHead=%u len=%u max@%u=%.6f entropy=%.4f top5:",
+        (unsigned)globalQHead,
+        (unsigned)globalKvHead,
+        (unsigned)len,
+        (unsigned)maxI,
+        (double)maxV,
+        entropy);
+    for (int k = 0; k < 5; ++k) {
+        if (top[k].v < 0.0f) break;
+        printf(" (%u,%.6f)", (unsigned)top[k].i, (double)top[k].v);
+    }
+    printf("\n");
+}
+
+#endif // DLLAMA_DEBUG_ATTN
+
 static void noopForward(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     (void)nThreads;
     (void)threadIndex;
@@ -26,7 +562,9 @@ static void noopForward(NnUint nThreads, NnUint threadIndex, NnUint batchSize, N
 
 static float dotProduct_F32(const float *a, const float *b, const unsigned int size);
 
-#define DEBUG_OP_INPUT_OUTPUT false
+#ifndef DEBUG_OP_INPUT_OUTPUT
+    #define DEBUG_OP_INPUT_OUTPUT 0
+#endif
 
 #if DEBUG_OP_INPUT_OUTPUT
     #define DEBUG_VECTOR(context, suffix, v) \
@@ -893,18 +1431,32 @@ static void multiheadAtt_F32(
     float *y, const float *q, float *att, float *keyCache, float *valueCache,
     const NnUint pos, const NnUint nHeads, const NnUint nHeads0, const NnUint nKvHeads,
     const NnUint kvDim0, const NnUint kvStart, const NnUint kvStride,
+    const NnUint qHeadStart,
     const NnUint headDim, const NnUint seqLen,
     const NnUint nThreads, const NnUint threadIndex) 
 {
     SPLIT_THREADS(h0Start, h0End, nHeads0, nThreads, threadIndex);
+    assert(nKvHeads != 0u);
+    assert((nHeads % nKvHeads) == 0u);
     const NnUint kvMul = nHeads / nKvHeads;
     const float headDimRoot = sqrtf(headDim);
+    assert(headDim != 0u);
+    assert((kvStart % headDim) == 0u);
+    assert((kvDim0 % headDim) == 0u);
+    const NnUint kvHeadStart = kvStart / headDim;
+    const NnUint kvHeads0 = kvDim0 / headDim;
 
     for (NnUint h0 = h0Start; h0 < h0End; h0++) {
         const float *hQ = &q[h0 * headDim];
-        const NnUint headIndex = h0 / kvMul;
-        const float *hKc = &keyCache[kvStart + headIndex * headDim];
-        const float *hVc = &valueCache[kvStart + headIndex * headDim];
+        const NnUint globalQHead = qHeadStart + h0;
+        const NnUint globalKvHead = globalQHead / kvMul;
+        const long localKvHeadSigned = (long)globalKvHead - (long)kvHeadStart;
+        assert(localKvHeadSigned >= 0);
+        const NnUint localKvHead = (NnUint)localKvHeadSigned;
+        assert(localKvHead < kvHeads0);
+
+        const float *hKc = &keyCache[kvStart + localKvHead * headDim];
+        const float *hVc = &valueCache[kvStart + localKvHead * headDim];
         float *hAtt = &att[h0 * seqLen];
 
         for (NnUint t = 0; t <= pos; t++) {
@@ -1039,6 +1591,44 @@ static void ropeFalcon_F32(float* x, const float *cache, bool isQ, const NnUint 
             float q1 = x[o + j + slice->headDim / 2];
             x[o + j] = q0 * fcr0 - q1 * fci0;
             x[o + j + slice->headDim / 2] = q0 * fci0 + q1 * fcr0;
+        }
+    }
+}
+
+static void ropeFalcon_F32_view(
+    float *xBase,
+    const float *cache,
+    const bool isQ,
+    const NnUint pos,
+    const NnRopeSlice *slice,
+    const NnUint offset,
+    const NnUint len,
+    const NnUint nThreads,
+    const NnUint threadIndex)
+{
+    (void)isQ;
+    // Falcon RoPE cache is per-position and per-dimension within headDim.
+    // View-slicing is only well-defined when slicing whole heads.
+    assert(slice->headDim != 0u);
+    assert((offset % slice->headDim) == 0u);
+    assert((len % slice->headDim) == 0u);
+
+    const NnUint nHeadsView = len / slice->headDim;
+    float *x = xBase + offset;
+    SPLIT_THREADS(hs, he, nHeadsView, nThreads, threadIndex);
+
+    const float *posCache = &cache[pos * slice->headDim];
+
+    for (NnUint h = hs; h < he; ++h) {
+        const NnUint o = h * slice->headDim;
+        for (NnUint j = 0u; j < slice->headDim / 2u; ++j) {
+            const float fcr0 = posCache[j];
+            const float fci0 = posCache[j + slice->headDim / 2u];
+
+            const float v0 = x[o + j];
+            const float v1 = x[o + j + slice->headDim / 2u];
+            x[o + j] = v0 * fcr0 - v1 * fci0;
+            x[o + j + slice->headDim / 2u] = v0 * fci0 + v1 * fcr0;
         }
     }
 }
@@ -1392,6 +1982,7 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
                 const bool viewAware = (config->aView.offset != 0u || config->aView.sizeX != 0u || config->cView.offset != 0u || config->cView.sizeX != 0u);
                 const bool forceStyle = viewAware && (config->aView.strideX == 0u) && (config->cView.strideX == 0u);
                 const bool offsetActive = (config->aView.offset != 0u || config->cView.offset != 0u);
+#if DLLAMA_DEBUG_ATTN
                 printf("🔎 [matmul][llamafile] op=%s viewMode=%u aView={off=%u sizeX=%u strideX=%u} cView={off=%u sizeX=%u strideX=%u} batch=%u nThreads=%u\n",
                     context->name,
                     config->view,
@@ -1404,13 +1995,14 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
                     forceStyle ? 1u : 0u,
                     offsetActive ? 1u : 0u);
                 std::fflush(stdout);
+#endif
             }
         }
     }
 
     const NnUint n = context->weightSize.y / getBlockSize(context->inputSize.floatType);
     const NnUint d = context->weightSize.x;
-    return llamafile_sgemm(
+    const bool ok = llamafile_sgemm(
         d, batchSize, n,
         context->weight, n,
         context->input[0], n,
@@ -1420,6 +2012,37 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
         context->inputSize.floatType,
         F_32
     );
+
+    // Optional matmul IO debug summary (best-effort; prints from thread 0).
+#if DLLAMA_DEBUG_ATTN
+    if (ok && threadIndex == 0u) {
+        static std::atomic<NnUint> ioPrinted{0u};
+        const bool ioDbg = matmulIoDebugEnabledForOp(context->name);
+        const NnUint ioLimit = matmulIoDebugLimit();
+        const NnUint ioOutOff = matmulIoOutOffset();
+        const NnUint ioOutLen = matmulIoOutLen();
+        if (ioDbg) {
+            const NnUint idx = ioPrinted.fetch_add(1u, std::memory_order_relaxed);
+            if (ioLimit == 0u || idx < ioLimit) {
+                // This fast path implies cView/aView offsets are 0 and cLen == outputSize.x.
+                const float *outBase = (const float *)context->output[0];
+                printMatmulOutSummaryF32(
+                    context->name,
+                    context->opIndex,
+                    0u,
+                    0u,
+                    outBase,
+                    context->outputSize.x,
+                    0u,
+                    context->outputSize.x,
+                    ioOutOff,
+                    ioOutLen);
+            }
+        }
+    }
+#endif
+
+    return ok;
 }
 
 static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
@@ -1429,6 +2052,14 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
     const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
     const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
     const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
+
+#if DLLAMA_DEBUG_ATTN
+    static std::atomic<NnUint> ioPrinted{0u};
+    const bool ioDbg = matmulIoDebugEnabledForOp(context->name);
+    const NnUint ioLimit = matmulIoDebugLimit();
+    const NnUint ioOutOff = matmulIoOutOffset();
+    const NnUint ioOutLen = matmulIoOutLen();
+#endif
 
     for (NnUint y = 0; y < batchSize; y++) {
         for (NnUint e = 0; e < nActiveExpertsOr1; e++) {
@@ -1490,6 +2121,25 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
                 throw std::runtime_error("Unsupported matmul view mode");
             }
             DEBUG_VECTOR(context, "output", output);
+
+#if DLLAMA_DEBUG_ATTN
+            if (ioDbg && threadIndex == 0u) {
+                const NnUint idx = ioPrinted.fetch_add(1u, std::memory_order_relaxed);
+                if (ioLimit == 0u || idx < ioLimit) {
+                    printMatmulOutSummaryF32(
+                        context->name,
+                        context->opIndex,
+                        y,
+                        e,
+                        outputBase,
+                        context->outputSize.x,
+                        cView->offset,
+                        cLen,
+                        ioOutOff,
+                        ioOutLen);
+                }
+            }
+#endif
         }
     }
 }
@@ -1501,6 +2151,14 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
     const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
     const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
     const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
+
+#if DLLAMA_DEBUG_ATTN
+    static std::atomic<NnUint> ioPrinted{0u};
+    const bool ioDbg = matmulIoDebugEnabledForOp(context->name);
+    const NnUint ioLimit = matmulIoDebugLimit();
+    const NnUint ioOutOff = matmulIoOutOffset();
+    const NnUint ioOutLen = matmulIoOutLen();
+#endif
 
     for (NnUint y = 0; y < batchSize; y++) {
         for (NnUint e = 0; e < nActiveExpertsOr1; e++) {
@@ -1567,6 +2225,26 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
                 throw std::runtime_error("Unsupported matmul view mode");
             }
             DEBUG_VECTOR(context, "output", output);
+
+#if DLLAMA_DEBUG_ATTN
+            if (ioDbg && threadIndex == 0u) {
+                const NnUint idx = ioPrinted.fetch_add(1u, std::memory_order_relaxed);
+                if (ioLimit == 0u || idx < ioLimit) {
+                    printMatmulInSummaryQ80(context->name, context->opIndex, y, e, x, aLen);
+                    printMatmulOutSummaryF32(
+                        context->name,
+                        context->opIndex,
+                        y,
+                        e,
+                        outputBase,
+                        context->outputSize.x,
+                        cView->offset,
+                        cLen,
+                        ioOutOff,
+                        ioOutLen);
+                }
+            }
+#endif
         }
     }
 }
@@ -1687,9 +2365,34 @@ static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
 
     assert(strideX == 1u);
 
+#if DLLAMA_DEBUG_ATTN
+    static std::atomic<NnUint> ropePrinted{0u};
+    const bool ropeDbg = ropeIoDebugEnabledForOp(context->name);
+    const NnUint ropeLimit = ropeIoDebugLimit();
+    const NnUint ropeOff = ropeIoOffset();
+    const NnUint ropeLen = ropeIoLen();
+#endif
+
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *x = (float *)context->input[batchIndex];
         const NnUint pos = (NnUint)positions[batchIndex];
+
+#if DLLAMA_DEBUG_ATTN
+        if (ropeDbg && threadIndex == 0u) {
+            const NnUint idx = ropePrinted.fetch_add(1u, std::memory_order_relaxed);
+            if (ropeLimit == 0u || idx < ropeLimit) {
+                printf("🔁 [rope][io] op=%s opIndex=%u batch=%u pos=%u isQ=%u viewOff=%u viewLen=%u\n",
+                    (context->name ? context->name : "Unknown"),
+                    (unsigned)context->opIndex,
+                    (unsigned)batchIndex,
+                    (unsigned)pos,
+                    (unsigned)(isQ ? 1u : 0u),
+                    (unsigned)offset,
+                    (unsigned)len);
+                printFloatSliceStats("rope-in", context->name, context->opIndex, x, context->inputSize.x, ropeOff, ropeLen);
+            }
+        }
+#endif
 
         if (config->type == ROPE_LLAMA || config->type == ROPE_LLAMA3_1) {
             const NnUint dim0 = isQ ? slice->qDim0 : slice->kvDim0;
@@ -1700,12 +2403,26 @@ static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
                 ropeLlama_F32_view(x + offset, cache, isQ, pos, slice, offset, len, nThreads, threadIndex);
             }
         } else if (config->type == ROPE_FALCON) {
-            // Falcon RoPE view-slicing is not implemented yet.
-            assert(offset == 0u && len == (isQ ? slice->qDim0 : slice->kvDim0));
-            ropeFalcon_F32(x, cache, isQ, pos, slice, nThreads, threadIndex);
+            const NnUint dim0 = isQ ? slice->qDim0 : slice->kvDim0;
+            assert(offset + len <= dim0);
+            if (offset == 0u && len == dim0) {
+                ropeFalcon_F32(x, cache, isQ, pos, slice, nThreads, threadIndex);
+            } else {
+                ropeFalcon_F32_view(x, cache, isQ, pos, slice, offset, len, nThreads, threadIndex);
+            }
         } else {
             throw std::runtime_error("Unsupported rope type");
         }
+
+#if DLLAMA_DEBUG_ATTN
+        if (ropeDbg && threadIndex == 0u) {
+            const NnUint idx = ropePrinted.load(std::memory_order_relaxed);
+            // Use the same budget as the pre-print.
+            if (ropeLimit == 0u || (idx - 1u) < ropeLimit) {
+                printFloatSliceStats("rope-out", context->name, context->opIndex, x, context->inputSize.x, ropeOff, ropeLen);
+            }
+        }
+#endif
     }
 }
 
@@ -1732,6 +2449,34 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
     float *att = (float *)context->buffers[config->attBufferIndex];
     const float *positions = (float *)context->pipes[config->positionPipeIndex];
 
+#if DLLAMA_DEBUG_ATTN
+    static std::atomic<NnUint> dbgPrinted{0u};
+    const bool dbg = kvCacheDebugEnabled();
+    const NnUint dbgLimit = kvCacheDebugLimit();
+    
+    static std::atomic<NnUint> kvPerHeadPrinted{0u};
+    const bool kvPerHeadDbg = kvCachePerHeadEnabled();
+    const NnUint kvPerHeadLimit = kvCachePerHeadLimit();
+    const NnUint kvPerHeadBatchSel = kvCachePerHeadBatch();
+    const long kvPerHeadKvHeadSel = kvCachePerHeadSelectKvHead();
+    const char *kvPerHeadKvHeadsSpec = kvCachePerHeadSelectKvHeadsSpec();
+    const long kvPerHeadPosSel = kvCachePerHeadSelectPos();
+    const NnUint kvPerHeadDimsSel = kvCachePerHeadDims();
+    const bool kvPerHeadGlobal = kvCachePerHeadGlobalEnabled();
+    
+    static std::atomic<NnUint> attPrinted{0u};
+    const bool attDbg = attDebugEnabled();
+    const NnUint attLimit = attDebugLimit();
+    const NnUint attBatch = attDebugBatch();
+    const long attHeadSel = attDebugHead();
+    const bool attScores = attScoresEnabled();
+    const NnUint attScoresLen = attScoresMaxLen();
+    const bool attQkDbg = attQkEnabled();
+    const NnUint attQkDimsSel = attQkDims();
+    const NnUint attQkTopKSel = attQkTopK();
+    const long attQkPosSel = attQkForcePos();
+#endif
+
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *y = (float *)context->output[batchIndex];
         const NnUint qStride = config->qStride == 0u ? config->qSliceD0 : config->qStride;
@@ -1739,7 +2484,126 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
         NnUint pos = (NnUint)positions[batchIndex];
         assert(pos < config->seqLen);
 
+        const NnUint qHeadStart = (config->headDim != 0u) ? (config->qStart / config->headDim) : 0u;
+
         const NnUint kvStride = config->kvStride == 0u ? config->kvDim0 : config->kvStride;
+
+        // Debug: print K/V cache values per owned KV-head on this node.
+        // Enable with: DLLAMA_DEBUG_KVCACHE_PER_HEAD=1
+        // Optional:
+        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_FILTER=substring (match op name)
+        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_LIMIT=N (default 32, 0 unlimited)
+        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_BATCH=N (default 0)
+        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_POS=P (default -1 = all)
+        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEAD=H (default -1 = all owned)
+        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_DIMS=D (default 8, 0 = full headDim)
+    #if DLLAMA_DEBUG_ATTN
+        if (kvPerHeadDbg && threadIndex == 0u && batchIndex == kvPerHeadBatchSel && kvCachePerHeadPassesFilter(context->name)) {
+            if (kvPerHeadPosSel < 0 || (NnUint)kvPerHeadPosSel == pos) {
+                const NnUint idx = kvPerHeadPrinted.fetch_add(1u, std::memory_order_relaxed);
+                if (kvPerHeadLimit == 0u || idx < kvPerHeadLimit) {
+                    const NnUint headDim = config->headDim;
+                    const NnUint dimsToPrint = (kvPerHeadDimsSel == 0u) ? headDim : std::min(headDim, kvPerHeadDimsSel);
+                    if (headDim == 0u || dimsToPrint == 0u) {
+                        printf("🧠 [kvcache][kvhead][skip] node=%u op=%s opIndex=%u batch=%u pos=%u headDim=%u (invalid)\n",
+                            (unsigned)context->nodeIndex,
+                            (context->name ? context->name : "Unknown"),
+                            (unsigned)context->opIndex,
+                            (unsigned)batchIndex,
+                            (unsigned)pos,
+                            (unsigned)config->headDim);
+                        std::fflush(stdout);
+                    } else if (kvPerHeadGlobal) {
+                        // Global kvHead print path: requires full KV cache buffers (global stride).
+                        if (config->kvStride == 0u) {
+                            printf("🧠 [kvcache][kvhead][skip] node=%u op=%s opIndex=%u batch=%u pos=%u global=1 requires full KV buffers (kvStride!=0)\n",
+                                (unsigned)context->nodeIndex,
+                                (context->name ? context->name : "Unknown"),
+                                (unsigned)context->opIndex,
+                                (unsigned)batchIndex,
+                                (unsigned)pos);
+                            std::fflush(stdout);
+                        } else {
+                            const NnUint globalKvDim = config->kvStride;
+                            const NnUint maxHeadsByStride = (headDim != 0u) ? (globalKvDim / headDim) : 0u;
+                            const NnUint nHeadsToScan = std::min(config->nKvHeads, maxHeadsByStride);
+                            for (NnUint globalKvHead = 0u; globalKvHead < nHeadsToScan; ++globalKvHead) {
+                                if (!kvHeadMatchesSelection(globalKvHead, kvPerHeadKvHeadsSpec, kvPerHeadKvHeadSel)) continue;
+                                const NnUint col0 = globalKvHead * headDim;
+                                const float *kPtr = &keyCache[pos * kvStride + col0];
+                                const float *vPtr = &valueCache[pos * kvStride + col0];
+
+                                printf("🧠 [kvcache][kvhead] node=%u op=%s opIndex=%u batch=%u pos=%u kvHead=%u colStart=%u dims=%u K=",
+                                    (unsigned)context->nodeIndex,
+                                    (context->name ? context->name : "Unknown"),
+                                    (unsigned)context->opIndex,
+                                    (unsigned)batchIndex,
+                                    (unsigned)pos,
+                                    (unsigned)globalKvHead,
+                                    (unsigned)col0,
+                                    (unsigned)dimsToPrint);
+                                for (NnUint d = 0u; d < dimsToPrint; ++d) {
+                                    printf("%s%.6f", (d == 0u ? "[" : ","), (double)kPtr[d]);
+                                }
+                                printf("] V=");
+                                for (NnUint d = 0u; d < dimsToPrint; ++d) {
+                                    printf("%s%.6f", (d == 0u ? "[" : ","), (double)vPtr[d]);
+                                }
+                                printf("]\n");
+                            }
+                            std::fflush(stdout);
+                        }
+                    } else {
+                        // Owned kvHead slice print path (existing behavior).
+                        const NnUint kvStart = config->kvStart;
+                        const NnUint kvDim0 = config->kvDim0;
+                        if ((kvStart % headDim) == 0u && (kvDim0 % headDim) == 0u) {
+                            const NnUint kvHeadStart = kvStart / headDim;
+                            const NnUint kvHeadLen = kvDim0 / headDim;
+                            for (NnUint localKv = 0u; localKv < kvHeadLen; ++localKv) {
+                                const NnUint globalKvHead = kvHeadStart + localKv;
+                                if (!kvHeadMatchesSelection(globalKvHead, kvPerHeadKvHeadsSpec, kvPerHeadKvHeadSel)) continue;
+                                const NnUint col0 = kvStart + localKv * headDim;
+                                const float *kPtr = &keyCache[pos * kvStride + col0];
+                                const float *vPtr = &valueCache[pos * kvStride + col0];
+
+                                printf("🧠 [kvcache][kvhead] node=%u op=%s opIndex=%u batch=%u pos=%u kvHead=%u colStart=%u dims=%u K=",
+                                    (unsigned)context->nodeIndex,
+                                    (context->name ? context->name : "Unknown"),
+                                    (unsigned)context->opIndex,
+                                    (unsigned)batchIndex,
+                                    (unsigned)pos,
+                                    (unsigned)globalKvHead,
+                                    (unsigned)col0,
+                                    (unsigned)dimsToPrint);
+                                for (NnUint d = 0u; d < dimsToPrint; ++d) {
+                                    printf("%s%.6f", (d == 0u ? "[" : ","), (double)kPtr[d]);
+                                }
+                                printf("] V=");
+                                for (NnUint d = 0u; d < dimsToPrint; ++d) {
+                                    printf("%s%.6f", (d == 0u ? "[" : ","), (double)vPtr[d]);
+                                }
+                                printf("]\n");
+                            }
+                            std::fflush(stdout);
+                        } else {
+                            printf("🧠 [kvcache][kvhead][skip] node=%u op=%s opIndex=%u batch=%u pos=%u headDim=%u kvStart=%u kvDim0=%u (unaligned)\n",
+                                (unsigned)context->nodeIndex,
+                                (context->name ? context->name : "Unknown"),
+                                (unsigned)context->opIndex,
+                                (unsigned)batchIndex,
+                                (unsigned)pos,
+                                (unsigned)config->headDim,
+                                (unsigned)config->kvStart,
+                                (unsigned)config->kvDim0);
+                            std::fflush(stdout);
+                        }
+                    }
+                }
+            }
+        }
+
+    #endif // DLLAMA_DEBUG_ATTN
 
         DEBUG_VECTOR(context, "input", y);
         DEBUG_VECTOR(context, "q", q);
@@ -1750,7 +2614,171 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
             config->nHeads, config->nHeads0,
             config->nKvHeads,
             config->kvDim0, config->kvStart, kvStride,
+            qHeadStart,
             config->headDim, config->seqLen, nThreads, threadIndex);
+
+        // Attention debug: print per forward position (after softmax).
+        // Enable with: DLLAMA_DEBUG_ATT=1
+        // Optional:
+        // - DLLAMA_DEBUG_ATT_FILTER=substring (only ops whose name matches)
+        // - DLLAMA_DEBUG_ATT_BATCH=N (default 0)
+        // - DLLAMA_DEBUG_ATT_HEAD=H (default 0), -1 prints all local heads
+        // - DLLAMA_DEBUG_ATT_LIMIT=N (0 unlimited)
+    #if DLLAMA_DEBUG_ATTN
+        if (attDbg && threadIndex == 0u && batchIndex == attBatch && attDebugPassesFilter(context->name)) {
+            const NnUint idx = attPrinted.fetch_add(1u, std::memory_order_relaxed);
+            if (attLimit == 0u || idx < attLimit) {
+                const NnUint len = pos + 1u;
+                const float *attBatchPtr = &att[batchIndex * config->nHeads0 * config->seqLen];
+                const NnUint globalQHeadStart = (config->headDim != 0u) ? (config->qStart / config->headDim) : 0u;
+                const NnUint gqaGroup = (config->nKvHeads != 0u && (config->nHeads % config->nKvHeads) == 0u)
+                    ? (config->nHeads / config->nKvHeads)
+                    : 0u;
+
+                    auto printHead = [&](NnUint localHead) {
+                    if (localHead >= config->nHeads0) return;
+                    const NnUint globalQHead = globalQHeadStart + localHead;
+                    const NnUint globalKvHead = (gqaGroup != 0u) ? (globalQHead / gqaGroup) : 0u;
+                    const float *row = &attBatchPtr[localHead * config->seqLen];
+                    printf("🧪 [att][pos] op=%s opIndex=%u pos=%u batch=%u qHead=%u kvHead=%u qStart=%u kvStart=%u kvDim0=%u kvStride=%u\n",
+                        (context->name ? context->name : "Unknown"),
+                        (unsigned)context->opIndex,
+                        (unsigned)pos,
+                        (unsigned)batchIndex,
+                        (unsigned)globalQHead,
+                        (unsigned)globalKvHead,
+                        (unsigned)config->qStart,
+                        (unsigned)config->kvStart,
+                        (unsigned)config->kvDim0,
+                        (unsigned)(config->kvStride == 0u ? config->kvDim0 : config->kvStride));
+                    printAttRowSummary(row, len, globalQHead, globalKvHead);
+                    if (attScores) {
+                        printAttRowValues(row, len, attScoresLen);
+                    }
+                    if (attQkDbg) {
+                        const NnUint headDim = config->headDim;
+                        if (headDim == 0u) {
+                            printf("🧪 [att][qk][skip] headDim=0\n");
+                            return;
+                        }
+
+                        const NnUint dimsToPrint = (attQkDimsSel == 0u) ? headDim : std::min(headDim, attQkDimsSel);
+                        const float *qVec = q + localHead * headDim;
+
+                        printf("🧪 [att][qk][ptr] query=%p qVec=%p keyCache=%p\n",
+                            (const void *)query,
+                            (const void *)qVec,
+                            (const void *)keyCache);
+
+                        printf("🧪 [att][qk] qHead=%u kvHead=%u headDim=%u ",
+                            (unsigned)globalQHead,
+                            (unsigned)globalKvHead,
+                            (unsigned)headDim);
+                        printVecDims("Q", qVec, headDim, dimsToPrint);
+                        printf(" qNorm=%.6f\n", std::sqrt(l2NormSq_F32(qVec, headDim)));
+
+                        auto kvColStart = [&](NnUint gKvHead, NnUint &col0Out) -> bool {
+                            // Prefer full-stride addressing when kvStride is configured.
+                            if (config->kvStride != 0u) {
+                                const NnUint stride = config->kvStride;
+                                const NnUint needed = (gKvHead + 1u) * headDim;
+                                if (needed <= stride) {
+                                    col0Out = gKvHead * headDim;
+                                    return true;
+                                }
+                            }
+                            // Fall back to slice addressing (owned heads only).
+                            if ((config->kvStart % headDim) != 0u || (config->kvDim0 % headDim) != 0u) return false;
+                            const NnUint sliceHeadStart = config->kvStart / headDim;
+                            const NnUint sliceHeadLen = config->kvDim0 / headDim;
+                            if (gKvHead < sliceHeadStart) return false;
+                            const NnUint localKv = gKvHead - sliceHeadStart;
+                            if (localKv >= sliceHeadLen) return false;
+                            col0Out = config->kvStart + localKv * headDim;
+                            return true;
+                        };
+
+                        std::vector<NnUint> idxs;
+                        if (attQkPosSel >= 0) {
+                            const NnUint p = (NnUint)attQkPosSel;
+                            if (p < len) idxs.push_back(p);
+                        } else {
+                            selectTopKIndices(row, len, attQkTopKSel, idxs);
+                        }
+
+                        NnUint col0 = 0u;
+                        if (!kvColStart(globalKvHead, col0)) {
+                            printf("🧪 [att][qk][skip] cannot map kvHead=%u to K colStart (kvStart=%u kvDim0=%u kvStride=%u headDim=%u)\n",
+                                (unsigned)globalKvHead,
+                                (unsigned)config->kvStart,
+                                (unsigned)config->kvDim0,
+                                (unsigned)(config->kvStride == 0u ? config->kvDim0 : config->kvStride),
+                                (unsigned)headDim);
+                            return;
+                        }
+
+                        const double invSqrtHd = 1.0 / std::sqrt((double)headDim);
+                        for (NnUint t = 0u; t < idxs.size(); ++t) {
+                            const NnUint p = idxs[t];
+                            const float w = row[p];
+                            const float *kVec = &keyCache[p * kvStride + col0];
+                            const float dot = dotProduct_F32(qVec, kVec, headDim);
+                            const double kNorm = std::sqrt(l2NormSq_F32(kVec, headDim));
+
+                            printf("🧪 [att][qk] pos=%u w=%.6f colStart=%u dot=%.6f dotScaled=%.6f kNorm=%.6f ",
+                                (unsigned)p,
+                                (double)w,
+                                (unsigned)col0,
+                                (double)dot,
+                                (double)((double)dot * invSqrtHd),
+                                (double)kNorm);
+                            printVecDims("K", kVec, headDim, dimsToPrint);
+                            printf("\n");
+                        }
+                    }
+                };
+
+                if (attHeadSel < 0) {
+                    for (NnUint h = 0u; h < config->nHeads0; ++h) {
+                        printHead(h);
+                    }
+                } else {
+                    printHead((NnUint)attHeadSel);
+                }
+                std::fflush(stdout);
+            }
+        }
+
+        // Debug: print a small attention summary for batch0/head0 at current pos.
+        // This helps diagnose repetition / quality drops after repartition by checking whether
+        // attention collapses to a single token or becomes inconsistent.
+        if (dbg && dbgLimit != 0u && threadIndex == 0u && batchIndex == 0u) {
+            const NnUint printed = dbgPrinted.fetch_add(1u, std::memory_order_relaxed);
+            if (printed < dbgLimit) {
+                const NnUint len = pos + 1u;
+                const float *attBatch = &att[batchIndex * config->nHeads0 * config->seqLen];
+
+                const NnUint localHead = 0u;
+                const NnUint globalQHeadStart = (config->headDim != 0u) ? (config->qStart / config->headDim) : 0u;
+                const NnUint globalQHead = globalQHeadStart + localHead;
+                const NnUint globalKvHead = (config->nKvHeads != 0u && config->nHeads % config->nKvHeads == 0u)
+                    ? (globalQHead / (config->nHeads / config->nKvHeads))
+                    : 0u;
+
+                const float *row = &attBatch[localHead * config->seqLen];
+                printf("🧪 [att] op=%s opIndex=%u pos=%u qStart=%u kvStart=%u kvDim0=%u\n",
+                    context->name,
+                    (unsigned)context->opIndex,
+                    (unsigned)pos,
+                    (unsigned)config->qStart,
+                    (unsigned)config->kvStart,
+                    (unsigned)config->kvDim0);
+                printAttRowSummary(row, len, globalQHead, globalKvHead);
+                std::fflush(stdout);
+            }
+        }
+
+	#endif // DLLAMA_DEBUG_ATTN
 
         DEBUG_VECTOR(context, "output", y);
     }
@@ -2053,6 +3081,26 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
     const NnSize dimBytes = getBytes(F_32, context->inputSize.x);
     NnByte *output = context->output[0];
 
+#if DLLAMA_DEBUG_ATTN
+    // Optional debug: print KV cache values per KV-head written by this shift.
+    // This is the right place to observe KV redundancy compute (kvHeadComputeSplit), because
+    // MHA reads only owned kvHeadSplit but SHIFT may write a wider range.
+    const bool kvPerHeadDbg = kvCachePerHeadEnabled() && kvCachePerHeadShiftEnabled() && kvCachePerHeadPassesFilter(context->name);
+    const NnUint kvPerHeadLimit = kvCachePerHeadLimit();
+    const long kvPerHeadKvHeadSel = kvCachePerHeadSelectKvHead();
+    const long kvPerHeadPosSel = kvCachePerHeadSelectPos();
+    const NnUint kvPerHeadDimsSel = kvCachePerHeadDims();
+    const NnUint headDimOverride = kvCachePerHeadHeadDimOverride();
+    static std::atomic<NnUint> kvShiftPrinted{0u};
+
+    auto isShiftK = [&]() -> bool {
+        return context->name != nullptr && std::strstr(context->name, "shift_k") != nullptr;
+    };
+    auto isShiftV = [&]() -> bool {
+        return context->name != nullptr && std::strstr(context->name, "shift_v") != nullptr;
+    };
+#endif
+
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         const NnSize index = (NnSize)indexes[batchIndex];
         if (config->dstRowStride == 0u) {
@@ -2075,6 +3123,66 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
                 dimBytes,
                 nThreads,
                 threadIndex);
+
+#if DLLAMA_DEBUG_ATTN
+            // Print after the write so we read from the actual cache.
+            if (kvPerHeadDbg && threadIndex == 0u) {
+                if (kvPerHeadPosSel < 0 || (NnUint)kvPerHeadPosSel == (NnUint)index) {
+                    const NnUint printed = kvShiftPrinted.fetch_add(1u, std::memory_order_relaxed);
+                    if (kvPerHeadLimit == 0u || printed < kvPerHeadLimit) {
+                        NnUint headDim = config->dstColStartUnit;
+                        if (headDim == 0u) headDim = headDimOverride;
+                        if (headDim == 0u) {
+                            printf("🧠 [kvcache][kvhead][shift][skip] node=%u op=%s opIndex=%u pos=%u need headDim; set DLLAMA_DEBUG_KVCACHE_PER_HEAD_HEADDIM=... (dstColStartUnit=0)\n",
+                                (unsigned)context->nodeIndex,
+                                (context->name ? context->name : "Unknown"),
+                                (unsigned)context->opIndex,
+                                (unsigned)index);
+                            std::fflush(stdout);
+                        } else if ((config->dstColStart % headDim) != 0u || (context->inputSize.x % headDim) != 0u) {
+                            printf("🧠 [kvcache][kvhead][shift][skip] node=%u op=%s opIndex=%u pos=%u unaligned headDim=%u dstColStart=%u writeLen=%u\n",
+                                (unsigned)context->nodeIndex,
+                                (context->name ? context->name : "Unknown"),
+                                (unsigned)context->opIndex,
+                                (unsigned)index,
+                                (unsigned)headDim,
+                                (unsigned)config->dstColStart,
+                                (unsigned)context->inputSize.x);
+                            std::fflush(stdout);
+                        } else {
+                            const NnUint kvHeadStart = config->dstColStart / headDim;
+                            const NnUint kvHeadLen = context->inputSize.x / headDim;
+                            const NnUint dimsToPrint = (kvPerHeadDimsSel == 0u) ? headDim : std::min(headDim, kvPerHeadDimsSel);
+                            const float *row = (const float *)(output + index * rowStrideBytes);
+                            const char *kind = isShiftK() ? "K" : (isShiftV() ? "V" : "KV");
+
+                            for (NnUint localKv = 0u; localKv < kvHeadLen; ++localKv) {
+                                const NnUint globalKvHead = kvHeadStart + localKv;
+                                if (kvPerHeadKvHeadSel >= 0 && (NnUint)kvPerHeadKvHeadSel != globalKvHead) continue;
+                                const NnUint col0 = config->dstColStart + localKv * headDim;
+                                const float *ptr = row + col0;
+
+                                printf("🧠 [kvcache][kvhead][shift] node=%u op=%s opIndex=%u batch=%u pos=%u kvHead=%u colStart=%u dims=%u %s=",
+                                    (unsigned)context->nodeIndex,
+                                    (context->name ? context->name : "Unknown"),
+                                    (unsigned)context->opIndex,
+                                    (unsigned)batchIndex,
+                                    (unsigned)index,
+                                    (unsigned)globalKvHead,
+                                    (unsigned)col0,
+                                    (unsigned)dimsToPrint,
+                                    kind);
+                                for (NnUint d = 0u; d < dimsToPrint; ++d) {
+                                    printf("%s%.6f", (d == 0u ? "[" : ","), (double)ptr[d]);
+                                }
+                                printf("]\n");
+                            }
+                            std::fflush(stdout);
+                        }
+                    }
+                }
+            }
+#endif
         }
     }
 }

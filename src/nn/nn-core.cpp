@@ -479,6 +479,7 @@ NnUnevenPartitionPlan createPartitionPlan(
     
     allocSplit(plan.headSplit);
     allocSplit(plan.kvHeadSplit);
+    allocSplit(plan.kvHeadComputeSplit);
     allocSplit(plan.vocabSplit);
     allocSplit(plan.ffnSplit);
     allocSplit(plan.dimSplit);
@@ -516,6 +517,24 @@ NnUnevenPartitionPlan createPartitionPlan(
             
             // KV Heads
             fillDimSplitForStage(plan.kvHeadSplit, currentNodeOffset, globalNKvHeads, def.tpRatios, 1);
+
+            // KV Compute Heads (with redundancy padding)
+            // This range is used to optionally compute extra KV heads for online migrations.
+            // Ownership (and default KV cache layout) is still defined by kvHeadSplit.
+            const NnUint kvPad = 2u;
+            for (NnUint i = 0; i < config.nNodes; i++) {
+                const NnUint globalIdx = currentNodeOffset + i;
+                const NnUint start0 = plan.kvHeadSplit.starts[globalIdx];
+                const NnUint len0 = plan.kvHeadSplit.lengths[globalIdx];
+
+                const NnUint start1 = (start0 > kvPad) ? (start0 - kvPad) : 0u;
+                NnUint end1 = start0 + len0 + kvPad;
+                if (end1 > globalNKvHeads) end1 = globalNKvHeads;
+                const NnUint len1 = (end1 > start1) ? (end1 - start1) : 0u;
+
+                plan.kvHeadComputeSplit.starts[globalIdx] = start1;
+                plan.kvHeadComputeSplit.lengths[globalIdx] = len1;
+            }
             
             // Q Heads (GQA 对齐)
             // 基于刚刚生成的 KV Split 计算 Q Split
@@ -957,11 +976,20 @@ void fullfillRopeCache(const NnRopeOpConfig *config, float *cache) {
 void releasePartitionPlan(NnUnevenPartitionPlan* plan) {
     if (plan == nullptr) return;
 
+    if (plan->stages) {
+        delete[] plan->stages;
+        plan->stages = nullptr;
+    }
+    plan->nStages = 0;
+
     delete[] plan->headSplit.starts;
     delete[] plan->headSplit.lengths;
     
     delete[] plan->kvHeadSplit.starts;
     delete[] plan->kvHeadSplit.lengths;
+
+    delete[] plan->kvHeadComputeSplit.starts;
+    delete[] plan->kvHeadComputeSplit.lengths;
 
     delete[] plan->vocabSplit.starts;
     delete[] plan->vocabSplit.lengths;
@@ -969,10 +997,15 @@ void releasePartitionPlan(NnUnevenPartitionPlan* plan) {
     delete[] plan->ffnSplit.starts;
     delete[] plan->ffnSplit.lengths;
 
+    delete[] plan->dimSplit.starts;
+    delete[] plan->dimSplit.lengths;
+
     // 将指针设为 null 以防止重复释放
     plan->headSplit = {nullptr, nullptr};
     plan->kvHeadSplit = {nullptr, nullptr};
+    plan->kvHeadComputeSplit = {nullptr, nullptr};
     plan->vocabSplit = {nullptr, nullptr};
     plan->ffnSplit = {nullptr, nullptr};
+    plan->dimSplit = {nullptr, nullptr};
     plan->nNodes = 0;
 }

@@ -11,6 +11,18 @@
 #include "nn-quants.hpp"
 #include "nn-core.hpp"
 
+// Compile-time gate for heavy attention / slicing debug logging.
+// Default is OFF; enable by building with: -DDLLAMA_DEBUG_ATTN=1
+#ifndef DLLAMA_DEBUG_ATTN
+#define DLLAMA_DEBUG_ATTN 0
+#endif
+
+// Online plan changes / migration logging.
+// Default is OFF; enable by building with: -DDLLAMA_DEBUG_ONLINE_CHANGE=1
+#ifndef DLLAMA_DEBUG_ONLINE_CHANGE
+#define DLLAMA_DEBUG_ONLINE_CHANGE 0
+#endif
+
 // ======================================================================================
 // Primitives
 // ======================================================================================
@@ -79,14 +91,19 @@ struct NnUnevenPartitionPlan {
 
     NnDimSplit headSplit;
     NnDimSplit kvHeadSplit;
+    // KV compute range (in KV heads) used for redundancy.
+    // This does NOT change ownership semantics of kvHeadSplit.
+    // When enabled, a device may compute (and possibly store) KV for this broader range.
+    NnDimSplit kvHeadComputeSplit;
     NnDimSplit vocabSplit;
     NnDimSplit ffnSplit;
     NnDimSplit dimSplit;
 
     // 默认构造函数
-    NnUnevenPartitionPlan() : nNodes(0) {
+    NnUnevenPartitionPlan() : nNodes(0), nStages(0), stages(nullptr) {
         std::memset(&headSplit, 0, sizeof(headSplit));
         std::memset(&kvHeadSplit, 0, sizeof(kvHeadSplit));
+        std::memset(&kvHeadComputeSplit, 0, sizeof(kvHeadComputeSplit));
         std::memset(&vocabSplit, 0, sizeof(vocabSplit));
         std::memset(&ffnSplit, 0, sizeof(ffnSplit));
         std::memset(&dimSplit, 0, sizeof(dimSplit));
@@ -94,8 +111,13 @@ struct NnUnevenPartitionPlan {
 
     // 析构函数：释放内部数组
     ~NnUnevenPartitionPlan() {
+        if (stages) {
+            delete[] stages;
+            stages = nullptr;
+        }
         freeSplit(headSplit);
         freeSplit(kvHeadSplit);
+        freeSplit(kvHeadComputeSplit);
         freeSplit(vocabSplit);
         freeSplit(ffnSplit);
         freeSplit(dimSplit);
@@ -103,17 +125,22 @@ struct NnUnevenPartitionPlan {
 
     // 移动构造函数：用于 std::move 和 unique_ptr
     NnUnevenPartitionPlan(NnUnevenPartitionPlan&& other) noexcept 
-        : nNodes(other.nNodes),
-          headSplit(other.headSplit),
-          kvHeadSplit(other.kvHeadSplit),
-          vocabSplit(other.vocabSplit),
-          ffnSplit(other.ffnSplit),
-          dimSplit(other.dimSplit) {
+                : nNodes(other.nNodes),
+                    nStages(other.nStages),
+                    stages(other.stages),
+                    headSplit(other.headSplit),
+                    kvHeadSplit(other.kvHeadSplit),
+                    kvHeadComputeSplit(other.kvHeadComputeSplit),
+                    vocabSplit(other.vocabSplit),
+                    ffnSplit(other.ffnSplit),
+                    dimSplit(other.dimSplit) {
         
         // 剥夺源对象的所有权
-        other.stages = nullptr; // 接管 stages
+                other.stages = nullptr; // 接管 stages
+                other.nStages = 0;
         zeroSplit(other.headSplit);
         zeroSplit(other.kvHeadSplit);
+                zeroSplit(other.kvHeadComputeSplit);
         zeroSplit(other.vocabSplit);
         zeroSplit(other.ffnSplit);
         zeroSplit(other.dimSplit);

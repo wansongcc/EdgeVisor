@@ -728,24 +728,49 @@ static NnNodeConfig buildLlmNodeInternal(
         return (int)x;
     };
 
-    // Hard migration trigger (CPU-only test hook).
-    // Enable by setting:
-    //   DLLAMA_HARD_MIGRATE_POS=<pos> DLLAMA_HARD_MIGRATE_LAYER=<layer>
-    // Defaults (-1) disable the hook.
-    const int hardMigratePos = getenvIntOr("DLLAMA_HARD_MIGRATE_POS", -1);
-    const int hardMigrateLayer = getenvIntOr("DLLAMA_HARD_MIGRATE_LAYER", -1);
-    // Migration kind: 1=headSplit, 2=ffnSplit, 3=both
-    const int hardMigrateKind = getenvIntOr("DLLAMA_HARD_MIGRATE_KIND", 1);
-    const int hardMigrateHeadMove = getenvIntOr("DLLAMA_HARD_MIGRATE_HEAD_MOVE", 1);
-    const int hardMigrateFfnMove = getenvIntOr("DLLAMA_HARD_MIGRATE_FFN_MOVE", 256);
+    // Per-layer plan barrier/apply is a CPU-only hook for online repartition.
+    // Keep it opt-in for normal runs.
+    //
+    // NOTE: Legacy env hard-migrate variables are treated as a deprecated *enable signal*
+    // only. Actual trigger/move parameters are now provided via PlanCommand cache.
+    const bool legacyHardMigrateRequested =
+        (std::getenv("DLLAMA_HARD_MIGRATE_POS") != nullptr) ||
+        (std::getenv("DLLAMA_HARD_MIGRATE_LAYER") != nullptr) ||
+        (std::getenv("DLLAMA_HARD_MIGRATE_KIND") != nullptr) ||
+        (std::getenv("DLLAMA_HARD_MIGRATE_HEAD_MOVE") != nullptr) ||
+        (std::getenv("DLLAMA_HARD_MIGRATE_FFN_MOVE") != nullptr);
+
+    const bool enablePlanBarrier =
+        (std::getenv("DLLAMA_ENABLE_PLAN_BARRIER") != nullptr) || legacyHardMigrateRequested;
 
     // 2. 计算切分 (Slicing)
     NnKvCacheSliceUneven kvCacheSlice = sliceKvCacheUneven(h->seqLen, h->headDim, plan, nodeIndex);
     NnMultiHeadAttSliceUneven multiHeadAttSlice = sliceMultiHeadAttUneven(nBatches, h->nHeads, h->seqLen, plan, nodeIndex);
     
     NnRowMatmulSliceUneven qSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->headSplit, h->qDim, nodeIndex);
-    NnRowMatmulSliceUneven kSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, nodeIndex);
-    NnRowMatmulSliceUneven vSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, nodeIndex);
+    NnRowMatmulSliceUneven kOwnedSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, nodeIndex);
+    NnRowMatmulSliceUneven vOwnedSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, nodeIndex);
+
+    // KV redundancy compute slice:
+    // - Only meaningful when stageFullWeights/fullAttBuffers are enabled (full KV cache buffer exists).
+    // - Uses kvHeadComputeSplit which may overlap across nodes; do NOT use it for pointer slicing.
+    bool enableKvRedundancy = fullAttBuffers && plan != nullptr &&
+        plan->kvHeadComputeSplit.starts != nullptr && plan->kvHeadComputeSplit.lengths != nullptr;
+
+    // Online migration test hook: by default we keep the older, correctness-first behavior and
+    // disable KV redundancy when plan barrier/migration is enabled.
+    // If you want redundancy to provide a "no extra comm" migration experiment, opt-in via:
+    //   DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=1
+    if (enablePlanBarrier && std::getenv("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION") == nullptr) {
+        enableKvRedundancy = false;
+    }
+
+    NnRowMatmulSliceUneven kSlice = enableKvRedundancy
+        ? sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadComputeSplit, h->kvDim, nodeIndex)
+        : kOwnedSlice;
+    NnRowMatmulSliceUneven vSlice = enableKvRedundancy
+        ? sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadComputeSplit, h->kvDim, nodeIndex)
+        : vOwnedSlice;
     NnColMatmulSliceUneven woSlice = sliceColMatmulAttUneven(h->weightType, h->qDim, h->dim, h->headDim, plan, nodeIndex);
 
     NnRowMatmulSliceUneven w1Slice = sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, nodeIndex);
@@ -756,23 +781,55 @@ static NnNodeConfig buildLlmNodeInternal(
     NnRopeSliceUneven unevenRope = sliceRopeUneven(h->ropeType, h->seqLen, h->kvDim, h->nKvHeads, h->headDim, h->ropeTheta, plan, nodeIndex);
     
     // 适配旧版 Rope Config
-    NnRopeSlice ropeSlice;
-    std::memset(&ropeSlice, 0, sizeof(NnRopeSlice));
-    ropeSlice.qDim0 = unevenRope.qDimLen;
-    ropeSlice.qDimStart = unevenRope.qDimStart;
-    ropeSlice.qDimEnd = unevenRope.qDimStart + unevenRope.qDimLen;
-    ropeSlice.qShift = unevenRope.qShift;
-    ropeSlice.kvDim = unevenRope.kvDim;
-    ropeSlice.kvDim0 = unevenRope.kvDimLen;
-    ropeSlice.kvDimStart = unevenRope.kvDimStart;
-    ropeSlice.sliceDim = unevenRope.sliceDim;
-    ropeSlice.seqLen = unevenRope.seqLen;
-    ropeSlice.headDim = unevenRope.headDim;
-    ropeSlice.nKvHeads = unevenRope.nKvHeads;
-    ropeSlice.ropeTheta = unevenRope.ropeTheta;
-    ropeSlice.cacheSize = unevenRope.cacheSize;
-    printf("🔍 [Node %u DEBUG] RoPE Slice: Start=%u, Len=%u, KVDim=%u, HeadDim=%u\n", 
-        nodeIndex, ropeSlice.qDimStart, ropeSlice.qDim0, ropeSlice.kvDim, ropeSlice.headDim);
+    // Build separate RoPE slices/caches for Q and K so KV redundancy can extend kvDimStart/kvDim0
+    // without affecting Q's cache layout.
+    NnRopeSlice ropeSliceQ;
+    std::memset(&ropeSliceQ, 0, sizeof(NnRopeSlice));
+    ropeSliceQ.qDim0 = unevenRope.qDimLen;
+    ropeSliceQ.qDimStart = unevenRope.qDimStart;
+    ropeSliceQ.qDimEnd = unevenRope.qDimStart + unevenRope.qDimLen;
+    ropeSliceQ.qShift = unevenRope.qShift;
+    ropeSliceQ.kvDim = unevenRope.kvDim;
+    ropeSliceQ.kvDim0 = unevenRope.kvDimLen;
+    ropeSliceQ.kvDimStart = unevenRope.kvDimStart;
+    ropeSliceQ.sliceDim = unevenRope.sliceDim;
+    ropeSliceQ.seqLen = unevenRope.seqLen;
+    ropeSliceQ.headDim = unevenRope.headDim;
+    ropeSliceQ.nKvHeads = unevenRope.nKvHeads;
+    ropeSliceQ.ropeTheta = unevenRope.ropeTheta;
+    ropeSliceQ.cacheSize = unevenRope.cacheSize;
+
+    // K RoPE cache should cover exactly the K buffer range.
+    // IMPORTANT: when KV redundancy extends kvHeadComputeSplit beyond kvHeadSplit, using Q-derived
+    // (qDimStart/qDimEnd) for K cache can under-fill the cache or cause OOB reads in ropeForward
+    // (especially when nHeads == nKvHeads, i.e. gqaGroupSize==1).
+    NnRopeSlice ropeSliceK = ropeSliceQ;
+    ropeSliceK.kvDim0 = kSlice.inLen;
+    ropeSliceK.kvDimStart = kSlice.inStart;
+
+    // Make K cache self-contained: [kvDimStart, kvDimStart+kvDim0)
+    ropeSliceK.qDimStart = ropeSliceK.kvDimStart;
+    ropeSliceK.qDim0 = ropeSliceK.kvDim0;
+    ropeSliceK.qDimEnd = ropeSliceK.qDimStart + ropeSliceK.qDim0;
+    ropeSliceK.qShift = 0u;
+
+    if (h->ropeType == ROPE_LLAMA || h->ropeType == ROPE_LLAMA3_1) {
+        ropeSliceK.sliceDim = ropeSliceK.kvDim0;
+        assert((ropeSliceK.sliceDim % 2u) == 0u);
+        ropeSliceK.cacheSize = size2D(F_32, h->seqLen, ropeSliceK.sliceDim);
+    } else if (h->ropeType == ROPE_FALCON) {
+        ropeSliceK.sliceDim = h->headDim;
+        ropeSliceK.cacheSize = size2D(F_32, h->seqLen, h->headDim);
+    }
+
+#if DLLAMA_DEBUG_ATTN
+    printf("🔍 [Node %u DEBUG] RoPE Q Slice: qStart=%u qLen=%u kvStart=%u kvLen=%u headDim=%u\n",
+        nodeIndex, ropeSliceQ.qDimStart, ropeSliceQ.qDim0, ropeSliceQ.kvDimStart, ropeSliceQ.kvDim0, ropeSliceQ.headDim);
+    printf("🔍 [Node %u DEBUG] RoPE K Slice%s: qStart=%u qLen=%u kvStart=%u kvLen=%u headDim=%u\n",
+        nodeIndex,
+        enableKvRedundancy ? " (redundant)" : "",
+        ropeSliceK.qDimStart, ropeSliceK.qDim0, ropeSliceK.kvDimStart, ropeSliceK.kvDim0, ropeSliceK.headDim);
+#endif
 
     NnUint nQNormColumns = 1, nKNormColumns = 1, nInvBufferColumns = 1;
     if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
@@ -810,13 +867,22 @@ static NnNodeConfig buildLlmNodeInternal(
         size2D(F_32, nBatches, fullAttBuffers ? h->qDim : qSlice.inLen));
     const NnUint kTempBufferIndex = nodeBuilder.addBuffer(
         "k_temp",
-        size2D(F_32, nBatches, fullAttBuffers ? h->kvDim : kSlice.inLen));
+        size2D(F_32, nBatches, (fullAttBuffers && enableKvRedundancy) ? kSlice.inLen : (fullAttBuffers ? h->kvDim : kSlice.inLen)));
     const NnUint vTempBufferIndex = nodeBuilder.addBuffer(
         "v_temp",
-        size2D(F_32, nBatches, fullAttBuffers ? h->kvDim : vSlice.inLen));
+        size2D(F_32, nBatches, (fullAttBuffers && enableKvRedundancy) ? vSlice.inLen : (fullAttBuffers ? h->kvDim : vSlice.inLen)));
     const NnUint invRmsBufferIndex = nodeBuilder.addBuffer("inv_rms", size2D(F_32, nBatches, nInvBufferColumns));
-    const NnUint ropeCacheBufferIndex = nodeBuilder.addBuffer("rope_cache", ropeSlice.cacheSize);
-    const NnUint attBufferIndex = nodeBuilder.addBuffer("att", multiHeadAttSlice.attSize);
+    const NnUint ropeCacheQBufferIndex = nodeBuilder.addBuffer("rope_cache_q", ropeSliceQ.cacheSize);
+    const NnUint ropeCacheKBufferIndex = nodeBuilder.addBuffer("rope_cache_k", ropeSliceK.cacheSize);
+    // Attention scratch buffer: sized by local headLen * seqLen in the static plan.
+    // With online repartition (plan barrier/apply), nHeads0 may change at runtime,
+    // but buffers are not resized. Allocate a safe upper bound to avoid OOB writes
+    // into att during/after migration.
+    NnSize3D attSize = multiHeadAttSlice.attSize;
+    if (enablePlanBarrier) {
+        attSize = size2D(F_32, nBatches, h->nHeads * h->seqLen);
+    }
+    const NnUint attBufferIndex = nodeBuilder.addBuffer("att", attSize);
     const NnUint logitsSliceBufferIndex = nodeBuilder.addBuffer(
         "lg",
         size2D(F_32, nBatches, fullLogitsBuffers ? h->vocabSize : wclsSlice.inLen));
@@ -985,13 +1051,18 @@ static NnNodeConfig buildLlmNodeInternal(
             att.addOp(OP_CAST, "block_cast_y", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
         }
 
+        // IMPORTANT: when using PNTR_BATCHED_SLICE with sliceTag=AUTO, resolvePointer() may
+        // accidentally match kvHeadSplit (multiplier = gqaGroup * headDim) instead of headSplit
+        // for Q buffers (qDim is divisible by both totals). After online migration, headSplit totals
+        // can be uneven/stage-local and AUTO matching becomes fragile, leading to Q-heads reading 0.
+        // Force NN_SLICE_HEAD so matmul_q/rope_q and MHA agree on the same qStart slice.
         const NnPointerConfig qSlicePtr = fullAttBuffers
-            ? pointerBatchedSliceConfig(SRC_BUFFER, qBufferIndex)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, qBufferIndex, NN_SLICE_HEAD)
             : pointerBatchConfig(SRC_BUFFER, qBufferIndex);
-        const NnPointerConfig kTempSlicePtr = fullAttBuffers
+        const NnPointerConfig kTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
             ? pointerBatchedSliceConfig(SRC_BUFFER, kTempBufferIndex)
             : pointerBatchConfig(SRC_BUFFER, kTempBufferIndex);
-        const NnPointerConfig vTempSlicePtr = fullAttBuffers
+        const NnPointerConfig vTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
             ? pointerBatchedSliceConfig(SRC_BUFFER, vTempBufferIndex)
             : pointerBatchConfig(SRC_BUFFER, vTempBufferIndex);
         const NnPointerConfig mhaOutSlicePtr = fullAttBuffers
@@ -1002,8 +1073,19 @@ static NnNodeConfig buildLlmNodeInternal(
             : pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex);
 
         att.addOp(OP_MATMUL, "block_matmul_q", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), qSlicePtr, stageFullWeights ? qSlice.size : qSlice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_HEAD, h->headDim, qSlice.n, qSlice.inLen, qSlice.inStart));
-        att.addOp(OP_MATMUL, "block_matmul_k", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), kTempSlicePtr, stageFullWeights ? kSlice.size : kSlice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, kSlice.n, kSlice.inLen, kSlice.inStart));
-        att.addOp(OP_MATMUL, "block_matmul_v", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), vTempSlicePtr, stageFullWeights ? vSlice.size : vSlice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, vSlice.n, vSlice.inLen, vSlice.inStart));
+        NnMatmulOpConfig kCfg = enableKvRedundancy
+            ? makeRowMatmulCfg(kSlice.n, kSlice.inLen, kSlice.inStart)
+            : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, kSlice.n, kSlice.inLen, kSlice.inStart);
+        NnMatmulOpConfig vCfg = enableKvRedundancy
+            ? makeRowMatmulCfg(vSlice.n, vSlice.inLen, vSlice.inStart)
+            : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, vSlice.n, vSlice.inLen, vSlice.inStart);
+        if (enableKvRedundancy) {
+            // Keep headDim unit for debug printing (do NOT set outSliceTag, to avoid refreshPointers remapping outStart).
+            kCfg.outStartUnit = h->headDim;
+            vCfg.outStartUnit = h->headDim;
+        }
+        att.addOp(OP_MATMUL, "block_matmul_k", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), kTempSlicePtr, stageFullWeights ? kSlice.size : kSlice.sliceSize, kCfg);
+        att.addOp(OP_MATMUL, "block_matmul_v", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), vTempSlicePtr, stageFullWeights ? vSlice.size : vSlice.sliceSize, vCfg);
 
         if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
             att.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex, qSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nQNormColumns});
@@ -1012,21 +1094,42 @@ static NnNodeConfig buildLlmNodeInternal(
             att.addOp(OP_RMS_NORM, "block_norm_k", layerIndex, kTempSlicePtr, kTempSlicePtr, size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
         }
 
-        att.addOp(OP_ROPE, "block_rope_q", layerIndex, qSlicePtr, qSlicePtr, size0(), NnRopeOpConfig{h->ropeType, 1, n->positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
-        att.addOp(OP_ROPE, "block_rope_k", layerIndex, kTempSlicePtr, kTempSlicePtr, size0(), NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
+        att.addOp(OP_ROPE, "block_rope_q", layerIndex, qSlicePtr, qSlicePtr, size0(), NnRopeOpConfig{h->ropeType, 1, n->positionPipeIndex, ropeCacheQBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceQ});
+        att.addOp(OP_ROPE, "block_rope_k", layerIndex, kTempSlicePtr, kTempSlicePtr, size0(), NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheKBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceK});
 
         const NnShiftOpCodeConfig shiftKCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, kvCacheSlice.kvStart, h->kvDim, h->headDim}
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
             : NnShiftOpCodeConfig{n->positionPipeIndex};
         const NnShiftOpCodeConfig shiftVCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, kvCacheSlice.kvStart, h->kvDim, h->headDim}
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
             : NnShiftOpCodeConfig{n->positionPipeIndex};
         att.addOp(OP_SHIFT, "block_shift_k", layerIndex, kTempSlicePtr, pointerRawConfig(SRC_BUFFER, kBufferIndex), size0(), shiftKCfg);
         att.addOp(OP_SHIFT, "block_shift_v", layerIndex, vTempSlicePtr, pointerRawConfig(SRC_BUFFER, vBufferIndex), size0(), shiftVCfg);
 
+        // Basic invariants for head-aligned slices.
+        assert(h->headDim != 0u);
+        assert((qSlice.inStart % h->headDim) == 0u);
+        assert((qSlice.inLen % h->headDim) == 0u);
+        assert((kvCacheSlice.kvStart % h->headDim) == 0u);
+        assert((kvCacheSlice.kvLen % h->headDim) == 0u);
+        assert(kvCacheSlice.kvStart + kvCacheSlice.kvLen <= h->kvDim);
+        if (enableKvRedundancy) {
+            assert((kSlice.inStart % h->headDim) == 0u);
+            assert((kSlice.inLen % h->headDim) == 0u);
+            assert(kSlice.inStart + kSlice.inLen <= h->kvDim);
+            assert((vSlice.inStart % h->headDim) == 0u);
+            assert((vSlice.inLen % h->headDim) == 0u);
+            assert(vSlice.inStart + vSlice.inLen <= h->kvDim);
+        }
+
         const NnUint qStart = fullAttBuffers ? qSlice.inStart : 0u;
         const NnUint qStride = fullAttBuffers ? h->qDim : qSlice.inLen;
+
+        // MHA reads owned KV heads (kvHeadSplit) from the KV cache.
+        // KV redundancy only widens the set of heads that get written into this same KV cache,
+        // so that after migration a node may already have history for newly-owned kvHeads.
         const NnUint kvStart = fullAttBuffers ? kvCacheSlice.kvStart : 0u;
+        const NnUint kvDim0 = kvCacheSlice.kvLen;
         const NnUint kvStride = fullAttBuffers ? h->kvDim : kvCacheSlice.kvLen;
         att.addOp(OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex, mhaOutSlicePtr, mhaOutSlicePtr, size0(),
             NnMultiHeadAttOpConfig{
@@ -1036,7 +1139,7 @@ static NnNodeConfig buildLlmNodeInternal(
                 h->headDim,
                 h->seqLen,
                 qSlice.inLen,
-                kvCacheSlice.kvLen,
+                kvDim0,
                 qStart,
                 qStride,
                 kvStart,
@@ -1046,7 +1149,19 @@ static NnNodeConfig buildLlmNodeInternal(
                 kBufferIndex,
                 vBufferIndex,
                 attBufferIndex});
-        printf("🔍 [Node %u DEBUG] MHA: nHeads=%u, nHeads0=%u\n", nodeIndex, multiHeadAttSlice.nHeads, multiHeadAttSlice.nHeads0);
+
+#if DLLAMA_DEBUG_ATTN
+        printf(" [Node %u DEBUG] MHA: nHeads=%u nHeads0=%u qStart=%u qSliceD0=%u kvStart=%u kvDim0=%u kvStride=%u%s\n",
+            nodeIndex,
+            multiHeadAttSlice.nHeads,
+            multiHeadAttSlice.nHeads0,
+            qStart,
+            qSlice.inLen,
+            kvStart,
+            kvDim0,
+            kvStride,
+            enableKvRedundancy ? " (kv-redundant)" : "");
+#endif
 
         if (mhaOutBufferIndex != mhaOutQBufferIndex) {
              att.addOp(OP_CAST, "block_cast_y2", layerIndex, mhaOutSlicePtr, mhaOutQSlicePtr, size0(), NnCastOpCodeConfig{});
@@ -1194,9 +1309,9 @@ static NnNodeConfig buildLlmNodeInternal(
         nodeBuilder.addSegment(ff.build());
 
         // ----------------------------------------------------------------------
-        // Per-layer barrier: stage-local sync + optional hardcoded head migration
+        // Optional per-layer barrier/apply (CPU-only test hook for online repartition)
         // ----------------------------------------------------------------------
-        {
+        if (enablePlanBarrier) {
             NnSegmentConfigBuilder planBarrier;
             planBarrier.addOp(
                 OP_PLAN_BARRIER,
@@ -1208,14 +1323,14 @@ static NnNodeConfig buildLlmNodeInternal(
                 NnPlanBarrierOpCodeConfig{
                     n->positionPipeIndex,
                     n->planPipeIndex,
-                    (hardMigratePos < 0 ? 0xFFFFFFFFu : (NnUint)hardMigratePos),
-                    (hardMigrateLayer < 0 ? 0xFFFFFFFFu : (NnUint)hardMigrateLayer),
-                    0u, // fromNodeIndex: node0
-                    1u, // toNodeIndex: node1
-                    (hardMigrateHeadMove < 0 ? 0u : (NnUint)hardMigrateHeadMove),
-                    (hardMigrateKind < 0 ? 1u : (NnUint)hardMigrateKind),
-                    (hardMigrateFfnMove < 0 ? 0u : (NnUint)hardMigrateFfnMove),
-                    0u  // onlyStageIndex: stage0
+                    0xFFFFFFFFu, // triggerPos (deprecated: PlanCommand supplies trigger)
+                    0xFFFFFFFFu, // triggerLayer (deprecated)
+                    0u, // fromNodeIndex (deprecated)
+                    0u, // toNodeIndex (deprecated)
+                    0u, // nHeadsToMove (deprecated)
+                    0u, // cmdKind (deprecated)
+                    0u, // nFfnToMove (deprecated)
+                    (myStage != nullptr ? myStage->stageIndex : 0u) // onlyStageIndex: my stage
                 });
             // Broadcast the control packet within the current stage.
             planBarrier.addSync(n->planPipeIndex, SYNC_WITH_ROOT);
@@ -1229,7 +1344,7 @@ static NnNodeConfig buildLlmNodeInternal(
                 pointerBatchConfig(SRC_PIPE, n->planPipeIndex),
                 pointerBatchConfig(SRC_PIPE, n->planPipeIndex),
                 size0(),
-                NnPlanApplyOpCodeConfig{n->planPipeIndex, 0u});
+                NnPlanApplyOpCodeConfig{n->planPipeIndex, (myStage != nullptr ? myStage->stageIndex : 0u)});
             nodeBuilder.addSegment(planApply.build());
         }
     }

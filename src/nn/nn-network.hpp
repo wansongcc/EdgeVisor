@@ -4,6 +4,9 @@
 #include "nn-executor.hpp"
 #include "nn-core.hpp"
 
+#include <atomic>
+#include <vector>
+
 #define ROOT_SOCKET_INDEX 0
 
 void initSockets();
@@ -64,7 +67,7 @@ public:
     void readAck(const NnUint socketIndex);
     bool tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts);
     void writeMany(NnUint n, NnSocketIo *ios);
-    void writeAll(void *data, NnSize size);
+    void writeAll(const void *data, NnSize size);
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
     void sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size);
@@ -82,6 +85,42 @@ private:
     NnNodeConfig *nodeConfig;
     const NnUnevenPartitionPlan *plan;
     const NnStageConfig* myStage = nullptr;
+
+    struct SyncProfileSlot {
+        std::atomic<NnUint> epoch{0u};
+        std::atomic<NnUint> arrived{0u};
+        std::atomic<NnUint> done{0u};
+        std::atomic<long long> startUs{0};
+        std::atomic<long long> endUs{0};
+
+        SyncProfileSlot() = default;
+        SyncProfileSlot(const SyncProfileSlot &other)
+            : epoch(other.epoch.load(std::memory_order_relaxed)),
+              arrived(other.arrived.load(std::memory_order_relaxed)),
+              done(other.done.load(std::memory_order_relaxed)),
+              startUs(other.startUs.load(std::memory_order_relaxed)),
+              endUs(other.endUs.load(std::memory_order_relaxed)) {}
+
+        SyncProfileSlot &operator=(const SyncProfileSlot &other) {
+            if (this == &other) return *this;
+            epoch.store(other.epoch.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            arrived.store(other.arrived.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            done.store(other.done.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startUs.store(other.startUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            endUs.store(other.endUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+
+        SyncProfileSlot(SyncProfileSlot &&other) noexcept
+            : SyncProfileSlot(static_cast<const SyncProfileSlot &>(other)) {}
+
+        SyncProfileSlot &operator=(SyncProfileSlot &&other) noexcept {
+            return (*this = static_cast<const SyncProfileSlot &>(other));
+        }
+    };
+
+    std::vector<NnUint> syncProfileBaseBySegment;
+    std::vector<SyncProfileSlot> syncProfileSlots;
 public:
     NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr);
     ~NnNetworkNodeSynchronizer() override {};

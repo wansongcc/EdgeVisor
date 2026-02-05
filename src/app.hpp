@@ -10,6 +10,7 @@
 #include "nn/nn-network-local.hpp"
 #include "tokenizer.hpp"
 #include "llm.hpp"
+#include "plan-command.hpp"
 
 class AppCliArgs {
 public:
@@ -53,10 +54,12 @@ typedef struct {
     NnUint position;
     NnUint batchSize; // 0 = stop signal
     NnUint flags;     // bit0: enable per-token profiling
+    NnUint planCmdSeq; // command seq; valid only when LLM_CTRL_HAS_PLAN_CMD is set
 } LlmControlPacket;
 
 enum LlmControlFlags : NnUint {
     LLM_CTRL_PROFILE = 1u << 0,
+    LLM_CTRL_HAS_PLAN_CMD = 1u << 1,
 };
 
 typedef struct {
@@ -93,6 +96,8 @@ class RootLlmInference {
 public:
     float *logitsPipe;
     const std::vector<LlmPerfPacket>& getLastPerf() const { return lastPerf; }
+    NnUint getPosition() const { return controlPacket.position; }
+    NnUint getBatchSize() const { return controlPacket.batchSize; }
 private:
     float *tokenPipe;
     float *positionPipe;
@@ -104,6 +109,7 @@ private:
     bool profileEnabled = false;
     const NnUnevenPartitionPlan* plan = nullptr;
     std::vector<LlmPerfPacket> lastPerf;
+    NnUint lastPlanCmdSeqSent = 0u;
 public:
     RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled);
     void setBatchSize(NnUint batchSize);
@@ -124,6 +130,7 @@ private:
     NnNetExecution *execution;
     NnNetwork *network;
     LlmControlPacket controlPacket;
+    NnUint lastPlanCmdSeqRecv = 0u;
 public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network);
     bool tryReadControlPacket();

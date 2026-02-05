@@ -13,11 +13,53 @@
 #include <algorithm>
 #include <cstdlib>
 
+static void computeLogitsStats(const float* logits, NnUint vocabSize,
+                              bool &hasNaN, bool &hasInf,
+                              float &minLogit, float &maxLogit,
+                              int &maxIndex, NnUint &zeroCount) {
+    hasNaN = false;
+    hasInf = false;
+    minLogit = 1e9f;
+    maxLogit = -1e9f;
+    maxIndex = -1;
+    zeroCount = 0u;
+    if (logits == nullptr || vocabSize == 0u) return;
+    for (NnUint i = 0; i < vocabSize; ++i) {
+        float v = logits[i];
+        if (v == 0.0f) zeroCount++;
+        if (std::isnan(v)) { hasNaN = true; continue; }
+        if (std::isinf(v)) { hasInf = true; continue; }
+        if (v > maxLogit) { maxLogit = v; maxIndex = (int)i; }
+        if (v < minLogit) minLogit = v;
+    }
+}
+
 #ifndef DLLAMA_DEBUG_TOPK_LOGITS
 #define DLLAMA_DEBUG_TOPK_LOGITS 0
 #endif
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
+static int debugLogitsBatchSelect() {
+    const char *v = std::getenv("DLLAMA_DEBUG_LOGITS_BATCH");
+    if (v == nullptr || *v == '\0') return 0; // default: batch 0
+    return std::atoi(v); // -1 => all batches
+}
+
+static void debugValidateLogits(const float* logits, NnUint vocabSize, bool &hasNaN, bool &hasInf, float &minLogit, float &maxLogit, int &maxIndex) {
+    hasNaN = false;
+    hasInf = false;
+    maxLogit = -1e9f;
+    minLogit = 1e9f;
+    maxIndex = -1;
+    for (NnUint i = 0; i < vocabSize; ++i) {
+        float val = logits[i];
+        if (std::isnan(val)) hasNaN = true;
+        if (std::isinf(val)) hasInf = true;
+        if (val > maxLogit) { maxLogit = val; maxIndex = (int)i; }
+        if (val < minLogit) minLogit = val;
+    }
+}
+
 static void printEscapedPiece(const char* s, size_t maxLen = 32) {
     if (s == nullptr) {
         printf("~");
@@ -202,26 +244,45 @@ static void inference(AppInferenceContext *context) {
         NnUint vocabSize = context->header->vocabSize;
         bool hasNaN = false;
         bool hasInf = false;
-        float maxLogit = -1e9;
-        float minLogit = 1e9;
+        float maxLogit = -1e9f;
+        float minLogit = 1e9f;
         int maxIndex = -1;
 
-        // 简单抽样检查或全量检查
-        for (NnUint i = 0; i < vocabSize; ++i) {
-            float val = logits[i];
-            if (std::isnan(val)) hasNaN = true;
-            if (std::isinf(val)) hasInf = true;
-            if (val > maxLogit) { maxLogit = val; maxIndex = i; }
-            if (val < minLogit) minLogit = val;
-        }
+        // Always compute basic logits stats (even when TOPK debug isn't compiled).
+        // In eval stage logits pipe is [batch][vocab]. Use the latest row of this window.
+        const NnUint statBatch = (batchSize > 0u) ? (batchSize - 1u) : 0u;
+        const float* logitsRow = logits + (size_t)statBatch * (size_t)vocabSize;
+        NnUint zeroCount = 0u;
+        computeLogitsStats(logitsRow, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
+        debugValidateLogits(logits, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex);
+
+
         // 只在 eval 阶段前几步打印，避免刷屏
         {
-            char tag[64];
-            std::snprintf(tag, sizeof(tag), "eval pos=%u batch=%u", (unsigned)pos, (unsigned)batchSize);
-            debugTopKLogits(context, logits, vocabSize, 10, tag);
-            debugVocabCoverage(logits, vocabSize, tag);
+            const int sel = debugLogitsBatchSelect();
+            if (sel < 0) {
+                for (NnUint bi = 0; bi < batchSize; ++bi) {
+                    char tag[96];
+                    std::snprintf(tag, sizeof(tag), "eval pos=%u batchSize=%u batchIndex=%u", (unsigned)pos, (unsigned)batchSize, (unsigned)bi);
+                    debugTopKLogits(context, logits + (size_t)bi * (size_t)vocabSize, vocabSize, 10, tag);
+                    debugVocabCoverage(logits + (size_t)bi * (size_t)vocabSize, vocabSize, tag);
+                }
+            } else {
+                const NnUint bi = (NnUint)std::max(sel, 0);
+                if (bi < batchSize) {
+                    char tag[96];
+                    std::snprintf(tag, sizeof(tag), "eval pos=%u batchSize=%u batchIndex=%u", (unsigned)pos, (unsigned)batchSize, (unsigned)bi);
+                    debugTopKLogits(context, logits + (size_t)bi * (size_t)vocabSize, vocabSize, 10, tag);
+                    debugVocabCoverage(logits + (size_t)bi * (size_t)vocabSize, vocabSize, tag);
+                } else {
+                    char tag[96];
+                    std::snprintf(tag, sizeof(tag), "eval pos=%u batchSize=%u batchIndex=%d(out-of-range)", (unsigned)pos, (unsigned)batchSize, sel);
+                    debugTopKLogits(context, logits, vocabSize, 10, tag);
+                    debugVocabCoverage(logits, vocabSize, tag);
+                }
+            }
         }
 #endif
 
@@ -241,9 +302,12 @@ static void inference(AppInferenceContext *context) {
             sentBytes / 1024,
             recvBytes / 1024,
             batchSize);
-        printf("🧪 [Root Logits] Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | NetDelta: S=%zu R=%zu\n", 
-            (hasNaN || hasInf) ? "❌ FAIL" : "✅ OK", 
-            minLogit, maxLogit, maxIndex, 
+        const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && vocabSize > 0u);
+        printf("🧪 [Root Logits] (eval batchIndex=%u) Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | Zero: %u/%u | NetDelta: S=%zu R=%zu\n",
+            (unsigned)statBatch,
+            statsOk ? "✅ OK" : "❌ FAIL",
+            minLogit, maxLogit, maxIndex,
+            (unsigned)zeroCount, (unsigned)vocabSize,
             sentBytes, recvBytes);
         evalTotalTime += evalTime + syncTime;
     }
@@ -261,6 +325,23 @@ static void inference(AppInferenceContext *context) {
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
         context->inference->forward();
+
+        // In pred stage batchSize==1. Always compute logits stats for debugging.
+        {
+            bool hasNaN = false;
+            bool hasInf = false;
+            float maxLogit = -1e9f;
+            float minLogit = 1e9f;
+            int maxIndex = -1;
+            NnUint zeroCount = 0u;
+            computeLogitsStats(context->inference->logitsPipe, context->header->vocabSize,
+                               hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
+            const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && context->header->vocabSize > 0u);
+            printf("🧪 [Root Logits] (pred) Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | Zero: %u/%u\n",
+                statsOk ? "✅ OK" : "❌ FAIL",
+                minLogit, maxLogit, maxIndex,
+                (unsigned)zeroCount, (unsigned)context->header->vocabSize);
+        }
 
         if (context->args->benchmark) {
             const std::vector<LlmPerfPacket>& perf = context->inference->getLastPerf();
@@ -283,6 +364,16 @@ static void inference(AppInferenceContext *context) {
             std::snprintf(tag, sizeof(tag), "pred pos=%u", (unsigned)pos);
             debugTopKLogits(context, context->inference->logitsPipe, context->header->vocabSize, 10, tag);
             debugVocabCoverage(context->inference->logitsPipe, context->header->vocabSize, tag);
+
+            bool hasNaN = false;
+            bool hasInf = false;
+            float maxLogit = -1e9f;
+            float minLogit = 1e9f;
+            int maxIndex = -1;
+            debugValidateLogits(context->inference->logitsPipe, context->header->vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex);
+            printf("🧪 [Root Logits] (pred) Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d\n",
+                (hasNaN || hasInf) ? "❌ FAIL" : "✅ OK",
+                minLogit, maxLogit, maxIndex);
         }
 #endif
         token = context->sampler->sample(context->inference->logitsPipe);
@@ -294,9 +385,10 @@ static void inference(AppInferenceContext *context) {
 
         NnUint predTime = context->executor->getTotalTime(STEP_EXECUTE_OP);
         NnUint syncTime = context->executor->getTotalTime(STEP_SYNC_NODES);
-        printf("🔶 Pred%5u ms Sync%5u ms | Sent%6zu kB Recv%6zu kB | %s\n",
+        printf("🔶 Pred%5u ms Sync%5u ms | pos=%u | Sent%6zu kB Recv%6zu kB | %s\n",
             predTime / 1000,
             syncTime / 1000,
+            (unsigned)pos,
             sentBytes / 1024,
             recvBytes / 1024,
             piece == nullptr ? "~" : piece);

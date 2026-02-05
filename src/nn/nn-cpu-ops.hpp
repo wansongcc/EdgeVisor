@@ -14,6 +14,9 @@ typedef struct {
     const char *name;
     NnOpCode opCode;
     NnUint opIndex;
+    // Which node/device this op context belongs to.
+    // Filled by NnCpuDevice::createSegment().
+    NnUint nodeIndex;
     NnByte nBatches;
     NnByte *bufferFlags;
     NnByte **buffers;

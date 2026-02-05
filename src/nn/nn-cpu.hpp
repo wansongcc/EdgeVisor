@@ -30,6 +30,9 @@ public:
     NnDeviceSegment *createSegment(NnUint segmentIndex) override;
     std::vector<NnByte *> resolvePointer(NnSize3D *pntrSize, NnPointerConfig *pointerConfig);
 
+    NnUint getBufferCount() const { return nBuffers; }
+    NnUint getPipeCount() const { return netConfig ? netConfig->nPipes : 0u; }
+
     // Online TP repartition (CPU-only): update the plan used by resolvePointer.
     void setPartitionPlan(const NnUnevenPartitionPlan *newPlan);
     const NnUnevenPartitionPlan *getPartitionPlan() const { return partitionPlan; }
@@ -56,10 +59,21 @@ public:
     // to be logged with a stable pos value.
     std::atomic_uint lastPos{0xFFFFFFFFu};
     std::atomic_uint planEpochReady{0u};
+    // Debug: track last writer op per buffer/pipe (best-effort, segment-local).
+    std::vector<int> lastWriteOpByBuffer;
+    std::vector<const char *> lastWriteNameByBuffer;
+    std::vector<int> lastWriteOpByPipe;
+    std::vector<const char *> lastWriteNameByPipe;
     NnCpuDeviceSegment(NnCpuDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnCpuOpForward *opForward, NnCpuOpContext *opContexts, NnUint nOps)
         : segmentIndex(segmentIndex), nOps(nOps), opForward(opForward), opContexts(opContexts), device(device), segmentConfig(segmentConfig), sliceFwdPrintedOnce(nOps, 0u), tpRangePrintedEpoch(nOps, 0xFFFFFFFFu) {
             if (device != nullptr) {
                 planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+                const NnUint nBuffers = device->getBufferCount();
+                const NnUint nPipes = device->getPipeCount();
+                lastWriteOpByBuffer.assign(nBuffers, -1);
+                lastWriteNameByBuffer.assign(nBuffers, nullptr);
+                lastWriteOpByPipe.assign(nPipes, -1);
+                lastWriteNameByPipe.assign(nPipes, nullptr);
             }
         }
     ~NnCpuDeviceSegment() override;

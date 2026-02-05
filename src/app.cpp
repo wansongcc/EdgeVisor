@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "plan-controller.hpp"
 #include <cassert>
 #include <cstring>
 #include <sstream>
@@ -28,6 +29,60 @@ static inline void logRootControlSend(const LlmControlPacket& p) {
 #else
     (void)p;
 #endif
+}
+
+static bool parseEnvInt(const char *name, int &out) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return false;
+    char *end = nullptr;
+    long x = std::strtol(v, &end, 10);
+    if (end == v) return false;
+    out = (int)x;
+    return true;
+}
+
+static void maybeSeedPlanCommandFromLegacyEnv() {
+    // Deprecated legacy hook: env hard-migrate → PlanCommand(EXACT).
+    // External controller should be preferred.
+    int pos = -1;
+    int layer = -1;
+    bool hasPos = parseEnvInt("DLLAMA_HARD_MIGRATE_POS", pos);
+    bool hasLayer = parseEnvInt("DLLAMA_HARD_MIGRATE_LAYER", layer);
+    if (!hasPos && !hasLayer) return;
+
+    static bool warned = false;
+    if (!warned) {
+        std::fprintf(stderr,
+            "[DEPRECATED] DLLAMA_HARD_MIGRATE_* env hooks are deprecated. "
+            "Use PlanCommand via UDS controller instead. (env will be used as fallback)\n");
+        warned = true;
+    }
+
+    if (!(hasPos && hasLayer) || pos < 0 || layer < 0) {
+        std::fprintf(stderr,
+            "[plan][env] ignored: DLLAMA_HARD_MIGRATE_POS and DLLAMA_HARD_MIGRATE_LAYER must both be set (>=0)\n");
+        return;
+    }
+
+    int kind = 3;
+    (void)parseEnvInt("DLLAMA_HARD_MIGRATE_KIND", kind);
+    int headMove = 1;
+    (void)parseEnvInt("DLLAMA_HARD_MIGRATE_HEAD_MOVE", headMove);
+    int ffnMove = 256;
+    (void)parseEnvInt("DLLAMA_HARD_MIGRATE_FFN_MOVE", ffnMove);
+
+    PlanCommand cmd = makeEmptyPlanCommand();
+    cmd.mode = PLAN_CMD_MODE_EXACT;
+    cmd.stageIndex = 0u; // legacy behavior
+    cmd.triggerPos = (uint32_t)pos;
+    cmd.triggerLayer = (uint32_t)layer;
+    cmd.fromNodeIndex = 0u;
+    cmd.toNodeIndex = 1u;
+    cmd.cmdKind = (kind < 1 ? PLAN_CMD_KIND_BOTH : (uint32_t)kind);
+    cmd.nHeadsToMove = (headMove < 0 ? 0u : (uint32_t)headMove);
+    cmd.nFfnToMove = (ffnMove < 0 ? 0u : (uint32_t)ffnMove);
+
+    planCommandCache().store(cmd);
 }
 
 static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const AppCliArgs *args) {
@@ -629,6 +684,8 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->plan = plan;
     this->profileEnabled = profileEnabled;
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
+    this->controlPacket.planCmdSeq = 0u;
+    this->lastPlanCmdSeqSent = 0u;
 }
 
 void RootLlmInference::setBatchSize(NnUint batchSize) {
@@ -652,8 +709,27 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
 
 void RootLlmInference::forward() {
     if (network != nullptr) {
-        logRootControlSend(controlPacket);
-        network->writeAll(&controlPacket, sizeof(LlmControlPacket));
+        // Prefer external PlanCommand; env fallback is applied once at startup.
+        const PlanCommandSnapshot snap = planCommandCache().load();
+        const NnUint planCmdSeqLo = (NnUint)(snap.cacheSeq & 0xFFFFFFFFu);
+
+        LlmControlPacket out = controlPacket;
+        out.flags = controlPacket.flags;
+        out.planCmdSeq = planCmdSeqLo;
+
+        const bool planChanged = (planCmdSeqLo != lastPlanCmdSeqSent);
+        if (planChanged) {
+            out.flags |= LLM_CTRL_HAS_PLAN_CMD;
+            lastPlanCmdSeqSent = planCmdSeqLo;
+        } else {
+            out.flags &= ~LLM_CTRL_HAS_PLAN_CMD;
+        }
+
+        logRootControlSend(out);
+        network->writeAll(&out, sizeof(LlmControlPacket));
+        if (planChanged) {
+            network->writeAll(&snap.cmd, sizeof(PlanCommand));
+        }
     }
     executor->forward();
 
@@ -697,8 +773,12 @@ void RootLlmInference::finish() {
         // Stop packet: position is not meaningful when batchSize==0.
         // Set to 0 to avoid confusing logs / downstream checks.
         controlPacket.position = 0;
-        logRootControlSend(controlPacket);
-        network->writeAll(&controlPacket, sizeof(LlmControlPacket));
+        LlmControlPacket out = controlPacket;
+        out.flags = controlPacket.flags & LLM_CTRL_PROFILE;
+        out.flags &= ~LLM_CTRL_HAS_PLAN_CMD;
+        out.planCmdSeq = 0u;
+        logRootControlSend(out);
+        network->writeAll(&out, sizeof(LlmControlPacket));
     }
 }
 
@@ -718,6 +798,21 @@ bool WorkerLlmInference::tryReadControlPacket() {
         printf("📨 [Worker] Recv Control: Batch=0 (stop)\n");
         isFinished = true;
         return true;
+    }
+
+    // Optional PlanCommand packet piggybacked after control packet.
+    if ((controlPacket.flags & LLM_CTRL_HAS_PLAN_CMD) != 0u) {
+        PlanCommand cmd;
+        network->read(ROOT_SOCKET_INDEX, &cmd, sizeof(cmd));
+        if (cmd.magic == DLLAMA_PLAN_CMD_MAGIC && cmd.version == DLLAMA_PLAN_CMD_VERSION) {
+            // Avoid redundant stores when multiple forwards share the same seq.
+            if (controlPacket.planCmdSeq != lastPlanCmdSeqRecv) {
+                planCommandCache().store(cmd);
+                lastPlanCmdSeqRecv = controlPacket.planCmdSeq;
+            }
+        } else {
+            printf("⚠️  [Worker] Bad PlanCommand packet (magic=0x%08x version=%u)\n", cmd.magic, cmd.version);
+        }
     }
     printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);
     for (NnUint i = 0; i < controlPacket.batchSize; i++)
@@ -820,6 +915,16 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     }
 
     RootLlmInference inference(&net, &execution, &executor, network, planPtr.get(), profileEnabled);
+
+    // Step 1: seed PlanCommand cache from deprecated env hooks (fallback).
+    maybeSeedPlanCommandFromLegacyEnv();
+
+    // Step 4: external controller (UDS). Enabled by setting DLLAMA_PLAN_CTRL_SOCKET.
+    std::unique_ptr<PlanUdsController> planCtrl;
+    const char *planSock = std::getenv("DLLAMA_PLAN_CTRL_SOCKET");
+    if (planSock != nullptr && planSock[0] != '\0') {
+        planCtrl = PlanUdsController::start(std::string(planSock), &inference);
+    }
 
     if (network != nullptr) {
         network->resetStats();

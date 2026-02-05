@@ -757,7 +757,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     } while (isWriting);
 }
 
-void NnNetwork::writeAll(void *data, NnSize size) {
+void NnNetwork::writeAll(const void *data, NnSize size) {
     std::vector<NnSocketIo> ios(nSockets);
     for (NnUint i = 0; i < nSockets; i++) {
         NnSocketIo *io = &ios[i];
@@ -1260,6 +1260,20 @@ NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetEx
         }
     }
 stage_found:;
+
+    // Build a stable (segmentIndex, syncIndex) -> slot mapping for optional sync profiling.
+    // This enables measuring full sync wall-time across all executor threads.
+    syncProfileBaseBySegment.clear();
+    syncProfileSlots.clear();
+    if (nodeConfig != nullptr && nodeConfig->segments != nullptr) {
+        syncProfileBaseBySegment.resize(nodeConfig->nSegments, 0u);
+        NnUint totalSlots = 0u;
+        for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+            syncProfileBaseBySegment[s] = totalSlots;
+            totalSlots += nodeConfig->segments[s].nSyncs;
+        }
+        syncProfileSlots.resize(totalSlots);
+    }
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
@@ -1268,6 +1282,13 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
     const bool kvAggProof = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF") != nullptr);
     const bool kvAggProofAllBatches = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES") != nullptr);
     const bool syncTrace = (std::getenv("DLLAMA_SYNC_TRACE") != nullptr);
+    const bool syncProfile = (std::getenv("DLLAMA_SYNC_PROFILE") != nullptr);
+
+    auto nowUs = []() -> long long {
+        return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::high_resolution_clock::now().time_since_epoch())
+            .count();
+    };
 
     auto findPipeIndexByName = [&](const char *name) -> int {
         for (NnUint i = 0; i < netConfig->nPipes; i++) {
@@ -1284,6 +1305,33 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         NnPipeConfig *pipeConfig = &netConfig->pipes[syncConfig->pipeIndex];
         NnSize batchBytes = getBytes(pipeConfig->size.floatType, pipeConfig->size.x);
         NnUint totalElements = pipeConfig->size.x; // [New] Get total elements
+
+        // Optional full-wall sync timing (across all executor threads).
+        SyncProfileSlot *slot = nullptr;
+        if (syncProfile && segmentIndex < syncProfileBaseBySegment.size()) {
+            const NnUint base = syncProfileBaseBySegment[segmentIndex];
+            const NnUint slotIndex = base + syncIndex;
+            if (slotIndex < syncProfileSlots.size()) slot = &syncProfileSlots[slotIndex];
+        }
+
+        NnUint epoch = 0u;
+        if (slot != nullptr) {
+            if (threadIndex == 0) {
+                epoch = slot->epoch.fetch_add(1u) + 1u;
+                slot->arrived.store(0u, std::memory_order_release);
+                slot->done.store(0u, std::memory_order_release);
+                slot->startUs.store(nowUs(), std::memory_order_release);
+            }
+
+            // Barrier: wait for all threads to reach this syncIndex.
+            // This makes duration represent the full executor sync step.
+            // NOTE: spin-wait is OK for debugging; keep it behind env var.
+            while ((epoch = slot->epoch.load(std::memory_order_acquire)) == 0u) {
+            }
+            slot->arrived.fetch_add(1u, std::memory_order_acq_rel);
+            while (slot->arrived.load(std::memory_order_acquire) < nThreads) {
+            }
+        }
 
         auto printHeadTail16 = [&](const char *pipeName, NnUint pipeIndex, NnUint batchIndex, const NnByte *data, NnSize nBytes) {
             if (pipeName == nullptr) pipeName = "(null)";
@@ -1328,7 +1376,6 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         //            pipeConfig->size.floatType, pipeConfig->size.x, (size_t)batchBytes);
         // }
 
-        auto start = std::chrono::high_resolution_clock::now();
         const char* syncTypeStr = "UNKNOWN";
 
         for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
@@ -1401,10 +1448,36 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                     }
                 }
 
-                auto end = std::chrono::high_resolution_clock::now();
-                (void)end;
-                // double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
-                // (void)elapsedMs;
+                // (optional) extra debug hooks go here
+            }
+        }
+
+        if (slot != nullptr) {
+            // Barrier end: wait all threads to finish this syncIndex.
+            const NnUint done = slot->done.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+            if (done == nThreads) {
+                slot->endUs.store(nowUs(), std::memory_order_release);
+            }
+            while (slot->done.load(std::memory_order_acquire) < nThreads) {
+            }
+
+            if (threadIndex == 0) {
+                const long long startUs = slot->startUs.load(std::memory_order_acquire);
+                const long long endUs = slot->endUs.load(std::memory_order_acquire);
+                const double ms = (endUs > startUs) ? (double)(endUs - startUs) / 1000.0 : 0.0;
+                const char *pipeName = pipeConfig->name ? pipeConfig->name : "(null)";
+                const size_t totalBytes = (size_t)batchBytes * (size_t)execution->batchSize;
+                printf(
+                    "⏱️ [sync-prof] node=%u seg=%u sync=%u type=%s pipe=%u name=%s totalBytes=%zu wall=%.3f ms\n",
+                    (unsigned)nodeConfig->nodeIndex,
+                    (unsigned)segmentIndex,
+                    (unsigned)syncIndex,
+                    syncTypeStr,
+                    (unsigned)syncConfig->pipeIndex,
+                    pipeName,
+                    totalBytes,
+                    ms);
+                std::fflush(stdout);
             }
         }
     }
@@ -1446,19 +1519,13 @@ static std::vector<std::string> buildEnvSyncList() {
     static const char *kDefaults[] = {
         "DLLAMA_STAGE_FULL_WEIGHTS",
         "DLLAMA_FORCE_MATMUL_VIEWS",
-        "DLLAMA_MIGRATE_APPLY_HEAD",
-        "DLLAMA_MIGRATE_APPLY_FFN",
-        "DLLAMA_MIGRATE_APPLY_DRYRUN",
         "DLLAMA_KV_AGGREGATE",
         "DLLAMA_KV_AGGREGATE_PROOF",
         "DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES",
         "DLLAMA_SYNC_TRACE",
         "DLLAMA_CONTROL_LOG",
-        "DLLAMA_HARD_MIGRATE_POS",
-        "DLLAMA_HARD_MIGRATE_LAYER",
-        "DLLAMA_HARD_MIGRATE_KIND",
-        "DLLAMA_HARD_MIGRATE_HEAD_MOVE",
-        "DLLAMA_HARD_MIGRATE_FFN_MOVE",
+        "DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT",
+        "DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION"
     };
 
     std::set<std::string> names;

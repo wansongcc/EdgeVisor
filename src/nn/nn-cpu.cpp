@@ -129,7 +129,7 @@ static inline bool tpRangeTargetEnabled() {
         return true;
     const PlanCommandSnapshot snap = planCommandCache().load();
     const PlanCommand &pc = snap.cmd;
-    if (pc.magic != DLLAMA_PLAN_CMD_MAGIC || pc.version != DLLAMA_PLAN_CMD_VERSION)
+    if (pc.magic != DLLAMA_PLAN_CMD_MAGIC || pc.version != DLLAMA_PLAN_CMD_VERSION_V2)
         return false;
     return (pc.mode == PLAN_CMD_MODE_EXACT && pc.triggerPos != 0xFFFFFFFFu && pc.triggerLayer != 0xFFFFFFFFu);
 }
@@ -142,7 +142,7 @@ static inline bool tpRangeTargetMatch(NnUint layerIndex, NnUint pos) {
     if (targetPos < 0 || targetLayer < 0) {
         const PlanCommandSnapshot snap = planCommandCache().load();
         const PlanCommand &pc = snap.cmd;
-        if (pc.magic == DLLAMA_PLAN_CMD_MAGIC && pc.version == DLLAMA_PLAN_CMD_VERSION && pc.mode == PLAN_CMD_MODE_EXACT) {
+        if (pc.magic == DLLAMA_PLAN_CMD_MAGIC && pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.mode == PLAN_CMD_MODE_EXACT) {
             targetPos = (pc.triggerPos == 0xFFFFFFFFu) ? -1 : (int)pc.triggerPos;
             targetLayer = (pc.triggerLayer == 0xFFFFFFFFu) ? -1 : (int)pc.triggerLayer;
             // Default behavior: when using PlanCommand(EXACT) target as the debug anchor,
@@ -1123,7 +1123,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
             const PlanCommand &pc = snap.cmd;
             const bool hasCmd =
                 (pc.magic == DLLAMA_PLAN_CMD_MAGIC) &&
-                (pc.version == DLLAMA_PLAN_CMD_VERSION) &&
+                (pc.version == DLLAMA_PLAN_CMD_VERSION_V1 || pc.version == DLLAMA_PLAN_CMD_VERSION_V2) &&
                 (pc.mode == PLAN_CMD_MODE_EXACT || pc.mode == PLAN_CMD_MODE_NEXT_BARRIER);
 
             const NnUint layerIndex = (segmentConfig != nullptr) ? segmentConfig->ops[opIndex].index : 0u;
@@ -1149,51 +1149,76 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
             bool trigger = false;
             if (hasCmd && isStageRoot) {
+                // One-shot guard: only emit once per command seq.
+                const unsigned int lastEmitted = device->getLastPlanCmdSeqEmitted();
+                if (pc.seq != 0u && pc.seq <= lastEmitted) {
+                    trigger = false;
+                } else {
                 if (pc.mode == PLAN_CMD_MODE_EXACT) {
                     trigger = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
                 } else if (pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) {
                     trigger = true;
                 }
+                }
             }
 
             if (trigger) {
                 emitEpoch = curEpoch + 1u;
-                cmd = pc.cmdKind;
-                headMove = pc.nHeadsToMove;
-                ffnMove = pc.nFfnToMove;
-                fromNode = pc.fromNodeIndex;
-                toNode = pc.toNodeIndex;
-                const char *kind = (cmd == 1u) ? "head" : (cmd == 2u ? "ffn" : (cmd == 3u ? "both" : "unknown"));
-                if (cmd == 3u) {
-                    printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=%s headMove=%u ffnMove=%u from=%u to=%u\n",
+                const bool useMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u);
+                if (useMoveList) {
+                    // cmd=4 means: apply from PlanCommand move list, referenced by seq.
+                    cmd = 4u;
+                    headMove = 0u;
+                    ffnMove = 0u;
+                    fromNode = pc.seq; // overloaded: cmdSeq
+                    toNode = 0u;
+                    printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=cmdlist seq=%u moves=%u\n",
+                        (unsigned)myNode,
+                        (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                        (unsigned)layerIndex,
+                        (unsigned)pos,
+                        (unsigned)emitEpoch,
+                        (unsigned)pc.seq,
+                        (unsigned)pc.nMoves);
+                } else {
+                    cmd = pc.cmdKind;
+                    headMove = pc.nHeadsToMove;
+                    ffnMove = pc.nFfnToMove;
+                    fromNode = pc.fromNodeIndex;
+                    toNode = pc.toNodeIndex;
+
+                    const char *kind = (cmd == 1u) ? "head" : (cmd == 2u ? "ffn" : (cmd == 3u ? "both" : "unknown"));
+                    if (cmd == 3u) {
+                        printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=%s headMove=%u ffnMove=%u from=%u to=%u\n",
+                            (unsigned)myNode,
+                            (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                            (unsigned)layerIndex,
+                            (unsigned)pos,
+                            (unsigned)emitEpoch,
+                            kind,
+                            (unsigned)headMove,
+                            (unsigned)ffnMove,
+                            (unsigned)fromNode,
+                            (unsigned)toNode);
+                    } else {
+                        const unsigned int move = (cmd == 2u) ? ffnMove : headMove;
+                        printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=%s move=%u from=%u to=%u\n",
                         (unsigned)myNode,
                         (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
                         (unsigned)layerIndex,
                         (unsigned)pos,
                         (unsigned)emitEpoch,
                         kind,
-                        (unsigned)headMove,
-                        (unsigned)ffnMove,
+                        (unsigned)move,
                         (unsigned)fromNode,
                         (unsigned)toNode);
-                } else {
-                    const unsigned int move = (cmd == 2u) ? ffnMove : headMove;
-                    printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=%s move=%u from=%u to=%u\n",
-                    (unsigned)myNode,
-                    (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
-                    (unsigned)layerIndex,
-                    (unsigned)pos,
-                    (unsigned)emitEpoch,
-                    kind,
-                    (unsigned)move,
-                    (unsigned)fromNode,
-                    (unsigned)toNode);
+                    }
                 }
+                const char *kind = (cmd == 1u) ? "head" : (cmd == 2u ? "ffn" : (cmd == 3u ? "both" : "unknown"));
                 std::fflush(stdout);
                 std::fflush(stdout);
 
-                // One-shot consumption: external commands have priority, env is fallback.
-                planCommandCache().consumeIfCacheSeq(snap.cacheSeq);
+                device->setLastPlanCmdSeqEmitted(pc.seq);
             }
 
             // Write control packet into the plan pipe for all batches.
@@ -1229,7 +1254,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
             const unsigned int pos = (in0[6] >= 0.0f) ? (unsigned int)in0[6] : 0u;
             const unsigned int ffnMove = (in0[7] >= 0.0f) ? (unsigned int)in0[7] : 0u;
 
-            if ((cmd == 1u || cmd == 2u || cmd == 3u) && msgEpoch > curEpoch) {
+            if ((cmd == 1u || cmd == 2u || cmd == 3u || cmd == 4u) && msgEpoch > curEpoch) {
                 auto *plan = const_cast<NnUnevenPartitionPlan *>(device->getPartitionPlan());
                 if (plan != nullptr && plan->nStages > 0) {
                     const NnUint myNode = device->getNodeIndex();
@@ -1244,156 +1269,435 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                             return false;
                         };
 
-                        if (inStage(fromNode) && inStage(toNode)) {
-                            bool changed = false;
+                        auto stageRank = [&](NnUint node) -> int {
+                            for (NnUint i = 0; i < st->nNodes; ++i) {
+                                if (st->nodeIndices[i] == node) return (int)i;
+                            }
+                            return -1;
+                        };
 
-                            auto applyHead = [&]() {
-                                if (headMove == 0u) return;
-                                if (!plan->headSplit.starts || !plan->headSplit.lengths) return;
+                        auto areAdjacentInStage = [&](NnUint a, NnUint b) -> bool {
+                            const int ra = stageRank(a);
+                            const int rb = stageRank(b);
+                            if (ra < 0 || rb < 0) return false;
+                            const int d = (ra >= rb) ? (ra - rb) : (rb - ra);
+                            return d == 1;
+                        };
 
-                                // Strict GQA lockstep migration:
-                                // - If this stage uses GQA, we treat headMove as "KV heads to move".
-                                // - We migrate kvHeadSplit, then re-derive headSplit = kvHeadSplit * gqaGroupSize.
-                                // This guarantees: qHeadStart == kvHeadStart * gqaGroupSize, with no cross-group.
-                                NnUint stageQHeadsTotal = 0u;
-                                NnUint stageKvHeadsTotal = 0u;
-                                if (st != nullptr && plan->kvHeadSplit.lengths != nullptr) {
-                                    for (NnUint i = 0; i < st->nNodes; ++i) {
-                                        const NnUint n = st->nodeIndices[i];
-                                        stageQHeadsTotal += plan->headSplit.lengths[n];
-                                        stageKvHeadsTotal += plan->kvHeadSplit.lengths[n];
+                        // Determine GQA group size (best-effort).
+                        NnUint stageQHeadsTotal = 0u;
+                        NnUint stageKvHeadsTotal = 0u;
+                        if (st != nullptr && plan->kvHeadSplit.lengths != nullptr && plan->headSplit.lengths != nullptr) {
+                            for (NnUint i = 0; i < st->nNodes; ++i) {
+                                const NnUint n = st->nodeIndices[i];
+                                stageQHeadsTotal += plan->headSplit.lengths[n];
+                                stageKvHeadsTotal += plan->kvHeadSplit.lengths[n];
+                            }
+                        }
+                        NnUint gqaGroupSize = 1u;
+                        if (stageKvHeadsTotal != 0u && stageQHeadsTotal != 0u && (stageQHeadsTotal % stageKvHeadsTotal) == 0u) {
+                            const NnUint g = stageQHeadsTotal / stageKvHeadsTotal;
+                            if (g != 0u) gqaGroupSize = g;
+                        }
+
+                        bool changed = false;
+
+                        // Helper: recompute contiguous starts within this stage.
+                        auto recomputeStarts = [&](NnDimSplit &split) {
+                            NnUint run = 0u;
+                            for (NnUint i = 0; i < st->nNodes; ++i) {
+                                const NnUint n = st->nodeIndices[i];
+                                split.starts[n] = run;
+                                run += split.lengths[n];
+                            }
+                        };
+
+                        // v2 move list apply (cmd==4): aggregate deltas first, then apply once.
+                        if (cmd == 4u) {
+                            const unsigned int wantSeq = fromNode; // overloaded by barrier for cmdlist
+                            const PlanCommandSnapshot snap2 = planCommandCache().load();
+                            const PlanCommand &pc2 = snap2.cmd;
+                            if (!isValidPlanCommandHeader(pc2) || pc2.seq != wantSeq || pc2.mode == PLAN_CMD_MODE_NONE) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u cmdlist missing/mismatch (wantSeq=%u gotSeq=%u ver=%u mode=%u)\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    (unsigned)wantSeq,
+                                    (unsigned)pc2.seq,
+                                    (unsigned)pc2.version,
+                                    (unsigned)pc2.mode);
+                                std::fflush(stdout);
+                                return;
+                            }
+                            if (!planCommandHasMoveList(pc2)) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u cmdlist has no moves (seq=%u)\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    (unsigned)pc2.seq);
+                                std::fflush(stdout);
+                                return;
+                            }
+
+                            const uint32_t stageNodes = st->nNodes;
+                            uint32_t maxMovesAllowed = (uint32_t)(2u * stageNodes);
+                            if (maxMovesAllowed > DLLAMA_PLAN_CMD_MAX_MOVES) maxMovesAllowed = DLLAMA_PLAN_CMD_MAX_MOVES;
+                            if (pc2.nMoves > maxMovesAllowed) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: nMoves=%u > maxAllowed=%u (stageNodes=%u)\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    (unsigned)pc2.nMoves,
+                                    (unsigned)maxMovesAllowed,
+                                    (unsigned)stageNodes);
+                                std::fflush(stdout);
+                                return;
+                            }
+
+                            std::vector<int> deltaHeadOrKv(plan->nNodes, 0);
+                            std::vector<int> deltaFfn(plan->nNodes, 0);
+
+                            bool reject = false;
+                            const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
+                            auto envBoolDefaultTrue = [&](const char *name) -> bool {
+                                const char *v = std::getenv(name);
+                                if (v == nullptr) return true;
+                                if (v[0] == '0') return false;
+                                if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+                                return true;
+                            };
+                            const bool kvRedundancyEnabled = envBoolDefaultTrue("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION");
+                            for (uint32_t i = 0; i < pc2.nMoves; ++i) {
+                                const PlanMove &m = pc2.moves[i];
+                                const NnUint f = (NnUint)m.fromNodeIndex;
+                                const NnUint t = (NnUint)m.toNodeIndex;
+                                if (!inStage(f) || !inStage(t) || f == t) { reject = true; break; }
+                                if (!areAdjacentInStage(f, t)) { reject = true; break; }
+                                if (m.headMove != 0u) {
+                                    // KV-head migration safety (GQA lockstep): without KV cache transfer, we
+                                    // require KV redundancy to be enabled AND moved heads within the precomputed pad.
+                                    if (gqaLockstep) {
+                                        if (!kvRedundancyEnabled) { reject = true; break; }
+                                        if (m.headMove > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; break; }
                                     }
+                                    deltaHeadOrKv[f] -= (int)m.headMove;
+                                    deltaHeadOrKv[t] += (int)m.headMove;
                                 }
-                                NnUint gqaGroupSize = 1u;
-                                if (stageKvHeadsTotal != 0u && stageQHeadsTotal != 0u && (stageQHeadsTotal % stageKvHeadsTotal) == 0u) {
-                                    const NnUint g = stageQHeadsTotal / stageKvHeadsTotal;
-                                    if (g != 0u) gqaGroupSize = g;
+                                if (m.ffnMove != 0u) {
+                                    deltaFfn[f] -= (int)m.ffnMove;
+                                    deltaFfn[t] += (int)m.ffnMove;
                                 }
+                            }
+                            if (reject) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: bad move (non-adjacent/out-of-stage/self or KV safety)\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos);
+                                std::fflush(stdout);
+                                return;
+                            }
 
-                                if (gqaGroupSize > 1u && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths) {
-                                    const NnUint kvMove = headMove;
-                                    if (kvMove == 0u) return;
-                                    if (plan->kvHeadSplit.lengths[fromNode] < kvMove) return;
-
-                                    const NnUint beforeKvFrom = plan->kvHeadSplit.lengths[fromNode];
-                                    const NnUint beforeKvTo = plan->kvHeadSplit.lengths[toNode];
-
-                                    plan->kvHeadSplit.lengths[fromNode] -= kvMove;
-                                    plan->kvHeadSplit.lengths[toNode] += kvMove;
-
-                                    // Recompute contiguous KV starts within the stage.
-                                    NnUint runKv = 0u;
-                                    for (NnUint i = 0; i < st->nNodes; ++i) {
-                                        const NnUint n = st->nodeIndices[i];
-                                        plan->kvHeadSplit.starts[n] = runKv;
-                                        runKv += plan->kvHeadSplit.lengths[n];
-                                    }
-
-                                    // Re-derive Q head split from KV head split (strict lockstep).
+                            // Apply head/KV deltas.
+                            if (gqaLockstep) {
+                                for (NnUint i = 0; i < st->nNodes; ++i) {
+                                    const NnUint n = st->nodeIndices[i];
+                                    const int d = deltaHeadOrKv[n];
+                                    if (d == 0) continue;
+                                    const int newLen = (int)plan->kvHeadSplit.lengths[n] + d;
+                                    if (newLen < 0) { reject = true; break; }
+                                }
+                                if (reject) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: kvHead underflow\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos);
+                                    std::fflush(stdout);
+                                    return;
+                                }
+                                for (NnUint i = 0; i < st->nNodes; ++i) {
+                                    const NnUint n = st->nodeIndices[i];
+                                    const int d = deltaHeadOrKv[n];
+                                    if (d == 0) continue;
+                                    plan->kvHeadSplit.lengths[n] = (NnUint)((int)plan->kvHeadSplit.lengths[n] + d);
+                                    changed = true;
+                                }
+                                if (changed) {
+                                    recomputeStarts(plan->kvHeadSplit);
+                                    // Derive Q head split from KV head split.
                                     for (NnUint i = 0; i < st->nNodes; ++i) {
                                         const NnUint n = st->nodeIndices[i];
                                         plan->headSplit.starts[n] = plan->kvHeadSplit.starts[n] * gqaGroupSize;
                                         plan->headSplit.lengths[n] = plan->kvHeadSplit.lengths[n] * gqaGroupSize;
                                     }
+                                }
+                            } else {
+                                // Non-GQA: treat headMove as Q heads.
+                                if (!plan->headSplit.starts || !plan->headSplit.lengths) return;
+                                for (NnUint i = 0; i < st->nNodes; ++i) {
+                                    const NnUint n = st->nodeIndices[i];
+                                    const int d = deltaHeadOrKv[n];
+                                    if (d == 0) continue;
+                                    const int newLen = (int)plan->headSplit.lengths[n] + d;
+                                    if (newLen < 0) { reject = true; break; }
+                                }
+                                if (reject) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: head underflow\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos);
+                                    std::fflush(stdout);
+                                    return;
+                                }
+                                for (NnUint i = 0; i < st->nNodes; ++i) {
+                                    const NnUint n = st->nodeIndices[i];
+                                    const int d = deltaHeadOrKv[n];
+                                    if (d == 0) continue;
+                                    plan->headSplit.lengths[n] = (NnUint)((int)plan->headSplit.lengths[n] + d);
+                                    changed = true;
+                                }
+                                if (changed) recomputeStarts(plan->headSplit);
+                            }
 
-                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u GQA lockstep kvLen[%u]:%u->%u kvLen[%u]:%u->%u (kvMove=%u gqaGroup=%u)\n",
+                            // Apply FFN deltas.
+                            if (!plan->ffnSplit.starts || !plan->ffnSplit.lengths) return;
+                            for (NnUint i = 0; i < st->nNodes; ++i) {
+                                const NnUint n = st->nodeIndices[i];
+                                const int d = deltaFfn[n];
+                                if (d == 0) continue;
+                                const int newLen = (int)plan->ffnSplit.lengths[n] + d;
+                                if (newLen < 0) { reject = true; break; }
+                            }
+                            if (reject) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: ffn underflow\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos);
+                                std::fflush(stdout);
+                                return;
+                            }
+                            bool ffnChanged = false;
+                            for (NnUint i = 0; i < st->nNodes; ++i) {
+                                const NnUint n = st->nodeIndices[i];
+                                const int d = deltaFfn[n];
+                                if (d == 0) continue;
+                                plan->ffnSplit.lengths[n] = (NnUint)((int)plan->ffnSplit.lengths[n] + d);
+                                ffnChanged = true;
+                            }
+                            if (ffnChanged) {
+                                recomputeStarts(plan->ffnSplit);
+                                changed = true;
+                            }
+
+                            if (changed) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u cmdlist seq=%u moves=%u (gqaGroup=%u)\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    (unsigned)pc2.seq,
+                                    (unsigned)pc2.nMoves,
+                                    (unsigned)gqaGroupSize);
+                                std::fflush(stdout);
+                                device->setPlanEpoch(msgEpoch);
+                            }
+                            return;
+                        }
+
+                        // Legacy single-edge apply (cmd 1/2/3)
+                        if (inStage(fromNode) && inStage(toNode)) {
+                            if (!areAdjacentInStage(fromNode, toNode)) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: legacy move not adjacent (from=%u to=%u)\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    (unsigned)fromNode,
+                                    (unsigned)toNode);
+                                std::fflush(stdout);
+                                return;
+                            }
+                            // Keep previous behavior for single-edge mode.
+                            bool legacyChanged = false;
+                            bool legacyNoOp = false;
+
+                            const char *legacyKind = (cmd == 1u) ? "head" : (cmd == 2u ? "ffn" : (cmd == 3u ? "both" : "unknown"));
+
+                            auto applyHeadLegacy = [&]() {
+                                if (headMove == 0u) return;
+                                if (!plan->headSplit.starts || !plan->headSplit.lengths) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: missing head split arrays\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos);
+                                    std::fflush(stdout);
+                                    legacyNoOp = true;
+                                    return;
+                                }
+                                const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
+                                if (gqaLockstep) {
+                                    auto envBoolDefaultTrue = [&](const char *name) -> bool {
+                                        const char *v = std::getenv(name);
+                                        if (v == nullptr) return true;
+                                        if (v[0] == '0') return false;
+                                        if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+                                        return true;
+                                    };
+                                    const bool kvRedundancyEnabled = envBoolDefaultTrue("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION");
+                                    if (!kvRedundancyEnabled) {
+                                        printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV redundancy disabled (set DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=1)\n",
+                                            (unsigned)myNode,
+                                            (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                            (unsigned)msgEpoch,
+                                            (unsigned)layerIndex,
+                                            (unsigned)pos);
+                                        std::fflush(stdout);
+                                        legacyNoOp = true;
+                                        return;
+                                    }
+                                    const NnUint kvMove = headMove;
+                                    if (kvMove > NN_KV_REDUNDANCY_PAD_HEADS) {
+                                        printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV move=%u exceeds pad=%u\n",
+                                            (unsigned)myNode,
+                                            (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                            (unsigned)msgEpoch,
+                                            (unsigned)layerIndex,
+                                            (unsigned)pos,
+                                            (unsigned)kvMove,
+                                            (unsigned)NN_KV_REDUNDANCY_PAD_HEADS);
+                                        std::fflush(stdout);
+                                        legacyNoOp = true;
+                                        return;
+                                    }
+                                    if (plan->kvHeadSplit.lengths[fromNode] < kvMove) {
+                                        printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: kvHead insufficient (from=%u len=%u need=%u)\n",
+                                            (unsigned)myNode,
+                                            (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                            (unsigned)msgEpoch,
+                                            (unsigned)layerIndex,
+                                            (unsigned)pos,
+                                            (unsigned)fromNode,
+                                            (unsigned)plan->kvHeadSplit.lengths[fromNode],
+                                            (unsigned)kvMove);
+                                        std::fflush(stdout);
+                                        legacyNoOp = true;
+                                        return;
+                                    }
+                                    plan->kvHeadSplit.lengths[fromNode] -= kvMove;
+                                    plan->kvHeadSplit.lengths[toNode] += kvMove;
+                                    recomputeStarts(plan->kvHeadSplit);
+                                    for (NnUint i = 0; i < st->nNodes; ++i) {
+                                        const NnUint n = st->nodeIndices[i];
+                                        plan->headSplit.starts[n] = plan->kvHeadSplit.starts[n] * gqaGroupSize;
+                                        plan->headSplit.lengths[n] = plan->kvHeadSplit.lengths[n] * gqaGroupSize;
+                                    }
+                                    legacyChanged = true;
+                                    return;
+                                }
+                                const NnUint qMove = headMove;
+                                if (plan->headSplit.lengths[fromNode] < qMove) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: head insufficient (from=%u len=%u need=%u)\n",
                                         (unsigned)myNode,
                                         (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
                                         (unsigned)msgEpoch,
                                         (unsigned)layerIndex,
                                         (unsigned)pos,
                                         (unsigned)fromNode,
-                                        (unsigned)beforeKvFrom,
-                                        (unsigned)plan->kvHeadSplit.lengths[fromNode],
-                                        (unsigned)toNode,
-                                        (unsigned)beforeKvTo,
-                                        (unsigned)plan->kvHeadSplit.lengths[toNode],
-                                        (unsigned)kvMove,
-                                        (unsigned)gqaGroupSize);
+                                        (unsigned)plan->headSplit.lengths[fromNode],
+                                        (unsigned)qMove);
                                     std::fflush(stdout);
-                                    changed = true;
+                                    legacyNoOp = true;
                                     return;
                                 }
-
-                                // Non-GQA (or missing kvHeadSplit info): migrate Q heads directly.
-                                const NnUint qMove = headMove;
-                                if (plan->headSplit.lengths[fromNode] < qMove) return;
-                                const NnUint beforeFrom = plan->headSplit.lengths[fromNode];
-                                const NnUint beforeTo = plan->headSplit.lengths[toNode];
-
                                 plan->headSplit.lengths[fromNode] -= qMove;
                                 plan->headSplit.lengths[toNode] += qMove;
-
-                                // Recompute contiguous starts within the stage.
-                                NnUint run = 0u;
-                                for (NnUint i = 0; i < st->nNodes; ++i) {
-                                    const NnUint n = st->nodeIndices[i];
-                                    plan->headSplit.starts[n] = run;
-                                    run += plan->headSplit.lengths[n];
-                                }
-
-                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u headLen[%u]:%u->%u headLen[%u]:%u->%u (headMove=%u)\n",
-                                    (unsigned)myNode,
-                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
-                                    (unsigned)msgEpoch,
-                                    (unsigned)layerIndex,
-                                    (unsigned)pos,
-                                    (unsigned)fromNode,
-                                    (unsigned)beforeFrom,
-                                    (unsigned)plan->headSplit.lengths[fromNode],
-                                    (unsigned)toNode,
-                                    (unsigned)beforeTo,
-                                    (unsigned)plan->headSplit.lengths[toNode],
-                                    (unsigned)headMove);
-                                std::fflush(stdout);
-                                changed = true;
+                                recomputeStarts(plan->headSplit);
+                                legacyChanged = true;
                             };
 
-                            auto applyFfn = [&]() {
+                            auto applyFfnLegacy = [&]() {
                                 if (ffnMove == 0u) return;
-                                if (!plan->ffnSplit.starts || !plan->ffnSplit.lengths) return;
-                                if (plan->ffnSplit.lengths[fromNode] < ffnMove) return;
-                                const NnUint beforeFrom = plan->ffnSplit.lengths[fromNode];
-                                const NnUint beforeTo = plan->ffnSplit.lengths[toNode];
-
+                                if (!plan->ffnSplit.starts || !plan->ffnSplit.lengths) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: missing ffn split arrays\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos);
+                                    std::fflush(stdout);
+                                    legacyNoOp = true;
+                                    return;
+                                }
+                                if (plan->ffnSplit.lengths[fromNode] < ffnMove) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: ffn insufficient (from=%u len=%u need=%u)\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos,
+                                        (unsigned)fromNode,
+                                        (unsigned)plan->ffnSplit.lengths[fromNode],
+                                        (unsigned)ffnMove);
+                                    std::fflush(stdout);
+                                    legacyNoOp = true;
+                                    return;
+                                }
                                 plan->ffnSplit.lengths[fromNode] -= ffnMove;
                                 plan->ffnSplit.lengths[toNode] += ffnMove;
+                                recomputeStarts(plan->ffnSplit);
+                                legacyChanged = true;
+                            };
 
-                                // Recompute contiguous starts within the stage.
-                                NnUint run = 0u;
-                                for (NnUint i = 0; i < st->nNodes; ++i) {
-                                    const NnUint n = st->nodeIndices[i];
-                                    plan->ffnSplit.starts[n] = run;
-                                    run += plan->ffnSplit.lengths[n];
-                                }
+                            if (cmd == 1u) applyHeadLegacy();
+                            else if (cmd == 2u) applyFfnLegacy();
+                            else if (cmd == 3u) { applyHeadLegacy(); applyFfnLegacy(); }
 
-                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u ffnLen[%u]:%u->%u ffnLen[%u]:%u->%u\n",
+                            if (legacyChanged) {
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u kind=%s headMove=%u ffnMove=%u from=%u to=%u (gqaGroup=%u)\n",
                                     (unsigned)myNode,
                                     (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
                                     (unsigned)msgEpoch,
                                     (unsigned)layerIndex,
                                     (unsigned)pos,
+                                    legacyKind,
+                                    (unsigned)headMove,
+                                    (unsigned)ffnMove,
                                     (unsigned)fromNode,
-                                    (unsigned)beforeFrom,
-                                    (unsigned)plan->ffnSplit.lengths[fromNode],
                                     (unsigned)toNode,
-                                    (unsigned)beforeTo,
-                                    (unsigned)plan->ffnSplit.lengths[toNode]);
+                                    (unsigned)gqaGroupSize);
                                 std::fflush(stdout);
-                                changed = true;
-                            };
-
-                            if (cmd == 1u) {
-                                applyHead();
-                            } else if (cmd == 2u) {
-                                applyFfn();
-                            } else if (cmd == 3u) {
-                                applyHead();
-                                applyFfn();
-                            }
-
-                            if (changed) {
                                 device->setPlanEpoch(msgEpoch);
+                            } else if (!legacyNoOp) {
+                                // This happens if cmd asks to move 0, or cmd kind is unknown.
+                                printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u no-op (kind=%s headMove=%u ffnMove=%u from=%u to=%u)\n",
+                                    (unsigned)myNode,
+                                    (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    (unsigned)msgEpoch,
+                                    (unsigned)layerIndex,
+                                    (unsigned)pos,
+                                    legacyKind,
+                                    (unsigned)headMove,
+                                    (unsigned)ffnMove,
+                                    (unsigned)fromNode,
+                                    (unsigned)toNode);
+                                std::fflush(stdout);
                             }
                         }
                     }

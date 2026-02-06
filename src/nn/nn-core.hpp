@@ -55,6 +55,7 @@ typedef struct {
 struct NnStageDef {
     NnUint nLayers;              // 该 Stage 负责多少层
     std::vector<float> tpRatios; // 该 Stage 内部的 TP 比例 (例如 {1.0, 3.0})
+    std::vector<NnUint> kvRedundancyPerNode; // 每个节点的 KV 冗余 head 数量
 };
 
 // [新增] 描述一个 Stage 的具体配置 (生成后的结果)
@@ -715,7 +716,8 @@ NnUnevenPartitionPlan createPartitionPlan(
     NnUint globalNKvHeads,
     NnUint globalVocabSize,
     NnUint globalFfnDim,
-    NnUint globalDim
+    NnUint globalDim,
+    const std::vector<NnUint>& globalKvRedundancyPerNode = {} // 每个节点的 KV 冗余 head 数量
 );
 
 // 释放计划 (旧接口，如果使用栈上对象+析构函数可忽略，但保留以防遗留调用)

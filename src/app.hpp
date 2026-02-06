@@ -41,7 +41,9 @@ public:
     int gpuSegmentFrom;
     int gpuSegmentTo;
 
-    char *ratiosStr; 
+    char *ratiosStr;
+    char *kvRedundancyStr; // KV redundancy per node, format: "2" (all) or "2,3,2,3" (per-node)
+    bool enablePlanBarrier; // Enable plan barrier for online migration
 
     // worker
     NnUint port;
@@ -75,8 +77,9 @@ typedef struct {
 // Bootstrap settings sent from root to worker after socket connect and before
 // sending net/node configs. This removes the need for workers to pass --model/--ratios.
 enum LlmBootstrapFlags : NnUint {
-    LLM_BOOTSTRAP_HAS_MODEL_PATH = 1u << 0,
-    LLM_BOOTSTRAP_HAS_RATIOS     = 1u << 1,
+    LLM_BOOTSTRAP_HAS_MODEL_PATH      = 1u << 0,
+    LLM_BOOTSTRAP_HAS_RATIOS          = 1u << 1,
+    LLM_BOOTSTRAP_ENABLE_PLAN_BARRIER = 1u << 2,
 };
 
 typedef struct {
@@ -84,6 +87,7 @@ typedef struct {
     NnUint version;    // 2
     NnUint flags;      // LlmBootstrapFlags
     NnUint benchmarkEnabled; // 0/1, enables executor timer on workers
+    NnUint enablePlanBarrier; // 0/1, enables plan barrier for online migration
     NnUint maxSeqLen;  // forwarded from root args
     NnUint syncType;   // NnFloatType (as NnUint)
     NnUint modelPathLen; // bytes including '\0' if present
@@ -91,7 +95,7 @@ typedef struct {
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 2u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 3u;
 
 class RootLlmInference {
 public:

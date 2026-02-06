@@ -452,7 +452,8 @@ NnUnevenPartitionPlan createPartitionPlan(
     NnUint globalNKvHeads,
     NnUint globalVocabSize,
     NnUint globalFfnDim,
-    NnUint globalDim
+    NnUint globalDim,
+    const std::vector<NnUint>& globalKvRedundancyPerNode
 ) {
     NnUnevenPartitionPlan plan;
     
@@ -521,14 +522,49 @@ NnUnevenPartitionPlan createPartitionPlan(
             // KV Compute Heads (with redundancy padding)
             // This range is used to optionally compute extra KV heads for online migrations.
             // Ownership (and default KV cache layout) is still defined by kvHeadSplit.
-            const NnUint kvPad = NN_KV_REDUNDANCY_PAD_HEADS;
+            //
+            // New redundancy logic:
+            // - First node in stage: only add redundancy to the right (avoid underflow to 0)
+            // - Last node in stage: only add redundancy to the left (avoid overflow past globalNKvHeads)
+            // - Middle nodes: split redundancy evenly on both sides (e.g., 4 -> 2 left, 2 right)
             for (NnUint i = 0; i < config.nNodes; i++) {
                 const NnUint globalIdx = currentNodeOffset + i;
                 const NnUint start0 = plan.kvHeadSplit.starts[globalIdx];
                 const NnUint len0 = plan.kvHeadSplit.lengths[globalIdx];
 
-                const NnUint start1 = (start0 > kvPad) ? (start0 - kvPad) : 0u;
-                NnUint end1 = start0 + len0 + kvPad;
+                // Get redundancy for this node (default to NN_KV_REDUNDANCY_PAD_HEADS if not specified)
+                NnUint kvPad = NN_KV_REDUNDANCY_PAD_HEADS;
+                if (!globalKvRedundancyPerNode.empty() && globalIdx < globalKvRedundancyPerNode.size()) {
+                    kvPad = globalKvRedundancyPerNode[globalIdx];
+                }
+
+                NnUint start1 = start0;
+                NnUint end1 = start0 + len0;
+
+                // Apply redundancy based on node position in stage
+                if (i == 0) {
+                    // First node: only add redundancy to the right
+                    end1 += kvPad;
+                } else if (i == config.nNodes - 1) {
+                    // Last node: only add redundancy to the left
+                    if (start1 >= kvPad) {
+                        start1 -= kvPad;
+                    } else {
+                        start1 = 0u;
+                    }
+                } else {
+                    // Middle node: split redundancy evenly on both sides
+                    NnUint leftPad = kvPad / 2;
+                    NnUint rightPad = kvPad - leftPad; // Handle odd numbers
+                    if (start1 >= leftPad) {
+                        start1 -= leftPad;
+                    } else {
+                        start1 = 0u;
+                    }
+                    end1 += rightPad;
+                }
+
+                // Clamp to global bounds
                 if (end1 > globalNKvHeads) end1 = globalNKvHeads;
                 const NnUint len1 = (end1 > start1) ? (end1 - start1) : 0u;
 

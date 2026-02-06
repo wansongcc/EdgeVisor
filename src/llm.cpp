@@ -10,6 +10,13 @@
 #include <stdexcept>
 #include <functional>
 
+// Global flag to enable plan barrier (set from app via bootstrap packet)
+static bool g_enablePlanBarrier = false;
+
+void setEnablePlanBarrier(bool enable) {
+    g_enablePlanBarrier = enable;
+}
+
 static const char *hiddenActToString(LlmHiddenAct act) {
     if (act == HIDDEN_ACT_GELU) return "Gelu";
     if (act == HIDDEN_ACT_SILU) return "Silu";
@@ -740,8 +747,7 @@ static NnNodeConfig buildLlmNodeInternal(
         (std::getenv("DLLAMA_HARD_MIGRATE_HEAD_MOVE") != nullptr) ||
         (std::getenv("DLLAMA_HARD_MIGRATE_FFN_MOVE") != nullptr);
 
-    const bool enablePlanBarrier =
-        (std::getenv("DLLAMA_ENABLE_PLAN_BARRIER") != nullptr) || legacyHardMigrateRequested;
+    const bool enablePlanBarrier = g_enablePlanBarrier || legacyHardMigrateRequested;
 
     // 2. 计算切分 (Slicing)
     NnKvCacheSliceUneven kvCacheSlice = sliceKvCacheUneven(h->seqLen, h->headDim, plan, nodeIndex);

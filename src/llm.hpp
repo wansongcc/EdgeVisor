@@ -153,4 +153,7 @@ void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
 void loadLlmNetWeightUneven(const char* path, LlmNet *net, NnLocalWeightLoader *loader, const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
 
+// Set enable plan barrier flag (called from app after reading bootstrap packet)
+void setEnablePlanBarrier(bool enable);
+
 #endif

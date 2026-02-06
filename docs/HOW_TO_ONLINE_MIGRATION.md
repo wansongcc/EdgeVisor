@@ -6,7 +6,7 @@
 
 ---
 
-## 1. 背景与机制（你在测什么）
+## 1. 背景与机制
 
 在启用 plan barrier 后，执行图里会插入两类 CPU-only op：
 
@@ -23,27 +23,40 @@
 - apply 侧：节点把 plan 更新并 bump epoch；
 - 执行侧：pointer/slice 配置随 epoch 更新发生变化。
 
+通信实现基于Unix Domain Sockets 用于同一台主机上的进程间通信（IPC）。它的 API 和网络套接字（TCP/IP）非常相似，但不通过网络卡，而是通过文件系统中的一个“路径”作为地址，因此速度极快且开销很小。
+
 ---
 
 ## 2. 开启与启动
 
 ### 2.1 必要开关
-
-- `DLLAMA_ENABLE_PLAN_BARRIER=1`
-  - 这是总开关（存在即启用）。不开启就不会插入/执行 barrier/apply。
+#### 作为环境变量开关在启动时开启
 
 - `DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
   - 设置后 root 进程会启动 UDS 控制器线程。
   - 进程启动后会在 stderr 打印：`[plan-uds] listening on /tmp/dllama_plan.sock`。
 
+
 UDS 控制器协议说明与客户端示例见：
 - [docs/README_ENV_VARS.md](README_ENV_VARS.md)
 - 客户端脚本：[examples/plan-uds-client.py](../examples/plan-uds-client.py)
 
-### 2.2 推荐的“单机 2 节点”冒烟拓扑
+kv冗余计算
+ - 单个值：`--kv-redundancy 2`  所有节点使用 2 个冗余 head
+ - 每个节点：`--kv-redundancy 2,3,2,3`  每个节点指定不同数量
+ - **ps:kv冗余计算配置为全局配置，如果代码没有彻底退出，将一直保留该配置**
 
-用 1 个 worker 进程模拟 2 节点，验证 root→worker 分发与 apply 是否都正常。
+### 2.2 运行
 
+用 3 个 worker 进程模拟 4 节点，验证 root→worker 分发与 apply 是否都正常。
+#### 容器准备
+```
+$cloud25
+cd /home/cc/docker_file
+export WORKER_NAME=worker-node-0X
+docker compose -f docker-compose-rpi.yml up -d
+```
+ -已经配置好了网络连接，使用`rpi-net`连接各个节点，在连接是不需要知道ip，使用容器名即可
 #### 终端 A：启动 worker
 
 ```bash
@@ -60,19 +73,20 @@ cd /workspace/dllama/distributed-llama
 
 ```bash
 cd /workspace/dllama/distributed-llama
-export DLLAMA_ENABLE_PLAN_BARRIER=1
-export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
-
 ./dllama inference \
+  --interactive \
   --prompt "The capital of France is" \
-  --steps 256 \
-  --model models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
-  --tokenizer models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
+  --steps 64 \
+  --model /workspace/dllama/distributed-llama/models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
+  --tokenizer /workspace/dllama/distributed-llama/models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
-  --nthreads 4 \
+  --enable-plan-barrier \ #启用在线迁移
+  --kv-redundancy 2 \
+  --nthreads 2 \
   --max-seq-len 2048 \
-  --workers 127.0.0.1:9999 \
-  --ratios 1:1
+  --benchmark \
+  --workers rpi-trixie5:9999 rpi-trixie2:9999 rpi-trixie6:9999 \
+  --ratios "1:1*1:1*1:1"
 ```
 
 > 如果你使用多 stage（如 `--ratios 1:1*1:1`），请在命令里用正确的 `stageIndex` 指向想迁移的 stage。
@@ -96,7 +110,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
 - 当前缓存的 `PlanCommand`（含 `mode/seq/stageIndex/from/to/...`）
 - 以及 root 推理的 `position/batchSize/perfSamples`（用于确认推理在跑）
 
-### 3.2 推荐触发模式：`next_barrier`
+### 3.2 下一次 barrier 触发模式：`next_barrier`
 
 “下一次 barrier 立即触发”（用于真实运行时最稳的方式）：
 
@@ -113,6 +127,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
 - `from/to`：在该 stage 内从哪个 node 迁移到哪个 node
 - `kind=3`：`1=headSplit` `2=ffnSplit` `3=both`
 - `heads/ffn`：迁移量（注意：head 迁移在 GQA 情况下会按 KV-head lockstep 处理）
+- **`seq` 信令编号：同一次代码运行中（没有退出代码，而不是同一次推理中）携带相同的seq的指令二次接收到后会被抛弃，如果在同一次运行中，每次的指令的seq需要递增**
 
 ### 3.3 调试触发模式：`exact`
 
@@ -128,6 +143,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
 用于：
 - 精准复现某个 layer/pos 处的迁移行为
 - 对照迁移前后某个固定点的 slice/pointer/kv 范围变化
+- ps：seq同上，注意递增
 
 ---
 

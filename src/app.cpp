@@ -91,6 +91,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.version = LLM_BOOTSTRAP_VERSION;
     p.flags = 0u;
     p.benchmarkEnabled = args->benchmark ? 1u : 0u;
+    p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
     p.maxSeqLen = args->maxSeqLen;
     p.syncType = (NnUint)args->syncType;
     p.modelPathLen = 0u;
@@ -176,6 +177,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
     args.ratiosStr = nullptr;
+    args.kvRedundancyStr = nullptr;
+    args.enablePlanBarrier = false;
 
     int i = 1;
     if (requireMode && argc > 1) {
@@ -204,6 +207,18 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.benchmark = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--enable-plan-barrier") == 0) {
+            // Support both: "--enable-plan-barrier" and "--enable-plan-barrier 1|0".
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.enablePlanBarrier = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.enablePlanBarrier = true;
                 i += 1;
             }
             continue;
@@ -265,6 +280,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.syncType = parseFloatType(value);
         } else if (std::strcmp(name, "--ratios") == 0) {
             args.ratiosStr = value;
+        } else if (std::strcmp(name, "--kv-redundancy") == 0) {
+            args.kvRedundancyStr = value;
         } else if (std::strcmp(name, "--port") == 0) {
             args.port = atoi(value);
         } else if (std::strcmp(name, "--nthreads") == 0) {
@@ -335,6 +352,48 @@ static std::vector<float> parseRatios(const char *ratiosStr, NnUint nNodes) {
         );
     }
     return ratios;
+}
+
+// 解析 KV 冗余范围字符串
+// 格式：
+//   - "2" - 所有节点都使用 2 个冗余 head
+//   - "2,3,2,3" - 每个节点指定不同的冗余 head 数量
+// 返回每个节点的冗余 head 数量
+static std::vector<NnUint> parseKvRedundancy(const char *redundancyStr, NnUint nNodes) {
+    if (redundancyStr == nullptr) {
+        // 默认值为 2（与 NN_KV_REDUNDANCY_PAD_HEADS 保持一致）
+        std::vector<NnUint> redundancies(nNodes, 2u);
+        return redundancies;
+    }
+
+    std::vector<NnUint> redundancies;
+    std::string s(redundancyStr);
+    std::stringstream ss(s);
+    std::string item;
+
+    while (std::getline(ss, item, ',')) {
+        try {
+            NnUint val = (NnUint)std::stoul(item);
+            redundancies.push_back(val);
+        } catch (const std::exception& e) {
+            throw std::invalid_argument(std::string("无效的 KV 冗余值: ") + item);
+        }
+    }
+
+    if (redundancies.size() == 1) {
+        // 单个值，应用到所有节点
+        std::vector<NnUint> result(nNodes, redundancies[0]);
+        return result;
+    }
+
+    if (redundancies.size() != nNodes) {
+        throw std::invalid_argument(
+            std::string("KV 冗余值数量 (") + std::to_string(redundancies.size()) +
+            std::string(") 必须等于节点总数 (nNodes = ") + std::to_string(nNodes) + ")"
+        );
+    }
+
+    return redundancies;
 }
 
 // [修改] 解析多 Stage 格式: "1.0:10;0.5,0.5:14"
@@ -856,8 +915,19 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         std::vector<NnStageDef> stageDefs = parseStageDefs(args->ratiosStr, nNodes, header.nLayers);
         NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
 
+        // Parse KV redundancy per node
+        std::vector<NnUint> kvRedundancyPerNode = parseKvRedundancy(args->kvRedundancyStr, nNodes);
+        if (args->info && args->kvRedundancyStr != nullptr) {
+            printf("⚡ KV Redundancy: \"");
+            for (size_t i = 0; i < kvRedundancyPerNode.size(); ++i) {
+                if (i > 0) printf(",");
+                printf("%u", kvRedundancyPerNode[i]);
+            }
+            printf("\"\n");
+        }
+
         planPtr.reset(new NnUnevenPartitionPlan(
-            createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim)
+            createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, kvRedundancyPerNode)
         ));
         
         // 使用 Uneven Builder (传入 planPtr)
@@ -932,6 +1002,9 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     // Step 1: seed PlanCommand cache from deprecated env hooks (fallback).
     maybeSeedPlanCommandFromLegacyEnv();
 
+    // Set enable plan barrier flag from CLI argument
+    setEnablePlanBarrier(args->enablePlanBarrier);
+
     // Step 4: external controller (UDS). Enabled by setting DLLAMA_PLAN_CTRL_SOCKET.
     std::unique_ptr<PlanUdsController> planCtrl;
     const char *planSock = std::getenv("DLLAMA_PLAN_CTRL_SOCKET");
@@ -978,6 +1051,10 @@ void runWorkerApp(AppCliArgs *args) {
         const NnUint bootMaxSeqLen = boot.maxSeqLen;
         const NnFloatType bootSyncType = (NnFloatType)boot.syncType;
         const bool bootBenchmarkEnabled = boot.benchmarkEnabled != 0u;
+        const bool bootEnablePlanBarrier = boot.enablePlanBarrier != 0u;
+
+        // Set enable plan barrier flag from bootstrap packet
+        setEnablePlanBarrier(bootEnablePlanBarrier);
 
         NnWorkerConfigReader configReader(network);
         NnNetConfig netConfig = configReader.readNet();
@@ -1004,10 +1081,10 @@ void runWorkerApp(AppCliArgs *args) {
 
                std::vector<NnStageDef> stageDefs = parseStageDefs(bootRatios.c_str(), netConfig.nNodes, header.nLayers);
              NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
-             
 
+             // Worker side: use default KV redundancy (empty vector = default to NN_KV_REDUNDANCY_PAD_HEADS)
              planPtr.reset(new NnUnevenPartitionPlan(
-                 createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim)
+                 createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, {})
              ));
         }
 

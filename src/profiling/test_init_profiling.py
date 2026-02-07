@@ -71,9 +71,19 @@ def run_simulation():
     
     # 表头
     # ID | Memory (GB) | Compute (GFLOPS) | Attention Timing
-    headers = ["ID", "Mem(GB)", "GFLOPS", "T_kv(us)", "T_full(us)", "Gamma"]
+    headers = [
+        "ID",
+        "Mem(GB)",
+        "GFLOPS",
+        "T_kv(us)",
+        "T_attn(us)",
+        "T_ffn(us)",
+        "T_attn+ffn(us)",
+        "T_full(us)",
+        "Gamma",
+    ]
     print(
-        f"{headers[0]:<4} | {headers[1]:<8} | {headers[2]:<10} | {headers[3]:<10} | {headers[4]:<11} | {headers[5]}"
+        f"{headers[0]:<4} | {headers[1]:<8} | {headers[2]:<10} | {headers[3]:<10} | {headers[4]:<11} | {headers[5]:<10} | {headers[6]:<14} | {headers[7]:<10} | {headers[8]}"
     )
     print("-" * 90)
 
@@ -102,10 +112,15 @@ def run_simulation():
         mem_gb = r.get('memory_bytes', 0) / (1024 ** 3)
         comp = r.get('compute_gflops', 0.0)
         t_kv = r.get('t_kv_us', 0.0)
+        t_attn = r.get('t_attn_us', 0.0)
+        t_ffn = r.get('t_ffn_us', 0.0)
+        t_attn_ffn = r.get('t_attn_ffn_us', 0.0)
         t_full = r.get('t_full_us', 0.0)
         gamma = r.get('gamma_ratio', 0.0)
 
-        print(f"{dev_id:<4} | {mem_gb:<8.2f} | {comp:<10.2f} | {t_kv:<10.4f} | {t_full:<11.4f} | {gamma:.4f}")
+        print(
+            f"{dev_id:<4} | {mem_gb:<8.2f} | {comp:<10.2f} | {t_kv:<10.4f} | {t_attn:<11.4f} | {t_ffn:<10.4f} | {t_attn_ffn:<14.4f} | {t_full:<10.4f} | {gamma:.4f}"
+        )
 
     print("="*90)
     print("Simulation Finished.")

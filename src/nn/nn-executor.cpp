@@ -1,7 +1,52 @@
 #include <cassert>
 #include <cstring>
+#include <algorithm>
 #include "nn-executor.hpp"
 #include "nn-cpu.hpp"
+
+// Segment kind codes for per-layer compute profiling.
+static constexpr NnByte SEG_KIND_OTHER = 0;
+static constexpr NnByte SEG_KIND_ATTN  = 1;
+static constexpr NnByte SEG_KIND_FFN   = 2;
+
+static inline bool nameHas(const char *name, const char *needle) {
+    if (name == nullptr || needle == nullptr) return false;
+    return std::strstr(name, needle) != nullptr;
+}
+
+static NnByte classifySegmentKind(const NnSegmentConfig &seg) {
+    bool hasAttn = false;
+    bool hasFfn = false;
+    for (NnUint i = 0; i < seg.nOps; ++i) {
+        const char *n = seg.ops[i].name;
+        // FFN / MoE markers
+        if (nameHas(n, "block_matmul_w1") || nameHas(n, "block_matmul_w2") || nameHas(n, "block_matmul_w3") ||
+            nameHas(n, "block_moe_") || nameHas(n, "moe_") || nameHas(n, "_moe_")) {
+            hasFfn = true;
+        }
+        // Attention markers
+        if (nameHas(n, "block_matmul_q") || nameHas(n, "block_matmul_k") || nameHas(n, "block_matmul_v") ||
+            nameHas(n, "block_matmul_wo") || nameHas(n, "block_multihead_att") || nameHas(n, "block_rope_") ||
+            nameHas(n, "_att")) {
+            hasAttn = true;
+        }
+    }
+    if (hasFfn) return SEG_KIND_FFN;
+    if (hasAttn) return SEG_KIND_ATTN;
+    return SEG_KIND_OTHER;
+}
+
+static NnUint inferMaxLayerIndex(const NnNodeConfig *nodeConfig) {
+    NnUint maxIdx = 0u;
+    if (nodeConfig == nullptr || nodeConfig->segments == nullptr) return 0u;
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        const NnSegmentConfig &seg = nodeConfig->segments[s];
+        for (NnUint i = 0; i < seg.nOps; ++i) {
+            maxIdx = std::max(maxIdx, seg.ops[i].index);
+        }
+    }
+    return maxIdx;
+}
 
 void NnFakeNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     // Nothing
@@ -20,9 +65,15 @@ NnNetExecution::NnNetExecution(NnUint nThreads, NnNetConfig *netConfig) {
         std::memset(pipe, 0, pipeConfig->size.nBytes);
         pipes[pipeIndex] = pipe;
     }
+
+    layerPerf = nullptr;
 }
 
 NnNetExecution::~NnNetExecution() {
+    if (layerPerf != nullptr) {
+        delete layerPerf;
+        layerPerf = nullptr;
+    }
     for (NnUint pipeIndex = 0; pipeIndex < nPipes; pipeIndex++)
         delete[] pipes[pipeIndex];
     delete[] pipes;
@@ -44,7 +95,7 @@ NnExecutorException::NnExecutorException(const std::string message)
 {}
 
 NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *devices, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark)
-    : segments(nodeConfig->nSegments), steps()
+    : netExecution(netExecution), nodeConfig(nodeConfig), segments(nodeConfig->nSegments), steps(), segmentKinds(), threads(nullptr)
 {
     NnUint maxNThreads = 0;
     for (NnExecutorDevice &d : *devices) {
@@ -54,10 +105,25 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     if (netExecution->nThreads > maxNThreads)
         throw std::invalid_argument("This configuration supports max " + std::to_string(maxNThreads) + " threads");
 
-    this->netExecution = netExecution;
-    this->nodeConfig = nodeConfig;
+    // Lazily allocate per-layer profiling state when benchmark/profile is enabled.
+    if (benchmark && this->netExecution != nullptr && this->netExecution->layerPerf == nullptr) {
+        const NnUint maxLayer = inferMaxLayerIndex(nodeConfig);
+        const NnUint nLayers = maxLayer + 1u;
+        auto *st = new NnNetExecution::LayerPerfState();
+        st->nLayers = nLayers;
+        st->attnUs.resize(nLayers, 0ull);
+        st->ffnUs.resize(nLayers, 0ull);
+        this->netExecution->layerPerf = st;
+    }
 
     bool useSynchronizer = netConfig->nNodes > 1;
+
+    // Build segment kind table for this node config.
+    segmentKinds.assign(nodeConfig->nSegments, SEG_KIND_OTHER);
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        segmentKinds[s] = classifySegmentKind(nodeConfig->segments[s]);
+    }
+
     for (NnUint segmentIndex = 0; segmentIndex < nodeConfig->nSegments; segmentIndex++) {
         NnDevice *device = nullptr;
         for (NnExecutorDevice &d : *devices) {
@@ -74,18 +140,15 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
 
         NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
         if (segmentConfig->nOps > 0) {
-            printf("🔧 [DEBUG] Creating Segment %u ...\n", segmentIndex);
             NnDeviceSegment *segment = device->createSegment(segmentIndex);
             segments[segmentIndex] = std::unique_ptr<NnDeviceSegment>(segment);
 
             for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
-                printf("  🔨 [DEBUG] Adding Step: Segment %u, Op %u (%s)\n", segmentIndex, opIndex, segmentConfig->ops[opIndex].name);
-                steps.push_back(NnExecutorStep{ STEP_EXECUTE_OP, segment, opIndex, &segmentConfig->ops[opIndex] });
+                steps.push_back(NnExecutorStep{ STEP_EXECUTE_OP, segment, opIndex, &segmentConfig->ops[opIndex], segmentIndex });
             }
         }
         if (useSynchronizer && segmentConfig->nSyncs > 0){
-            printf("  📡 [DEBUG] Adding Step: Segment %u, Sync Nodes (%u syncs)\n", segmentIndex, segmentConfig->nSyncs);
-            steps.push_back(NnExecutorStep{ STEP_SYNC_NODES, nullptr, segmentIndex, nullptr });
+            steps.push_back(NnExecutorStep{ STEP_SYNC_NODES, nullptr, segmentIndex, nullptr, segmentIndex });
         }
 
     }
@@ -96,6 +159,9 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.synchronizer = synchronizer;
     context.nSteps = (NnUint)steps.size();
     context.steps = steps.data();
+    context.layerPerf = (this->netExecution != nullptr) ? this->netExecution->layerPerf : nullptr;
+    context.segmentKinds = segmentKinds.empty() ? nullptr : segmentKinds.data();
+    context.nSegments = (this->nodeConfig != nullptr) ? this->nodeConfig->nSegments : 0u;
     if (benchmark)
         context.timer = new Timer();
     else
@@ -162,7 +228,7 @@ static inline void *executorThreadHandler(void *arg) {
             executeStep(step, nThreads, thread, context);
         } catch (const std::runtime_error &e) {
             context->isAlive.store(false);
-            printf("🚨 Execution error: %s\n", e.what());
+            printf("Execution error: %s\n", e.what());
             break;
         }
 
@@ -171,7 +237,26 @@ static inline void *executorThreadHandler(void *arg) {
             if (context->timer != nullptr) {
                 NnUint time = context->timer->elapsedMicroseconds();
                 context->totalTime[step->type] += time;
+
+                // Per-layer compute profiling (ATTN/FFN only).
+                if (context->layerPerf != nullptr && context->segmentKinds != nullptr && step->type == STEP_EXECUTE_OP && step->opConfig != nullptr) {
+                    const NnUint layerIndex = step->opConfig->index;
+                    if (layerIndex < context->layerPerf->nLayers && step->segmentIndex < context->nSegments) {
+                        const NnByte kind = context->segmentKinds[step->segmentIndex];
+                        if (kind == SEG_KIND_ATTN) {
+                            context->layerPerf->attnUs[layerIndex] += (unsigned long long)time;
+                        } else if (kind == SEG_KIND_FFN) {
+                            context->layerPerf->ffnUs[layerIndex] += (unsigned long long)time;
+                        }
+                    }
+                }
+
                 context->timer->reset();
+            }
+
+            // Optional hook after a full sync step (safe: all threads finished sync()).
+            if (step->type == STEP_SYNC_NODES && context->synchronizer != nullptr) {
+                context->synchronizer->onSyncStepComplete(step->arg0);
             }
 
             context->doneThreadCount.store(0);
@@ -198,6 +283,10 @@ void NnExecutor::forward() {
     if (context.timer != nullptr) {
         std::memset(context.totalTime, 0, sizeof(context.totalTime));
         context.timer->reset();
+    }
+
+    if (netExecution != nullptr && netExecution->layerPerf != nullptr) {
+        netExecution->layerPerf->reset();
     }
 
     NnUint threadIndex;

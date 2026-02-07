@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <vector>
+#include <string>
 
 #define ROOT_SOCKET_INDEX 0
 
@@ -65,6 +66,9 @@ public:
     void read(const NnUint socketIndex, void *data, const NnSize size);
     void writeAck(const NnUint socketIndex);
     void readAck(const NnUint socketIndex);
+    // ACK packet followed by a fixed-size payload.
+    void writeAckWithPayload(const NnUint socketIndex, const void *payload, const NnSize payloadSize);
+    void readAckWithPayload(const NnUint socketIndex, void *payload, const NnSize payloadSize);
     bool tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts);
     void writeMany(NnUint n, NnSocketIo *ios);
     void writeAll(const void *data, NnSize size);
@@ -76,6 +80,37 @@ public:
     void resetStats();
     
 };
+
+// Fixed-size per-layer compute timing message sent from node -> stage root.
+// Times are in microseconds and cover CPU compute only (no comm).
+typedef struct {
+    NnUint magic;     // 'DLPR'
+    NnUint version;   // 1
+    NnUint stageIndex;
+    NnUint nodeIndex;
+    NnUint layerIndex;
+    NnUint attnUs;
+    NnUint ffnUs;
+} NnLayerPerfMsg;
+
+static constexpr NnUint NN_LAYER_PERF_MAGIC = 0x52504c44u; // 'DLPR' little-endian
+static constexpr NnUint NN_LAYER_PERF_VERSION = 1u;
+
+// Shared snapshot format for cross-process query (mmap file written by stage root).
+typedef struct {
+    NnUint magic;         // 'DLPS'
+    NnUint version;       // 1
+    NnUint stageIndex;
+    NnUint rootNodeIndex;
+    NnUint nLayers;
+    NnUint nStageNodes;
+    NnUint reserved0;
+    NnUint reserved1;
+    unsigned long long epoch; // increments on each layer-end publish
+} NnLayerPerfSnapshotHeader;
+
+static constexpr NnUint NN_LAYER_PERF_SNAPSHOT_MAGIC = 0x53504c44u; // 'DLPS'
+static constexpr NnUint NN_LAYER_PERF_SNAPSHOT_VERSION = 1u;
 
 class NnNetworkNodeSynchronizer : public NnNodeSynchronizer {
 private:
@@ -121,10 +156,36 @@ private:
 
     std::vector<NnUint> syncProfileBaseBySegment;
     std::vector<SyncProfileSlot> syncProfileSlots;
+
+    // Thread barrier slots for layer profiling (separate from syncProfileSlots to avoid interference).
+    std::vector<NnUint> layerPerfBaseBySegment;
+    std::vector<SyncProfileSlot> layerPerfSlots;
+
+    // Layer profiling (stage-local)
+    bool layerProfileEnabled = false;
+    struct SegmentMeta {
+        NnUint layerIndex;
+        NnByte kind; // 0 other, 1 attn, 2 ffn
+    };
+    std::vector<SegmentMeta> segmentMeta;
+    std::vector<int> stageLocalIndexByGlobalNode;
+    std::vector<std::vector<NnLayerPerfMsg>> lastLayerPerfByLayer; // [layer][stageLocalNode]
+
+    // Cross-process query interface: stage root publishes snapshots to an mmap file.
+    bool layerPerfPrintEnabled = false;
+    std::string layerPerfPath;
+    int layerPerfFd = -1;
+    void *layerPerfMap = nullptr;
+    NnSize layerPerfMapSize = 0;
+    unsigned long long layerPerfEpoch = 0ull;
+
+    void maybeInitLayerPerfSnapshot();
+    void publishLayerPerfSnapshot(NnUint layerIndex);
 public:
-    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr);
-    ~NnNetworkNodeSynchronizer() override {};
+    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr, bool layerProfileEnabled = false);
+        ~NnNetworkNodeSynchronizer() override;
     void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override;
+    void onSyncStepComplete(NnUint segmentIndex) override;
 };
 
 class NnRootConfigWriter {

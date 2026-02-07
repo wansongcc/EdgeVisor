@@ -39,6 +39,14 @@ make dllama
 make dllama-api
 ```
 
+## Notes for ARM boards (Raspberry Pi / NVIDIA Jetson)
+
+- Recommended: compile *on the target device* (Raspberry Pi OS 64-bit / Jetson Linux aarch64).
+- If you need a **portable** binary that can run across different ARM CPUs (e.g. build on one Jetson and run on another Jetson/Pi), build with:
+  - `make DLLAMA_PORTABLE=1 dllama`
+  - `make DLLAMA_PORTABLE=1 dllama-api`
+- For Jetson GPU usage via Vulkan, see [docs/HOW_TO_RUN_GPU.md](./HOW_TO_RUN_GPU.md). When using `--gpu-index`, set `--nthreads 1`.
+
 4. Download the model to the **🔸 ROOT** device using the `launch.py` script. You don't need to download the model on worker devices.
 
 ```sh

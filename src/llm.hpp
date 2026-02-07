@@ -155,5 +155,6 @@ void loadLlmNetWeightUneven(const char* path, LlmNet *net, NnLocalWeightLoader *
 
 // Set enable plan barrier flag (called from app after reading bootstrap packet)
 void setEnablePlanBarrier(bool enable);
+bool getEnablePlanBarrier();
 
 #endif

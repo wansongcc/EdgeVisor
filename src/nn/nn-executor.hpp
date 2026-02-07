@@ -3,6 +3,7 @@
 
 #include "nn-core.hpp"
 #include <atomic>
+#include <algorithm>
 #include <vector>
 #include <stdexcept>
 #include "pthread.h"
@@ -25,6 +26,9 @@ class NnNodeSynchronizer {
 public:
     virtual ~NnNodeSynchronizer() {};
     virtual void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) = 0;
+    // Called exactly once per STEP_SYNC_NODES executor step, after all executor threads
+    // have returned from sync(). This is safe for additional network I/O on shared sockets.
+    virtual void onSyncStepComplete(NnUint /*segmentIndex*/) {}
 };
 
 class NnFakeNodeSynchronizer : public NnNodeSynchronizer {
@@ -40,9 +44,27 @@ public:
     NnByte **pipes;
     NnUint batchSize;
     NnUint nBatches;
+
+    // Optional per-layer profiling state shared between executor and synchronizer.
+    // Allocated lazily when benchmark/profile is enabled.
+    struct LayerPerfState;
+    LayerPerfState *layerPerf = nullptr;
+
     NnNetExecution(NnUint nThreads, NnNetConfig *netConfig);
     ~NnNetExecution();
     void setBatchSize(NnUint batchSize);
+};
+
+// Per-layer CPU compute timing (microseconds), filled by executor and consumed by synchronizer.
+struct NnNetExecution::LayerPerfState {
+    NnUint nLayers = 0u;
+    // Indexed by layerIndex.
+    std::vector<unsigned long long> attnUs;
+    std::vector<unsigned long long> ffnUs;
+    void reset() {
+        std::fill(attnUs.begin(), attnUs.end(), 0ull);
+        std::fill(ffnUs.begin(), ffnUs.end(), 0ull);
+    }
 };
 
 enum NnExecutorStepType {
@@ -65,6 +87,7 @@ typedef struct {
     NnDeviceSegment *segment;
     NnUint arg0;
     NnOpConfig *opConfig;
+    NnUint segmentIndex;
 } NnExecutorStep;
 
 typedef struct {
@@ -78,6 +101,11 @@ typedef struct {
     NnUint batchSize;
     Timer *timer;
     NnUint totalTime[N_STEP_TYPES];
+
+    // Optional per-layer compute profiling.
+    NnNetExecution::LayerPerfState *layerPerf;
+    const NnByte *segmentKinds;
+    NnUint nSegments;
 } NnExecutorContext;
 
 typedef struct {
@@ -97,6 +125,8 @@ private:
     NnNodeConfig *nodeConfig;
     std::vector<std::unique_ptr<NnDeviceSegment>> segments;
     std::vector<NnExecutorStep> steps;
+    // Segment classification (ATTN/FFN/OTHER) for per-layer compute profiling.
+    std::vector<NnByte> segmentKinds;
     NnExecutorThread *threads;
     NnExecutorContext context;
 public:

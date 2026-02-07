@@ -17,6 +17,10 @@ void setEnablePlanBarrier(bool enable) {
     g_enablePlanBarrier = enable;
 }
 
+bool getEnablePlanBarrier() {
+    return g_enablePlanBarrier;
+}
+
 static const char *hiddenActToString(LlmHiddenAct act) {
     if (act == HIDDEN_ACT_GELU) return "Gelu";
     if (act == HIDDEN_ACT_SILU) return "Silu";

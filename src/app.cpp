@@ -910,6 +910,10 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::unique_ptr<NnUnevenPartitionPlan> planPtr;
     std::vector<float> ratios;
 
+    // IMPORTANT: plan barrier affects graph construction (insertion of OP_PLAN_BARRIER/OP_PLAN_APPLY)
+    // so we must enable it before building the LLM net.
+    setEnablePlanBarrier(args->enablePlanBarrier);
+
     if(args->ratiosStr != nullptr){
         printf("nNodes=%d\n", nNodes);
         std::vector<NnStageDef> stageDefs = parseStageDefs(args->ratiosStr, nNodes, header.nLayers);
@@ -958,6 +962,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::unique_ptr<NnNetwork> networkPtr(nullptr);
     NnNetwork *network = nullptr;
 
+    const bool profileEnabled = args->benchmark;
+
     if (nNodes == 1) {
         synchronizer.reset(new NnFakeNodeSynchronizer());
     } else {
@@ -971,14 +977,13 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         }
 
         // 初始化 Synchronizer (传入 Plan)
-        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get()));
+        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get(), profileEnabled));
 
         NnRootConfigWriter configWriter(network);
         configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
     }
 
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
-    const bool profileEnabled = args->benchmark;
     NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), profileEnabled);
 
     // Load weights
@@ -1002,8 +1007,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     // Step 1: seed PlanCommand cache from deprecated env hooks (fallback).
     maybeSeedPlanCommandFromLegacyEnv();
 
-    // Set enable plan barrier flag from CLI argument
-    setEnablePlanBarrier(args->enablePlanBarrier);
+    // enablePlanBarrier was already applied before net construction.
 
     // Step 4: external controller (UDS). Enabled by setting DLLAMA_PLAN_CTRL_SOCKET.
     std::unique_ptr<PlanUdsController> planCtrl;
@@ -1091,7 +1095,7 @@ void runWorkerApp(AppCliArgs *args) {
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
         // Initialize Synchronizer with Plan
-        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get());
+        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get(), bootBenchmarkEnabled);
         
         // Benchmark flag is provided by root to keep all nodes consistent.
         // Worker CLI --benchmark is no longer required.

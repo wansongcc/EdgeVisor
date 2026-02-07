@@ -4,10 +4,15 @@
 #include "json.hpp"
 #include "plan-command.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 
 #ifndef _WIN32
 #include <errno.h>
@@ -20,6 +25,174 @@
 #endif
 
 using json = nlohmann::json;
+
+// Layer-prof snapshot reader (shared mmap file written by stage root).
+// Keep this standalone to avoid pulling in nn-network headers.
+static constexpr uint32_t kLayerPerfSnapshotMagic = 0x53504c44u; // 'DLPS'
+static constexpr uint32_t kLayerPerfSnapshotVersion = 1u;
+static constexpr uint32_t kLayerPerfMsgMagic = 0x52504c44u; // 'DLPR'
+static constexpr uint32_t kLayerPerfMsgVersion = 1u;
+
+struct LayerPerfSnapshotHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t stageIndex;
+    uint32_t rootNodeIndex;
+    uint32_t nLayers;
+    uint32_t nStageNodes;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint64_t epoch;
+};
+
+struct LayerPerfMsg {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t stageIndex;
+    uint32_t nodeIndex;
+    uint32_t layerIndex;
+    uint32_t attnUs;
+    uint32_t ffnUs;
+};
+
+static bool readFullFd(int fd, void *buf, size_t len) {
+    char *p = (char *)buf;
+    size_t left = len;
+    while (left > 0) {
+        ssize_t n = ::read(fd, p, left);
+        if (n < 0) {
+#ifndef _WIN32
+            if (errno == EINTR) continue;
+#endif
+            return false;
+        }
+        if (n == 0) return false;
+        p += (size_t)n;
+        left -= (size_t)n;
+    }
+    return true;
+}
+
+static std::string defaultLayerPerfPath(uint32_t stageIndex, uint32_t rootNodeIndex) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "/tmp/dllama_layer_prof_stage%u_root%u.bin", (unsigned)stageIndex, (unsigned)rootNodeIndex);
+    return std::string(buf);
+}
+
+static json readLayerPerfSnapshotJson(const json &req) {
+    // Request fields:
+    // - path (optional): explicit snapshot path
+    // - stageIndex/rootNodeIndex (optional): for default path when env/path not set
+    // - layerIndex (optional): return only a single layer row
+    // - all (optional bool): return full [layer][node] table
+
+    std::string path;
+    if (req.contains("path")) {
+        path = req.value("path", "");
+    }
+    if (path.empty()) {
+        const char *env = std::getenv("DLLAMA_LAYER_PROF_PATH");
+        if (env != nullptr && env[0] != '\0') path = std::string(env);
+    }
+    if (path.empty()) {
+        const uint32_t stageIndex = req.value("stageIndex", 0u);
+        const uint32_t rootNodeIndex = req.value("rootNodeIndex", 0u);
+        path = defaultLayerPerfPath(stageIndex, rootNodeIndex);
+    }
+
+#ifdef _WIN32
+    (void)path;
+    throw std::runtime_error("layer_prof snapshot is not supported on Windows");
+#else
+    const bool all = req.value("all", false);
+    const bool hasLayer = req.contains("layerIndex");
+    const uint32_t layerIndex = req.value("layerIndex", 0u);
+
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error(std::string("open snapshot failed: ") + path);
+    }
+
+    LayerPerfSnapshotHeader hdr;
+    std::memset(&hdr, 0, sizeof(hdr));
+    if (!readFullFd(fd, &hdr, sizeof(hdr))) {
+        ::close(fd);
+        throw std::runtime_error("read snapshot header failed");
+    }
+    if (hdr.magic != kLayerPerfSnapshotMagic || hdr.version != kLayerPerfSnapshotVersion) {
+        ::close(fd);
+        throw std::runtime_error("bad snapshot magic/version");
+    }
+    if (hdr.nLayers == 0u || hdr.nStageNodes == 0u) {
+        ::close(fd);
+        throw std::runtime_error("bad snapshot dimensions");
+    }
+
+    json out = json{{"path", path}, {"epoch", hdr.epoch}};
+    out["header"] = json{
+        {"magic", hdr.magic},
+        {"version", hdr.version},
+        {"stageIndex", hdr.stageIndex},
+        {"rootNodeIndex", hdr.rootNodeIndex},
+        {"nLayers", hdr.nLayers},
+        {"nStageNodes", hdr.nStageNodes},
+        {"epoch", hdr.epoch},
+    };
+
+    const size_t headerSize = sizeof(LayerPerfSnapshotHeader);
+    const size_t rowSize = (size_t)hdr.nStageNodes * sizeof(LayerPerfMsg);
+    const size_t tableSize = (size_t)hdr.nLayers * rowSize;
+
+    auto readRow = [&](uint32_t li) -> json {
+        if (li >= hdr.nLayers) throw std::runtime_error("layerIndex out of range");
+        const off_t off = (off_t)(headerSize + (size_t)li * rowSize);
+        if (::lseek(fd, off, SEEK_SET) < 0) throw std::runtime_error("lseek failed");
+        std::vector<LayerPerfMsg> row(hdr.nStageNodes);
+        if (!readFullFd(fd, row.data(), row.size() * sizeof(LayerPerfMsg))) {
+            throw std::runtime_error("read row failed");
+        }
+        json arr = json::array();
+        for (uint32_t i = 0; i < hdr.nStageNodes; ++i) {
+            const LayerPerfMsg &m = row[i];
+            if (m.magic != kLayerPerfMsgMagic || m.version != kLayerPerfMsgVersion) {
+                // Keep placeholder to preserve indices.
+                arr.push_back(json{{"ok", false}});
+                continue;
+            }
+            arr.push_back(json{
+                {"ok", true},
+                {"stageIndex", m.stageIndex},
+                {"nodeIndex", m.nodeIndex},
+                {"layerIndex", m.layerIndex},
+                {"attnUs", m.attnUs},
+                {"ffnUs", m.ffnUs},
+            });
+        }
+        return arr;
+    };
+
+    if (all) {
+        // Read the full table.
+        out["layers"] = json::array();
+        for (uint32_t li = 0; li < hdr.nLayers; ++li) {
+            out["layers"].push_back(readRow(li));
+        }
+    } else {
+        if (!hasLayer) {
+            // Default behavior: require an explicit layerIndex to keep response small.
+            ::close(fd);
+            throw std::runtime_error("missing layerIndex (or set all=true)");
+        }
+        out["layerIndex"] = layerIndex;
+        out["nodes"] = readRow(layerIndex);
+    }
+
+    // Best-effort: validate file is at least header+table.
+    (void)tableSize;
+    ::close(fd);
+    return out;
+#endif
+}
 
 static bool readLine(int fd, std::string &out) {
     out.clear();
@@ -273,6 +446,7 @@ void PlanUdsController::run() {
             } else if (op == "status") {
                 const PlanCommandSnapshot snap = planCommandCache().load();
                 resp = json{{"ok", true}, {"cacheSeq", snap.cacheSeq}, {"cmd", cmdToJson(snap.cmd)}};
+                resp["enablePlanBarrier"] = getEnablePlanBarrier();
                 if (inference_ != nullptr) {
                     resp["position"] = inference_->getPosition();
                     resp["batchSize"] = inference_->getBatchSize();
@@ -294,6 +468,10 @@ void PlanUdsController::run() {
                     }
                 }
                 resp["perf"] = arr;
+            } else if (op == "layer_prof") {
+                // Reads the mmap snapshot file written by stage root and returns JSON.
+                resp = json{{"ok", true}};
+                resp["layer_prof"] = readLayerPerfSnapshotJson(req);
             } else if (op == "ping") {
                 resp = json{{"ok", true}};
             } else {

@@ -70,6 +70,34 @@ def cmd_set_plan(args: argparse.Namespace) -> Dict[str, Any]:
     return {"op": "set_plan", "cmd": cmd}
 
 
+def cmd_layer_prof(args: argparse.Namespace) -> Dict[str, Any]:
+    req: Dict[str, Any] = {"op": "layer_prof"}
+    if args.path:
+        req["path"] = args.path
+    if args.all:
+        req["all"] = True
+    else:
+        req["layerIndex"] = args.layer
+    if args.stage is not None:
+        req["stageIndex"] = args.stage
+    if args.root is not None:
+        req["rootNodeIndex"] = args.root
+    return req
+
+
+def pick_min_max_nodes(nodes: Any) -> Any:
+    # nodes is a list of dicts: {ok,nodeIndex,attnUs,ffnUs,...}
+    ok_nodes = [n for n in nodes if isinstance(n, dict) and n.get("ok")]
+    if not ok_nodes:
+        return None
+    # score = attn + ffn
+    def score(n: Dict[str, Any]) -> int:
+        return int(n.get("attnUs", 0)) + int(n.get("ffnUs", 0))
+    slow = max(ok_nodes, key=score)
+    fast = min(ok_nodes, key=score)
+    return fast, slow, score(fast), score(slow)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="dllama plan UDS controller client (JSON line protocol)")
     p.add_argument("socket", help="UDS path, e.g. /tmp/dllama_plan.sock")
@@ -80,6 +108,24 @@ def main() -> int:
     sub.add_parser("status")
     sub.add_parser("perf")
     sub.add_parser("clear")
+    lp = sub.add_parser("layer_prof", help="query layer-prof snapshot via UDS")
+    lp.add_argument("--path", default=None, help="snapshot path (overrides env/default)")
+    lp.add_argument("--all", action="store_true", help="return full table (can be large)")
+    lp.add_argument("--layer", type=int, default=0, help="layer index (when --all is not set)")
+    lp.add_argument("--stage", type=int, default=None, help="stage index for default path")
+    lp.add_argument("--root", type=int, default=None, help="root node index for default path")
+
+    w = sub.add_parser("watch_layer_prof", help="poll layer-prof and trigger set_plan on a simple condition")
+    w.add_argument("--path", default=None, help="snapshot path (overrides env/default)")
+    w.add_argument("--layer", type=int, default=0, help="watch this layer index")
+    w.add_argument("--interval-ms", type=int, default=200)
+    w.add_argument("--threshold-us", type=int, default=20000, help="trigger when (max attn+ffn) exceeds this (legacy absolute threshold)")
+    w.add_argument("--delta-threshold-us", type=int, default=None, help="trigger when (slow-fast) score delta exceeds this (preferred)")
+    w.add_argument("--stage", type=int, default=0)
+    w.add_argument("--kind", type=int, default=1, help="1=headSplit 2=ffnSplit 3=both")
+    w.add_argument("--heads", type=int, default=1)
+    w.add_argument("--ffn", type=int, default=256)
+    w.add_argument("--dry-run", action="store_true", help="print planned set_plan but do not send")
 
     sp = sub.add_parser("set_plan")
     sp.add_argument("--seq", type=int, default=1)
@@ -104,10 +150,82 @@ def main() -> int:
 
     args = p.parse_args()
 
+    if args.op == "watch_layer_prof":
+        import time
+
+        last_epoch = None
+        seq = 1
+        try:
+            while True:
+                req = {
+                    "op": "layer_prof",
+                    "layerIndex": args.layer,
+                    "stageIndex": args.stage,
+                    "rootNodeIndex": 0,
+                }
+                if args.path:
+                    req["path"] = args.path
+                try:
+                    resp = uds_request(args.socket, req)
+                except Exception as e:
+                    sys.stderr.write(f"[watch] uds_request failed: {e}\n")
+                    return 2
+
+                if not resp.get("ok"):
+                    json.dump(resp, sys.stdout, indent=2, sort_keys=True)
+                    sys.stdout.write("\n")
+                    return 2
+
+                lp = resp.get("layer_prof", {})
+                epoch = lp.get("epoch")
+                nodes = lp.get("nodes", [])
+
+                if epoch is not None and epoch != last_epoch:
+                    last_epoch = epoch
+                    picked = pick_min_max_nodes(nodes)
+                    if picked is not None:
+                        fast, slow, fast_score, slow_score = picked
+                        delta = int(slow_score) - int(fast_score)
+                        print(f"[watch] epoch={epoch} layer={args.layer} slow=node{slow['nodeIndex']} score={slow_score} fast=node{fast['nodeIndex']} score={fast_score} delta={delta}")
+
+                        if slow.get("nodeIndex") != fast.get("nodeIndex"):
+                            if args.delta_threshold_us is not None:
+                                should_trigger = delta >= int(args.delta_threshold_us)
+                            else:
+                                should_trigger = slow_score >= args.threshold_us
+
+                        if slow.get("nodeIndex") != fast.get("nodeIndex") and should_trigger:
+                            cmd = {
+                                "seq": seq,
+                                "mode": "next_barrier",
+                                "stageIndex": args.stage,
+                                "fromNodeIndex": int(slow["nodeIndex"]),
+                                "toNodeIndex": int(fast["nodeIndex"]),
+                                "cmdKind": int(args.kind),
+                                "nHeadsToMove": int(args.heads),
+                                "nFfnToMove": int(args.ffn),
+                            }
+                            req2 = {"op": "set_plan", "cmd": cmd}
+                            if args.dry_run:
+                                print("[watch] trigger set_plan (dry-run):", json.dumps(req2))
+                            else:
+                                resp2 = uds_request(args.socket, req2)
+                                print("[watch] trigger set_plan resp:", json.dumps(resp2, sort_keys=True))
+                                if not resp2.get("ok"):
+                                    return 2
+                            seq += 1
+
+                time.sleep(max(1, args.interval_ms) / 1000.0)
+        except KeyboardInterrupt:
+            sys.stderr.write("[watch] stopped\n")
+            return 0
+
     if args.op == "raw":
         req = json.loads(args.json)
     elif args.op == "set_plan":
         req = cmd_set_plan(args)
+    elif args.op == "layer_prof":
+        req = cmd_layer_prof(args)
     else:
         req = {"op": args.op}
 

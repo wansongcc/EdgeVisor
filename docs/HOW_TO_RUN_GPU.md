@@ -18,6 +18,11 @@ DLLAMA_VULKAN=1 make dllama
 DLLAMA_VULKAN=1 make dllama-api
 ```
 
+Notes for NVIDIA Jetson:
+- Jetson (JetPack / Ubuntu aarch64) can usually run the Vulkan backend if Vulkan drivers are installed.
+- If you build on one Jetson and want to run on a different ARM device, consider `DLLAMA_PORTABLE=1`:
+  - `DLLAMA_VULKAN=1 make DLLAMA_PORTABLE=1 dllama`
+
 3. Now `dllama` and `dllama-api` binaries supports arguments related to GPU usage.
 
 ```

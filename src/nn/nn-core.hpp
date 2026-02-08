@@ -471,7 +471,7 @@ typedef struct {
     NnPreSyncConfig *preSyncs;
 } NnNetConfig;
 
-typedef struct {
+typedef struct NnNodeConfig {
     NnUint nodeIndex;
     NnUint nBuffers;
     NnBufferConfig *buffers;

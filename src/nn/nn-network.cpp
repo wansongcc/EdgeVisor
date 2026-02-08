@@ -1241,12 +1241,19 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
     }
 }
 
-NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan) {
+NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(
+    NnNetwork *network,
+    NnNetExecution *execution,
+    NnNetConfig *netConfig,
+    NnNodeConfig *nodeConfig,
+    const NnUnevenPartitionPlan *plan,
+    bool layerProfileEnabled) {
     this->network = network;
     this->execution = execution;
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
     this->plan = plan;
+    this->layerProfileEnabled = layerProfileEnabled;
     // [新增] 构造时缓存 myStage，避免运行时重复查找
     this->myStage = nullptr;
     if (plan) {
@@ -1274,6 +1281,160 @@ stage_found:;
         }
         syncProfileSlots.resize(totalSlots);
     }
+
+    // Layer profiling metadata (stage-local) and snapshot state.
+    stageLocalIndexByGlobalNode.clear();
+    lastLayerPerfByLayer.clear();
+    if (layerProfileEnabled && plan != nullptr && myStage != nullptr) {
+        stageLocalIndexByGlobalNode.assign(netConfig ? netConfig->nNodes : 0u, -1);
+        for (NnUint i = 0; i < myStage->nNodes; ++i) {
+            const NnUint g = myStage->nodeIndices[i];
+            if (netConfig != nullptr && g < netConfig->nNodes) {
+                stageLocalIndexByGlobalNode[g] = (int)i;
+            }
+        }
+
+        // Snapshot table: [stageLocalLayer][stageLocalNode]
+        lastLayerPerfByLayer.resize(myStage->nLayers);
+        for (NnUint li = 0; li < myStage->nLayers; ++li) {
+            lastLayerPerfByLayer[li].resize(myStage->nNodes);
+            for (NnUint ni = 0; ni < myStage->nNodes; ++ni) {
+                NnLayerPerfMsg m;
+                std::memset(&m, 0, sizeof(m));
+                lastLayerPerfByLayer[li][ni] = m;
+            }
+        }
+
+        // Default snapshot path (matches PlanUdsController reader default).
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "/tmp/dllama_layer_prof_stage%u_root%u.bin", (unsigned)myStage->stageIndex, (unsigned)myStage->rootNodeIndex);
+        layerPerfPath = std::string(buf);
+        const char *env = std::getenv("DLLAMA_LAYER_PROF_PATH");
+        if (env != nullptr && env[0] != '\0') {
+            layerPerfPath = std::string(env);
+        }
+    }
+}
+
+NnNetworkNodeSynchronizer::~NnNetworkNodeSynchronizer() {
+    // Best-effort cleanup; current snapshot writer uses plain file writes.
+}
+
+static void writeFullFile(const std::string &path, const void *data, size_t nBytes) {
+    FILE *f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) return;
+    std::fwrite(data, 1, nBytes, f);
+    std::fclose(f);
+}
+
+void NnNetworkNodeSynchronizer::onSyncStepComplete(NnUint segmentIndex) {
+    if (!layerProfileEnabled) return;
+    if (execution == nullptr || execution->layerPerf == nullptr) return;
+    if (plan == nullptr || myStage == nullptr) return;
+    if (nodeConfig == nullptr) return;
+
+    // Publish once per forward: after the last segment sync step.
+    if (nodeConfig->nSegments == 0u) return;
+    if (segmentIndex + 1u != nodeConfig->nSegments) return;
+
+    // NOTE: Current transport is root<->worker star topology.
+    // Layer-prof snapshot is supported when stage root is global root (node 0).
+    const bool stageRootIsGlobalRoot = (myStage->rootNodeIndex == 0u);
+    if (!stageRootIsGlobalRoot) {
+        return;
+    }
+
+    const NnUint myNodeIndex = nodeConfig->nodeIndex;
+    const int myLocalRank = (myNodeIndex < stageLocalIndexByGlobalNode.size()) ? stageLocalIndexByGlobalNode[myNodeIndex] : -1;
+    if (myLocalRank < 0) return;
+
+    // Build my local messages (stage-local layer indices).
+    std::vector<NnLayerPerfMsg> myMsgs;
+    myMsgs.resize(myStage->nLayers);
+    for (NnUint li = 0; li < myStage->nLayers; ++li) {
+        const NnUint gl = myStage->startLayer + li;
+        NnLayerPerfMsg m;
+        std::memset(&m, 0, sizeof(m));
+        m.magic = NN_LAYER_PERF_MAGIC;
+        m.version = NN_LAYER_PERF_VERSION;
+        m.stageIndex = myStage->stageIndex;
+        m.nodeIndex = myNodeIndex;
+        m.layerIndex = li;
+        if (gl < execution->layerPerf->nLayers) {
+            m.attnUs = (NnUint)std::min<unsigned long long>(execution->layerPerf->attnUs[gl], 0xFFFFFFFFull);
+            m.ffnUs = (NnUint)std::min<unsigned long long>(execution->layerPerf->ffnUs[gl], 0xFFFFFFFFull);
+        }
+        myMsgs[li] = m;
+    }
+
+    const bool amStageRoot = (myNodeIndex == myStage->rootNodeIndex);
+
+    if (!amStageRoot) {
+        // Worker sends its full stage-local table to global root.
+        if (network != nullptr) {
+            network->write(ROOT_SOCKET_INDEX, myMsgs.data(), (NnSize)(myMsgs.size() * sizeof(NnLayerPerfMsg)));
+        }
+        return;
+    }
+
+    // Stage root collects from other stage nodes.
+    // Store my own messages.
+    for (NnUint li = 0; li < myStage->nLayers; ++li) {
+        lastLayerPerfByLayer[li][(size_t)myLocalRank] = myMsgs[li];
+    }
+
+    // Receive from stage member nodes (excluding root).
+    if (network != nullptr) {
+        for (NnUint r = 0; r < myStage->nNodes; ++r) {
+            const NnUint nodeIndex = myStage->nodeIndices[r];
+            if (nodeIndex == myNodeIndex) continue;
+            // Root socketIndex mapping: nodeIndex 1.. -> socketIndex=nodeIndex-1.
+            const NnUint socketIndex = nodeIndex - 1u;
+
+            std::vector<NnLayerPerfMsg> buf;
+            buf.resize(myStage->nLayers);
+            network->read(socketIndex, buf.data(), (NnSize)(buf.size() * sizeof(NnLayerPerfMsg)));
+
+            for (NnUint li = 0; li < myStage->nLayers; ++li) {
+                const NnLayerPerfMsg &m = buf[li];
+                if (m.magic != NN_LAYER_PERF_MAGIC || m.version != NN_LAYER_PERF_VERSION) continue;
+                if (m.stageIndex != myStage->stageIndex) continue;
+                if (m.layerIndex >= myStage->nLayers) continue;
+                lastLayerPerfByLayer[m.layerIndex][r] = m;
+            }
+        }
+    }
+
+    // Publish snapshot file (header + full table).
+    layerPerfEpoch++;
+
+    NnLayerPerfSnapshotHeader hdr;
+    std::memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = NN_LAYER_PERF_SNAPSHOT_MAGIC;
+    hdr.version = NN_LAYER_PERF_SNAPSHOT_VERSION;
+    hdr.stageIndex = myStage->stageIndex;
+    hdr.rootNodeIndex = myStage->rootNodeIndex;
+    hdr.nLayers = myStage->nLayers;
+    hdr.nStageNodes = myStage->nNodes;
+    hdr.epoch = layerPerfEpoch;
+
+    const size_t headerSize = sizeof(hdr);
+    const size_t rowSize = (size_t)hdr.nStageNodes * sizeof(NnLayerPerfMsg);
+    const size_t tableSize = (size_t)hdr.nLayers * rowSize;
+    std::vector<unsigned char> blob;
+    blob.resize(headerSize + tableSize);
+    std::memcpy(blob.data(), &hdr, sizeof(hdr));
+
+    unsigned char *p = blob.data() + headerSize;
+    for (NnUint li = 0u; li < hdr.nLayers; ++li) {
+        for (NnUint r = 0u; r < hdr.nStageNodes; ++r) {
+            const NnLayerPerfMsg &m = lastLayerPerfByLayer[li][r];
+            std::memcpy(p, &m, sizeof(m));
+            p += sizeof(m);
+        }
+    }
+
+    writeFullFile(layerPerfPath, blob.data(), blob.size());
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {

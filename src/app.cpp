@@ -1,5 +1,6 @@
 #include "app.hpp"
 #include "plan-controller.hpp"
+#include "dynamic/dynamic_layer.hpp"
 #include <cassert>
 #include <cstring>
 #include <sstream>
@@ -1014,6 +1015,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     const char *planSock = std::getenv("DLLAMA_PLAN_CTRL_SOCKET");
     if (planSock != nullptr && planSock[0] != '\0') {
         planCtrl = PlanUdsController::start(std::string(planSock), &inference);
+    }
+
+    // Step 5: internal dynamic scheduler (queries UDS layer_prof and issues set_plan).
+    std::unique_ptr<DynamicLayerController> dynCtrl;
+    if (planSock != nullptr && planSock[0] != '\0') {
+        dynCtrl = DynamicLayerController::start(std::string(planSock), &inference);
     }
 
     if (network != nullptr) {

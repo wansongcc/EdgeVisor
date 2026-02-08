@@ -41,12 +41,29 @@ int main() {
     std::cout << "\nRunning RebalanceHeads (IBSA)..." << std::endl;
     std::vector<HeadRange> new_ranges = RebalanceHeads(devices);
 
+    std::cout << "\nRunning RebalanceHeadMoves (IBSA)..." << std::endl;
+    std::vector<RebalanceMove> moves = RebalanceHeadMoves(devices);
+
     std::cout << "\nRebalanced Ranges (Next Layer):" << std::endl;
     for (size_t i = 0; i < new_ranges.size(); ++i) {
         std::cout << "Dev " << devices[i].device_id 
                   << ": [" << new_ranges[i].start << ", " << new_ranges[i].end << "]"
                   << " Count=" << new_ranges[i].count()
                   << std::endl;
+    }
+
+    std::cout << "\nMoves (for UDS set_plan):" << std::endl;
+    if (moves.empty()) {
+        std::cout << "(no moves)" << std::endl;
+    } else {
+        for (const auto& m : moves) {
+            std::cout << "from Dev " << m.from_device_id
+                      << " -> Dev " << m.to_device_id
+                      << " cmdKind=" << m.cmdKind
+                      << " headMove=" << m.headMove
+                      << " ffnMove=" << m.ffnMove
+                      << std::endl;
+        }
     }
     
     return 0;

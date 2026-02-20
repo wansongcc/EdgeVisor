@@ -966,9 +966,14 @@ static inline float scaleFrequencyLlama3(const float freq, const NnRopeOpConfig 
 
 static inline void fullfillRopeLlamaCache(const NnRopeOpConfig *config, float *cache) {
     assert((config->slice.qDimEnd - config->slice.kvDimStart) % 2 == 0);
+    // For LLAMA-style RoPE, cache is defined over [kvDimStart, qDimEnd).
+    // sliceDim must cover this whole range.
+    assert(config->slice.sliceDim == (config->slice.qDimEnd - config->slice.kvDimStart));
 
     const bool applyScaling = config->ropeScalingFactor != 1.0f;
-    float theta = 1000000.0f;
+    // Historically theta was hard-coded to 1e6; honor per-model ropeTheta when provided.
+    // Keep a safe fallback for legacy configs that did not populate ropeTheta.
+    float theta = (config->slice.ropeTheta > 0.0f) ? config->slice.ropeTheta : 1000000.0f;
     for (NnUint pos = 0; pos < config->slice.seqLen; pos++) {
         for (NnUint i = config->slice.kvDimStart; i < config->slice.qDimEnd; i += 2) {
             const NnUint h = i % config->slice.headDim;

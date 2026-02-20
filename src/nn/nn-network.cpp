@@ -14,6 +14,7 @@ typedef SSIZE_T ssize_t;
 #include "nn-core.hpp"
 #include <cassert>
 #include <cstring>
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
@@ -21,6 +22,14 @@ typedef SSIZE_T ssize_t;
 #include <set>
 #include <chrono>
 #include <fcntl.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sched.h>
+#endif
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 
 #define SOCKET_LAST_ERRCODE errno
 #define SOCKET_LAST_ERROR strerror(errno)
@@ -28,12 +37,92 @@ typedef SSIZE_T ssize_t;
 #define ACK 23571114
 #define MAX_CHUNK_SIZE 65536
 
+static inline long long nowMsSteady() {
+    return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+static inline unsigned long getIoTimeoutMs() {
+    // 0 means disabled (legacy behavior: spin until done).
+    static std::atomic<unsigned long> cached{0ul};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        unsigned long v = 0ul;
+        if (const char *p = std::getenv("DLLAMA_IO_TIMEOUT_MS")) {
+            try {
+                v = std::stoul(std::string(p));
+            } catch (...) {
+                v = 0ul;
+            }
+        }
+        cached.store(v, std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
 static inline bool isEagainError() {
     #ifdef _WIN32
     return WSAGetLastError() == WSAEWOULDBLOCK;
     #else
     return SOCKET_LAST_ERRCODE == EAGAIN;
     #endif
+}
+
+static inline unsigned int getIoEagainYieldEvery() {
+    // 0 disables cooperative yielding (legacy behavior).
+    static std::atomic<unsigned int> cached{256u};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        unsigned int v = 256u;
+        if (const char *p = std::getenv("DLLAMA_IO_EAGAIN_YIELD_EVERY")) {
+            try {
+                v = (unsigned int)std::stoul(std::string(p));
+            } catch (...) {
+                v = 256u;
+            }
+        }
+        cached.store(v, std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
+static inline unsigned int getIoEagainSleepUs() {
+    // 0 disables sleeping.
+    static std::atomic<unsigned int> cached{0u};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        unsigned int v = 0u;
+        if (const char *p = std::getenv("DLLAMA_IO_EAGAIN_SLEEP_US")) {
+            try {
+                v = (unsigned int)std::stoul(std::string(p));
+            } catch (...) {
+                v = 0u;
+            }
+        }
+        cached.store(v, std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
+static inline void backoffOnEagain(unsigned int &spinCount) {
+    const unsigned int yieldEvery = getIoEagainYieldEvery();
+    if (yieldEvery == 0u) return;
+    spinCount++;
+    if ((spinCount % yieldEvery) != 0u) return;
+
+#ifdef _WIN32
+    Sleep(0);
+#else
+    sched_yield();
+    const unsigned int sleepUs = getIoEagainSleepUs();
+    if (sleepUs > 0u) {
+        usleep(sleepUs);
+    }
+#endif
 }
 
 static NnUint getSplitTotal(const NnDimSplit& split, NnUint nNodes) {
@@ -362,16 +451,19 @@ static void printBytes(const char* prefix, const void* data, NnSize size) {
 
 void writeSocket(int socket, const void *data, NnSize size) {
     printBytes("DEBUG: writeSocket", data, size);
+    unsigned int eagainSpins = 0u;
     while (size > 0) {
         ssize_t s = send(socket, (const char*)data, size, 0);
         if (s < 0) {
             if (isEagainError()) {
+                backoffOnEagain(eagainSpins);
                 continue;
             }
             throw NnTransferSocketException(0, "Error writing to socket");
         } else if (s == 0) {
             throw NnTransferSocketException(0, "Socket closed");
         }
+        eagainSpins = 0u;
         size -= s;
         data = (const char*)data + s;
     }
@@ -380,10 +472,12 @@ void writeSocket(int socket, const void *data, NnSize size) {
 static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned long maxAttempts) {
     // maxAttempts = 0 means infinite attempts
     NnSize s = size;
+    unsigned int eagainSpins = 0u;
     while (s > 0) {
         ssize_t r = recv(socket, (char*)data, s, 0);
         if (r < 0) {
             if (isEagainError()) {
+                backoffOnEagain(eagainSpins);
                 if (s == size && maxAttempts > 0) {
                     maxAttempts--;
                     if (maxAttempts == 0) {
@@ -397,6 +491,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
             throw NnTransferSocketException(0, "Socket closed");
         }
         printBytes("DEBUG: readSocket", data, r);
+        eagainSpins = 0u;
         data = (char*)data + r;
         s -= r;
     }
@@ -716,6 +811,52 @@ void NnNetwork::readAck(const NnUint socketIndex) {
     readAckPacket(sockets[socketIndex]);
 }
 
+void NnNetwork::writeAckWithPayload(const NnUint socketIndex, const void *payload, const NnSize payloadSize) {
+    assert(socketIndex >= 0 && socketIndex < nSockets);
+    writeAckPacket(sockets[socketIndex]);
+    sentBytes[socketIndex] += sizeof(int);
+    if (payloadSize > 0) {
+        write(socketIndex, payload, payloadSize);
+    }
+}
+
+void NnNetwork::readAckWithPayload(const NnUint socketIndex, void *payload, const NnSize payloadSize) {
+    assert(socketIndex >= 0 && socketIndex < nSockets);
+    readAckPacket(sockets[socketIndex]);
+    recvBytes[socketIndex] += sizeof(int);
+    if (payloadSize > 0) {
+        read(socketIndex, payload, payloadSize);
+    }
+}
+
+static constexpr NnByte SEG_KIND_OTHER = 0;
+static constexpr NnByte SEG_KIND_ATTN  = 1;
+static constexpr NnByte SEG_KIND_FFN   = 2;
+
+static inline bool nameHas(const char *name, const char *needle) {
+    if (name == nullptr || needle == nullptr) return false;
+    return std::strstr(name, needle) != nullptr;
+}
+
+static NnByte classifySegmentKind(const NnSegmentConfig &seg) {
+    bool hasAttn = false;
+    bool hasFfn = false;
+    for (NnUint i = 0; i < seg.nOps; ++i) {
+        const char *n = seg.ops[i].name;
+        if (nameHas(n, "block_matmul_w1") || nameHas(n, "block_matmul_w2") || nameHas(n, "block_matmul_w3") ||
+            nameHas(n, "block_moe_") || nameHas(n, "moe_") || nameHas(n, "_moe_")) {
+            hasFfn = true;
+        }
+        if (nameHas(n, "block_matmul_q") || nameHas(n, "block_matmul_k") || nameHas(n, "block_matmul_v") ||
+            nameHas(n, "block_matmul_wo") || nameHas(n, "block_multihead_att") || nameHas(n, "block_rope_")) {
+            hasAttn = true;
+        }
+    }
+    if (hasFfn) return SEG_KIND_FFN;
+    if (hasAttn) return SEG_KIND_ATTN;
+    return SEG_KIND_OTHER;
+}
+
 bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts) {
     assert(socketIndex >= 0 && socketIndex < nSockets);
     if (tryReadSocket(sockets[socketIndex], data, size, maxAttempts)) {
@@ -728,12 +869,21 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     bool isWriting;
     NnSize nBytes = 0;
+    const unsigned long timeoutMs = getIoTimeoutMs();
+    const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
+    unsigned int eagainSpins = 0u;
     for (NnUint i = 0; i < n; i++) {
         NnSocketIo *io = &ios[i];
         assert(io->socketIndex < nSockets);
         sentBytes[io->socketIndex] += io->size;
     }
     do {
+        if (timeoutMs > 0ul) {
+            const long long elapsed = nowMsSteady() - startMs;
+            if (elapsed > (long long)timeoutMs) {
+                throw NnTransferSocketException(ETIMEDOUT, "Socket write timeout (DLLAMA_IO_TIMEOUT_MS)");
+            }
+        }
         isWriting = false;
         for (NnUint i = 0; i < n; i++) {
             NnSocketIo *io = &ios[i];
@@ -744,12 +894,14 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 ssize_t s = send(socket, (const char*)io->data, chunkSize, 0);
                 if (s < 0) {
                     if (isEagainError()) {
+                        backoffOnEagain(eagainSpins);
                         continue;
                     }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
                 } else if (s == 0) {
                     throw NnTransferSocketException(0, "Socket closed");
                 }
+                eagainSpins = 0u;
                 io->size -= s;
                 io->data = (char*)io->data + s;
             }
@@ -771,12 +923,21 @@ void NnNetwork::writeAll(const void *data, NnSize size) {
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     bool isReading;
     NnSize nBytes = 0;
+    const unsigned long timeoutMs = getIoTimeoutMs();
+    const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
+    unsigned int eagainSpins = 0u;
     for (NnUint i = 0; i < n; i++) {
         NnSocketIo *io = &ios[i];
         assert(io->socketIndex < nSockets);
         recvBytes[io->socketIndex] += io->size;
     }
     do {
+        if (timeoutMs > 0ul) {
+            const long long elapsed = nowMsSteady() - startMs;
+            if (elapsed > (long long)timeoutMs) {
+                throw NnTransferSocketException(ETIMEDOUT, "Socket read timeout (DLLAMA_IO_TIMEOUT_MS)");
+            }
+        }
         isReading = false;
         for (NnUint i = 0; i < n; i++) {
             NnSocketIo *io = &ios[i];
@@ -786,12 +947,14 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                 ssize_t r = recv(socket, (char*)io->data, io->size, 0);
                 if (r < 0) {
                     if (isEagainError()) {
+                        backoffOnEagain(eagainSpins);
                         continue;
                     }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
                 } else if (r == 0) {
                     throw NnTransferSocketException(0, "Socket closed");
                 }
+                eagainSpins = 0u;
                 io->size -= r;
                 io->data = (char*)io->data + r;
             }
@@ -1073,6 +1236,11 @@ static void syncNodeSlices(
 
     std::vector<NnSocketIo> ios(nSocketsPerThread);
 
+    // My own slice (may be unused depending on mode)
+    const NnSize mySliceOffset = sliceOffsets[myNodeIndex];
+    NnByte *mySliceData = &buffer[mySliceOffset];
+    const NnSize mySliceSize = sliceSizes[myNodeIndex];
+
     // --- 发送阶段 (Send) ---
     bool iShouldSend = true;
     
@@ -1085,13 +1253,6 @@ static void syncNodeSlices(
     // NOTE: isLogitsGather already computed above for stage-aware slicing.
 
     if (iShouldSend) {
-        //  - 此处展示 TP 组内的 Gather 模式
-        // 注意：mySliceData 的偏移量依赖于 fillUnevenSlices 的逻辑
-        // 如果使用了之前讨论的“局部偏移重置”，这里 sliceOffsets[myNodeIndex] 也是正确的
-        NnSize mySliceOffset = sliceOffsets[myNodeIndex];
-        NnByte *mySliceData = &buffer[mySliceOffset];
-        NnSize mySliceSize = sliceSizes[myNodeIndex];
-
         // 通信预览（载荷字节/哈希）：默认关闭
 #if NN_NETWORK_COMM_DATA_LOG
         if (threadIndex == 0 && mySliceSize > 0) {
@@ -1111,13 +1272,7 @@ static void syncNodeSlices(
         }
 #endif
 
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint idx = startIdx + i;
-            ios[i].socketIndex = targetSockets[idx];
-            ios[i].data = mySliceData;
-            ios[i].size = mySliceSize;
-        }
-        network->writeMany(nSocketsPerThread, &ios[0]);
+        // NOTE: actual sends happen below (ordered exchange) unless this is worker->root mode.
     }
 
     // --- 接收阶段 (Receive) ---
@@ -1126,16 +1281,96 @@ static void syncNodeSlices(
     // [修改] 如果我是 Worker 且模式是 Worker->Root，我不接收
     if (onlyFromWorkerToRoot && !amIRoot) iShouldRecv = false; 
 
-    if (iShouldRecv) {
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint idx = startIdx + i;
-            NnUint targetNode = targetNodeIndices[idx];
-
-            ios[i].socketIndex = targetSockets[idx];
-            ios[i].data = &buffer[sliceOffsets[targetNode]];
-            ios[i].size = sliceSizes[targetNode]; 
+    // ---------------------------------------------------------
+    // Communication
+    // ---------------------------------------------------------
+    // For the unidirectional gather (worker -> root), keep the legacy behavior:
+    // - senders: writeMany()
+    // - receivers: readMany()
+    // This mode doesn't have a symmetric exchange and thus doesn't benefit from
+    // per-peer ordering.
+    if (onlyFromWorkerToRoot) {
+        if (iShouldSend) {
+            for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                const NnUint idx = startIdx + i;
+                ios[i].socketIndex = targetSockets[idx];
+                ios[i].data = mySliceData;
+                ios[i].size = mySliceSize;
+            }
+            network->writeMany(nSocketsPerThread, &ios[0]);
         }
-        network->readMany(nSocketsPerThread, &ios[0]);
+
+        if (iShouldRecv) {
+            for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                const NnUint idx = startIdx + i;
+                const NnUint targetNode = targetNodeIndices[idx];
+
+                ios[i].socketIndex = targetSockets[idx];
+                ios[i].data = &buffer[sliceOffsets[targetNode]];
+                ios[i].size = sliceSizes[targetNode];
+            }
+            network->readMany(nSocketsPerThread, &ios[0]);
+        }
+    } else {
+        // Full all-gather style exchange: for each peer connection, enforce a total order
+        // based on node indices so that one side is send-first and the other is recv-first.
+        // This prevents cross-node deadlocks/hangs caused by symmetric send/recv ordering.
+        std::vector<NnSocketIo> sendFirst;
+        std::vector<NnSocketIo> recvFirst;
+        std::vector<NnSocketIo> sendSecond;
+        std::vector<NnSocketIo> recvSecond;
+        sendFirst.reserve(nSocketsPerThread);
+        recvFirst.reserve(nSocketsPerThread);
+        sendSecond.reserve(nSocketsPerThread);
+        recvSecond.reserve(nSocketsPerThread);
+
+        for (NnUint i = 0; i < nSocketsPerThread; i++) {
+            const NnUint idx = startIdx + i;
+            const NnUint targetNode = targetNodeIndices[idx];
+            const int sock = targetSockets[idx];
+
+            const bool amSendFirst = (myNodeIndex < targetNode);
+
+            if (iShouldSend) {
+                NnSocketIo s{};
+                s.socketIndex = (NnUint)sock;
+                s.data = mySliceData;
+                s.size = mySliceSize;
+                if (amSendFirst) {
+                    sendFirst.push_back(s);
+                } else {
+                    sendSecond.push_back(s);
+                }
+            }
+
+            if (iShouldRecv) {
+                NnSocketIo r{};
+                r.socketIndex = (NnUint)sock;
+                r.data = &buffer[sliceOffsets[targetNode]];
+                r.size = sliceSizes[targetNode];
+                if (amSendFirst) {
+                    recvSecond.push_back(r);
+                } else {
+                    recvFirst.push_back(r);
+                }
+            }
+        }
+
+        if (iShouldSend && !sendFirst.empty()) {
+            network->writeMany((NnUint)sendFirst.size(), sendFirst.data());
+        }
+        if (iShouldRecv && !recvFirst.empty()) {
+            network->readMany((NnUint)recvFirst.size(), recvFirst.data());
+        }
+        if (iShouldRecv && !recvSecond.empty()) {
+            network->readMany((NnUint)recvSecond.size(), recvSecond.data());
+        }
+        if (iShouldSend && !sendSecond.empty()) {
+            network->writeMany((NnUint)sendSecond.size(), sendSecond.data());
+        }
+    }
+
+    if (iShouldRecv) {
 
         // 通信预览（载荷字节/哈希）：默认关闭
 #if NN_NETWORK_COMM_DATA_LOG
@@ -1241,12 +1476,23 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
     }
 }
 
-NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan) {
+NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan, bool layerProfileEnabled) {
     this->network = network;
     this->execution = execution;
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
     this->plan = plan;
+    this->layerProfileEnabled = layerProfileEnabled;
+
+    // Env toggles for layer profiling.
+    // - DLLAMA_LAYER_PROF_PRINT=1 enables stdout printing on stage root.
+    // - DLLAMA_LAYER_PROF_PATH sets explicit snapshot file path (stage root only).
+    const char *p = std::getenv("DLLAMA_LAYER_PROF_PRINT");
+    layerPerfPrintEnabled = (p != nullptr && p[0] != '\0' && std::atoi(p) != 0);
+    const char *pathEnv = std::getenv("DLLAMA_LAYER_PROF_PATH");
+    if (pathEnv != nullptr && pathEnv[0] != '\0') {
+        layerPerfPath = std::string(pathEnv);
+    }
     // [新增] 构造时缓存 myStage，避免运行时重复查找
     this->myStage = nullptr;
     if (plan) {
@@ -1261,6 +1507,44 @@ NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetEx
     }
 stage_found:;
 
+    // Build per-segment metadata for layer profiling.
+    segmentMeta.clear();
+    if (nodeConfig != nullptr && nodeConfig->segments != nullptr) {
+        segmentMeta.resize(nodeConfig->nSegments);
+        for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+            const NnSegmentConfig &seg = nodeConfig->segments[s];
+            SegmentMeta m{};
+            m.kind = classifySegmentKind(seg);
+            if (seg.nOps > 0) {
+                m.layerIndex = seg.ops[0].index;
+            } else {
+                m.layerIndex = 0xFFFFFFFFu;
+            }
+            segmentMeta[s] = m;
+        }
+    }
+
+    // Stage node -> local index map (only meaningful for stage-local profiling).
+    stageLocalIndexByGlobalNode.clear();
+    if (netConfig != nullptr) {
+        stageLocalIndexByGlobalNode.assign(netConfig->nNodes, -1);
+        if (myStage != nullptr) {
+            for (NnUint i = 0; i < myStage->nNodes; ++i) {
+                const NnUint g = myStage->nodeIndices[i];
+                if (g < netConfig->nNodes) stageLocalIndexByGlobalNode[g] = (int)i;
+            }
+        }
+    }
+
+    // Allocate storage for last per-layer per-node perf on stage root.
+    lastLayerPerfByLayer.clear();
+    if (this->layerProfileEnabled && execution != nullptr && execution->layerPerf != nullptr && myStage != nullptr) {
+        const NnUint nLayers = execution->layerPerf->nLayers;
+        lastLayerPerfByLayer.resize(nLayers);
+        for (NnUint l = 0; l < nLayers; ++l) {
+            lastLayerPerfByLayer[l].resize(myStage->nNodes);
+        }
+    }
     // Build a stable (segmentIndex, syncIndex) -> slot mapping for optional sync profiling.
     // This enables measuring full sync wall-time across all executor threads.
     syncProfileBaseBySegment.clear();
@@ -1273,7 +1557,124 @@ stage_found:;
             totalSlots += nodeConfig->segments[s].nSyncs;
         }
         syncProfileSlots.resize(totalSlots);
+
+        layerPerfBaseBySegment = syncProfileBaseBySegment;
+        layerPerfSlots.resize(totalSlots);
     }
+}
+
+void NnNetworkNodeSynchronizer::maybeInitLayerPerfSnapshot() {
+#ifdef _WIN32
+    return;
+#else
+    if (!layerProfileEnabled) return;
+    if (layerPerfMap != nullptr) return;
+    if (execution == nullptr || execution->layerPerf == nullptr) return;
+    if (myStage == nullptr || nodeConfig == nullptr) return;
+    if (nodeConfig->nodeIndex != myStage->rootNodeIndex) return;
+
+    // Default path includes stage+root to avoid collisions in multi-process setups.
+    if (layerPerfPath.empty()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "/tmp/dllama_layer_prof_stage%u_root%u.bin",
+                      (unsigned)myStage->stageIndex, (unsigned)myStage->rootNodeIndex);
+        layerPerfPath = std::string(buf);
+    }
+
+    const NnUint nLayers = execution->layerPerf->nLayers;
+    const NnUint nStageNodes = myStage->nNodes;
+    const size_t headerSize = sizeof(NnLayerPerfSnapshotHeader);
+    const size_t bodySize = (size_t)nLayers * (size_t)nStageNodes * sizeof(NnLayerPerfMsg);
+    const size_t totalSize = headerSize + bodySize;
+
+    int fd = ::open(layerPerfPath.c_str(), O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        std::perror("open(layer-prof snapshot)");
+        return;
+    }
+    if (::ftruncate(fd, (off_t)totalSize) != 0) {
+        std::perror("ftruncate(layer-prof snapshot)");
+        ::close(fd);
+        return;
+    }
+    void *mem = ::mmap(nullptr, totalSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) {
+        std::perror("mmap(layer-prof snapshot)");
+        ::close(fd);
+        return;
+    }
+
+    layerPerfFd = fd;
+    layerPerfMap = mem;
+    layerPerfMapSize = (NnSize)totalSize;
+    layerPerfEpoch = 0ull;
+
+    // Initialize header and zero payload.
+    NnLayerPerfSnapshotHeader *hdr = (NnLayerPerfSnapshotHeader *)layerPerfMap;
+    std::memset(hdr, 0, sizeof(*hdr));
+    hdr->magic = NN_LAYER_PERF_SNAPSHOT_MAGIC;
+    hdr->version = NN_LAYER_PERF_SNAPSHOT_VERSION;
+    hdr->stageIndex = myStage->stageIndex;
+    hdr->rootNodeIndex = myStage->rootNodeIndex;
+    hdr->nLayers = nLayers;
+    hdr->nStageNodes = nStageNodes;
+    hdr->epoch = 0ull;
+
+    std::memset((char *)layerPerfMap + headerSize, 0, bodySize);
+
+    // Best-effort flush.
+    (void)::msync(layerPerfMap, totalSize, MS_ASYNC);
+#endif
+}
+
+void NnNetworkNodeSynchronizer::publishLayerPerfSnapshot(NnUint layerIndex) {
+#ifdef _WIN32
+    (void)layerIndex;
+    return;
+#else
+    if (layerPerfMap == nullptr) return;
+    if (execution == nullptr || execution->layerPerf == nullptr) return;
+    if (myStage == nullptr) return;
+    const NnUint nLayers = execution->layerPerf->nLayers;
+    const NnUint nStageNodes = myStage->nNodes;
+    if (layerIndex >= nLayers) return;
+    if (lastLayerPerfByLayer.empty() || layerIndex >= lastLayerPerfByLayer.size()) return;
+
+    const size_t headerSize = sizeof(NnLayerPerfSnapshotHeader);
+    NnLayerPerfSnapshotHeader *hdr = (NnLayerPerfSnapshotHeader *)layerPerfMap;
+    if (hdr->magic != NN_LAYER_PERF_SNAPSHOT_MAGIC || hdr->version != NN_LAYER_PERF_SNAPSHOT_VERSION) return;
+    if (hdr->nLayers != nLayers || hdr->nStageNodes != nStageNodes) return;
+
+    // Copy only this layer's row.
+    NnLayerPerfMsg *base = (NnLayerPerfMsg *)((char *)layerPerfMap + headerSize);
+    NnLayerPerfMsg *row = base + (size_t)layerIndex * (size_t)nStageNodes;
+    for (NnUint i = 0; i < nStageNodes; ++i) {
+        row[i] = lastLayerPerfByLayer[layerIndex][i];
+    }
+
+    hdr->epoch = ++layerPerfEpoch;
+    (void)::msync(layerPerfMap, layerPerfMapSize, MS_ASYNC);
+#endif
+}
+
+NnNetworkNodeSynchronizer::~NnNetworkNodeSynchronizer() {
+#ifndef _WIN32
+    if (layerPerfMap != nullptr) {
+        ::munmap(layerPerfMap, (size_t)layerPerfMapSize);
+        layerPerfMap = nullptr;
+        layerPerfMapSize = 0;
+    }
+    if (layerPerfFd >= 0) {
+        ::close(layerPerfFd);
+        layerPerfFd = -1;
+    }
+#endif
+}
+
+void NnNetworkNodeSynchronizer::onSyncStepComplete(NnUint segmentIndex) {
+    (void)segmentIndex;
+    // NOTE: Do not send network traffic here.
+    // Post-sync hooks are not aligned across nodes and can desynchronize socket streams.
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
@@ -1282,6 +1683,7 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
     const bool kvAggProof = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF") != nullptr);
     const bool kvAggProofAllBatches = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES") != nullptr);
     const bool syncTrace = (std::getenv("DLLAMA_SYNC_TRACE") != nullptr);
+    const bool syncTraceAllThreads = (std::getenv("DLLAMA_SYNC_TRACE_ALL_THREADS") != nullptr);
     const bool syncProfile = (std::getenv("DLLAMA_SYNC_PROFILE") != nullptr);
 
     auto nowUs = []() -> long long {
@@ -1381,11 +1783,13 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
 
-            if (syncTrace && threadIndex == 0 && batchIndex == 0) {
+            if (syncTrace && (syncTraceAllThreads || threadIndex == 0) && batchIndex == 0) {
                 const char *pipeName = pipeConfig->name ? pipeConfig->name : "(null)";
                 printf(
-                    "⏱️ [sync] enter node=%u seg=%u sync=%u type=%u pipe=%u name=%s bytes=%zu stageRoot=%u stageNodes=%u\n",
+                    "⏱️ [sync] enter node=%u t=%u/%u seg=%u sync=%u type=%u pipe=%u name=%s bytes=%zu stageRoot=%u stageNodes=%u\n",
                     nodeConfig->nodeIndex,
+                    (unsigned)threadIndex,
+                    (unsigned)nThreads,
                     segmentIndex,
                     syncIndex,
                     (unsigned)syncConfig->syncType,
@@ -1425,11 +1829,13 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 throw std::invalid_argument("Unknown sync type");
             }
 
-            if (syncTrace && threadIndex == 0 && batchIndex == 0) {
+            if (syncTrace && (syncTraceAllThreads || threadIndex == 0) && batchIndex == 0) {
                 const char *pipeName = pipeConfig->name ? pipeConfig->name : "(null)";
                 printf(
-                    "⏱️ [sync] exit  node=%u seg=%u sync=%u type=%u pipe=%u name=%s\n",
+                    "⏱️ [sync] exit  node=%u t=%u/%u seg=%u sync=%u type=%u pipe=%u name=%s\n",
                     nodeConfig->nodeIndex,
+                    (unsigned)threadIndex,
+                    (unsigned)nThreads,
                     segmentIndex,
                     syncIndex,
                     (unsigned)syncConfig->syncType,
@@ -1449,6 +1855,107 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 }
 
                 // (optional) extra debug hooks go here
+            }
+        }
+
+        // Layer profiling: exchange per-layer compute times to stage root.
+        // IMPORTANT: must run inside the sync call with a local thread barrier,
+        // otherwise it can desynchronize socket streams across nodes.
+        if (layerProfileEnabled && syncConfig->syncType == SYNC_NODE_SLICES &&
+            execution != nullptr && execution->layerPerf != nullptr && myStage != nullptr &&
+            segmentIndex < segmentMeta.size() && segmentMeta[segmentIndex].kind == SEG_KIND_FFN) {
+
+            SyncProfileSlot *lp = nullptr;
+            if (segmentIndex < layerPerfBaseBySegment.size()) {
+                const NnUint base = layerPerfBaseBySegment[segmentIndex];
+                const NnUint slotIndex = base + syncIndex;
+                if (slotIndex < layerPerfSlots.size()) lp = &layerPerfSlots[slotIndex];
+            }
+
+            if (lp != nullptr) {
+                // Reusable barrier (race-free): last arriving thread advances epoch.
+                // This avoids a missed-epoch deadlock when one thread observes the
+                // incremented epoch and then waits for the next increment.
+                const NnUint observedEpoch = lp->epoch.load(std::memory_order_acquire);
+                const NnUint arrived = lp->arrived.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+                if (arrived == nThreads) {
+                    lp->arrived.store(0u, std::memory_order_release);
+                    lp->done.store(0u, std::memory_order_release);
+                    lp->epoch.store(observedEpoch + 1u, std::memory_order_release);
+                } else {
+                    while (lp->epoch.load(std::memory_order_acquire) == observedEpoch) {
+                    }
+                }
+
+                if (threadIndex == 0) {
+                    const NnUint myNode = nodeConfig->nodeIndex;
+                    const NnUint stageRoot = myStage->rootNodeIndex;
+                    const bool amRoot = (myNode == stageRoot);
+
+                    const NnUint layerIndex = segmentMeta[segmentIndex].layerIndex;
+                    if (layerIndex != 0xFFFFFFFFu && layerIndex < execution->layerPerf->nLayers) {
+                        // Lazy init root cache.
+                        if (lastLayerPerfByLayer.empty()) {
+                            const NnUint nLayers = execution->layerPerf->nLayers;
+                            lastLayerPerfByLayer.resize(nLayers);
+                            for (NnUint l = 0; l < nLayers; ++l) {
+                                lastLayerPerfByLayer[l].resize(myStage->nNodes);
+                            }
+                        }
+
+                        NnLayerPerfMsg msg{};
+                        msg.magic = NN_LAYER_PERF_MAGIC;
+                        msg.version = NN_LAYER_PERF_VERSION;
+                        msg.stageIndex = myStage->stageIndex;
+                        msg.nodeIndex = myNode;
+                        msg.layerIndex = layerIndex;
+                        msg.attnUs = (NnUint)std::min<unsigned long long>(execution->layerPerf->attnUs[layerIndex], 0xFFFFFFFFull);
+                        msg.ffnUs  = (NnUint)std::min<unsigned long long>(execution->layerPerf->ffnUs[layerIndex],  0xFFFFFFFFull);
+
+                        if (!amRoot) {
+                            network->sendToNode(stageRoot, myNode, &msg, sizeof(msg));
+                        } else {
+                            maybeInitLayerPerfSnapshot();
+                            // Root: receive from all other stage nodes.
+                            for (NnUint i = 0; i < myStage->nNodes; ++i) {
+                                const NnUint peer = myStage->nodeIndices[i];
+                                if (peer == myNode) continue;
+                                NnLayerPerfMsg in{};
+                                network->recvFromNode(peer, myNode, &in, sizeof(in));
+                                if (in.magic != NN_LAYER_PERF_MAGIC || in.version != NN_LAYER_PERF_VERSION) continue;
+                                if (in.layerIndex != layerIndex) continue;
+                                const int loc = (in.nodeIndex < (NnUint)stageLocalIndexByGlobalNode.size()) ? stageLocalIndexByGlobalNode[in.nodeIndex] : -1;
+                                if (loc >= 0 && in.layerIndex < lastLayerPerfByLayer.size()) {
+                                    lastLayerPerfByLayer[in.layerIndex][(size_t)loc] = in;
+                                }
+                            }
+
+                            // Store self.
+                            const int myLocal = (myNode < (NnUint)stageLocalIndexByGlobalNode.size()) ? stageLocalIndexByGlobalNode[myNode] : -1;
+                            if (myLocal >= 0 && layerIndex < lastLayerPerfByLayer.size()) {
+                                lastLayerPerfByLayer[layerIndex][(size_t)myLocal] = msg;
+                            }
+
+                            publishLayerPerfSnapshot(layerIndex);
+
+                            // Optional printing on stage root.
+                            if (layerPerfPrintEnabled) {
+                                for (NnUint i = 0; i < myStage->nNodes; ++i) {
+                                    const NnLayerPerfMsg &p = lastLayerPerfByLayer[layerIndex][i];
+                                    if (p.magic != NN_LAYER_PERF_MAGIC) continue;
+                                    printf("[layer-prof] stage=%u layer=%u node=%u attn=%u us ffn=%u us\n",
+                                           (unsigned)p.stageIndex, (unsigned)p.layerIndex, (unsigned)p.nodeIndex,
+                                           (unsigned)p.attnUs, (unsigned)p.ffnUs);
+                                }
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                }
+
+                lp->done.fetch_add(1u, std::memory_order_acq_rel);
+                while (lp->done.load(std::memory_order_acquire) < nThreads) {
+                }
             }
         }
 
@@ -1523,6 +2030,8 @@ static std::vector<std::string> buildEnvSyncList() {
         "DLLAMA_KV_AGGREGATE_PROOF",
         "DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES",
         "DLLAMA_SYNC_TRACE",
+        "DLLAMA_SYNC_TRACE_ALL_THREADS",
+        "DLLAMA_IO_TIMEOUT_MS",
         "DLLAMA_CONTROL_LOG",
         "DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT",
         "DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION"

@@ -1076,13 +1076,13 @@ static NnNodeConfig buildLlmNodeInternal(
             ? pointerBatchedSliceConfigTagged(SRC_BUFFER, qBufferIndex, NN_SLICE_HEAD)
             : pointerBatchConfig(SRC_BUFFER, qBufferIndex);
         const NnPointerConfig kTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfig(SRC_BUFFER, kTempBufferIndex)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, kTempBufferIndex, NN_SLICE_KV_HEAD)
             : pointerBatchConfig(SRC_BUFFER, kTempBufferIndex);
         const NnPointerConfig vTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfig(SRC_BUFFER, vTempBufferIndex)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, vTempBufferIndex, NN_SLICE_KV_HEAD)
             : pointerBatchConfig(SRC_BUFFER, vTempBufferIndex);
         const NnPointerConfig mhaOutSlicePtr = fullAttBuffers
-            ? pointerBatchedSliceConfig(SRC_BUFFER, mhaOutBufferIndex)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutBufferIndex, NN_SLICE_HEAD)
             : pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex);
         const NnPointerConfig mhaOutQSlicePtr = fullAttBuffers
             ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutQBufferIndex, NN_SLICE_HEAD)

@@ -49,6 +49,7 @@ struct NnSocketIo {
 class NnNetwork {
 private:
     int *sockets;
+    NnUint *peerNodeBySocket;
     NnSize *sentBytes;
     NnSize *recvBytes;
 
@@ -58,7 +59,7 @@ public:
 
     NnUint nSockets;
 
-    NnNetwork(std::vector<NnSocket> *sockets);
+    NnNetwork(std::vector<NnSocket> *sockets, std::vector<NnUint> *peerNodeBySocket);
     ~NnNetwork();
 
     void setTurbo(bool enabled);
@@ -66,6 +67,7 @@ public:
     void read(const NnUint socketIndex, void *data, const NnSize size);
     void writeAck(const NnUint socketIndex);
     void readAck(const NnUint socketIndex);
+    void readAckWithTimeout(const NnUint socketIndex, unsigned long timeoutMs);
     // ACK packet followed by a fixed-size payload.
     void writeAckWithPayload(const NnUint socketIndex, const void *payload, const NnSize payloadSize);
     void readAckWithPayload(const NnUint socketIndex, void *payload, const NnSize payloadSize);

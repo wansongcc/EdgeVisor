@@ -75,8 +75,8 @@
         "--enable-plan-barrier",
         // "--net-turbo",
         "--benchmark",
-        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie6:9999",
-        "--ratios", "1:1:1:1"
+        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie6:9999", "rpi-trixie7:9999", "rpi-trixie8:9999",
+        "--ratios", "3:5@24*1:1:2@1*1@11"
       ],
       "cwd": "/workspace/distributed-llama",
       "stopAtEntry": true,

@@ -681,7 +681,9 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
     printf("⭕ NodeIndex: %d\n", nodeIndex);
 
     std::vector<NnSocket> sockets(nSockets);
+    std::vector<NnUint> peerNodeBySocket(nSockets, 0u);
     sockets[0].assign(rootSocket.release());
+    peerNodeBySocket[0] = 0u;
 
     printf("⭕ Socket[0]: accepted root node\n");
     std::vector<std::unique_ptr<char[]>> hosts(nNodes);
@@ -707,6 +709,8 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
         char *host = hosts[i].get();
         int port = ports[i];
         NnUint socketIndex = i + 1;
+        const NnUint peerWorkerIndex = (i < nodeIndex) ? i : (i + 1u);
+        peerNodeBySocket[socketIndex] = peerWorkerIndex + 1u;
         if (i >= nodeIndex) {
             printf("⭕ Socket[%d]: connecting to %s:%d worker\n", socketIndex, host, port);
             sockets[socketIndex].assign(connectSocket(host, port));
@@ -719,13 +723,14 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
     }
 
     printf("⭕ Network is initialized\n");
-    return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets));
+    return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets, &peerNodeBySocket));
 }
 
 std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnUint *ports) {
     assert(nSockets > 0);
 
     std::vector<NnSocket> sockets(nSockets);
+    std::vector<NnUint> peerNodeBySocket(nSockets, 0u);
     struct sockaddr_in addr;
     for (NnUint i = 0; i < nSockets; i++) {
         printf("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
@@ -743,24 +748,32 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
         }
         readAckPacket(fd);
         printf("⭕ Socket[%d]: connected\n", i);
+        peerNodeBySocket[i] = i + 1u;
     }
     for (NnUint i = 0; i < nSockets; i++) {
         writeAckPacket(sockets[i].fd);
     }
     printf("⭕ Network is initialized\n");
-    return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets));
+    return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets, &peerNodeBySocket));
 }
 
-NnNetwork::NnNetwork(std::vector<NnSocket> *sockets) {
+NnNetwork::NnNetwork(std::vector<NnSocket> *sockets, std::vector<NnUint> *peerNodeBySocket) {
     this->nSockets = sockets->size();
     this->sockets = new int[nSockets];
     for (NnUint i = 0; i < nSockets; i++)
         this->sockets[i] = sockets->at(i).release();
+    this->peerNodeBySocket = new NnUint[nSockets];
+    for (NnUint i = 0; i < nSockets; i++) {
+        this->peerNodeBySocket[i] = (peerNodeBySocket != nullptr && i < peerNodeBySocket->size())
+            ? peerNodeBySocket->at(i)
+            : 0u;
+    }
     this->sentBytes = new NnSize[nSockets];
     this->recvBytes = new NnSize[nSockets];
 }
 
 NnNetwork::~NnNetwork() {
+    delete[] peerNodeBySocket;
     delete[] sentBytes;
     delete[] recvBytes;
     for (NnUint i = 0; i < nSockets; i++)
@@ -809,6 +822,31 @@ void NnNetwork::writeAck(const NnUint socketIndex) {
 void NnNetwork::readAck(const NnUint socketIndex) {
     assert(socketIndex >= 0 && socketIndex < nSockets);
     readAckPacket(sockets[socketIndex]);
+}
+
+void NnNetwork::readAckWithTimeout(const NnUint socketIndex, unsigned long timeoutMs) {
+    assert(socketIndex >= 0 && socketIndex < nSockets);
+    if (timeoutMs == 0ul) {
+        readAck(socketIndex);
+        return;
+    }
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(sockets[socketIndex], &rfds);
+
+    struct timeval tv;
+    tv.tv_sec = (long)(timeoutMs / 1000ul);
+    tv.tv_usec = (long)((timeoutMs % 1000ul) * 1000ul);
+
+    const int rc = select(sockets[socketIndex] + 1, &rfds, nullptr, nullptr, &tv);
+    if (rc == 0) {
+        throw NnTransferSocketException(ETIMEDOUT, "Socket ack timeout (DLLAMA_IO_TIMEOUT_MS)");
+    }
+    if (rc < 0) {
+        throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
+    }
+    readAck(socketIndex);
 }
 
 void NnNetwork::writeAckWithPayload(const NnUint socketIndex, const void *payload, const NnSize payloadSize) {
@@ -980,14 +1018,13 @@ void NnNetwork::resetStats() {
 }
 
 int NnNetwork::getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const {
-    // 假设网络是全连接 Mesh，sockets 数组按 Node ID 排序 (跳过自己)
-    if (targetNodeIndex < myNodeIndex) {
-        return (int)targetNodeIndex;
+    (void)myNodeIndex;
+    for (NnUint i = 0; i < nSockets; ++i) {
+        if (peerNodeBySocket[i] == targetNodeIndex) {
+            return (int)i;
+        }
     }
-    if (targetNodeIndex > myNodeIndex) {
-        return (int)targetNodeIndex - 1;
-    }
-    return -1; // Should not happen (target == self)
+    return -1;
 }
 
 void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size) {
@@ -1031,19 +1068,31 @@ static void syncWithRoot(
         
         // 确定目标节点列表
         std::vector<int> targetSockets;
+        std::vector<NnUint> targetNodes;
         if (stage) {
             // Stage 内广播：只发给组内其他节点
             for(NnUint i=0; i<stage->nNodes; ++i) {
                 NnUint target = stage->nodeIndices[i];
                 if(target != myNodeIndex) {
                     int sock = network->getSocketIndexForNode(target, myNodeIndex);
-                    if(sock >= 0) targetSockets.push_back(sock);
+                    if(sock >= 0) {
+                        targetSockets.push_back(sock);
+                        targetNodes.push_back(target);
+                    } else {
+                        throw std::runtime_error("syncWithRoot: target node not reachable by socket mapping");
+                    }
                 }
+            }
+            if (targetSockets.size() != (size_t)(stage->nNodes - 1u)) {
+                throw std::runtime_error("syncWithRoot: stage broadcast target set is incomplete");
             }
         } else {
             // 全局广播：发给所有 Socket (简单处理)
             // 注意：这假设 network->nSockets 包含了所有 Worker
-            for(NnUint i=0; i<network->nSockets; ++i) targetSockets.push_back(i);
+            for(NnUint i=0; i<network->nSockets; ++i) {
+                targetSockets.push_back(i);
+                targetNodes.push_back(0u);
+            }
         }
 
         NnUint nTargets = targetSockets.size();
@@ -1059,6 +1108,7 @@ static void syncWithRoot(
         }
 
         std::vector<NnSocketIo> ios(nSocketsPerThread);
+        const unsigned long ackTimeoutMs = getIoTimeoutMs();
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
             ios[i].socketIndex = targetSockets[startIdx + i]; // 使用真实的 Socket Index
             ios[i].data = buffer;
@@ -1069,7 +1119,20 @@ static void syncWithRoot(
         // [新增] Root 等待 Workers 确认 (ACK)
         // 确保 Workers 已经接收完数据，实现同步屏障
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            network->readAck(ios[i].socketIndex);
+            try {
+                network->readAckWithTimeout(ios[i].socketIndex, ackTimeoutMs);
+            } catch (const std::exception &e) {
+                const NnUint targetNode = targetNodes[startIdx + i];
+                std::fprintf(stderr,
+                             "❌ syncWithRoot ack timeout/fail root=%u targetNode=%u socket=%u stageRoot=%u stageNodes=%u err=%s\n",
+                             (unsigned)myNodeIndex,
+                             (unsigned)targetNode,
+                             (unsigned)ios[i].socketIndex,
+                             (unsigned)groupRootIndex,
+                             stage ? (unsigned)stage->nNodes : 0u,
+                             e.what());
+                throw;
+            }
         }
 
     } else {
@@ -1079,8 +1142,7 @@ static void syncWithRoot(
 
         int rootSocketIndex = network->getSocketIndexForNode(groupRootIndex, myNodeIndex);
         if (rootSocketIndex < 0) {
-            // 异常：找不到 Root 的连接
-            return; 
+            throw std::runtime_error("syncWithRoot: cannot resolve root socket index");
         }
 
         NnSocketIo ios;

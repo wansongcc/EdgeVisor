@@ -13,12 +13,28 @@
 // Global flag to enable plan barrier (set from app via bootstrap packet)
 static bool g_enablePlanBarrier = false;
 
+// Global flag to enable stage full residency (set from app via bootstrap packet or env var)
+static bool g_enableStageFullWeights = false;
+
 void setEnablePlanBarrier(bool enable) {
     g_enablePlanBarrier = enable;
 }
 
 bool getEnablePlanBarrier() {
     return g_enablePlanBarrier;
+}
+
+void setEnableStageFullWeights(bool enable) {
+    g_enableStageFullWeights = enable;
+}
+
+bool getEnableStageFullWeights() {
+    // If set via command line/bootstrap packet, use that value
+    if (g_enableStageFullWeights) {
+        return true;
+    }
+    // Otherwise, fall back to environment variable for backward compatibility
+    return std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr;
 }
 
 static const char *hiddenActToString(LlmHiddenAct act) {
@@ -721,7 +737,7 @@ static NnNodeConfig buildLlmNodeInternal(
     NnUint ffDim = (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim;
 
     const NnStageConfig* myStage = getStageForNode(plan, nodeIndex);
-    const bool stageFullWeights = (std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr) && (myStage != nullptr);
+    const bool stageFullWeights = getEnableStageFullWeights() && (myStage != nullptr);
     // When stageFullWeights is enabled, we treat this as the single “full residency” mode toggle:
     // - stage-local weights are loaded in full
     // - attention/ffn/logits activations are allocated as full buffers
@@ -1576,10 +1592,10 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     }
 
     // Opt-in: stage 内全量加载本 stage 的模型权重（每个节点都持有本 stage 的全量 weight tensor）。
-    // 注意：这只改变“加载多少权重到本地”；要真正利用全量权重进行区间计算，还需要算子/建图侧用 view/outStart 等参数选择计算区间。
-    const bool stageFullWeights = (std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr) && (myStage != nullptr);
+    // 注意：这只改变”加载多少权重到本地”；要真正利用全量权重进行区间计算，还需要算子/建图侧用 view/outStart 等参数选择计算区间。
+    const bool stageFullWeights = getEnableStageFullWeights() && (myStage != nullptr);
     if (stageFullWeights) {
-        printf("   [PP] Node %u: Stage full-weight loading ENABLED (DLLAMA_STAGE_FULL_WEIGHTS)\n", nodeIndex);
+        printf("   [PP] Node %u: Stage full-weight loading ENABLED\n", nodeIndex);
     }
 
     MmapFile file;

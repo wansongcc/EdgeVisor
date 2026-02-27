@@ -44,6 +44,7 @@ public:
     char *ratiosStr;
     char *kvRedundancyStr; // KV redundancy per node, format: "2" (all) or "2,3,2,3" (per-node)
     bool enablePlanBarrier; // Enable plan barrier for online migration
+    bool enableStageFullWeights; // Enable stage full residency (full weights and buffers)
 
     // worker
     NnUint port;
@@ -77,9 +78,10 @@ typedef struct {
 // Bootstrap settings sent from root to worker after socket connect and before
 // sending net/node configs. This removes the need for workers to pass --model/--ratios.
 enum LlmBootstrapFlags : NnUint {
-    LLM_BOOTSTRAP_HAS_MODEL_PATH      = 1u << 0,
-    LLM_BOOTSTRAP_HAS_RATIOS          = 1u << 1,
-    LLM_BOOTSTRAP_ENABLE_PLAN_BARRIER = 1u << 2,
+    LLM_BOOTSTRAP_HAS_MODEL_PATH          = 1u << 0,
+    LLM_BOOTSTRAP_HAS_RATIOS              = 1u << 1,
+    LLM_BOOTSTRAP_ENABLE_PLAN_BARRIER    = 1u << 2,
+    LLM_BOOTSTRAP_ENABLE_STAGE_FULL_WEIGHTS = 1u << 3,
 };
 
 typedef struct {
@@ -88,6 +90,7 @@ typedef struct {
     NnUint flags;      // LlmBootstrapFlags
     NnUint benchmarkEnabled; // 0/1, enables executor timer on workers
     NnUint enablePlanBarrier; // 0/1, enables plan barrier for online migration
+    NnUint enableStageFullWeights; // 0/1, enables stage full residency (full weights and buffers)
     NnUint maxSeqLen;  // forwarded from root args
     NnUint syncType;   // NnFloatType (as NnUint)
     NnUint modelPathLen; // bytes including '\0' if present
@@ -95,7 +98,7 @@ typedef struct {
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 3u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 4u;
 
 class RootLlmInference {
 public:

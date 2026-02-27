@@ -73,10 +73,11 @@
         "--nthreads", "2",
         "--max-seq-len", "2048",
         "--enable-plan-barrier",
+        "--enable-stage-full-weights",
         // "--net-turbo",
         "--benchmark",
-        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie6:9999", "rpi-trixie7:9999", "rpi-trixie8:9999",
-        "--ratios", "3:5@24*1:1:2@1*1@11"
+        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie6:9999",
+        "--ratios", "3:5@24*1:1@12"
       ],
       "cwd": "/workspace/distributed-llama",
       "stopAtEntry": true,
@@ -85,7 +86,7 @@
       "miDebuggerPath": "/usr/bin/gdb",
       "environment": [
         { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" },
-        { "name": "DLLAMA_STAGE_FULL_WEIGHTS", "value": "1" },
+        // { "name": "DLLAMA_STAGE_FULL_WEIGHTS", "value": "1" },
         // { "name": "DLLAMA_DEBUG_WEIGHT_RANGES", "value": "0" },
         { "name": "DLLAMA_ATT_FULL_BUFFERS", "value": "1" },
         // { "name": "DLLAMA_DEBUG_SLICE_PARAMS", "value": "0" },

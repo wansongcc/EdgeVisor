@@ -106,6 +106,8 @@ public:
     const std::vector<LlmPerfPacket>& getLastPerf() const { return lastPerf; }
     NnUint getPosition() const { return controlPacket.position; }
     NnUint getBatchSize() const { return controlPacket.batchSize; }
+    const NnUnevenPartitionPlan* getPartitionPlan() const { return plan; }
+    NnUint getNodeIndex() const { return 0u; }
 private:
     float *tokenPipe;
     float *positionPipe;

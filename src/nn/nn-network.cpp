@@ -1538,7 +1538,13 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
     }
 }
 
-NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan, bool layerProfileEnabled) {
+NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(
+    NnNetwork *network,
+    NnNetExecution *execution,
+    NnNetConfig *netConfig,
+    NnNodeConfig *nodeConfig,
+    const NnUnevenPartitionPlan *plan,
+    bool layerProfileEnabled) {
     this->network = network;
     this->execution = execution;
     this->netConfig = netConfig;

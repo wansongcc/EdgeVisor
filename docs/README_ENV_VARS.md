@@ -71,12 +71,13 @@ export DLLAMA_POISON_CHECK_LIMIT=50
 
 ### 1.3 网络/执行路径行为开关
 
-- `DLLAMA_STAGE_FULL_WEIGHTS`（存在即启用）
+- `--enable-stage-full-weights`（命令行参数）
   - 默认：关闭
   - 作用：在 uneven 分片构建中启用“stage full residency”模式：
     - stage 内权重按 full 方式加载
     - attention/ffn/logits activation buffer 按 full 分配
     - op 通过 `PNTR_BATCHED_SLICE`（必要时显式 start/stride）在 full buffer 上运行 slice
+  - 备注：该开关由 root 通过 bootstrap 同步到 workers。
 
 - `DLLAMA_FORCE_MATMUL_VIEWS`（存在即启用）
   - 默认：关闭
@@ -116,8 +117,7 @@ export DLLAMA_POISON_CHECK_LIMIT=50
   - 作用：在 root 进程内启动 UDS 控制器线程，供外部监控/规划进程下发 `PlanCommand`（推荐方式）。
   - 示例：
     - `export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
-    - `export DLLAMA_ENABLE_PLAN_BARRIER=1`
-    - `./dllama inference ...`
+    - `./dllama inference --enable-plan-barrier ...`
 
 UDS 协议为“单行 JSON 请求 → 单行 JSON 响应”（每次连接只处理 1 条请求）。支持的 `op`：`ping` / `status` / `perf` / `set_plan` / `clear`。
 
@@ -150,9 +150,13 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
   - 状态：**Deprecated（兼容兜底）**
   - 作用：不再直接驱动 barrier 的“静态触发器”。当检测到这些变量时，root 会在启动时**自动生成一条 `PlanCommand(mode=exact)`** 并打印 deprecate warning；外部 UDS 下发命令优先。
 
-- `DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION`（存在即启用）
-  - 默认：关闭
-  - 作用：当启用 plan barrier/migration 时，默认会禁用 KV redundancy（偏保守保证正确性）；设置该变量可在 migration 期间仍保留 redundancy，用于“无额外通信”的实验。
+- `--enable-kv-redundancy-during-migration`（命令行参数）
+  - 默认：开启（`1`）
+  - 作用：当启用 plan barrier/migration 时，控制 migration 期间是否保留 KV redundancy（用于“无额外通信”的实验）。
+  - 用法：
+    - 开启：`--enable-kv-redundancy-during-migration` 或 `--enable-kv-redundancy-during-migration 1`
+    - 关闭：`--enable-kv-redundancy-during-migration 0`
+  - 备注：该开关由 root 通过 bootstrap 同步到 workers。
 
 ### 1.6 分布式：Root 同步环境变量到 Workers
 
@@ -162,7 +166,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
   - 用法：
     - 例如你想把 `kvcache_debug`、`kvcache_debug_limit` 也一起同步：
       - `export DLLAMA_SYNC_ENV_VARS="kvcache_debug,kvcache_debug_limit"`
-  - 备注：默认同步名单在代码里硬编码（见 nn-network.cpp），包括 `DLLAMA_STAGE_FULL_WEIGHTS`、`DLLAMA_FORCE_MATMUL_VIEWS`、`DLLAMA_KV_AGGREGATE`、`DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION` 等。
+  - 备注：默认同步名单在代码里硬编码（见 nn-network.cpp），包括 `DLLAMA_FORCE_MATMUL_VIEWS`、`DLLAMA_KV_AGGREGATE` 等。
 
 ### 1.7 E2E Matmul-View（offset=0）对照检查
 

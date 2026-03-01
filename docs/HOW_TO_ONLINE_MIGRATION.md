@@ -206,7 +206,7 @@ DLLAMA_DEBUG_ONLINE_CHANGE=1 make -j dllama
 ### 5.1 socket 文件没有出现 / `ping` 连接失败
 
 - 确认 root 进程设置了：
-  - `DLLAMA_ENABLE_PLAN_BARRIER=1`
+  - 启动命令包含 `--enable-plan-barrier`
   - `DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
 - root stderr 应该打印：`[plan-uds] listening on ...`
 - 若提示 bind 失败：删除旧 socket：`rm -f /tmp/dllama_plan.sock`

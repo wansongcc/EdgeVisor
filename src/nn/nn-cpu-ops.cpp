@@ -1896,10 +1896,6 @@ static void initMatmulForward(NnCpuOpContext *context) {
     ASSERT_EQ(context->outputSize.z, std::max(config->nActiveExperts, 1u));
     ASSERT_EQ(context->weightSize.z, std::max(config->nExperts, 1u));
 
-    if (!context->hasInputContinuousMemory)
-        printf("🚧 Op %s does not have contiguous memory for input\n", context->name);
-    if (!context->hasOutputContinuousMemory)
-        printf("🚧 Op %s does not have contiguous memory for output\n", context->name);
 
 }
 

@@ -230,17 +230,10 @@ stageWeights*tpStage0*tpStage1*...
 
 ### 4.1 启用迁移功能（必须）
 
-在 root 运行 inference/chat/api 时设置：
+在 root 运行 inference/chat/api 时，通过命令行参数启用：
 
-```bash
-export DLLAMA_ENABLE_PLAN_BARRIER=1
-```
-
-并建议打开 stage full residency（迁移/冗余更容易正确）：
-
-```bash
-export DLLAMA_STAGE_FULL_WEIGHTS=1
-```
+- `--enable-plan-barrier`
+- `--enable-stage-full-weights`（推荐，迁移/冗余更容易正确）
 
 ### 4.2 启用 UDS 控制器（推荐）
 
@@ -310,14 +303,14 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
 你仍然可以显式关闭：
 
 ```bash
-export DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=0
+--enable-kv-redundancy-during-migration 0
 ```
 
-> 注意：KV redundancy 依赖 full KV buffer（通常需要 DLLAMA_STAGE_FULL_WEIGHTS=1）。
+> 注意：KV redundancy 依赖 full KV buffer（通常需要 `--enable-stage-full-weights`）。
 
 ### 4.7 如何确认迁移已发生
 
-运行时会打印类似日志（只要启用了 DLLAMA_ENABLE_PLAN_BARRIER，并且命中触发点）：
+运行时会打印类似日志（只要启用了 `--enable-plan-barrier`，并且命中触发点）：
 
 - barrier 侧：
   - 🧭 [plan][emit] ...
@@ -353,7 +346,7 @@ DLLAMA_VULKAN=1 make -j dllama
 ### 6.1 UDS socket 不存在 / ping 失败
 
 - 确认 root 进程设置了：
-  - DLLAMA_ENABLE_PLAN_BARRIER=1
+  - 启动命令包含 `--enable-plan-barrier`
   - DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
 - 如 socket 被旧进程占用：
 
@@ -412,8 +405,6 @@ export DLLAMA_SYNC_ENV_VARS="kvcache_debug,kvcache_debug_limit"
 终端 B（root）：
 
 ```bash
-export DLLAMA_ENABLE_PLAN_BARRIER=1
-export DLLAMA_STAGE_FULL_WEIGHTS=1
 export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
 
 ./dllama inference \
@@ -424,6 +415,9 @@ export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
   --buffer-float-type q80 \
   --nthreads 4 \
   --max-seq-len 2048 \
+  --enable-plan-barrier \
+  --enable-stage-full-weights \
+  --enable-kv-redundancy-during-migration 1 \
   --workers 127.0.0.1:9999 \
   --ratios 1:1
 ```

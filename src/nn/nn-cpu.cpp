@@ -2,6 +2,7 @@
 #include "nn-cpu-ops.hpp"
 #include "nn-core.hpp"
 #include "plan-command.hpp"
+#include "llm.hpp"
 #include <cassert>
 #include <iostream> 
 #include <cstdio>
@@ -1365,14 +1366,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
                             bool reject = false;
                             const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
-                            auto envBoolDefaultTrue = [&](const char *name) -> bool {
-                                const char *v = std::getenv(name);
-                                if (v == nullptr) return true;
-                                if (v[0] == '0') return false;
-                                if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
-                                return true;
-                            };
-                            const bool kvRedundancyEnabled = envBoolDefaultTrue("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION");
+                            const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
                             for (uint32_t i = 0; i < pc2.nMoves; ++i) {
                                 const PlanMove &m = pc2.moves[i];
                                 const NnUint f = (NnUint)m.fromNodeIndex;
@@ -1553,16 +1547,9 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 }
                                 const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
                                 if (gqaLockstep) {
-                                    auto envBoolDefaultTrue = [&](const char *name) -> bool {
-                                        const char *v = std::getenv(name);
-                                        if (v == nullptr) return true;
-                                        if (v[0] == '0') return false;
-                                        if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
-                                        return true;
-                                    };
-                                    const bool kvRedundancyEnabled = envBoolDefaultTrue("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION");
+                                    const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
                                     if (!kvRedundancyEnabled) {
-                                        printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV redundancy disabled (set DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=1)\n",
+                                        printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV redundancy disabled (--enable-kv-redundancy-during-migration=0)\n",
                                             (unsigned)myNode,
                                             (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
                                             (unsigned)msgEpoch,

@@ -13,12 +13,33 @@
 // Global flag to enable plan barrier (set from app via bootstrap packet)
 static bool g_enablePlanBarrier = false;
 
+// Global flag to enable stage full residency (set from app via bootstrap packet)
+static bool g_enableStageFullWeights = false;
+// Global flag to keep KV redundancy enabled during migration (set from app via bootstrap packet)
+static bool g_enableKvRedundancyDuringMigration = true;
+
 void setEnablePlanBarrier(bool enable) {
     g_enablePlanBarrier = enable;
 }
 
 bool getEnablePlanBarrier() {
     return g_enablePlanBarrier;
+}
+
+void setEnableStageFullWeights(bool enable) {
+    g_enableStageFullWeights = enable;
+}
+
+bool getEnableStageFullWeights() {
+    return g_enableStageFullWeights;
+}
+
+void setEnableKvRedundancyDuringMigration(bool enable) {
+    g_enableKvRedundancyDuringMigration = enable;
+}
+
+bool getEnableKvRedundancyDuringMigration() {
+    return g_enableKvRedundancyDuringMigration;
 }
 
 static const char *hiddenActToString(LlmHiddenAct act) {
@@ -721,7 +742,7 @@ static NnNodeConfig buildLlmNodeInternal(
     NnUint ffDim = (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim;
 
     const NnStageConfig* myStage = getStageForNode(plan, nodeIndex);
-    const bool stageFullWeights = (std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr) && (myStage != nullptr);
+    const bool stageFullWeights = getEnableStageFullWeights() && (myStage != nullptr);
     // When stageFullWeights is enabled, we treat this as the single “full residency” mode toggle:
     // - stage-local weights are loaded in full
     // - attention/ffn/logits activations are allocated as full buffers
@@ -767,18 +788,10 @@ static NnNodeConfig buildLlmNodeInternal(
     bool enableKvRedundancy = fullAttBuffers && plan != nullptr &&
         plan->kvHeadComputeSplit.starts != nullptr && plan->kvHeadComputeSplit.lengths != nullptr;
 
-    // Online migration hook: KV redundancy is now enabled by default during migration.
-    // This relies on kvHeadComputeSplit padding (see NN_KV_REDUNDANCY_PAD_HEADS).
-    // You can still disable it by setting:
-    //   DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=0
-    if (enablePlanBarrier) {
-        const char *v = std::getenv("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION");
-        if (v != nullptr) {
-            // Treat "0" / "false" as disabled; anything else enables.
-            if (v[0] == '0' || ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A'))) {
-                enableKvRedundancy = false;
-            }
-        }
+    // During online migration, whether KV redundancy remains enabled is controlled
+    // by the CLI/bootstrap flag (--enable-kv-redundancy-during-migration).
+    if (enablePlanBarrier && !getEnableKvRedundancyDuringMigration()) {
+        enableKvRedundancy = false;
     }
 
     NnRowMatmulSliceUneven kSlice = enableKvRedundancy
@@ -1076,13 +1089,13 @@ static NnNodeConfig buildLlmNodeInternal(
             ? pointerBatchedSliceConfigTagged(SRC_BUFFER, qBufferIndex, NN_SLICE_HEAD)
             : pointerBatchConfig(SRC_BUFFER, qBufferIndex);
         const NnPointerConfig kTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfig(SRC_BUFFER, kTempBufferIndex)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, kTempBufferIndex, NN_SLICE_KV_HEAD)
             : pointerBatchConfig(SRC_BUFFER, kTempBufferIndex);
         const NnPointerConfig vTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfig(SRC_BUFFER, vTempBufferIndex)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, vTempBufferIndex, NN_SLICE_KV_HEAD)
             : pointerBatchConfig(SRC_BUFFER, vTempBufferIndex);
         const NnPointerConfig mhaOutSlicePtr = fullAttBuffers
-            ? pointerBatchedSliceConfig(SRC_BUFFER, mhaOutBufferIndex)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutBufferIndex, NN_SLICE_HEAD)
             : pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex);
         const NnPointerConfig mhaOutQSlicePtr = fullAttBuffers
             ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutQBufferIndex, NN_SLICE_HEAD)
@@ -1576,10 +1589,10 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     }
 
     // Opt-in: stage 内全量加载本 stage 的模型权重（每个节点都持有本 stage 的全量 weight tensor）。
-    // 注意：这只改变“加载多少权重到本地”；要真正利用全量权重进行区间计算，还需要算子/建图侧用 view/outStart 等参数选择计算区间。
-    const bool stageFullWeights = (std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr) && (myStage != nullptr);
+    // 注意：这只改变”加载多少权重到本地”；要真正利用全量权重进行区间计算，还需要算子/建图侧用 view/outStart 等参数选择计算区间。
+    const bool stageFullWeights = getEnableStageFullWeights() && (myStage != nullptr);
     if (stageFullWeights) {
-        printf("   [PP] Node %u: Stage full-weight loading ENABLED (DLLAMA_STAGE_FULL_WEIGHTS)\n", nodeIndex);
+        printf("   [PP] Node %u: Stage full-weight loading ENABLED\n", nodeIndex);
     }
 
     MmapFile file;

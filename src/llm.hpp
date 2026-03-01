@@ -157,4 +157,12 @@ void loadLlmNetWeightUneven(const char* path, LlmNet *net, NnLocalWeightLoader *
 void setEnablePlanBarrier(bool enable);
 bool getEnablePlanBarrier();
 
+// Set enable stage full weights flag (called from app after reading bootstrap packet)
+void setEnableStageFullWeights(bool enable);
+bool getEnableStageFullWeights();
+
+// Set migration-time KV redundancy flag (called from app after reading bootstrap packet)
+void setEnableKvRedundancyDuringMigration(bool enable);
+bool getEnableKvRedundancyDuringMigration();
+
 #endif

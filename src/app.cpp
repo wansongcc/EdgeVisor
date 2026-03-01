@@ -93,6 +93,8 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.flags = 0u;
     p.benchmarkEnabled = args->benchmark ? 1u : 0u;
     p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
+    p.enableStageFullWeights = args->enableStageFullWeights ? 1u : 0u;
+    p.enableKvRedundancyDuringMigration = args->enableKvRedundancyDuringMigration ? 1u : 0u;
     p.maxSeqLen = args->maxSeqLen;
     p.syncType = (NnUint)args->syncType;
     p.modelPathLen = 0u;
@@ -180,6 +182,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.ratiosStr = nullptr;
     args.kvRedundancyStr = nullptr;
     args.enablePlanBarrier = false;
+    args.enableStageFullWeights = false;
+    args.enableKvRedundancyDuringMigration = true;
 
     int i = 1;
     if (requireMode && argc > 1) {
@@ -220,6 +224,30 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.enablePlanBarrier = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--enable-stage-full-weights") == 0) {
+            // Support both: "--enable-stage-full-weights" and "--enable-stage-full-weights 1|0".
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.enableStageFullWeights = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.enableStageFullWeights = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--enable-kv-redundancy-during-migration") == 0) {
+            // Support both: "--enable-kv-redundancy-during-migration" and "--enable-kv-redundancy-during-migration 1|0".
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.enableKvRedundancyDuringMigration = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.enableKvRedundancyDuringMigration = true;
                 i += 1;
             }
             continue;
@@ -914,6 +942,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     // IMPORTANT: plan barrier affects graph construction (insertion of OP_PLAN_BARRIER/OP_PLAN_APPLY)
     // so we must enable it before building the LLM net.
     setEnablePlanBarrier(args->enablePlanBarrier);
+    // IMPORTANT: stage full weights affects weight loading and buffer allocation
+    // so we must enable it before building the LLM net.
+    setEnableStageFullWeights(args->enableStageFullWeights);
+    // IMPORTANT: migration-time KV redundancy safety checks and compute range selection
+    // depend on this flag during graph construction.
+    setEnableKvRedundancyDuringMigration(args->enableKvRedundancyDuringMigration);
 
     if(args->ratiosStr != nullptr){
         printf("nNodes=%d\n", nNodes);
@@ -1063,9 +1097,15 @@ void runWorkerApp(AppCliArgs *args) {
         const NnFloatType bootSyncType = (NnFloatType)boot.syncType;
         const bool bootBenchmarkEnabled = boot.benchmarkEnabled != 0u;
         const bool bootEnablePlanBarrier = boot.enablePlanBarrier != 0u;
+        const bool bootEnableStageFullWeights = boot.enableStageFullWeights != 0u;
+        const bool bootEnableKvRedundancyDuringMigration = boot.enableKvRedundancyDuringMigration != 0u;
 
         // Set enable plan barrier flag from bootstrap packet
         setEnablePlanBarrier(bootEnablePlanBarrier);
+        // Set enable stage full weights flag from bootstrap packet
+        setEnableStageFullWeights(bootEnableStageFullWeights);
+        // Set migration-time KV redundancy behavior from bootstrap packet
+        setEnableKvRedundancyDuringMigration(bootEnableKvRedundancyDuringMigration);
 
         NnWorkerConfigReader configReader(network);
         NnNetConfig netConfig = configReader.readNet();

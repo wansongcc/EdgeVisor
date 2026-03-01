@@ -14,6 +14,7 @@ Supports Linux, macOS, and Windows. Optimized for ARM and x86_64 AVX2 CPUs.
 - [🧠 How to Run on GPU](./docs/HOW_TO_RUN_GPU.md)
 - [🧷 Environment Variable Switches](./docs/README_ENV_VARS.md)
 - [🧭 Online Migration (PlanCommand + UDS)](./docs/HOW_TO_ONLINE_MIGRATION.md)
+- [⚖️ Uneven TP/PP Startup Configuration](./doc/UNEVEN_TP_PP_CONFIG.md)
 
 **News**
 - 16 Sep 2025 - Qwen 3 MoE models are now supported on Vulkan.

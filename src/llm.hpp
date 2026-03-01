@@ -161,4 +161,8 @@ bool getEnablePlanBarrier();
 void setEnableStageFullWeights(bool enable);
 bool getEnableStageFullWeights();
 
+// Set migration-time KV redundancy flag (called from app after reading bootstrap packet)
+void setEnableKvRedundancyDuringMigration(bool enable);
+bool getEnableKvRedundancyDuringMigration();
+
 #endif

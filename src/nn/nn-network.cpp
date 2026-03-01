@@ -516,6 +516,28 @@ static void writeAckPacket(int socket) {
     writeSocket(socket, &packet, sizeof(packet));
 }
 
+static constexpr NnUint WORKER_PEER_HELLO_MAGIC = 0x314b5057u; // 'WPK1'
+
+static void exchangeWorkerPeerIndex(int socket, NnUint myWorkerIndex, NnUint *peerWorkerIndex) {
+    NnUint out[2] = {WORKER_PEER_HELLO_MAGIC, myWorkerIndex};
+    writeSocket(socket, out, sizeof(out));
+
+    NnUint in[2] = {0u, 0u};
+    readSocket(socket, in, sizeof(in));
+    if (in[0] != WORKER_PEER_HELLO_MAGIC) {
+        throw std::runtime_error("Invalid worker-peer hello magic");
+    }
+    *peerWorkerIndex = in[1];
+}
+
+static inline NnUint peerWorkerToSocketIndex(NnUint myWorkerIndex, NnUint peerWorkerIndex) {
+    // socket[0] is root. Worker-peer sockets use compressed worker index space
+    // where local worker index is removed:
+    //   peer < my  -> socket = peer + 1
+    //   peer > my  -> socket = peer
+    return (peerWorkerIndex < myWorkerIndex) ? (peerWorkerIndex + 1u) : peerWorkerIndex;
+}
+
 static inline int connectSocket(char *host, int port) {
     struct addrinfo hints;
     struct addrinfo *addr = NULL;
@@ -676,14 +698,16 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
 
     readSocket(rootSocketFd, &nSockets, sizeof(nSockets));
     NnUint nNodes = nSockets - 1; // nSockets - 1 root node
-    printf("⭕ nNodes: %d\n", nNodes);
+    printf("⭕ peerWorkers: %d\n", nNodes);
     readSocket(rootSocketFd, &nodeIndex, sizeof(nodeIndex));
     printf("⭕ NodeIndex: %d\n", nodeIndex);
 
     std::vector<NnSocket> sockets(nSockets);
     std::vector<NnUint> peerNodeBySocket(nSockets, 0u);
+    std::vector<bool> slotAssigned(nSockets, false);
     sockets[0].assign(rootSocket.release());
     peerNodeBySocket[0] = 0u;
+    slotAssigned[0] = true;
 
     printf("⭕ Socket[0]: accepted root node\n");
     std::vector<std::unique_ptr<char[]>> hosts(nNodes);
@@ -708,17 +732,76 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
     for (NnUint i = 0; i < nNodes; i++) {
         char *host = hosts[i].get();
         int port = ports[i];
-        NnUint socketIndex = i + 1;
         const NnUint peerWorkerIndex = (i < nodeIndex) ? i : (i + 1u);
-        peerNodeBySocket[socketIndex] = peerWorkerIndex + 1u;
+
         if (i >= nodeIndex) {
-            printf("⭕ Socket[%d]: connecting to %s:%d worker\n", socketIndex, host, port);
-            sockets[socketIndex].assign(connectSocket(host, port));
-            printf("⭕ Socket[%d]: connected\n", socketIndex);
+            printf("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s:%d)\n",
+                   nodeIndex,
+                   peerWorkerIndex,
+                   host,
+                   port);
+
+            int fd = connectSocket(host, port);
+            NnUint actualPeerWorkerIndex = 0u;
+            exchangeWorkerPeerIndex(fd, nodeIndex, &actualPeerWorkerIndex);
+
+            if (actualPeerWorkerIndex != peerWorkerIndex) {
+                throw std::runtime_error("Worker-peer handshake mismatch on connect path");
+            }
+
+            const NnUint socketIndex = peerWorkerToSocketIndex(nodeIndex, actualPeerWorkerIndex);
+            if (socketIndex >= nSockets) {
+                throw std::runtime_error("Worker-peer handshake produced out-of-range socket index");
+            }
+            if (slotAssigned[socketIndex]) {
+                throw std::runtime_error("Duplicate worker-peer socket detected (connect path)");
+            }
+
+            sockets[socketIndex].assign(fd);
+            peerNodeBySocket[socketIndex] = actualPeerWorkerIndex + 1u;
+            slotAssigned[socketIndex] = true;
+
+            printf("⭕ Socket[%u]: connected to worker(globalNode=%u, workerIndex=%u)\n",
+                   socketIndex,
+                   actualPeerWorkerIndex + 1u,
+                   actualPeerWorkerIndex);
         } else {
-            printf("⭕ Socket[%d]: wait for %s:%d worker\n", socketIndex, host, port);
-            sockets[socketIndex].assign(acceptSocket(socketSocket.fd));
-            printf("⭕ Socket[%d]: accepted\n", socketIndex);
+            printf("⭕ Waiting worker-pair accept: localWorker=%u expecting one of [0..%u]\n",
+                   nodeIndex,
+                   nodeIndex == 0 ? 0 : (nodeIndex - 1u));
+
+            int fd = acceptSocket(socketSocket.fd);
+            NnUint actualPeerWorkerIndex = 0u;
+            exchangeWorkerPeerIndex(fd, nodeIndex, &actualPeerWorkerIndex);
+
+            if (actualPeerWorkerIndex >= nodeIndex) {
+                throw std::runtime_error("Worker-peer handshake mismatch on accept path");
+            }
+
+            const NnUint socketIndex = peerWorkerToSocketIndex(nodeIndex, actualPeerWorkerIndex);
+            if (socketIndex >= nSockets) {
+                throw std::runtime_error("Worker-peer handshake produced out-of-range socket index");
+            }
+            if (slotAssigned[socketIndex]) {
+                throw std::runtime_error("Duplicate worker-peer socket detected (accept path)");
+            }
+
+            sockets[socketIndex].assign(fd);
+            peerNodeBySocket[socketIndex] = actualPeerWorkerIndex + 1u;
+            slotAssigned[socketIndex] = true;
+
+            printf("⭕ Socket[%u]: accepted worker(globalNode=%u, workerIndex=%u)\n",
+                   socketIndex,
+                   actualPeerWorkerIndex + 1u,
+                   actualPeerWorkerIndex);
+        }
+    }
+
+    for (NnUint workerIndex = 0; workerIndex < nNodes; ++workerIndex) {
+        if (workerIndex == nodeIndex) continue;
+        const NnUint socketIndex = peerWorkerToSocketIndex(nodeIndex, workerIndex);
+        if (socketIndex >= nSockets || !slotAssigned[socketIndex]) {
+            throw std::runtime_error("Missing worker-peer socket at startup");
         }
     }
 
@@ -2092,7 +2175,6 @@ static std::vector<std::string> buildEnvSyncList() {
     // Default whitelist (debug/migration switches). Extend at runtime via:
     //   DLLAMA_SYNC_ENV_VARS="FOO,BAR,BAZ"
     static const char *kDefaults[] = {
-        "DLLAMA_STAGE_FULL_WEIGHTS",
         "DLLAMA_FORCE_MATMUL_VIEWS",
         "DLLAMA_KV_AGGREGATE",
         "DLLAMA_KV_AGGREGATE_PROOF",
@@ -2101,8 +2183,7 @@ static std::vector<std::string> buildEnvSyncList() {
         "DLLAMA_SYNC_TRACE_ALL_THREADS",
         "DLLAMA_IO_TIMEOUT_MS",
         "DLLAMA_CONTROL_LOG",
-        "DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT",
-        "DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION"
+        "DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT"
     };
 
     std::set<std::string> names;

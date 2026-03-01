@@ -45,6 +45,7 @@ public:
     char *kvRedundancyStr; // KV redundancy per node, format: "2" (all) or "2,3,2,3" (per-node)
     bool enablePlanBarrier; // Enable plan barrier for online migration
     bool enableStageFullWeights; // Enable stage full residency (full weights and buffers)
+    bool enableKvRedundancyDuringMigration; // Keep KV redundancy enabled during online migration
 
     // worker
     NnUint port;
@@ -82,6 +83,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_HAS_RATIOS              = 1u << 1,
     LLM_BOOTSTRAP_ENABLE_PLAN_BARRIER    = 1u << 2,
     LLM_BOOTSTRAP_ENABLE_STAGE_FULL_WEIGHTS = 1u << 3,
+    LLM_BOOTSTRAP_ENABLE_KV_REDUNDANCY_DURING_MIGRATION = 1u << 4,
 };
 
 typedef struct {
@@ -91,6 +93,7 @@ typedef struct {
     NnUint benchmarkEnabled; // 0/1, enables executor timer on workers
     NnUint enablePlanBarrier; // 0/1, enables plan barrier for online migration
     NnUint enableStageFullWeights; // 0/1, enables stage full residency (full weights and buffers)
+    NnUint enableKvRedundancyDuringMigration; // 0/1, keeps KV redundancy enabled during migration
     NnUint maxSeqLen;  // forwarded from root args
     NnUint syncType;   // NnFloatType (as NnUint)
     NnUint modelPathLen; // bytes including '\0' if present
@@ -98,7 +101,7 @@ typedef struct {
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 4u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 5u;
 
 class RootLlmInference {
 public:

@@ -13,8 +13,10 @@
 // Global flag to enable plan barrier (set from app via bootstrap packet)
 static bool g_enablePlanBarrier = false;
 
-// Global flag to enable stage full residency (set from app via bootstrap packet or env var)
+// Global flag to enable stage full residency (set from app via bootstrap packet)
 static bool g_enableStageFullWeights = false;
+// Global flag to keep KV redundancy enabled during migration (set from app via bootstrap packet)
+static bool g_enableKvRedundancyDuringMigration = true;
 
 void setEnablePlanBarrier(bool enable) {
     g_enablePlanBarrier = enable;
@@ -29,12 +31,15 @@ void setEnableStageFullWeights(bool enable) {
 }
 
 bool getEnableStageFullWeights() {
-    // If set via command line/bootstrap packet, use that value
-    if (g_enableStageFullWeights) {
-        return true;
-    }
-    // Otherwise, fall back to environment variable for backward compatibility
-    return std::getenv("DLLAMA_STAGE_FULL_WEIGHTS") != nullptr;
+    return g_enableStageFullWeights;
+}
+
+void setEnableKvRedundancyDuringMigration(bool enable) {
+    g_enableKvRedundancyDuringMigration = enable;
+}
+
+bool getEnableKvRedundancyDuringMigration() {
+    return g_enableKvRedundancyDuringMigration;
 }
 
 static const char *hiddenActToString(LlmHiddenAct act) {
@@ -783,18 +788,10 @@ static NnNodeConfig buildLlmNodeInternal(
     bool enableKvRedundancy = fullAttBuffers && plan != nullptr &&
         plan->kvHeadComputeSplit.starts != nullptr && plan->kvHeadComputeSplit.lengths != nullptr;
 
-    // Online migration hook: KV redundancy is now enabled by default during migration.
-    // This relies on kvHeadComputeSplit padding (see NN_KV_REDUNDANCY_PAD_HEADS).
-    // You can still disable it by setting:
-    //   DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION=0
-    if (enablePlanBarrier) {
-        const char *v = std::getenv("DLLAMA_ENABLE_KV_REDUNDANCY_DURING_MIGRATION");
-        if (v != nullptr) {
-            // Treat "0" / "false" as disabled; anything else enables.
-            if (v[0] == '0' || ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A'))) {
-                enableKvRedundancy = false;
-            }
-        }
+    // During online migration, whether KV redundancy remains enabled is controlled
+    // by the CLI/bootstrap flag (--enable-kv-redundancy-during-migration).
+    if (enablePlanBarrier && !getEnableKvRedundancyDuringMigration()) {
+        enableKvRedundancy = false;
     }
 
     NnRowMatmulSliceUneven kSlice = enableKvRedundancy

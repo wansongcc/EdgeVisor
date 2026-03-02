@@ -1313,6 +1313,24 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                             }
                         };
 
+                        auto logLocalWorkSplit = [&](const char *reason) {
+                            const NnUint stageIndex = ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex;
+                            const NnUint kvHeadLen = (plan->kvHeadSplit.lengths != nullptr) ? plan->kvHeadSplit.lengths[myNode] : 0u;
+                            const NnUint qHeadLen = (plan->headSplit.lengths != nullptr) ? plan->headSplit.lengths[myNode] : 0u;
+                            const NnUint ffnLen = (plan->ffnSplit.lengths != nullptr) ? plan->ffnSplit.lengths[myNode] : 0u;
+                            printf("📊 [plan][work] node=%u stage=%u epoch=%u layer=%u pos=%u kvHeads=%u qHeads=%u ffnDim=%u reason=%s\n",
+                                (unsigned)myNode,
+                                (unsigned)stageIndex,
+                                (unsigned)msgEpoch,
+                                (unsigned)layerIndex,
+                                (unsigned)pos,
+                                (unsigned)kvHeadLen,
+                                (unsigned)qHeadLen,
+                                (unsigned)ffnLen,
+                                reason);
+                            std::fflush(stdout);
+                        };
+
                         // v2 move list apply (cmd==4): aggregate deltas first, then apply once.
                         if (cmd == 4u) {
                             const unsigned int wantSeq = fromNode; // overloaded by barrier for cmdlist
@@ -1507,6 +1525,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)pc2.nMoves,
                                     (unsigned)gqaGroupSize);
                                 std::fflush(stdout);
+                                logLocalWorkSplit("cmdlist");
                                 device->setPlanEpoch(msgEpoch);
                             }
                             return;
@@ -1670,6 +1689,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)toNode,
                                     (unsigned)gqaGroupSize);
                                 std::fflush(stdout);
+                                logLocalWorkSplit("legacy");
                                 device->setPlanEpoch(msgEpoch);
                             } else if (!legacyNoOp) {
                                 // This happens if cmd asks to move 0, or cmd kind is unknown.

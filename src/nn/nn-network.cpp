@@ -141,6 +141,32 @@ static NnUint getGroupRootIndex(const NnStageConfig* stage) {
     return 0;
 }
 
+static bool isStageNodeSyncActive(const NnUnevenPartitionPlan *plan, const NnStageConfig *stage, NnUint nodeIndex) {
+    if (stage == nullptr || plan == nullptr) return true;
+    // Keep stage root always active for control-plane consistency (plan barrier / broadcasts).
+    if (nodeIndex == stage->rootNodeIndex) return true;
+
+    const bool hasHead = (plan->headSplit.lengths != nullptr) && (plan->headSplit.lengths[nodeIndex] > 0u);
+    const bool hasFfn = (plan->ffnSplit.lengths != nullptr) && (plan->ffnSplit.lengths[nodeIndex] > 0u);
+    return hasHead || hasFfn;
+}
+
+static bool isNodeInStage(const NnStageConfig *stage, NnUint nodeIndex) {
+    if (stage == nullptr || stage->nodeIndices == nullptr) return false;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        if (stage->nodeIndices[i] == nodeIndex) return true;
+    }
+    return false;
+}
+
+static bool isLogitsGatherWorkerActive(const NnUnevenPartitionPlan *plan, NnUint nodeIndex) {
+    if (plan == nullptr || plan->nStages == 0 || plan->stages == nullptr) return false;
+    const NnStageConfig *lastStage = &plan->stages[plan->nStages - 1u];
+    if (!isNodeInStage(lastStage, nodeIndex)) return false;
+    if (plan->vocabSplit.lengths == nullptr) return true;
+    return plan->vocabSplit.lengths[nodeIndex] > 0u;
+}
+
 static inline void setNonBlocking(int socket, bool enabled) {
 #ifdef _WIN32
     u_long mode = enabled ? 1 : 0;
@@ -1140,12 +1166,16 @@ static void syncWithRoot(
     NnSize nBytes, 
     NnUint nThreads, 
     NnUint threadIndex,
-    const NnStageConfig *stage // [新增] 传入 Stage 信息
+    const NnStageConfig *stage, // [新增] 传入 Stage 信息
+    const NnUnevenPartitionPlan *plan
 ) {
     // 1. 确定谁是 Root
     NnUint groupRootIndex = getGroupRootIndex(stage); // 复用之前的辅助函数
     bool amIRoot = (myNodeIndex == groupRootIndex);
     
+    const bool amIActive = isStageNodeSyncActive(plan, stage, myNodeIndex);
+    if (!amIActive) return;
+
     if (amIRoot) {
         // --- Root 发送 (Broadcast) ---
         
@@ -1157,6 +1187,7 @@ static void syncWithRoot(
             for(NnUint i=0; i<stage->nNodes; ++i) {
                 NnUint target = stage->nodeIndices[i];
                 if(target != myNodeIndex) {
+                    if (!isStageNodeSyncActive(plan, stage, target)) continue;
                     int sock = network->getSocketIndexForNode(target, myNodeIndex);
                     if(sock >= 0) {
                         targetSockets.push_back(sock);
@@ -1166,9 +1197,7 @@ static void syncWithRoot(
                     }
                 }
             }
-            if (targetSockets.size() != (size_t)(stage->nNodes - 1u)) {
-                throw std::runtime_error("syncWithRoot: stage broadcast target set is incomplete");
-            }
+            // target set can be smaller than (stage->nNodes - 1) when zero-workload nodes are excluded.
         } else {
             // 全局广播：发给所有 Socket (简单处理)
             // 注意：这假设 network->nSockets 包含了所有 Worker
@@ -1260,9 +1289,29 @@ static void syncNodeSlices(
     NnUint groupRootIndex = getGroupRootIndex(stage);
     bool amIRoot = (myNodeIndex == groupRootIndex);
 
+    const bool isLogitsGather = (onlyFromWorkerToRoot && plan != nullptr && plan->nStages > 0 && stage == nullptr);
+
+    const bool amIActive = isLogitsGather
+        ? (amIRoot || isLogitsGatherWorkerActive(plan, myNodeIndex))
+        : isStageNodeSyncActive(plan, stage, myNodeIndex);
+    if (!amIActive) return;
+
     // 1. 确定参与同步的节点列表 (Peers)
-    const NnUint* groupNodes = stage ? stage->nodeIndices : nullptr;
-    NnUint nGroupNodes = stage ? stage->nNodes : nTotalNodes;
+    std::vector<NnUint> activeStageNodes;
+    const NnUint* groupNodes = nullptr;
+    NnUint nGroupNodes = 0u;
+    if (stage != nullptr) {
+        activeStageNodes.reserve(stage->nNodes);
+        for (NnUint i = 0; i < stage->nNodes; ++i) {
+            const NnUint n = stage->nodeIndices[i];
+            if (isStageNodeSyncActive(plan, stage, n)) activeStageNodes.push_back(n);
+        }
+        groupNodes = activeStageNodes.data();
+        nGroupNodes = (NnUint)activeStageNodes.size();
+    } else {
+        groupNodes = nullptr;
+        nGroupNodes = nTotalNodes;
+    }
 
     // 2. 筛选出需要通信的 Socket
     std::vector<int> targetSockets;
@@ -1279,14 +1328,14 @@ static void syncNodeSlices(
         if (onlyFromWorkerToRoot) {
             // 检查是否是 Logits 收集 (Global gather with PP plan)
             // 如果是，只有 Last Stage 的节点需要发送给 Root
-            bool isLogitsGather = (plan != nullptr && plan->nStages > 0 && stage == nullptr);
+            bool logitsGather = isLogitsGather;
 
             // Case A: 我是 Worker (不是本组 Root)
             if (!amIRoot) {
                 // Worker 只理会本组的 Root
                 if (targetNode != groupRootIndex) continue; 
 
-                if (isLogitsGather) {
+                if (logitsGather) {
                     const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
                     bool amInLastStage = false;
                     for(unsigned k=0; k<lastStage.nNodes; ++k) {
@@ -1296,13 +1345,14 @@ static void syncNodeSlices(
                         }
                     }
                     if (!amInLastStage) continue;
+                    if (!isLogitsGatherWorkerActive(plan, myNodeIndex)) continue;
                 }
             }
             // Case B: 我是 Root (本组 Root)
             else { 
                 // Root 理会所有人 (接收)
                 // 但如果是 Logits 收集，Root 只接收 Last Stage 的数据
-                if (isLogitsGather) {
+                if (logitsGather) {
                     const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
                     bool targetInLastStage = false;
                     for(unsigned k=0; k<lastStage.nNodes; ++k) {
@@ -1312,6 +1362,7 @@ static void syncNodeSlices(
                         }
                     }
                     if (!targetInLastStage) continue;
+                    if (!isLogitsGatherWorkerActive(plan, targetNode)) continue;
                 }
             }
         }
@@ -1338,7 +1389,6 @@ static void syncNodeSlices(
     std::vector<NnSize> sliceSizes(nTotalNodes);
     
     // For PP, split tables are stage-local. For logits gather, slices come from the LAST stage.
-    const bool isLogitsGather = (onlyFromWorkerToRoot && plan != nullptr && plan->nStages > 0 && stage == nullptr);
     const NnStageConfig* stageForSplit = stage;
     if (isLogitsGather) {
         stageForSplit = &plan->stages[plan->nStages - 1];
@@ -1955,7 +2005,7 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
 
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
                 syncTypeStr = "SYNC_WITH_ROOT";
-                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage);
+                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage, plan);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeStr = "SYNC_NODE_SLICES";
                 syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements);

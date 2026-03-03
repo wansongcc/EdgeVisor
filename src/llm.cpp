@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <functional>
+#include <algorithm>
 
 // Global flag to enable plan barrier (set from app via bootstrap packet)
 static bool g_enablePlanBarrier = false;
@@ -17,6 +18,15 @@ static bool g_enablePlanBarrier = false;
 static bool g_enableStageFullWeights = false;
 // Global flag to keep KV redundancy enabled during migration (set from app via bootstrap packet)
 static bool g_enableKvRedundancyDuringMigration = true;
+
+static int getenvIntOrDefaultLlm(const char *name, int fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    char *end = nullptr;
+    long x = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0') return fallback;
+    return (int)x;
+}
 
 void setEnablePlanBarrier(bool enable) {
     g_enablePlanBarrier = enable;
@@ -730,6 +740,9 @@ static NnNodeConfig buildLlmNodeInternal(
     LlmHeader *h, 
     LlmNet *n, // 为了获取全局 Pipe Index
     const NnUnevenPartitionPlan *plan,
+    const RuntimeStageLayerPlan *runtimePlan,
+    std::vector<NnUint> *layerKRegistry,
+    std::vector<NnUint> *layerVRegistry,
     NnUint nBatches,
     NnUint startLayer,
     NnUint endLayer,
@@ -773,6 +786,31 @@ static NnNodeConfig buildLlmNodeInternal(
         (std::getenv("DLLAMA_HARD_MIGRATE_FFN_MOVE") != nullptr);
 
     const bool enablePlanBarrier = g_enablePlanBarrier || legacyHardMigrateRequested;
+
+    // M1: static runtime plan -> collect active/redundant layers for this stage.
+    std::vector<NnUint> activeLayers;
+    std::vector<NnUint> redundantLayers;
+    if (runtimePlan != nullptr && myStage != nullptr && runtimePlan->nLayers > 0u) {
+        const NnUint stageIndex = myStage->stageIndex;
+        for (NnUint layer = 0u; layer < runtimePlan->nLayers; ++layer) {
+            const RuntimeLayerRole role = runtimePlan->getRole(stageIndex, layer);
+            if (role == RUNTIME_LAYER_PRIMARY) {
+                activeLayers.push_back(layer);
+            } else if (role == RUNTIME_LAYER_REDUNDANT) {
+                redundantLayers.push_back(layer);
+            }
+        }
+
+        if (std::getenv("DLLAMA_RUNTIME_PLAN_PRINT") != nullptr) {
+            printf("🧭 [runtime-role] node=%u stage=%u active=%zu redundant=%zu range=[%u,%u)\n",
+                (unsigned)nodeIndex,
+                (unsigned)stageIndex,
+                activeLayers.size(),
+                redundantLayers.size(),
+                (unsigned)startLayer,
+                (unsigned)endLayer);
+        }
+    }
 
     // 2. 计算切分 (Slicing)
     NnKvCacheSliceUneven kvCacheSlice = sliceKvCacheUneven(h->seqLen, h->headDim, plan, nodeIndex);
@@ -876,6 +914,23 @@ static NnNodeConfig buildLlmNodeInternal(
 
     // 3. 构建 Node Config
     NnNodeConfigBuilder nodeBuilder(nodeIndex);
+    const bool segBuildPrint = (std::getenv("DLLAMA_SEG_BUILD_PRINT") != nullptr);
+    const NnUint logStageIndex = (myStage != nullptr) ? myStage->stageIndex : 0xFFFFFFFFu;
+    auto addSegmentLogged = [&](NnSegmentConfigBuilder &builder, const char *segKind, NnUint layerIndex) {
+        if (segBuildPrint) {
+            printf("🧱 [seg-build] node=%u stage=%u kind=%s layer=%u\n",
+                (unsigned)nodeIndex,
+                (unsigned)logStageIndex,
+                (segKind != nullptr ? segKind : "unknown"),
+                (unsigned)layerIndex);
+        }
+        nodeBuilder.addSegment(builder.build());
+    };
+
+    int kvAggCollectLayer = getenvIntOrDefaultLlm("DLLAMA_ASYNC_KV_COLLECT_LAYER", -1);
+    if (kvAggCollectLayer < 0 && myStage != nullptr && myStage->endLayer > myStage->startLayer) {
+        kvAggCollectLayer = (int)(myStage->endLayer - 1u);
+    }
 
     // Buffers
     const NnUint xBufferIndex = nodeBuilder.addBuffer("x", size2D(F_32, nBatches, h->dim));
@@ -936,6 +991,14 @@ static NnNodeConfig buildLlmNodeInternal(
     const NnUint moeDQBufferIndex = (h->syncType == F_32) ? moeDBufferIndex : nodeBuilder.addBuffer("q_moe_d", size3D(h->syncType, nActiveExpertsOr1, nBatches, w1Slice.inLen));
     const NnUint moeLBufferIndex = nodeBuilder.addBuffer("moe_l", size3D(F_32, nActiveExpertsOr1, nBatches, w3Slice.inLen));
     const NnUint moeSBufferIndex = nodeBuilder.addBuffer("moe_s", size3D(F_32, nActiveExpertsOr1, nBatches, 1));
+
+    // PP send anchor buffer:
+    // - Dedicated cache for stage output that will be sent to next PP stage.
+    // - Keep PP communication segment stable and avoid coupling with last-layer working buffers.
+    NnUint ppStageOutCacheBufferIndex = (NnUint)-1;
+    if (!isLastStage) {
+        ppStageOutCacheBufferIndex = nodeBuilder.addBuffer("pp_stage_out", size2D(F_32, nBatches, h->dim));
+    }
 
     // Opt-in: force all OP_MATMUL ops to take the view-aware code path.
     // This is useful for distributed A/B checks while keeping buffer layouts unchanged (offset=0).
@@ -1016,7 +1079,7 @@ static NnNodeConfig buildLlmNodeInternal(
             pointerBatchConfig(SRC_PIPE, n->xPipeIndex), 
             n->tokenEmbeddingSize, NnEmbeddingOpConfig{});
     }
-    nodeBuilder.addSegment(start.build());
+    addSegmentLogged(start, "start", 0u);
 
     if (!isFirstStage) {
         // 创建一个专门的 Segment 来处理接收
@@ -1034,7 +1097,257 @@ static NnNodeConfig buildLlmNodeInternal(
         // 暂时假设：Stage 内部使用 SYNC_WITH_ROOT 广播 (需要 syncWithRoot 支持局部广播)
         ppRecvSeg.addSync(n->xPipeIndex, SYNC_WITH_ROOT); 
 
-        nodeBuilder.addSegment(ppRecvSeg.build());
+        addSegmentLogged(ppRecvSeg, "pp_recv", startLayer);
+    }
+
+    auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromStageTailZq) {
+        const NnUint redundantKBufferIndex = nodeBuilder.addBuffer(
+            "red_k",
+            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.keySize);
+        const NnUint redundantVBufferIndex = nodeBuilder.addBuffer(
+            "red_v",
+            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.valueSize);
+        if (layerKRegistry != nullptr && layerIndex < layerKRegistry->size()) {
+            (*layerKRegistry)[layerIndex] = redundantKBufferIndex;
+        }
+        if (layerVRegistry != nullptr && layerIndex < layerVRegistry->size()) {
+            (*layerVRegistry)[layerIndex] = redundantVBufferIndex;
+        }
+
+        NnSegmentConfigBuilder redAtt;
+        if (!readFromStageTailZq) {
+            redAtt.addOp(OP_CAST, "runtime_redundant_att_in_left", layerIndex,
+                pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(), NnCastOpCodeConfig{});
+        } else {
+            redAtt.addOp(OP_MERGE_ADD, "runtime_redundant_att_in_right", layerIndex,
+                pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(), NnMergeAddOpCodeConfig{});
+        }
+        redAtt.addOp(OP_INV_RMS, "block_norm_pre_0", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+            size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
+        redAtt.addOp(OP_RMS_NORM, "block_norm_0", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            n->rmsNormSize,
+            NnRmsNormOpConfig{invRmsBufferIndex, 1});
+        if (yBufferIndex != yqBufferIndex) {
+            redAtt.addOp(OP_CAST, "block_cast_y", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                size0(), NnCastOpCodeConfig{});
+        }
+
+        const NnPointerConfig qSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, qBufferIndex, NN_SLICE_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, qBufferIndex);
+        const NnPointerConfig kTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, kTempBufferIndex, NN_SLICE_KV_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, kTempBufferIndex);
+        const NnPointerConfig vTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, vTempBufferIndex, NN_SLICE_KV_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, vTempBufferIndex);
+        const NnPointerConfig mhaOutSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutBufferIndex, NN_SLICE_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex);
+        const NnPointerConfig mhaOutQSlicePtr = fullAttBuffers
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutQBufferIndex, NN_SLICE_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex);
+
+        redAtt.addOp(OP_MATMUL, "block_matmul_q", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), qSlicePtr,
+            stageFullWeights ? qSlice.size : qSlice.sliceSize,
+            makeRowMatmulCfgTagged(NN_SLICE_HEAD, h->headDim, qSlice.n, qSlice.inLen, qSlice.inStart));
+        NnMatmulOpConfig kCfg = enableKvRedundancy
+            ? makeRowMatmulCfg(kSlice.n, kSlice.inLen, kSlice.inStart)
+            : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, kSlice.n, kSlice.inLen, kSlice.inStart);
+        NnMatmulOpConfig vCfg = enableKvRedundancy
+            ? makeRowMatmulCfg(vSlice.n, vSlice.inLen, vSlice.inStart)
+            : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, vSlice.n, vSlice.inLen, vSlice.inStart);
+        if (enableKvRedundancy) {
+            kCfg.outStartUnit = h->headDim;
+            vCfg.outStartUnit = h->headDim;
+        }
+        redAtt.addOp(OP_MATMUL, "block_matmul_k", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), kTempSlicePtr,
+            stageFullWeights ? kSlice.size : kSlice.sliceSize, kCfg);
+        redAtt.addOp(OP_MATMUL, "block_matmul_v", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), vTempSlicePtr,
+            stageFullWeights ? vSlice.size : vSlice.sliceSize, vCfg);
+
+        if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
+            redAtt.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex,
+                qSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+                size0(), NnInvRmsOpConfig{h->normEpsilon, nQNormColumns});
+            redAtt.addOp(OP_RMS_NORM, "block_norm_q", layerIndex,
+                qSlicePtr, qSlicePtr,
+                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nQNormColumns});
+            redAtt.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex,
+                kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+                size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
+            redAtt.addOp(OP_RMS_NORM, "block_norm_k", layerIndex,
+                kTempSlicePtr, kTempSlicePtr,
+                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
+        }
+
+        redAtt.addOp(OP_ROPE, "block_rope_q", layerIndex,
+            qSlicePtr, qSlicePtr,
+            size0(),
+            NnRopeOpConfig{h->ropeType, 1, n->positionPipeIndex, ropeCacheQBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceQ});
+        redAtt.addOp(OP_ROPE, "block_rope_k", layerIndex,
+            kTempSlicePtr, kTempSlicePtr,
+            size0(),
+            NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheKBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceK});
+
+        const NnShiftOpCodeConfig redShiftKCfg = fullAttBuffers
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
+            : NnShiftOpCodeConfig{n->positionPipeIndex};
+        const NnShiftOpCodeConfig redShiftVCfg = fullAttBuffers
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
+            : NnShiftOpCodeConfig{n->positionPipeIndex};
+        redAtt.addOp(OP_SHIFT, "block_shift_k", layerIndex,
+            kTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantKBufferIndex),
+            size0(), redShiftKCfg);
+        redAtt.addOp(OP_SHIFT, "block_shift_v", layerIndex,
+            vTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantVBufferIndex),
+            size0(), redShiftVCfg);
+
+        const NnUint redQStart = fullAttBuffers ? qSlice.inStart : 0u;
+        const NnUint redQStride = fullAttBuffers ? h->qDim : qSlice.inLen;
+        const NnUint redKvStart = fullAttBuffers ? kvCacheSlice.kvStart : 0u;
+        const NnUint redKvDim0 = kvCacheSlice.kvLen;
+        const NnUint redKvStride = fullAttBuffers ? h->kvDim : kvCacheSlice.kvLen;
+        redAtt.addOp(OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex,
+            mhaOutSlicePtr, mhaOutSlicePtr, size0(),
+            NnMultiHeadAttOpConfig{
+                multiHeadAttSlice.nHeads,
+                multiHeadAttSlice.nHeads0,
+                h->nKvHeads,
+                h->headDim,
+                h->seqLen,
+                qSlice.inLen,
+                redKvDim0,
+                redQStart,
+                redQStride,
+                redKvStart,
+                redKvStride,
+                n->positionPipeIndex,
+                qBufferIndex,
+                redundantKBufferIndex,
+                redundantVBufferIndex,
+                attBufferIndex});
+
+        if (mhaOutBufferIndex != mhaOutQBufferIndex) {
+            redAtt.addOp(OP_CAST, "block_cast_y2", layerIndex,
+                mhaOutSlicePtr, mhaOutQSlicePtr,
+                size0(), NnCastOpCodeConfig{});
+        }
+
+        redAtt.addOp(OP_MATMUL, "block_matmul_wo", layerIndex,
+            mhaOutQSlicePtr,
+            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            stageFullWeights ? woSlice.size : woSlice.sliceSize,
+            makeColMatmulCfgTagged(NN_SLICE_HEAD, h->headDim, woSlice.n0, woSlice.d, woSlice.outStart));
+        redAtt.addOp(OP_CAST, "block_cast_d", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            pointerBatchedSliceConfigTagged(SRC_PIPE, n->zqPipeIndex, NN_SLICE_STACKED_BY_NODE),
+            size0(), NnCastOpCodeConfig{});
+        redAtt.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
+        addSegmentLogged(redAtt, "redundant_att", layerIndex);
+
+        NnSegmentConfigBuilder redFf;
+        redFf.addOp(OP_INV_RMS, "block_norm_pre_1", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+            size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
+        redFf.addOp(OP_RMS_NORM, "block_norm_1", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            n->rmsNormSize,
+            NnRmsNormOpConfig{invRmsBufferIndex, 1});
+
+        NnUint ffDim = (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim;
+        if (h->nExperts > 0) {
+            redFf.addOp(OP_MATMUL, "block_moe_gate", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex),
+                n->moeGateSize,
+                makeRowMatmulCfg(n->moeGateSize.x, nExpertsOr1, 0u));
+
+            NnSize3D w1ExpertSliceSize = stageFullWeights
+                ? size3D(h->weightType, h->nExperts, w1Slice.n, ffDim)
+                : size3D(h->weightType, h->nExperts, w1Slice.n, w1Slice.inLen);
+            NnSize3D w3ExpertSliceSize = stageFullWeights
+                ? size3D(h->weightType, h->nExperts, w3Slice.n, ffDim)
+                : size3D(h->weightType, h->nExperts, w3Slice.n, w3Slice.inLen);
+            NnSize3D w2ExpertSliceSize = stageFullWeights
+                ? size3D(h->weightType, h->nExperts, w2Slice.n, w2Slice.d)
+                : size3D(h->weightType, h->nExperts, w2Slice.n0, w2Slice.d);
+
+            NnMatmulOpConfig w1Cfg = makeMoeRowMatmulCfg(w1Slice.n, w1Slice.inLen, w1Slice.inStart);
+            w1Cfg.outSliceTag = NN_SLICE_FFN;
+            w1Cfg.outStartUnit = 1u;
+            redFf.addOp(OP_MATMUL, "block_matmul_w1", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
+                w1ExpertSliceSize,
+                w1Cfg);
+
+            NnMatmulOpConfig w3Cfg = makeMoeRowMatmulCfg(w3Slice.n, w3Slice.inLen, w3Slice.inStart);
+            w3Cfg.outSliceTag = NN_SLICE_FFN;
+            w3Cfg.outStartUnit = 1u;
+            redFf.addOp(OP_MATMUL, "block_matmul_w3", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, moeLBufferIndex),
+                w3ExpertSliceSize,
+                w3Cfg);
+
+            NnMatmulOpConfig w2Cfg = makeMoeColMatmulCfg(w2Slice.n0, w2Slice.d, w2Slice.outStart);
+            w2Cfg.inSliceTag = NN_SLICE_FFN;
+            w2Cfg.inStartUnit = 1u;
+            redFf.addOp(OP_MATMUL, "block_matmul_w2", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, moeYBufferIndex),
+                w2ExpertSliceSize,
+                w2Cfg);
+        } else {
+            const NnPointerConfig dSlicePtr = fullFfnBuffers
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, dBufferIndex, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, dBufferIndex);
+            const NnPointerConfig dqSlicePtr = fullFfnBuffers
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, dqBufferIndex, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, dqBufferIndex);
+            const NnPointerConfig lSlicePtr = fullFfnBuffers
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, lBufferIndex, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, lBufferIndex);
+
+            redFf.addOp(OP_MATMUL, "block_matmul_w1", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, yqBufferIndex), dSlicePtr,
+                stageFullWeights ? w1Slice.size : w1Slice.sliceSize,
+                makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w1Slice.n, w1Slice.inLen, w1Slice.inStart));
+            redFf.addOp(OP_MATMUL, "block_matmul_w3", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, yqBufferIndex), lSlicePtr,
+                stageFullWeights ? w3Slice.size : w3Slice.sliceSize,
+                makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w3Slice.n, w3Slice.inLen, w3Slice.inStart));
+            redFf.addOp(OP_MATMUL, "block_matmul_w2", layerIndex,
+                dqSlicePtr, pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                stageFullWeights ? w2Slice.size : w2Slice.sliceSize,
+                makeColMatmulCfgTagged(NN_SLICE_FFN, 1u, w2Slice.n0, w2Slice.d, w2Slice.outStart));
+        }
+        addSegmentLogged(redFf, "redundant_ff", layerIndex);
+    };
+
+    // Place left-boundary redundant layers before active range.
+    for (NnUint i = 0; i < redundantLayers.size(); ++i) {
+        const NnUint layerIndex = redundantLayers[i];
+        if (layerIndex < startLayer) {
+            addRedundantWeightHolderForLayer(layerIndex, false);
+            printf("⚠️ [seg-build] Adding redundant weight holder for layer %u before startLayer %u\n", layerIndex, startLayer);
+        }
     }
 
     // 5. Layers Loop (PP: 只构建负责的层)
@@ -1046,6 +1359,12 @@ static NnNodeConfig buildLlmNodeInternal(
         const NnUint vBufferIndex = nodeBuilder.addBuffer(
             "v",
             fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.valueSize);
+        if (layerKRegistry != nullptr && layerIndex < layerKRegistry->size()) {
+            (*layerKRegistry)[layerIndex] = kBufferIndex;
+        }
+        if (layerVRegistry != nullptr && layerIndex < layerVRegistry->size()) {
+            (*layerVRegistry)[layerIndex] = vBufferIndex;
+        }
 
         NnSegmentConfigBuilder att;
         NnSegmentConfigBuilder ff;
@@ -1205,7 +1524,8 @@ static NnNodeConfig buildLlmNodeInternal(
         // Using PNTR_BATCH on them will trip ASSERT_EQ(sourceSize->y, nBatches).
         // Instead, aggregate the per-token KV vectors that were just written (kTemp/vTemp),
         // which are batch-major and correspond to the current POS window.
-        if (n->kvAggKPipeIndex != (NnUint)-1 && n->kvAggVPipeIndex != (NnUint)-1) {
+        if (n->kvAggKPipeIndex != (NnUint)-1 && n->kvAggVPipeIndex != (NnUint)-1 &&
+            (kvAggCollectLayer < 0 || layerIndex == (NnUint)kvAggCollectLayer)) {
             att.addOp(
                 OP_CAST, "kvagg_cast_k", layerIndex,
                 kTempSlicePtr,
@@ -1334,8 +1654,8 @@ static NnNodeConfig buildLlmNodeInternal(
         ff.addOp(OP_CAST, "block_cast_d3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfigTagged(SRC_PIPE, n->zqPipeIndex, NN_SLICE_STACKED_BY_NODE), size0(), NnCastOpCodeConfig{});
         ff.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
 
-        nodeBuilder.addSegment(att.build());
-        nodeBuilder.addSegment(ff.build());
+        addSegmentLogged(att, "att", layerIndex);
+        addSegmentLogged(ff, "ff", layerIndex);
 
         // ----------------------------------------------------------------------
         // Optional per-layer barrier/apply (CPU-only test hook for online repartition)
@@ -1363,7 +1683,7 @@ static NnNodeConfig buildLlmNodeInternal(
                 });
             // Broadcast the control packet within the current stage.
             planBarrier.addSync(n->planPipeIndex, SYNC_WITH_ROOT);
-            nodeBuilder.addSegment(planBarrier.build());
+            addSegmentLogged(planBarrier, "plan_barrier", layerIndex);
 
             NnSegmentConfigBuilder planApply;
             planApply.addOp(
@@ -1374,30 +1694,38 @@ static NnNodeConfig buildLlmNodeInternal(
                 pointerBatchConfig(SRC_PIPE, n->planPipeIndex),
                 size0(),
                 NnPlanApplyOpCodeConfig{n->planPipeIndex, (myStage != nullptr ? myStage->stageIndex : 0u)});
-            nodeBuilder.addSegment(planApply.build());
+            addSegmentLogged(planApply, "plan_apply", layerIndex);
+        }
+    }
+
+    // Place right-boundary redundant layers after active range and before pp_send/end.
+    for (NnUint i = 0; i < redundantLayers.size(); ++i) {
+        const NnUint layerIndex = redundantLayers[i];
+        if (layerIndex >= endLayer) {
+            addRedundantWeightHolderForLayer(layerIndex, true);
         }
     }
 
     if (!isLastStage) {
         NnSegmentConfigBuilder ppSendSeg;
-        
-        // 1. Merge Add: 将本 Stage 最后一层的 TP 分片合并为完整激活值
-        // 结果存入 xBufferIndex
-        ppSendSeg.addOp(OP_MERGE_ADD, "pp_stage_merge", endLayer-1,
-            pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            size0(), NnMergeAddOpCodeConfig{});
 
-        // 2. Cast: 将完整激活值写入 X Pipe (复用通信管道)
-        ppSendSeg.addOp(OP_CAST, "pp_cast_out", endLayer-1,
+        // 1. Snapshot: copy stage output to dedicated PP cache buffer.
+        // NOTE: xBufferIndex already holds the final stage output after the last layer FFN merge.
+        ppSendSeg.addOp(OP_CAST, "pp_stage_merge", endLayer-1,
             pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
+            size0(), NnCastOpCodeConfig{});
+
+        // 2. Cast: 固定从 PP stage cache buffer 读取后写入 X Pipe (复用通信管道)
+        ppSendSeg.addOp(OP_CAST, "pp_cast_out", endLayer-1,
+            pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
             pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
             size0(), NnCastOpCodeConfig{});
             
         // 3. Send: 触发 PP 发送
         ppSendSeg.addSync(n->xPipeIndex, SYNC_PP_SEND);
         
-        nodeBuilder.addSegment(ppSendSeg.build());
+        addSegmentLogged(ppSendSeg, "pp_send", (endLayer > 0u ? endLayer - 1u : 0u));
     }
 
     // 6. End Segment (Final Norm & Logits)
@@ -1428,7 +1756,7 @@ static NnNodeConfig buildLlmNodeInternal(
         
         end.addSync(n->logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
     }
-    nodeBuilder.addSegment(end.build());
+    addSegmentLogged(end, "end", 0u);
     if (nodeIndex == 0 && !isLastStage) {
         NnSegmentConfigBuilder rootWaitSeg;
         
@@ -1436,7 +1764,7 @@ static NnNodeConfig buildLlmNodeInternal(
         // 语义：Node 0 等待 Last Stage 的节点发送 Logits 给它
         rootWaitSeg.addSync(n->logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
         
-        nodeBuilder.addSegment(rootWaitSeg.build());
+        addSegmentLogged(rootWaitSeg, "root_wait", 0u);
     }
 
     NnNodeConfig config = nodeBuilder.build();
@@ -1444,9 +1772,70 @@ static NnNodeConfig buildLlmNodeInternal(
     return config;
 }
 
+static RuntimeStageLayerPlan buildRuntimeStageLayerPlanStatic(const NnUnevenPartitionPlan *plan, NnUint nLayers) {
+    RuntimeStageLayerPlan out;
+    if (plan == nullptr || plan->stages == nullptr || plan->nStages == 0u || nLayers == 0u) return out;
+
+    out.nLayers = nLayers;
+    out.nStages = plan->nStages;
+    out.layerRoleByStage.assign((size_t)out.nStages * (size_t)out.nLayers, RUNTIME_LAYER_DISABLED);
+
+    auto parseEnvInt = [](const char *name, int fallback) -> int {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') return fallback;
+        char *end = nullptr;
+        long x = std::strtol(v, &end, 10);
+        if (end == v) return fallback;
+        return (int)x;
+    };
+
+    const int boundarySpan = std::max(0, parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", 1));
+
+    // Primary ownership from stage ranges.
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        const NnStageConfig &st = plan->stages[s];
+        const NnUint begin = std::min(st.startLayer, nLayers);
+        const NnUint end = std::min(st.endLayer, nLayers);
+        for (NnUint l = begin; l < end; ++l) {
+            out.setRole(st.stageIndex, l, RUNTIME_LAYER_PRIMARY);
+        }
+    }
+
+    if (boundarySpan == 0) return out;
+
+    // Redundant ownership near PP stage boundaries:
+    // - Right stage keeps left-boundary layers as redundant.
+    // - Left stage keeps right-boundary layers as redundant.
+    for (NnUint s = 0; s + 1u < plan->nStages; ++s) {
+        const NnStageConfig &left = plan->stages[s];
+        const NnStageConfig &right = plan->stages[s + 1u];
+
+        const NnUint rightStart = std::min(right.startLayer, nLayers);
+        const NnUint leftEnd = std::min(left.endLayer, nLayers);
+
+        for (int k = 0; k < boundarySpan; ++k) {
+            if ((NnUint)k < rightStart) {
+                const NnUint layer = rightStart - (NnUint)k - 1u;
+                if (out.getRole(right.stageIndex, layer) == RUNTIME_LAYER_DISABLED) {
+                    out.setRole(right.stageIndex, layer, RUNTIME_LAYER_REDUNDANT);
+                }
+            }
+            if (leftEnd + (NnUint)k < nLayers) {
+                const NnUint layer = leftEnd + (NnUint)k;
+                if (out.getRole(left.stageIndex, layer) == RUNTIME_LAYER_DISABLED) {
+                    out.setRole(left.stageIndex, layer, RUNTIME_LAYER_REDUNDANT);
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
 LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnUnevenPartitionPlan* plan) {
     LlmNet n;
     n.header = h;
+    n.runtimeStageLayerPlan = buildRuntimeStageLayerPlanStatic(plan, h->nLayers);
 
     // 1. Global Dimensions
     n.tokenEmbeddingSize = size2D(F_32, h->vocabSize, h->dim);
@@ -1474,6 +1863,8 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
     netBuilder.addPreSync(n.positionPipeIndex);
     n.netConfig = netBuilder.build();
     n.nodeConfigs = new NnNodeConfig[nNodes];
+    n.nodeLayerKBufferIndex.assign(nNodes, std::vector<NnUint>(h->nLayers, (NnUint)-1));
+    n.nodeLayerVBufferIndex.assign(nNodes, std::vector<NnUint>(h->nLayers, (NnUint)-1));
 
     // 3. Loop Nodes and Build Internal Graph
     for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
@@ -1492,10 +1883,46 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
             isLastStage = (myStage->stageIndex == plan->nStages - 1);
         }
         n.nodeConfigs[nodeIndex] = buildLlmNodeInternal(
-            nodeIndex, h, &n, plan, nBatches,
+            nodeIndex, h, &n, plan, &n.runtimeStageLayerPlan,
+            &n.nodeLayerKBufferIndex[nodeIndex],
+            &n.nodeLayerVBufferIndex[nodeIndex],
+            nBatches,
             startLayer, endLayer, isFirstStage, isLastStage
         );
         n.nodeConfigs[nodeIndex].partitionPlan = plan;
+    }
+
+    if (n.runtimeStageLayerPlan.nLayers > 0u) {
+        const size_t activeMarks = std::count(
+            n.runtimeStageLayerPlan.layerRoleByStage.begin(),
+            n.runtimeStageLayerPlan.layerRoleByStage.end(),
+            RUNTIME_LAYER_PRIMARY);
+        const size_t redundantMarks = std::count(
+            n.runtimeStageLayerPlan.layerRoleByStage.begin(),
+            n.runtimeStageLayerPlan.layerRoleByStage.end(),
+            RUNTIME_LAYER_REDUNDANT);
+        printf("🧩 [runtime-plan] static layer plan ready: layers=%u stages=%u activeMarks=%zu redundantMarks=%zu\n",
+            (unsigned)n.runtimeStageLayerPlan.nLayers,
+            (unsigned)n.runtimeStageLayerPlan.nStages,
+            activeMarks,
+            redundantMarks);
+
+        if (std::getenv("DLLAMA_RUNTIME_PLAN_PRINT") != nullptr) {
+            for (NnUint stage = 0; stage < n.runtimeStageLayerPlan.nStages; ++stage) {
+                size_t stageActive = 0u;
+                size_t stageRedundant = 0u;
+                for (NnUint layer = 0; layer < n.runtimeStageLayerPlan.nLayers; ++layer) {
+                    const RuntimeLayerRole role = n.runtimeStageLayerPlan.getRole(stage, layer);
+                    if (role == RUNTIME_LAYER_PRIMARY) {
+                        ++stageActive;
+                    } else if (role == RUNTIME_LAYER_REDUNDANT) {
+                        ++stageRedundant;
+                    }
+                }
+                printf("🧩 [runtime-plan] stage=%u active=%zu redundant=%zu\n",
+                    (unsigned)stage, stageActive, stageRedundant);
+            }
+        }
     }
 
     return n;
@@ -1595,6 +2022,27 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         printf("   [PP] Node %u: Stage full-weight loading ENABLED\n", nodeIndex);
     }
 
+    const RuntimeStageLayerPlan *runtimePlan = &net->runtimeStageLayerPlan;
+    const bool hasRuntimeRolePlan =
+        (myStage != nullptr) &&
+        (runtimePlan->nLayers == net->header->nLayers) &&
+        (runtimePlan->nStages > myStage->stageIndex);
+
+    size_t primaryLoadLayers = 0u;
+    size_t redundantLoadLayers = 0u;
+    if (hasRuntimeRolePlan) {
+        for (NnUint layerIndex = 0u; layerIndex < net->header->nLayers; ++layerIndex) {
+            const RuntimeLayerRole role = runtimePlan->getRole(myStage->stageIndex, layerIndex);
+            if (role == RUNTIME_LAYER_PRIMARY) {
+                ++primaryLoadLayers;
+            } else if (role == RUNTIME_LAYER_REDUNDANT) {
+                ++redundantLoadLayers;
+            }
+        }
+        printf("   [PP] Node %u: Runtime-role loading primary=%zu redundant=%zu\n",
+            nodeIndex, primaryLoadLayers, redundantLoadLayers);
+    }
+
     MmapFile file;
     openMmapFile(&file, path, net->header->fileSize);
     std::unique_ptr<MmapFile, void(*)(MmapFile *)> fdPtr(&file, closeMmapFile);
@@ -1615,13 +2063,20 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
 
     // --- 2. 逐层加载 ---
     for (NnUint layerIndex = 0u; layerIndex < h->nLayers; layerIndex++) {
-        
-        bool isMyLayer = (layerIndex >= startLayer && layerIndex < endLayer);
+        bool shouldLoadLayer = false;
+        if (hasRuntimeRolePlan) {
+            const RuntimeLayerRole role = runtimePlan->getRole(myStage->stageIndex, layerIndex);
+            shouldLoadLayer =
+                (role == RUNTIME_LAYER_PRIMARY) ||
+                (role == RUNTIME_LAYER_REDUNDANT);
+        } else {
+            shouldLoadLayer = (layerIndex >= startLayer && layerIndex < endLayer);
+        }
         
         // 预计算该层的理论大小 (用于 Skip 或 Verify)
         NnSize layerBytes = calculateLayerBytes(h, net->moeGateSize, net->rmsNormSize, net->qkRmsNormSize);
 
-        if (isMyLayer) {
+        if (shouldLoadLayer) {
             NnByte* layerStartPtr = b;
 
             // Attention

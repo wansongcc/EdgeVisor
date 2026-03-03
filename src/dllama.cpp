@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <string>
 #include <iostream>
+#include <deque>
 
 static void computeLogitsStats(const float* logits, NnUint vocabSize,
                               bool &hasNaN, bool &hasInf,
@@ -206,8 +207,23 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         NnUint stageIndex = 0;
         bool hasStage = false;
     };
+    struct TokenNodePerf {
+        unsigned long long execUs = 0;
+        unsigned long long syncUs = 0;
+        bool hasValue = false;
+    };
+    struct TokenPerfSample {
+        NnUint pos = 0u;
+        std::vector<TokenNodePerf> nodePerf;
+    };
     const NnUint nNodes = (context->args->nWorkers + 1);
     std::vector<NodePerfAgg> perfAgg;
+    std::deque<TokenPerfSample> predPerfHistory;
+    bool migrationPivotKnown = false;
+    bool migrationWindowReported = false;
+    NnUint migrationPivotPos = 0u;
+    NnUint migrationPivotLayer = 0u;
+    const NnUint migrationWindowTokens = 20u;
     if (context->args->benchmark) {
         perfAgg.resize(nNodes);
     }
@@ -357,6 +373,106 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 a.stageIndex = p.stageIndex;
                 a.hasStage = true;
             }
+
+            TokenPerfSample sample;
+            sample.pos = pos;
+            sample.nodePerf.resize(nNodes);
+            for (const LlmPerfPacket& p : perf) {
+                if (p.nodeIndex >= sample.nodePerf.size()) continue;
+                sample.nodePerf[p.nodeIndex].execUs = p.execUs;
+                sample.nodePerf[p.nodeIndex].syncUs = p.syncUs;
+                sample.nodePerf[p.nodeIndex].hasValue = true;
+            }
+            predPerfHistory.push_back(std::move(sample));
+            while (predPerfHistory.size() > 512u) {
+                predPerfHistory.pop_front();
+            }
+
+            if (!migrationPivotKnown && context->inference->hasMigrationAck()) {
+                const int ackPos = context->inference->getMigrationAckPos();
+                const int ackLayer = context->inference->getMigrationAckLayer();
+                if (ackPos >= 0 && ackLayer >= 0) {
+                    migrationPivotKnown = true;
+                    migrationPivotPos = (NnUint)ackPos;
+                    migrationPivotLayer = (NnUint)ackLayer;
+                    std::printf("📍 [migrate-prof] anchor layer=%u pos=%u window=%u-before/%u-after\n",
+                        (unsigned)migrationPivotLayer,
+                        (unsigned)migrationPivotPos,
+                        (unsigned)migrationWindowTokens,
+                        (unsigned)migrationWindowTokens);
+                    std::fflush(stdout);
+                }
+            }
+
+            if (migrationPivotKnown && !migrationWindowReported) {
+                struct WindowAgg {
+                    unsigned long long execUs = 0;
+                    unsigned long long syncUs = 0;
+                    unsigned long long count = 0;
+                };
+
+                const NnUint beforeStart = (migrationPivotPos >= migrationWindowTokens)
+                    ? (migrationPivotPos - migrationWindowTokens)
+                    : 0u;
+                const NnUint beforeEnd = migrationPivotPos;
+                const NnUint afterStart = migrationPivotPos + 1u;
+                const NnUint afterEnd = migrationPivotPos + 1u + migrationWindowTokens;
+
+                std::vector<WindowAgg> beforeAgg(nNodes);
+                std::vector<WindowAgg> afterAgg(nNodes);
+                for (const TokenPerfSample &s : predPerfHistory) {
+                    const bool inBefore = (s.pos >= beforeStart && s.pos < beforeEnd);
+                    const bool inAfter = (s.pos >= afterStart && s.pos < afterEnd);
+                    if (!inBefore && !inAfter) continue;
+                    for (NnUint node = 0; node < nNodes; ++node) {
+                        if (node >= s.nodePerf.size()) continue;
+                        const TokenNodePerf &np = s.nodePerf[node];
+                        if (!np.hasValue) continue;
+                        WindowAgg &dst = inBefore ? beforeAgg[node] : afterAgg[node];
+                        dst.execUs += np.execUs;
+                        dst.syncUs += np.syncUs;
+                        dst.count += 1ull;
+                    }
+                }
+
+                bool ready = true;
+                for (NnUint node = 0; node < nNodes; ++node) {
+                    if (beforeAgg[node].count < migrationWindowTokens || afterAgg[node].count < migrationWindowTokens) {
+                        ready = false;
+                        break;
+                    }
+                }
+
+                if (ready) {
+                    std::printf("\n⏱️  [Migration 20-token Avg] anchor(layer=%u pos=%u) before=[%u,%u) after=[%u,%u)\n",
+                        (unsigned)migrationPivotLayer,
+                        (unsigned)migrationPivotPos,
+                        (unsigned)beforeStart,
+                        (unsigned)beforeEnd,
+                        (unsigned)afterStart,
+                        (unsigned)afterEnd);
+                    for (NnUint node = 0; node < nNodes; ++node) {
+                        const double bExecMs = (double)beforeAgg[node].execUs / 1000.0 / (double)beforeAgg[node].count;
+                        const double bSyncMs = (double)beforeAgg[node].syncUs / 1000.0 / (double)beforeAgg[node].count;
+                        const double aExecMs = (double)afterAgg[node].execUs / 1000.0 / (double)afterAgg[node].count;
+                        const double aSyncMs = (double)afterAgg[node].syncUs / 1000.0 / (double)afterAgg[node].count;
+                        const double bTotalMs = bExecMs + bSyncMs;
+                        const double aTotalMs = aExecMs + aSyncMs;
+                        std::printf("  • Node %u: before=%6.2f ms (exec=%6.2f sync=%6.2f) | after=%6.2f ms (exec=%6.2f sync=%6.2f) | Δ=%+6.2f ms\n",
+                            (unsigned)node,
+                            bTotalMs,
+                            bExecMs,
+                            bSyncMs,
+                            aTotalMs,
+                            aExecMs,
+                            aSyncMs,
+                            aTotalMs - bTotalMs);
+                    }
+                    std::printf("\n");
+                    std::fflush(stdout);
+                    migrationWindowReported = true;
+                }
+            }
         }
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
@@ -444,6 +560,22 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
         printf("\n");
         printf("Hint: prompt eval uses batchSize>1, so per-token is usually the meaningful metric for rebalancing.\n");
+
+        if (migrationPivotKnown && !migrationWindowReported) {
+            const NnUint beforeStart = (migrationPivotPos >= migrationWindowTokens)
+                ? (migrationPivotPos - migrationWindowTokens)
+                : 0u;
+            const NnUint beforeEnd = migrationPivotPos;
+            const NnUint afterStart = migrationPivotPos + 1u;
+            const NnUint afterEnd = migrationPivotPos + 1u + migrationWindowTokens;
+            std::printf("[migrate-prof] insufficient tokens for full window: anchor(layer=%u pos=%u) need before=[%u,%u) after=[%u,%u)\n",
+                (unsigned)migrationPivotLayer,
+                (unsigned)migrationPivotPos,
+                (unsigned)beforeStart,
+                (unsigned)beforeEnd,
+                (unsigned)afterStart,
+                (unsigned)afterEnd);
+        }
     }
 }
 

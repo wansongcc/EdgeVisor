@@ -103,6 +103,8 @@ app.o: src/app.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 dynamic-layer.o: src/dynamic/dynamic_layer.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+kv-collector.o: src/dynamic/kv_collector.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 plan-command.o: src/plan-command.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 plan-controller.o: src/plan-controller.cpp
@@ -113,17 +115,17 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 
 # [TAB] <-- 这一行必须以 TAB 开始！
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
-worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o dynamic-layer.o ${DEPS}
+worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o dynamic-layer.o kv-collector.o ${DEPS}
 # [TAB]
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o ${DEPS}
 # [TAB]
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
-dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o dynamic-layer.o ${DEPS}
+dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o dynamic-layer.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
-dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o dynamic-layer.o ${DEPS}
+dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o dynamic-layer.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
-uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ${DEPS}
+uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 # Include auto-generated dependency files (created by -MMD).

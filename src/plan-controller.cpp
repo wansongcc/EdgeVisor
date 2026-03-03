@@ -238,6 +238,21 @@ static uint32_t parseU32(const json &j, const char *key, uint32_t fallback) {
     }
 }
 
+static bool parseBool(const json &j, const char *key, bool fallback) {
+    if (!j.contains(key)) return fallback;
+    try {
+        if (j.at(key).is_boolean()) {
+            return j.at(key).get<bool>();
+        }
+        if (j.at(key).is_number_integer() || j.at(key).is_number_unsigned()) {
+            return j.at(key).get<int>() != 0;
+        }
+    } catch (...) {
+        return fallback;
+    }
+    return fallback;
+}
+
 static std::string modeToStr(uint32_t mode) {
     if (mode == PLAN_CMD_MODE_EXACT) return "exact";
     if (mode == PLAN_CMD_MODE_NEXT_BARRIER) return "next_barrier";
@@ -440,6 +455,18 @@ void PlanUdsController::run() {
 
                 const uint64_t cacheSeq = planCommandCache().store(cmd);
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}};
+            } else if (op == "set_runtime_gate") {
+                if (inference_ == nullptr) throw std::runtime_error("inference not available");
+                const bool primaryEnabled = parseBool(req, "primaryEnabled", true);
+                const bool redundantEnabled = parseBool(req, "redundantEnabled", false);
+                inference_->setRuntimeLayerGate(primaryEnabled, redundantEnabled);
+                resp = json{{"ok", true}, {"primaryEnabled", primaryEnabled}, {"redundantEnabled", redundantEnabled}};
+            } else if (op == "set_primary_layer") {
+                if (inference_ == nullptr) throw std::runtime_error("inference not available");
+                const uint32_t layerIndex = parseU32(req, "layerIndex", 0u);
+                const bool enabled = parseBool(req, "enabled", true);
+                inference_->setPrimaryLayerEnabled(layerIndex, enabled);
+                resp = json{{"ok", true}, {"layerIndex", layerIndex}, {"enabled", enabled}};
             } else if (op == "clear") {
                 const uint64_t cacheSeq = planCommandCache().clear();
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}};

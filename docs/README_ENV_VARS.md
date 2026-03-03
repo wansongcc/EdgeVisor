@@ -158,6 +158,36 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
     - 关闭：`--enable-kv-redundancy-during-migration 0`
   - 备注：该开关由 root 通过 bootstrap 同步到 workers。
 
+- `DLLAMA_MIGRATION_LAYER_COUNT`（整数，推荐）
+  - 默认：`1`
+  - 作用：控制 runtime migration/redundant 的 boundary layer 数量（等价于 CLI 的 `--runtime-redundant-boundary-layers`）。
+  - 兼容：若未设置该变量，会回退读取 `DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS`。
+  - 优先级：若同时传了 CLI `--runtime-redundant-boundary-layers`，以 CLI 为准。
+  - 示例：
+    - `export DLLAMA_MIGRATION_LAYER_COUNT=2`
+    - `./dllama inference ...`
+
+- `DLLAMA_MIGRATION_LAYER_LIST`（逗号分隔整数列表）
+  - 默认：未设置
+  - 作用：指定在线迁移要批量处理的 layer 列表（transfer/ack/switch 按该列表批量执行）。
+  - 优先级：高于 `DLLAMA_MIGRATION_LAYER_COUNT`（设置列表后，count 只影响冗余构图跨度，不决定迁移目标列表）。
+  - 示例：
+    - `export DLLAMA_MIGRATION_LAYER_LIST=13,12,11,10`
+    - `export DLLAMA_ASYNC_KV_COLLECT_POS=31`
+    - `./dllama inference ...`
+
+- `DLLAMA_MIGRATION_DIRECTION`（字符串）
+  - 默认：`next`
+  - 作用：控制 layer 迁移方向（目标 stage）。
+    - `next` / `forward` / `right`：迁移到下一 stage（默认）
+    - `prev` / `backward` / `left`：迁移到上一 stage
+  - 与 `DLLAMA_MIGRATION_LAYER_COUNT` 组合时：
+    - `next`：默认从右边界层向左扩展 `count` 层
+    - `prev`：默认从左边界层向右扩展 `count` 层
+  - 示例：
+    - `export DLLAMA_MIGRATION_DIRECTION=prev`
+    - `export DLLAMA_MIGRATION_LAYER_COUNT=3`
+
 ### 1.6 分布式：Root 同步环境变量到 Workers
 
 - `DLLAMA_SYNC_ENV_VARS`（逗号分隔列表）

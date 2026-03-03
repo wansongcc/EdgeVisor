@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "plan-controller.hpp"
 #include "dynamic/dynamic_layer.hpp"
+#include "dynamic/kv_collector.hpp"
 #include <cassert>
 #include <cstring>
 #include <sstream>
@@ -8,7 +9,10 @@
 #include <cmath>
 #include <vector>
 #include <stdexcept>
+#include <cstdlib>
+#include <algorithm>
 #if defined(DLLAMA_VULKAN)
+#include <cstdlib>
     #include "nn/nn-vulkan.hpp"
 #endif
 
@@ -40,6 +44,43 @@ static bool parseEnvInt(const char *name, int &out) {
     if (end == v) return false;
     out = (int)x;
     return true;
+}
+
+static std::vector<NnUint> parseLayerListEnv(const char *name) {
+    std::vector<NnUint> out;
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return out;
+    std::stringstream ss{std::string(v)};
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (token.empty()) continue;
+        try {
+            int x = std::stoi(token);
+            if (x >= 0) out.push_back((NnUint)x);
+        } catch (...) {
+        }
+    }
+    return out;
+}
+
+static void appendUniqueLayer(std::vector<NnUint> &layers, NnUint layer) {
+    if (std::find(layers.begin(), layers.end(), layer) == layers.end()) {
+        layers.push_back(layer);
+    }
+}
+
+static void setRuntimeRedundantEnv(NnUint boundaryLayers, bool activeSegEnabled, bool redundantSegEnabled, const char *primarySkipLayersStr) {
+    std::string boundary = std::to_string((unsigned)boundaryLayers);
+    std::string active = activeSegEnabled ? "1" : "0";
+    std::string redundant = redundantSegEnabled ? "1" : "0";
+    setenv("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", boundary.c_str(), 1);
+    setenv("DLLAMA_RUNTIME_ACTIVE_SEG_ENABLED", active.c_str(), 1);
+    setenv("DLLAMA_RUNTIME_REDUNDANT_SEG_ENABLED", redundant.c_str(), 1);
+    if (primarySkipLayersStr != nullptr && primarySkipLayersStr[0] != '\0') {
+        setenv("DLLAMA_RUNTIME_PRIMARY_SKIP_LAYERS", primarySkipLayersStr, 1);
+    } else {
+        unsetenv("DLLAMA_RUNTIME_PRIMARY_SKIP_LAYERS");
+    }
 }
 
 static void maybeSeedPlanCommandFromLegacyEnv() {
@@ -95,10 +136,14 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
     p.enableStageFullWeights = args->enableStageFullWeights ? 1u : 0u;
     p.enableKvRedundancyDuringMigration = args->enableKvRedundancyDuringMigration ? 1u : 0u;
+    p.runtimeRedundantBoundaryLayers = args->runtimeRedundantBoundaryLayers;
+    p.runtimeActiveSegEnabled = args->runtimeActiveSegEnabled ? 1u : 0u;
+    p.runtimeRedundantSegEnabled = args->runtimeRedundantSegEnabled ? 1u : 0u;
     p.maxSeqLen = args->maxSeqLen;
     p.syncType = (NnUint)args->syncType;
     p.modelPathLen = 0u;
     p.ratiosLen = 0u;
+    p.primarySkipLayersLen = 0u;
 
     if (args->modelPath != nullptr) {
         p.flags |= LLM_BOOTSTRAP_HAS_MODEL_PATH;
@@ -108,13 +153,18 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
         p.flags |= LLM_BOOTSTRAP_HAS_RATIOS;
         p.ratiosLen = (NnUint)std::strlen(args->ratiosStr) + 1u;
     }
+    if (args->runtimePrimarySkipLayersStr != nullptr && args->runtimePrimarySkipLayersStr[0] != '\0') {
+        p.flags |= LLM_BOOTSTRAP_HAS_PRIMARY_SKIP_LAYERS;
+        p.primarySkipLayersLen = (NnUint)std::strlen(args->runtimePrimarySkipLayersStr) + 1u;
+    }
 
     network->write(socketIndex, &p, sizeof(p));
     if (p.modelPathLen > 0u) network->write(socketIndex, args->modelPath, p.modelPathLen);
     if (p.ratiosLen > 0u) network->write(socketIndex, args->ratiosStr, p.ratiosLen);
+    if (p.primarySkipLayersLen > 0u) network->write(socketIndex, args->runtimePrimarySkipLayersStr, p.primarySkipLayersLen);
 }
 
-static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &modelPath, std::string &ratiosStr) {
+static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &modelPath, std::string &ratiosStr, std::string &primarySkipLayersStr) {
     LlmBootstrapPacket p;
     network->read(ROOT_SOCKET_INDEX, &p, sizeof(p));
     if (p.magic != LLM_BOOTSTRAP_MAGIC)
@@ -124,6 +174,7 @@ static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &m
 
     modelPath.clear();
     ratiosStr.clear();
+    primarySkipLayersStr.clear();
     if ((p.flags & LLM_BOOTSTRAP_HAS_MODEL_PATH) != 0u) {
         std::vector<char> buf(p.modelPathLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.modelPathLen);
@@ -133,6 +184,11 @@ static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &m
         std::vector<char> buf(p.ratiosLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.ratiosLen);
         ratiosStr.assign(buf.data());
+    }
+    if ((p.flags & LLM_BOOTSTRAP_HAS_PRIMARY_SKIP_LAYERS) != 0u) {
+        std::vector<char> buf(p.primarySkipLayersLen);
+        network->read(ROOT_SOCKET_INDEX, buf.data(), p.primarySkipLayersLen);
+        primarySkipLayersStr.assign(buf.data());
     }
     return p;
 }
@@ -184,6 +240,22 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.enablePlanBarrier = false;
     args.enableStageFullWeights = false;
     args.enableKvRedundancyDuringMigration = true;
+    args.runtimeRedundantBoundaryLayers = 1u;
+    args.runtimeActiveSegEnabled = true;
+    args.runtimeRedundantSegEnabled = false;
+    args.runtimePrimarySkipLayersStr = nullptr;
+
+    {
+        int envBoundaryLayers = -1;
+        bool hasEnvBoundaryLayers = parseEnvInt("DLLAMA_MIGRATION_LAYER_COUNT", envBoundaryLayers);
+        if (!hasEnvBoundaryLayers) {
+            hasEnvBoundaryLayers = parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", envBoundaryLayers);
+        }
+        if (hasEnvBoundaryLayers) {
+            if (envBoundaryLayers < 0) envBoundaryLayers = 0;
+            args.runtimeRedundantBoundaryLayers = (NnUint)envBoundaryLayers;
+        }
+    }
 
     int i = 1;
     if (requireMode && argc > 1) {
@@ -248,6 +320,28 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.enableKvRedundancyDuringMigration = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--runtime-active-seg-enabled") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.runtimeActiveSegEnabled = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.runtimeActiveSegEnabled = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--runtime-redundant-seg-enabled") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.runtimeRedundantSegEnabled = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.runtimeRedundantSegEnabled = true;
                 i += 1;
             }
             continue;
@@ -337,6 +431,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.gpuSegmentTo = atoi(separator + 1);
         } else if (std::strcmp(name, "--net-turbo") == 0) {
             args.netTurbo = atoi(value) == 1;
+        } else if (std::strcmp(name, "--runtime-redundant-boundary-layers") == 0) {
+            int x = std::atoi(value);
+            if (x < 0) x = 0;
+            args.runtimeRedundantBoundaryLayers = (NnUint)x;
+        } else if (std::strcmp(name, "--runtime-primary-skip-layers") == 0) {
+            args.runtimePrimarySkipLayersStr = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -774,11 +874,32 @@ static NnUint getStageIndexForNode(const NnUnevenPartitionPlan* plan, NnUint nod
     return 0;
 }
 
+static const NnStageConfig* findStageForNodeLocal(const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
+    if (plan == nullptr || plan->nStages == 0) return nullptr;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        const NnStageConfig* st = &plan->stages[s];
+        for (NnUint i = 0; i < st->nNodes; ++i) {
+            if (st->nodeIndices[i] == nodeIndex) return st;
+        }
+    }
+    return nullptr;
+}
+
+static const NnStageConfig* findStageByIndexLocal(const NnUnevenPartitionPlan* plan, NnUint stageIndex) {
+    if (plan == nullptr || plan->nStages == 0) return nullptr;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        if (plan->stages[s].stageIndex == stageIndex) return &plan->stages[s];
+    }
+    return nullptr;
+}
+
 RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
     this->positionPipe = (float *)execution->pipes[net->positionPipeIndex];
     this->logitsPipe = (float *)execution->pipes[net->logitsPipeIndex];
+    this->kvAggKPipe = (net->kvAggKPipeIndex != (NnUint)-1) ? (float *)execution->pipes[net->kvAggKPipeIndex] : nullptr;
+    this->kvAggVPipe = (net->kvAggVPipeIndex != (NnUint)-1) ? (float *)execution->pipes[net->kvAggVPipeIndex] : nullptr;
     this->execution = execution;
     this->executor = executor;
     this->network = network;
@@ -787,6 +908,107 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
     this->controlPacket.planCmdSeq = 0u;
     this->lastPlanCmdSeqSent = 0u;
+    this->asyncKvCollectLayer = -1;
+    this->asyncKvCollectPos = -1;
+    const char *layerEnv = std::getenv("DLLAMA_ASYNC_KV_COLLECT_LAYER");
+    if (layerEnv != nullptr && layerEnv[0] != '\0') {
+        char *end = nullptr;
+        long x = std::strtol(layerEnv, &end, 10);
+        if (end != layerEnv && *end == '\0' && x >= 0) {
+            this->asyncKvCollectLayer = (int)x;
+        }
+    }
+    const char *posEnv = std::getenv("DLLAMA_ASYNC_KV_COLLECT_POS");
+    if (posEnv != nullptr && posEnv[0] != '\0') {
+        char *end = nullptr;
+        long x = std::strtol(posEnv, &end, 10);
+        if (end != posEnv && *end == '\0' && x >= 0) {
+            this->asyncKvCollectPos = (int)x;
+        }
+    }
+
+    boundaryLayerForMigration = -1;
+    migrationLayers.clear();
+    migrationStageStartLayer = -1;
+    migrationStageEndLayer = -1;
+    migrationBatchSubmitted = false;
+    migrationAckSeen = false;
+    migrationAckPos = -1;
+    migrationAckLayer = -1;
+    nextStageRootNode = (NnUint)-1;
+    kvAckSocketIndex = -1;
+    const char *migrationDirEnv = std::getenv("DLLAMA_MIGRATION_DIRECTION");
+    bool migrateToPrevStage = false;
+    if (migrationDirEnv != nullptr && migrationDirEnv[0] != '\0') {
+        if (std::strcmp(migrationDirEnv, "prev") == 0 || std::strcmp(migrationDirEnv, "backward") == 0 || std::strcmp(migrationDirEnv, "left") == 0) {
+            migrateToPrevStage = true;
+        }
+    }
+
+    if (plan != nullptr) {
+        const NnStageConfig *myStage = findStageForNodeLocal(plan, 0u);
+        if (myStage != nullptr && myStage->endLayer > myStage->startLayer) {
+            boundaryLayerForMigration = migrateToPrevStage ? (int)myStage->startLayer : (int)(myStage->endLayer - 1u);
+            migrationStageStartLayer = (int)myStage->startLayer;
+            migrationStageEndLayer = (int)myStage->endLayer;
+            const NnUint targetStageIndex = migrateToPrevStage
+                ? (myStage->stageIndex == 0u ? myStage->stageIndex : (myStage->stageIndex - 1u))
+                : (myStage->stageIndex + 1u);
+            const NnStageConfig *targetStage =
+                (migrateToPrevStage && myStage->stageIndex == 0u) ? nullptr : findStageByIndexLocal(plan, targetStageIndex);
+            if (targetStage != nullptr) {
+                nextStageRootNode = targetStage->rootNodeIndex;
+                if (network != nullptr) {
+                    kvAckSocketIndex = network->getSocketIndexForNode(nextStageRootNode, 0u);
+                }
+            } else {
+                std::printf("⚠️  [kv-migrate] migration direction=%s has no target stage from stage=%u\n",
+                    migrateToPrevStage ? "prev" : "next",
+                    (unsigned)myStage->stageIndex);
+                std::fflush(stdout);
+            }
+        }
+    }
+
+    migrationLayers = parseLayerListEnv("DLLAMA_MIGRATION_LAYER_LIST");
+    if (migrationLayers.empty() && boundaryLayerForMigration >= 0) {
+        int layerCount = 1;
+        (void)parseEnvInt("DLLAMA_MIGRATION_LAYER_COUNT", layerCount);
+        if (layerCount < 1) layerCount = 1;
+        if (migrateToPrevStage) {
+            const int maxLayer = (migrationStageEndLayer > 0) ? (migrationStageEndLayer - 1) : ((header != nullptr) ? ((int)header->nLayers - 1) : boundaryLayerForMigration);
+            for (int i = 0; i < layerCount; ++i) {
+                const int layer = boundaryLayerForMigration + i;
+                if (layer > maxLayer) break;
+                appendUniqueLayer(migrationLayers, (NnUint)layer);
+            }
+        } else {
+            const int minLayer = (migrationStageStartLayer >= 0) ? migrationStageStartLayer : 0;
+            for (int i = 0; i < layerCount; ++i) {
+                const int layer = boundaryLayerForMigration - i;
+                if (layer < minLayer) break;
+                appendUniqueLayer(migrationLayers, (NnUint)layer);
+            }
+        }
+    }
+    std::sort(migrationLayers.begin(), migrationLayers.end());
+
+    if (!migrationLayers.empty()) {
+        std::ostringstream oss;
+        for (size_t i = 0; i < migrationLayers.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << migrationLayers[i];
+        }
+        std::printf("🧭 [kv-migrate] root migration direction=%s targetRoot=%u layers=[%s]\n",
+            migrateToPrevStage ? "prev" : "next",
+            (unsigned)nextStageRootNode,
+            oss.str().c_str());
+        std::fflush(stdout);
+    }
+
+    if (asyncKvCollectLayer < 0 && boundaryLayerForMigration >= 0) {
+        asyncKvCollectLayer = boundaryLayerForMigration;
+    }
 }
 
 void RootLlmInference::setBatchSize(NnUint batchSize) {
@@ -808,7 +1030,97 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
     tokenPipe[batchIndex] = (float)token;
 }
 
+void RootLlmInference::setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments) {
+    if (executor == nullptr) return;
+    executor->setRuntimeLayerGate(enablePrimarySegments, enableRedundantSegments);
+}
+
+void RootLlmInference::setPrimaryLayerEnabled(NnUint layerIndex, bool enabled) {
+    if (executor == nullptr) return;
+    executor->setPrimaryLayerEnabled(layerIndex, enabled);
+}
+
+bool RootLlmInference::hasAsyncKvCollector() const {
+    return (asyncKvCollectLayer >= 0) && (asyncKvCollectPos >= 0) &&
+           (kvAggKPipe != nullptr) && (kvAggVPipe != nullptr) &&
+           (execution != nullptr) && (header != nullptr);
+}
+
+bool RootLlmInference::tryPopAsyncKvRow(RootKvAggRowPacket &packet) {
+    std::lock_guard<std::mutex> lock(asyncKvRowsMutex);
+    if (asyncKvRows.empty()) return false;
+    packet = std::move(asyncKvRows.front());
+    asyncKvRows.pop_front();
+    return true;
+}
+
+bool RootLlmInference::submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
+    if (network == nullptr) return false;
+    if (nextStageRootNode == (NnUint)-1) return false;
+    if (!migrationLayers.empty()) {
+        const bool inList = std::find(migrationLayers.begin(), migrationLayers.end(), layerIndex) != migrationLayers.end();
+        if (!inList) return false;
+    }
+    if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return false;
+
+    std::lock_guard<std::mutex> lk(kvTransferMutex);
+    if (waitingKvAck) return false;
+
+    auto exists = [&](NnUint layer) {
+        for (const auto &it : pendingKvTransfers) {
+            if (it.header.layerIndex == layer) return true;
+        }
+        return false;
+    };
+    if (exists(layerIndex)) return false;
+
+    PendingKvTransferItem item;
+    item.header.magic = LLM_KV_TRANSFER_MAGIC;
+    item.header.version = LLM_KV_TRANSFER_VERSION;
+    item.header.layerIndex = layerIndex;
+    item.header.position = position;
+    item.header.kvDim = (NnUint)kRow.size();
+    item.header.fromNodeIndex = 0u;
+    item.header.targetNodeIndex = nextStageRootNode;
+    item.header.reserved = 0u;
+    item.kRow = kRow;
+    item.vRow = vRow;
+    pendingKvTransfers.push_back(std::move(item));
+    return true;
+}
+
 void RootLlmInference::forward() {
+    bool sendKvTransfer = false;
+    bool sendLayerSwitch = false;
+    std::vector<PendingKvTransferItem> kvTransfers;
+    std::vector<NnUint> switchLayers;
+
+    {
+        std::lock_guard<std::mutex> lk(kvTransferMutex);
+        if (!pendingKvTransfers.empty() && !waitingKvAck) {
+            sendKvTransfer = true;
+            kvTransfers = pendingKvTransfers;
+            pendingKvTransfers.clear();
+            waitingKvAck = true;
+            waitingKvAckLayers.clear();
+            for (const auto &it : kvTransfers) {
+                appendUniqueLayer(waitingKvAckLayers, it.header.layerIndex);
+            }
+            std::sort(waitingKvAckLayers.begin(), waitingKvAckLayers.end());
+        }
+        if (!pendingLayerSwitchLayers.empty()) {
+            sendLayerSwitch = true;
+            switchLayers = pendingLayerSwitchLayers;
+            pendingLayerSwitchLayers.clear();
+            if (executor != nullptr) {
+                for (NnUint layer : switchLayers) {
+                    executor->setPrimaryLayerEnabled(layer, false);
+                    executor->setRedundantLayerEnabled(layer, true);
+                }
+            }
+        }
+    }
+
     if (network != nullptr) {
         // Prefer external PlanCommand; env fallback is applied once at startup.
         const PlanCommandSnapshot snap = planCommandCache().load();
@@ -825,14 +1137,146 @@ void RootLlmInference::forward() {
         } else {
             out.flags &= ~LLM_CTRL_HAS_PLAN_CMD;
         }
+        if (sendKvTransfer) out.flags |= LLM_CTRL_HAS_KV_TRANSFER;
+        if (sendLayerSwitch) out.flags |= LLM_CTRL_HAS_LAYER_SWITCH;
 
         logRootControlSend(out);
         network->writeAll(&out, sizeof(LlmControlPacket));
         if (planChanged) {
             network->writeAll(&snap.cmd, sizeof(PlanCommand));
         }
+        if (sendKvTransfer) {
+            LlmKvTransferBatchHeader bh{};
+            bh.magic = LLM_KV_TRANSFER_BATCH_MAGIC;
+            bh.version = LLM_KV_TRANSFER_BATCH_VERSION;
+            bh.count = (NnUint)kvTransfers.size();
+            bh.reserved = 0u;
+            network->writeAll(&bh, sizeof(bh));
+            for (const auto &it : kvTransfers) {
+                network->writeAll(&it.header, sizeof(LlmKvTransferHeader));
+                network->writeAll(it.kRow.data(), it.kRow.size() * sizeof(float));
+                network->writeAll(it.vRow.data(), it.vRow.size() * sizeof(float));
+            }
+        }
+        if (sendLayerSwitch) {
+            LlmLayerSwitchBatchHeader sbh{};
+            sbh.magic = LLM_LAYER_SWITCH_BATCH_MAGIC;
+            sbh.version = LLM_LAYER_SWITCH_BATCH_VERSION;
+            sbh.count = (NnUint)switchLayers.size();
+            sbh.reserved = 0u;
+            network->writeAll(&sbh, sizeof(sbh));
+            for (NnUint layer : switchLayers) {
+                LlmLayerSwitchPacket switchPkt{};
+                switchPkt.magic = LLM_LAYER_SWITCH_MAGIC;
+                switchPkt.version = LLM_LAYER_SWITCH_VERSION;
+                switchPkt.boundaryLayer = layer;
+                switchPkt.fromNodeIndex = 0u;
+                switchPkt.toNodeIndex = nextStageRootNode;
+                switchPkt.reserved0 = 0u;
+                switchPkt.reserved1 = 0u;
+                switchPkt.reserved2 = 0u;
+                network->writeAll(&switchPkt, sizeof(switchPkt));
+            }
+        }
     }
     executor->forward();
+
+    if (network != nullptr && waitingKvAck && kvAckSocketIndex >= 0) {
+        LlmKvAckBatchHeader abh{};
+        if (network->tryReadWithMaxAttempts((NnUint)kvAckSocketIndex, &abh, sizeof(abh), 1ul)) {
+            if (abh.magic == LLM_KV_ACK_BATCH_MAGIC && abh.version == LLM_KV_ACK_BATCH_VERSION) {
+                std::vector<NnUint> ackedLayers;
+                ackedLayers.reserve(abh.count);
+                NnUint ackPos = 0u;
+                bool ackPosSet = false;
+                for (NnUint i = 0u; i < abh.count; ++i) {
+                    LlmKvAckPacket ack{};
+                    network->read((NnUint)kvAckSocketIndex, &ack, sizeof(ack));
+                    if (ack.magic != LLM_KV_ACK_MAGIC || ack.version != LLM_KV_ACK_VERSION) continue;
+                    if (ack.toNodeIndex != 0u || ack.fromNodeIndex != nextStageRootNode) continue;
+                    appendUniqueLayer(ackedLayers, ack.layerIndex);
+                    if (!ackPosSet) {
+                        ackPos = ack.position;
+                        ackPosSet = true;
+                    }
+                    std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
+                        (unsigned)ack.layerIndex,
+                        (unsigned)ack.position,
+                        (unsigned)ack.fromNodeIndex);
+                }
+
+                std::sort(ackedLayers.begin(), ackedLayers.end());
+                std::lock_guard<std::mutex> lk(kvTransferMutex);
+                if (!waitingKvAckLayers.empty() && ackedLayers == waitingKvAckLayers) {
+                    waitingKvAck = false;
+                    pendingLayerSwitchLayers = ackedLayers;
+                    migrationAckSeen = true;
+                    migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
+                    migrationAckLayer = !ackedLayers.empty() ? (int)ackedLayers.back() : migrationAckLayer;
+                    std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
+                        (unsigned)ackedLayers.size());
+                    std::fflush(stdout);
+                }
+            }
+        }
+    }
+
+    if (!migrationBatchSubmitted && asyncKvCollectPos >= 0 &&
+        controlPacket.position == (NnUint)asyncKvCollectPos &&
+        !migrationLayers.empty() && executor != nullptr && header != nullptr) {
+        NnUint exported = 0u;
+        NnUint queued = 0u;
+        for (NnUint layer : migrationLayers) {
+            std::vector<float> kRow;
+            std::vector<float> vRow;
+            if (executor->exportLayerKvRow(layer, (NnUint)asyncKvCollectPos, header->kvDim, kRow, vRow)) {
+                exported += 1u;
+                if (submitBoundaryKvTransfer(layer, (NnUint)asyncKvCollectPos, kRow, vRow)) {
+                    queued += 1u;
+                }
+            } else {
+                std::printf("⚠️  [kv-migrate] export row failed layer=%u pos=%u\n",
+                    (unsigned)layer,
+                    (unsigned)asyncKvCollectPos);
+            }
+        }
+        migrationBatchSubmitted = (queued > 0u);
+        std::printf("🧩 [kv-migrate] prepared batch exported=%u queued=%u pos=%u targetRoot=%u\n",
+            (unsigned)exported,
+            (unsigned)queued,
+            (unsigned)asyncKvCollectPos,
+            (unsigned)nextStageRootNode);
+        std::fflush(stdout);
+    }
+
+    if (hasAsyncKvCollector() && execution->batchSize > 0u) {
+        const NnUint kvDim = header->kvDim;
+        const NnUint seqLen = header->seqLen;
+        const NnUint basePos = controlPacket.position;
+        std::lock_guard<std::mutex> lock(asyncKvRowsMutex);
+        for (NnUint b = 0u; b < execution->batchSize; ++b) {
+            const NnUint pos = basePos + b;
+            if (pos >= seqLen) continue;
+            if (asyncKvCollectPos >= 0 && pos != (NnUint)asyncKvCollectPos) continue;
+
+            RootKvAggRowPacket packet;
+            packet.layerIndex = (NnUint)asyncKvCollectLayer;
+            packet.position = pos;
+            packet.kRow.resize(kvDim);
+            packet.vRow.resize(kvDim);
+
+            const float *srcK = kvAggKPipe + (NnSize)b * (NnSize)kvDim;
+            const float *srcV = kvAggVPipe + (NnSize)b * (NnSize)kvDim;
+            std::memcpy(packet.kRow.data(), srcK, (size_t)kvDim * sizeof(float));
+            std::memcpy(packet.vRow.data(), srcV, (size_t)kvDim * sizeof(float));
+            asyncKvRows.push_back(std::move(packet));
+        }
+
+        const size_t maxQueued = 64u;
+        while (asyncKvRows.size() > maxQueued) {
+            asyncKvRows.pop_front();
+        }
+    }
 
     if (!profileEnabled) return;
 
@@ -883,10 +1327,11 @@ void RootLlmInference::finish() {
     }
 }
 
-WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *network) {
+WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex) {
     this->isFinished = false;
     this->execution = execution;
     this->network = network;
+    this->localNodeIndex = localNodeIndex;
     this->positionPipe = (float *)execution->pipes[0];
 }
 
@@ -915,11 +1360,97 @@ bool WorkerLlmInference::tryReadControlPacket() {
             printf("⚠️  [Worker] Bad PlanCommand packet (magic=0x%08x version=%u)\n", cmd.magic, cmd.version);
         }
     }
+
+    if ((controlPacket.flags & LLM_CTRL_HAS_KV_TRANSFER) != 0u) {
+        LlmKvTransferBatchHeader bh{};
+        network->read(ROOT_SOCKET_INDEX, &bh, sizeof(bh));
+        if (bh.magic == LLM_KV_TRANSFER_BATCH_MAGIC && bh.version == LLM_KV_TRANSFER_BATCH_VERSION) {
+            for (NnUint i = 0u; i < bh.count; ++i) {
+                LlmKvTransferHeader hdr{};
+                network->read(ROOT_SOCKET_INDEX, &hdr, sizeof(hdr));
+                std::vector<float> kRow;
+                std::vector<float> vRow;
+                if (hdr.magic == LLM_KV_TRANSFER_MAGIC && hdr.version == LLM_KV_TRANSFER_VERSION && hdr.kvDim > 0u) {
+                    kRow.resize(hdr.kvDim);
+                    vRow.resize(hdr.kvDim);
+                    network->read(ROOT_SOCKET_INDEX, kRow.data(), kRow.size() * sizeof(float));
+                    network->read(ROOT_SOCKET_INDEX, vRow.data(), vRow.size() * sizeof(float));
+                    if (hdr.targetNodeIndex == localNodeIndex) {
+                        PendingKvTransferItem item;
+                        item.header = hdr;
+                        item.kRow = std::move(kRow);
+                        item.vRow = std::move(vRow);
+                        pendingKvTransfers.push_back(std::move(item));
+
+                        LlmKvAckPacket ack{};
+                        ack.magic = LLM_KV_ACK_MAGIC;
+                        ack.version = LLM_KV_ACK_VERSION;
+                        ack.layerIndex = hdr.layerIndex;
+                        ack.position = hdr.position;
+                        ack.fromNodeIndex = localNodeIndex;
+                        ack.toNodeIndex = 0u;
+                        pendingKvAcks.push_back(ack);
+                    }
+                } else {
+                    if (hdr.kvDim > 0u) {
+                        std::vector<float> discard((size_t)hdr.kvDim * 2u);
+                        network->read(ROOT_SOCKET_INDEX, discard.data(), discard.size() * sizeof(float));
+                    }
+                }
+            }
+        }
+    }
+
+    if ((controlPacket.flags & LLM_CTRL_HAS_LAYER_SWITCH) != 0u) {
+        LlmLayerSwitchBatchHeader sbh{};
+        network->read(ROOT_SOCKET_INDEX, &sbh, sizeof(sbh));
+        if (sbh.magic == LLM_LAYER_SWITCH_BATCH_MAGIC && sbh.version == LLM_LAYER_SWITCH_BATCH_VERSION) {
+            for (NnUint i = 0u; i < sbh.count; ++i) {
+                LlmLayerSwitchPacket pkt{};
+                network->read(ROOT_SOCKET_INDEX, &pkt, sizeof(pkt));
+                if (pkt.magic == LLM_LAYER_SWITCH_MAGIC && pkt.version == LLM_LAYER_SWITCH_VERSION) {
+                    pendingLayerSwitches.push_back(pkt);
+                }
+            }
+        }
+    }
+
     printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);
     for (NnUint i = 0; i < controlPacket.batchSize; i++)
         positionPipe[i] = (float)(controlPacket.position + i);
     execution->setBatchSize(controlPacket.batchSize);
     return true;
+}
+
+bool WorkerLlmInference::consumeLayerSwitch(LlmLayerSwitchPacket &packet) {
+    if (pendingLayerSwitches.empty()) return false;
+    packet = pendingLayerSwitches.front();
+    pendingLayerSwitches.pop_front();
+    return true;
+}
+
+bool WorkerLlmInference::consumePendingKvTransfer(LlmKvTransferHeader &hdr, std::vector<float> &kRow, std::vector<float> &vRow) {
+    if (pendingKvTransfers.empty()) return false;
+    PendingKvTransferItem item = std::move(pendingKvTransfers.front());
+    pendingKvTransfers.pop_front();
+    hdr = item.header;
+    kRow = std::move(item.kRow);
+    vRow = std::move(item.vRow);
+    return true;
+}
+
+void WorkerLlmInference::flushPendingKvAck() {
+    if (pendingKvAcks.empty() || network == nullptr) return;
+    LlmKvAckBatchHeader abh{};
+    abh.magic = LLM_KV_ACK_BATCH_MAGIC;
+    abh.version = LLM_KV_ACK_BATCH_VERSION;
+    abh.count = (NnUint)pendingKvAcks.size();
+    abh.reserved = 0u;
+    network->write(ROOT_SOCKET_INDEX, &abh, sizeof(abh));
+    for (const auto &ack : pendingKvAcks) {
+        network->write(ROOT_SOCKET_INDEX, &ack, sizeof(ack));
+    }
+    pendingKvAcks.clear();
 }
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
@@ -948,6 +1479,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     // IMPORTANT: migration-time KV redundancy safety checks and compute range selection
     // depend on this flag during graph construction.
     setEnableKvRedundancyDuringMigration(args->enableKvRedundancyDuringMigration);
+    // Runtime redundant plan/gate defaults (consumed by buildLlmNetUneven + NnExecutor).
+    setRuntimeRedundantEnv(
+        args->runtimeRedundantBoundaryLayers,
+        args->runtimeActiveSegEnabled,
+        args->runtimeRedundantSegEnabled,
+        args->runtimePrimarySkipLayersStr);
 
     if(args->ratiosStr != nullptr){
         printf("nNodes=%d\n", nNodes);
@@ -1053,6 +1590,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     // Step 5: internal dynamic scheduler (queries UDS layer_prof and issues set_plan).
     std::unique_ptr<DynamicLayerController> dynCtrl;
+    std::unique_ptr<RootKvCollector> kvCollector;
+    kvCollector = RootKvCollector::start(&inference);
     if (planSock != nullptr && planSock[0] != '\0') {
         dynCtrl = DynamicLayerController::start(std::string(planSock), &inference);
     }
@@ -1088,7 +1627,8 @@ void runWorkerApp(AppCliArgs *args) {
         // Read bootstrap settings from root.
         std::string bootModelPath;
         std::string bootRatios;
-        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios);
+        std::string bootPrimarySkipLayers;
+        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers);
 
         const bool hasBootModel = !bootModelPath.empty();
         const bool hasBootRatios = !bootRatios.empty();
@@ -1099,6 +1639,9 @@ void runWorkerApp(AppCliArgs *args) {
         const bool bootEnablePlanBarrier = boot.enablePlanBarrier != 0u;
         const bool bootEnableStageFullWeights = boot.enableStageFullWeights != 0u;
         const bool bootEnableKvRedundancyDuringMigration = boot.enableKvRedundancyDuringMigration != 0u;
+        const NnUint bootRuntimeRedundantBoundaryLayers = boot.runtimeRedundantBoundaryLayers;
+        const bool bootRuntimeActiveSegEnabled = boot.runtimeActiveSegEnabled != 0u;
+        const bool bootRuntimeRedundantSegEnabled = boot.runtimeRedundantSegEnabled != 0u;
 
         // Set enable plan barrier flag from bootstrap packet
         setEnablePlanBarrier(bootEnablePlanBarrier);
@@ -1106,6 +1649,12 @@ void runWorkerApp(AppCliArgs *args) {
         setEnableStageFullWeights(bootEnableStageFullWeights);
         // Set migration-time KV redundancy behavior from bootstrap packet
         setEnableKvRedundancyDuringMigration(bootEnableKvRedundancyDuringMigration);
+        // Apply runtime redundant plan/gate defaults from bootstrap packet.
+        setRuntimeRedundantEnv(
+            bootRuntimeRedundantBoundaryLayers,
+            bootRuntimeActiveSegEnabled,
+            bootRuntimeRedundantSegEnabled,
+            bootPrimarySkipLayers.c_str());
 
         NnWorkerConfigReader configReader(network);
         NnNetConfig netConfig = configReader.readNet();
@@ -1177,7 +1726,7 @@ void runWorkerApp(AppCliArgs *args) {
             weightReader.read();
         }
 
-        WorkerLlmInference inference(&execution, network);
+        WorkerLlmInference inference(&execution, network, nodeConfig.nodeIndex);
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
@@ -1204,7 +1753,41 @@ void runWorkerApp(AppCliArgs *args) {
                     isTurboEnabled = true;
                     printf("🚁 Network is in non-blocking mode\n");
                 }
+
+                LlmKvTransferHeader kvHdr{};
+                std::vector<float> kvK;
+                std::vector<float> kvV;
+                while (inference.consumePendingKvTransfer(kvHdr, kvK, kvV)) {
+                    const bool wOk = executor.applyTransferredKvRow(kvHdr.layerIndex, kvHdr.position, kvK, kvV);
+                    std::printf("🧩 [kv-write-check] node=%u layer=%u pos=%u kvDim=%u status=%s\n",
+                        (unsigned)nodeConfig.nodeIndex,
+                        (unsigned)kvHdr.layerIndex,
+                        (unsigned)kvHdr.position,
+                        (unsigned)kvHdr.kvDim,
+                        wOk ? "ok" : "fail");
+                    std::fflush(stdout);
+                }
+
+                LlmLayerSwitchPacket switchPkt{};
+                while (inference.consumeLayerSwitch(switchPkt)) {
+                    if (switchPkt.fromNodeIndex == nodeConfig.nodeIndex) {
+                        executor.setPrimaryLayerEnabled(switchPkt.boundaryLayer, false);
+                        std::printf("🔁 [worker-switch] node=%u sleep primary layer=%u\n",
+                            (unsigned)nodeConfig.nodeIndex,
+                            (unsigned)switchPkt.boundaryLayer);
+                        std::fflush(stdout);
+                    }
+                    if (switchPkt.toNodeIndex == nodeConfig.nodeIndex) {
+                        executor.setRedundantLayerEnabled(switchPkt.boundaryLayer, true);
+                        std::printf("🔁 [worker-switch] node=%u activate redundant layer=%u\n",
+                            (unsigned)nodeConfig.nodeIndex,
+                            (unsigned)switchPkt.boundaryLayer);
+                        std::fflush(stdout);
+                    }
+                }
+
                 executor.forward();
+                inference.flushPendingKvAck();
 
                 // Send per-forward profile packet to root (optional)
                 // IMPORTANT: root will block waiting for these packets when profiling is enabled.

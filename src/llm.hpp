@@ -5,6 +5,7 @@
 #include "nn/nn-executor.hpp"
 #include "nn/nn-network-local.hpp"
 #include "nn/nn-network.hpp"
+#include <vector>
 
 
 enum LlmHeaderKey {
@@ -75,6 +76,29 @@ typedef struct {
     NnFloatType syncType;
 } LlmHeader;
 
+enum RuntimeLayerRole : NnByte {
+    RUNTIME_LAYER_DISABLED = 0u,
+    RUNTIME_LAYER_PRIMARY = 1u,
+    RUNTIME_LAYER_REDUNDANT = 2u,
+};
+
+struct RuntimeStageLayerPlan {
+    NnUint nLayers = 0u;
+    NnUint nStages = 0u;
+    // Flattened [stageIndex * nLayers + layerIndex]
+    std::vector<RuntimeLayerRole> layerRoleByStage;
+
+    inline RuntimeLayerRole getRole(NnUint stageIndex, NnUint layerIndex) const {
+        if (stageIndex >= nStages || layerIndex >= nLayers) return RUNTIME_LAYER_DISABLED;
+        return layerRoleByStage[(size_t)stageIndex * (size_t)nLayers + (size_t)layerIndex];
+    }
+
+    inline void setRole(NnUint stageIndex, NnUint layerIndex, RuntimeLayerRole role) {
+        if (stageIndex >= nStages || layerIndex >= nLayers) return;
+        layerRoleByStage[(size_t)stageIndex * (size_t)nLayers + (size_t)layerIndex] = role;
+    }
+};
+
 typedef struct {
     LlmHeader *header;
     NnNetConfig netConfig;
@@ -102,6 +126,11 @@ typedef struct {
     NnSize3D rmsNormSize;
     NnSize3D qkRmsNormSize;
     NnSize3D moeGateSize;
+    RuntimeStageLayerPlan runtimeStageLayerPlan;
+    // Per-node, per-layer KV cache buffer registry for uneven runtime graph.
+    // Value is buffer index in node config, or (NnUint)-1 when absent.
+    std::vector<std::vector<NnUint>> nodeLayerKBufferIndex;
+    std::vector<std::vector<NnUint>> nodeLayerVBufferIndex;
 } LlmNet;
 
 typedef struct {

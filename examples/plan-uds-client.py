@@ -145,6 +145,14 @@ def main() -> int:
     sp.add_argument("--trigger-pos", type=int, default=None)
     sp.add_argument("--trigger-layer", type=int, default=None)
 
+    rg = sub.add_parser("set_runtime_gate", help="toggle primary/redundant segment gate at runtime")
+    rg.add_argument("--primary", type=int, choices=[0, 1], required=True, help="enable primary segments (0/1)")
+    rg.add_argument("--redundant", type=int, choices=[0, 1], required=True, help="enable redundant segments (0/1)")
+
+    pl = sub.add_parser("set_primary_layer", help="toggle a primary layer at runtime")
+    pl.add_argument("--layer", type=int, required=True, help="layer index")
+    pl.add_argument("--enabled", type=int, choices=[0, 1], required=True, help="enabled flag (0/1)")
+
     raw = sub.add_parser("raw")
     raw.add_argument("json", help='raw request JSON, e.g. {"op":"ping"}')
 
@@ -224,6 +232,18 @@ def main() -> int:
         req = json.loads(args.json)
     elif args.op == "set_plan":
         req = cmd_set_plan(args)
+    elif args.op == "set_runtime_gate":
+        req = {
+            "op": "set_runtime_gate",
+            "primaryEnabled": int(args.primary),
+            "redundantEnabled": int(args.redundant),
+        }
+    elif args.op == "set_primary_layer":
+        req = {
+            "op": "set_primary_layer",
+            "layerIndex": int(args.layer),
+            "enabled": int(args.enabled),
+        }
     elif args.op == "layer_prof":
         req = cmd_layer_prof(args)
     else:

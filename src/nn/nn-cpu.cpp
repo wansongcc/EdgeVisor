@@ -12,6 +12,7 @@
 #include <thread>
 #include <cstdlib>
 #include <limits>
+#include <atomic>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -175,6 +176,70 @@ static inline NnUint loadPosFromPipe(const NnCpuOpContext *context, NnUint pipeI
     if (!(posF >= 0.0f))
         return 0xFFFFFFFFu;
     return (NnUint)posF;
+}
+
+static inline void maybeDumpHardcodedLayerKvCacheOnce(
+    const NnCpuOpContext *context,
+    const NnSegmentConfig *segmentConfig,
+    NnUint opIndex,
+    NnUint nodeIndex) {
+    if (context == nullptr || segmentConfig == nullptr || context->name == nullptr) return;
+    if (context->opCode != OP_MULTIHEAD_ATT) return;
+    if (std::strstr(context->name, "block_multihead_att") == nullptr) return;
+
+    const NnUint layerIndex = segmentConfig->ops[opIndex].index;
+    static constexpr NnUint kTargetLayer = 15u;
+    static constexpr NnUint kTargetPos = 32u;
+    if (layerIndex != kTargetLayer) return;
+
+    const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+    if (cfg == nullptr) return;
+    const NnUint pos = loadPosFromPipe(context, cfg->positionPipeIndex);
+    if (pos != kTargetPos) return;
+
+    static std::atomic_uint8_t dumpedOnce{0u};
+    const NnUint old = dumpedOnce.exchange(1u, std::memory_order_acq_rel);
+    if (old != 0u) return;
+
+    const NnUint kBufferIndex = cfg->keyCacheBufferIndex;
+    const NnUint vBufferIndex = cfg->valueCacheBufferIndex;
+
+    const NnSize3D kSize = context->bufferConfigs[kBufferIndex].size;
+    const NnSize3D vSize = context->bufferConfigs[vBufferIndex].size;
+
+    char kPath[256];
+    char vPath[256];
+    std::snprintf(kPath, sizeof(kPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_k.bin",
+        (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
+    std::snprintf(vPath, sizeof(vPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_v.bin",
+        (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
+
+    auto dumpOne = [&](const char *path, const NnSize3D &size, NnByte *data) {
+        std::unique_ptr<FILE, int(*)(FILE *)> f(std::fopen(path, "wb"), std::fclose);
+        if (!f) return false;
+        const uint32_t magic = 0x4b564344u; // 'DVCK'
+        const uint32_t version = 1u;
+        std::fwrite(&magic, sizeof(magic), 1, f.get());
+        std::fwrite(&version, sizeof(version), 1, f.get());
+        std::fwrite(&nodeIndex, sizeof(nodeIndex), 1, f.get());
+        std::fwrite(&layerIndex, sizeof(layerIndex), 1, f.get());
+        std::fwrite(&pos, sizeof(pos), 1, f.get());
+        std::fwrite(&size, sizeof(size), 1, f.get());
+        std::fwrite(data, 1, size.nBytes, f.get());
+        return true;
+    };
+
+    const bool kOk = dumpOne(kPath, kSize, context->buffers[kBufferIndex]);
+    const bool vOk = dumpOne(vPath, vSize, context->buffers[vBufferIndex]);
+    std::printf("🧠 [kvcache][dump] node=%u layer=%u pos=%u k=%s (%s) v=%s (%s)\n",
+        (unsigned)nodeIndex,
+        (unsigned)layerIndex,
+        (unsigned)pos,
+        kPath,
+        kOk ? "ok" : "fail",
+        vPath,
+        vOk ? "ok" : "fail");
+    std::fflush(stdout);
 }
 
 static inline void printTpAffectedRange(
@@ -407,6 +472,123 @@ static inline void printTpAffectedRange(
 }
 
 #endif // DLLAMA_DEBUG_ATTN
+
+#if !DLLAMA_DEBUG_ATTN
+
+static inline NnUint loadPosFromPipe(const NnCpuOpContext *context, NnUint pipeIndex) {
+    if (context == nullptr || context->pipes == nullptr)
+        return 0xFFFFFFFFu;
+    const float posF = *(const float *)(context->pipes[pipeIndex]);
+    if (!(posF >= 0.0f))
+        return 0xFFFFFFFFu;
+    return (NnUint)posF;
+}
+
+static inline void maybeDumpHardcodedLayerKvCacheOnce(
+    const NnCpuOpContext *context,
+    const NnSegmentConfig *segmentConfig,
+    NnUint opIndex,
+    NnUint nodeIndex) {
+    if (context == nullptr || segmentConfig == nullptr || context->name == nullptr) return;
+    if (context->opCode != OP_MULTIHEAD_ATT) return;
+    if (std::strstr(context->name, "block_multihead_att") == nullptr) return;
+
+    const NnUint layerIndex = segmentConfig->ops[opIndex].index;
+    static constexpr NnUint kTargetLayer = 15u;
+    static constexpr NnUint kTargetPos = 32u;
+    if (layerIndex != kTargetLayer) return;
+
+    const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+    if (cfg == nullptr) return;
+    const NnUint pos = loadPosFromPipe(context, cfg->positionPipeIndex);
+    if (pos != kTargetPos) return;
+
+    static std::atomic_uint8_t dumpedOnce{0u};
+    const NnUint old = dumpedOnce.exchange(1u, std::memory_order_acq_rel);
+    if (old != 0u) return;
+
+    const NnUint kBufferIndex = cfg->keyCacheBufferIndex;
+    const NnUint vBufferIndex = cfg->valueCacheBufferIndex;
+
+    const NnSize3D kSize = context->bufferConfigs[kBufferIndex].size;
+    const NnSize3D vSize = context->bufferConfigs[vBufferIndex].size;
+
+    char kPath[256];
+    char vPath[256];
+    std::snprintf(kPath, sizeof(kPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_k.bin",
+        (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
+    std::snprintf(vPath, sizeof(vPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_v.bin",
+        (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
+
+    auto dumpOne = [&](const char *path, const NnSize3D &size, NnByte *data) {
+        std::unique_ptr<FILE, int(*)(FILE *)> f(std::fopen(path, "wb"), std::fclose);
+        if (!f) return false;
+        const uint32_t magic = 0x4b564344u; // 'DVCK'
+        const uint32_t version = 1u;
+        std::fwrite(&magic, sizeof(magic), 1, f.get());
+        std::fwrite(&version, sizeof(version), 1, f.get());
+        std::fwrite(&nodeIndex, sizeof(nodeIndex), 1, f.get());
+        std::fwrite(&layerIndex, sizeof(layerIndex), 1, f.get());
+        std::fwrite(&pos, sizeof(pos), 1, f.get());
+        std::fwrite(&size, sizeof(size), 1, f.get());
+        std::fwrite(data, 1, size.nBytes, f.get());
+        return true;
+    };
+
+    const bool kOk = dumpOne(kPath, kSize, context->buffers[kBufferIndex]);
+    const bool vOk = dumpOne(vPath, vSize, context->buffers[vBufferIndex]);
+    std::printf("🧠 [kvcache][dump] node=%u layer=%u pos=%u k=%s (%s) v=%s (%s)\n",
+        (unsigned)nodeIndex,
+        (unsigned)layerIndex,
+        (unsigned)pos,
+        kPath,
+        kOk ? "ok" : "fail",
+        vPath,
+        vOk ? "ok" : "fail");
+    std::fflush(stdout);
+}
+
+#endif
+
+static inline void maybeTraceRedundantInferencePath(
+    const NnCpuOpContext *context,
+    const NnSegmentConfig *segmentConfig,
+    NnUint opIndex,
+    NnUint nodeIndex,
+    NnUint segmentIndex) {
+    if (context == nullptr || segmentConfig == nullptr) return;
+    if (context->opCode != OP_MULTIHEAD_ATT) return;
+
+    bool segmentIsRuntimeRedundant = false;
+    char opNameBuf[64];
+    if (segmentConfig->ops != nullptr) {
+        for (NnUint i = 0; i < segmentConfig->nOps; ++i) {
+            const char *opName = segmentConfig->ops[i].name;
+            if (opName != nullptr && std::strstr(opName, "runtime_redundant_") != nullptr) {
+                segmentIsRuntimeRedundant = true;
+                std::strncpy(opNameBuf, opName, sizeof(opNameBuf) - 1);
+                break;
+            }
+        }
+    }
+    if (!segmentIsRuntimeRedundant) return;
+
+    const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+    if (cfg == nullptr) return;
+
+    const NnUint pos = loadPosFromPipe(context, cfg->positionPipeIndex);
+    if (pos == 0xFFFFFFFFu) return;
+
+    const NnUint layerIndex = segmentConfig->ops[opIndex].index;
+    std::printf("✅ [redundant-infer] node=%u seg=%u layer=%u pos=%u op=%s opname=%s path=active\n",
+        (unsigned)nodeIndex,
+        (unsigned)segmentIndex,
+        (unsigned)layerIndex,
+        (unsigned)pos,
+        (context->name != nullptr) ? context->name : "unknown",
+        (opNameBuf[0] != '\0') ? opNameBuf : "unknown");
+    std::fflush(stdout);
+}
 
 #if DLLAMA_DEBUG_ATTN
 
@@ -1113,6 +1295,11 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
         }
     }
 
+    if (threadIndex == 0u && device != nullptr) {
+        maybeTraceRedundantInferencePath(context, segmentConfig, opIndex, device->getNodeIndex(), segmentIndex);
+        maybeDumpHardcodedLayerKvCacheOnce(context, segmentConfig, opIndex, device->getNodeIndex());
+    }
+
     // ------------------------------------------------------------------
     // CPU-only: plan barrier/apply ops (PlanCommand-driven online migration)
     // ------------------------------------------------------------------
@@ -1713,6 +1900,43 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
         }
         return;
     }
+
+    // // Always-on: print KV buffer range -> layer mapping every 5 tokens at MHA.
+    // if (threadIndex == 0u && device != nullptr && context->opCode == OP_MULTIHEAD_ATT) {
+    //     auto nameHas = [&](const char *needle) -> bool {
+    //         if (context->name == nullptr || needle == nullptr) return false;
+    //         return std::strstr(context->name, needle) != nullptr;
+    //     };
+    //     if (nameHas("block_multihead_att")) {
+    //         const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+    //         const NnUint pos = (cfg != nullptr) ? loadPosFromPipe(context, cfg->positionPipeIndex) : 0xFFFFFFFFu;
+    //         if (cfg != nullptr && pos != 0xFFFFFFFFu && (pos % 5u) == 0u) {
+    //             const NnUint nodeIndex = device->getNodeIndex();
+    //             const unsigned int epoch = device->getPlanEpoch();
+    //             const NnUint layerIndex = (segmentConfig != nullptr) ? segmentConfig->ops[opIndex].index : 0u;
+    //             const NnUint kvStart = cfg->kvStart;
+    //             const NnUint kvEnd = cfg->kvStart + cfg->kvDim0;
+    //             const NnUint kBuf = cfg->keyCacheBufferIndex;
+    //             const NnUint vBuf = cfg->valueCacheBufferIndex;
+    //             const NnUint kCols = context->bufferConfigs[kBuf].size.x;
+    //             const NnUint vCols = context->bufferConfigs[vBuf].size.x;
+    //             printf("🧠 [kv-range-map] node=%u epoch=%u pos=%u layer=%u kBuf=%u/%u vBuf=%u/%u kRange=[%u,%u) vRange=[%u,%u)\n",
+    //                 (unsigned)nodeIndex,
+    //                 (unsigned)epoch,
+    //                 (unsigned)pos,
+    //                 (unsigned)layerIndex,
+    //                 (unsigned)kBuf,
+    //                 (unsigned)kCols,
+    //                 (unsigned)vBuf,
+    //                 (unsigned)vCols,
+    //                 (unsigned)kvStart,
+    //                 (unsigned)kvEnd,
+    //                 (unsigned)kvStart,
+    //                 (unsigned)kvEnd);
+    //             std::fflush(stdout);
+    //         }
+    //     }
+    // }
 
     // ------------------------------------------------------------------
     // Debug: KV compute / attention KV range tracing

@@ -105,6 +105,9 @@ typedef struct {
     // Optional per-layer compute profiling.
     NnNetExecution::LayerPerfState *layerPerf;
     const NnByte *segmentKinds;
+    const std::atomic_uint8_t *segmentEnabled;
+    const int *segmentLayerIndex;
+    const NnByte *segmentHasExecOps;
     NnUint nSegments;
 } NnExecutorContext;
 
@@ -127,6 +130,11 @@ private:
     std::vector<NnExecutorStep> steps;
     // Segment classification (ATTN/FFN/OTHER) for per-layer compute profiling.
     std::vector<NnByte> segmentKinds;
+    // Segment runtime role for gate control: 0=unguarded, 1=primary(active), 2=redundant.
+    std::vector<NnByte> segmentRuntimeRoles;
+    std::vector<int> segmentLayerIndex;
+    std::vector<NnByte> segmentHasExecOps;
+    std::unique_ptr<std::atomic_uint8_t[]> segmentEnabled;
     NnExecutorThread *threads;
     NnExecutorContext context;
 public:
@@ -140,6 +148,13 @@ public:
     void refreshPointers();
     // Convenience: set plan + refresh pointers/configs as one atomic reconfigure step.
     void applyPartitionPlan(const NnUnevenPartitionPlan *plan);
+    // Runtime segment gate APIs.
+    void setSegmentEnabled(NnUint segmentIndex, bool enabled);
+    void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
+    void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
+    void setRedundantLayerEnabled(NnUint layerIndex, bool enabled);
+    bool exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow);
+    bool applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
     NnUint getTotalTime(NnExecutorStepType type);
 };
 

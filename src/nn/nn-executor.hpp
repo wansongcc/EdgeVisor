@@ -105,6 +105,7 @@ typedef struct {
     // Optional per-layer compute profiling.
     NnNetExecution::LayerPerfState *layerPerf;
     const NnByte *segmentKinds;
+    const NnByte *segmentRuntimeRoles;
     const std::atomic_uint8_t *segmentEnabled;
     const int *segmentLayerIndex;
     const NnByte *segmentHasExecOps;

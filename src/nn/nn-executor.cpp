@@ -315,6 +315,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.steps = steps.data();
     context.layerPerf = (this->netExecution != nullptr) ? this->netExecution->layerPerf : nullptr;
     context.segmentKinds = segmentKinds.empty() ? nullptr : segmentKinds.data();
+    context.segmentRuntimeRoles = segmentRuntimeRoles.empty() ? nullptr : segmentRuntimeRoles.data();
     context.segmentEnabled = segmentEnabled.get();
     context.segmentLayerIndex = segmentLayerIndex.empty() ? nullptr : segmentLayerIndex.data();
     context.segmentHasExecOps = segmentHasExecOps.empty() ? nullptr : segmentHasExecOps.data();
@@ -364,7 +365,8 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
     const bool isThread0 = (thread != nullptr && thread->threadIndex == 0u);
     const bool canInspectSeg =
         (context != nullptr && step != nullptr && step->segmentIndex < context->nSegments &&
-         context->segmentEnabled != nullptr && context->segmentLayerIndex != nullptr && context->segmentHasExecOps != nullptr);
+         context->segmentEnabled != nullptr && context->segmentLayerIndex != nullptr &&
+         context->segmentHasExecOps != nullptr && context->segmentRuntimeRoles != nullptr);
     const bool isFirstExecOpStep = (step->type == STEP_EXECUTE_OP && step->arg0 == 0u);
     const bool isSyncOnlyStep = (step->type == STEP_SYNC_NODES && canInspectSeg && context->segmentHasExecOps[step->segmentIndex] == 0u);
 
@@ -373,9 +375,11 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
 
         if (segRuntimePrint && isThread0 && canInspectSeg && (isFirstExecOpStep || isSyncOnlyStep)) {
             const int layer = context->segmentLayerIndex[step->segmentIndex];
-            std::printf("🧮 [seg-runtime] segment=%u layer=%d status=%s\n",
+            const NnByte role = context->segmentRuntimeRoles[step->segmentIndex];
+            std::printf("🧮 [seg-runtime] segment=%u layer=%d role=%s status=%s\n",
                 (unsigned)step->segmentIndex,
                 layer,
+                segmentRoleToString(role),
                 enabled ? "执行" : "休眠");
         }
 

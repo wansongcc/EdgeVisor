@@ -124,7 +124,9 @@ void RootKvCollector::run() {
 
                     const bool kOk = dumpOne(kPath, packet.kRow);
                     const bool vOk = dumpOne(vPath, packet.vRow);
-                    const bool enqueued = inference_->submitBoundaryKvTransfer((NnUint)collectLayer, (NnUint)collectPos, packet.kRow, packet.vRow);
+                    const RootLlmInference::KvTransferSubmitStatus submitStatus =
+                        inference_->submitBoundaryKvTransferDetailed((NnUint)collectLayer, (NnUint)collectPos, packet.kRow, packet.vRow);
+                    const bool enqueued = (submitStatus == RootLlmInference::KV_TRANSFER_SUBMIT_OK);
                     std::fprintf(stderr, "[kv-collector] layer=%d pos=%d row dumped k=%s(%s) v=%s(%s) drained=%d\n",
                         collectLayer,
                         collectPos,
@@ -134,7 +136,22 @@ void RootKvCollector::run() {
                         vOk ? "ok" : "fail",
                         drained);
                     if (!enqueued) {
-                        std::fprintf(stderr, "[kv-collector] warn: transfer not queued for layer=%d pos=%d\n", collectLayer, collectPos);
+                        const char *reason = "unknown";
+                        switch (submitStatus) {
+                            case RootLlmInference::KV_TRANSFER_SUBMIT_NO_NETWORK: reason = "no-network"; break;
+                            case RootLlmInference::KV_TRANSFER_SUBMIT_NO_TARGET_STAGE: reason = "no-target-stage"; break;
+                            case RootLlmInference::KV_TRANSFER_SUBMIT_LAYER_NOT_IN_LIST: reason = "layer-not-in-migration-list"; break;
+                            case RootLlmInference::KV_TRANSFER_SUBMIT_INVALID_ROW: reason = "invalid-row"; break;
+                            case RootLlmInference::KV_TRANSFER_SUBMIT_WAITING_ACK: reason = "waiting-ack"; break;
+                            case RootLlmInference::KV_TRANSFER_SUBMIT_DUP_LAYER_PENDING: reason = "dup-layer-pending"; break;
+                            case RootLlmInference::KV_TRANSFER_SUBMIT_OK: reason = "ok"; break;
+                            default: reason = "unknown"; break;
+                        }
+                        std::fprintf(stderr,
+                            "[kv-collector] warn: transfer not queued for layer=%d pos=%d reason=%s\n",
+                            collectLayer,
+                            collectPos,
+                            reason);
                     }
                     rowDumped = true;
                     break;

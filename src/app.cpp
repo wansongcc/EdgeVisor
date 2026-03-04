@@ -1054,25 +1054,29 @@ bool RootLlmInference::tryPopAsyncKvRow(RootKvAggRowPacket &packet) {
     return true;
 }
 
-bool RootLlmInference::submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
-    if (network == nullptr) return false;
-    if (nextStageRootNode == (NnUint)-1) return false;
+RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTransferDetailed(
+    NnUint layerIndex,
+    NnUint position,
+    const std::vector<float> &kRow,
+    const std::vector<float> &vRow) {
+    if (network == nullptr) return KV_TRANSFER_SUBMIT_NO_NETWORK;
+    if (nextStageRootNode == (NnUint)-1) return KV_TRANSFER_SUBMIT_NO_TARGET_STAGE;
     if (!migrationLayers.empty()) {
         const bool inList = std::find(migrationLayers.begin(), migrationLayers.end(), layerIndex) != migrationLayers.end();
-        if (!inList) return false;
+        if (!inList) return KV_TRANSFER_SUBMIT_LAYER_NOT_IN_LIST;
     }
-    if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return false;
+    if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return KV_TRANSFER_SUBMIT_INVALID_ROW;
 
     std::lock_guard<std::mutex> lk(kvTransferMutex);
-    if (waitingKvAck) return false;
+    if (waitingKvAck) return KV_TRANSFER_SUBMIT_WAITING_ACK;
 
-    auto exists = [&](NnUint layer) {
+    auto exists = [&](NnUint layer, NnUint pos) {
         for (const auto &it : pendingKvTransfers) {
-            if (it.header.layerIndex == layer) return true;
+            if (it.header.layerIndex == layer && it.header.position == pos) return true;
         }
         return false;
     };
-    if (exists(layerIndex)) return false;
+    if (exists(layerIndex, position)) return KV_TRANSFER_SUBMIT_DUP_LAYER_PENDING;
 
     PendingKvTransferItem item;
     item.header.magic = LLM_KV_TRANSFER_MAGIC;
@@ -1086,7 +1090,11 @@ bool RootLlmInference::submitBoundaryKvTransfer(NnUint layerIndex, NnUint positi
     item.kRow = kRow;
     item.vRow = vRow;
     pendingKvTransfers.push_back(std::move(item));
-    return true;
+    return KV_TRANSFER_SUBMIT_OK;
+}
+
+bool RootLlmInference::submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
+    return submitBoundaryKvTransferDetailed(layerIndex, position, kRow, vRow) == KV_TRANSFER_SUBMIT_OK;
 }
 
 void RootLlmInference::forward() {
@@ -1102,6 +1110,7 @@ void RootLlmInference::forward() {
             kvTransfers = pendingKvTransfers;
             pendingKvTransfers.clear();
             waitingKvAck = true;
+            waitingKvAckExpectedCount = (NnUint)kvTransfers.size();
             waitingKvAckLayers.clear();
             for (const auto &it : kvTransfers) {
                 appendUniqueLayer(waitingKvAckLayers, it.header.layerIndex);
@@ -1113,9 +1122,13 @@ void RootLlmInference::forward() {
             switchLayers = pendingLayerSwitchLayers;
             pendingLayerSwitchLayers.clear();
             if (executor != nullptr) {
+                const NnUint selfNodeIndex = 0u;
+                const bool selfIsTarget = (nextStageRootNode == selfNodeIndex);
                 for (NnUint layer : switchLayers) {
                     executor->setPrimaryLayerEnabled(layer, false);
-                    executor->setRedundantLayerEnabled(layer, true);
+                    if (selfIsTarget) {
+                        executor->setRedundantLayerEnabled(layer, true);
+                    }
                 }
             }
         }
@@ -1187,6 +1200,7 @@ void RootLlmInference::forward() {
             if (abh.magic == LLM_KV_ACK_BATCH_MAGIC && abh.version == LLM_KV_ACK_BATCH_VERSION) {
                 std::vector<NnUint> ackedLayers;
                 ackedLayers.reserve(abh.count);
+                NnUint validAckCount = 0u;
                 NnUint ackPos = 0u;
                 bool ackPosSet = false;
                 for (NnUint i = 0u; i < abh.count; ++i) {
@@ -1194,6 +1208,7 @@ void RootLlmInference::forward() {
                     network->read((NnUint)kvAckSocketIndex, &ack, sizeof(ack));
                     if (ack.magic != LLM_KV_ACK_MAGIC || ack.version != LLM_KV_ACK_VERSION) continue;
                     if (ack.toNodeIndex != 0u || ack.fromNodeIndex != nextStageRootNode) continue;
+                    validAckCount += 1u;
                     appendUniqueLayer(ackedLayers, ack.layerIndex);
                     if (!ackPosSet) {
                         ackPos = ack.position;
@@ -1207,14 +1222,22 @@ void RootLlmInference::forward() {
 
                 std::sort(ackedLayers.begin(), ackedLayers.end());
                 std::lock_guard<std::mutex> lk(kvTransferMutex);
-                if (!waitingKvAckLayers.empty() && ackedLayers == waitingKvAckLayers) {
+                const bool layersMatched = !waitingKvAckLayers.empty() && ackedLayers == waitingKvAckLayers;
+                const bool rowsMatched = (waitingKvAckExpectedCount == 0u) || (validAckCount >= waitingKvAckExpectedCount);
+                if (layersMatched && rowsMatched) {
                     waitingKvAck = false;
+                    waitingKvAckExpectedCount = 0u;
                     pendingLayerSwitchLayers = ackedLayers;
                     migrationAckSeen = true;
                     migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
                     migrationAckLayer = !ackedLayers.empty() ? (int)ackedLayers.back() : migrationAckLayer;
                     std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
                         (unsigned)ackedLayers.size());
+                    std::fflush(stdout);
+                } else if (layersMatched && !rowsMatched) {
+                    std::printf("⚠️  [kv-migrate] ack rows incomplete got=%u expected=%u (waiting)\n",
+                        (unsigned)validAckCount,
+                        (unsigned)waitingKvAckExpectedCount);
                     std::fflush(stdout);
                 }
             }
@@ -1226,25 +1249,29 @@ void RootLlmInference::forward() {
         !migrationLayers.empty() && executor != nullptr && header != nullptr) {
         NnUint exported = 0u;
         NnUint queued = 0u;
+        const NnUint endPos = std::min((NnUint)asyncKvCollectPos, (header->seqLen > 0u) ? (header->seqLen - 1u) : 0u);
         for (NnUint layer : migrationLayers) {
-            std::vector<float> kRow;
-            std::vector<float> vRow;
-            if (executor->exportLayerKvRow(layer, (NnUint)asyncKvCollectPos, header->kvDim, kRow, vRow)) {
-                exported += 1u;
-                if (submitBoundaryKvTransfer(layer, (NnUint)asyncKvCollectPos, kRow, vRow)) {
-                    queued += 1u;
+            for (NnUint pos = 0u; pos <= endPos; ++pos) {
+                std::vector<float> kRow;
+                std::vector<float> vRow;
+                if (executor->exportLayerKvRow(layer, pos, header->kvDim, kRow, vRow)) {
+                    exported += 1u;
+                    if (submitBoundaryKvTransfer(layer, pos, kRow, vRow)) {
+                        queued += 1u;
+                    }
+                } else {
+                    std::printf("⚠️  [kv-migrate] export row failed layer=%u pos=%u\n",
+                        (unsigned)layer,
+                        (unsigned)pos);
                 }
-            } else {
-                std::printf("⚠️  [kv-migrate] export row failed layer=%u pos=%u\n",
-                    (unsigned)layer,
-                    (unsigned)asyncKvCollectPos);
             }
         }
         migrationBatchSubmitted = (queued > 0u);
-        std::printf("🧩 [kv-migrate] prepared batch exported=%u queued=%u pos=%u targetRoot=%u\n",
+        std::printf("🧩 [kv-migrate] prepared history batch exported=%u queued=%u layers=%u posRange=[0,%u] targetRoot=%u\n",
             (unsigned)exported,
             (unsigned)queued,
-            (unsigned)asyncKvCollectPos,
+            (unsigned)migrationLayers.size(),
+            (unsigned)endPos,
             (unsigned)nextStageRootNode);
         std::fflush(stdout);
     }

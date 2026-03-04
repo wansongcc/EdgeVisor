@@ -1260,6 +1260,10 @@ static NnNodeConfig buildLlmNodeInternal(
         addSegmentLogged(redAtt, "redundant_att", layerIndex);
 
         NnSegmentConfigBuilder redFf;
+        redFf.addOp(OP_CAST, "runtime_redundant_ff_marker", layerIndex,
+            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            size0(), NnCastOpCodeConfig{});
         redFf.addOp(OP_INV_RMS, "block_norm_pre_1", layerIndex,
             pointerBatchConfig(SRC_BUFFER, xBufferIndex),
             pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),

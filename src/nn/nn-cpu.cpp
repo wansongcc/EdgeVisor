@@ -726,6 +726,76 @@ static void printOpSliceParamsDbg(const char *opName, const NnOpCode opCode, con
 
 #endif // DLLAMA_DEBUG_ATTN
 
+static inline bool migrationOpTraceEnabled() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_OP_TRACE");
+    if (v == nullptr) return false;
+    if (v[0] == '0') return false;
+    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+    return true;
+}
+
+static inline NnUint migrationOpTraceLimit() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_OP_TRACE_LIMIT");
+    if (v == nullptr) return 0u;
+    long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline NnUint migrationKvTraceDims() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_KV_TRACE_DIMS");
+    if (v == nullptr) return 8u;
+    long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1024) return 1024u;
+    return (NnUint)n;
+}
+
+static inline bool nameHas(const char *name, const char *needle) {
+    if (name == nullptr || needle == nullptr) return false;
+    return std::strstr(name, needle) != nullptr;
+}
+
+static inline bool isFfnTraceOp(const NnCpuOpContext *context) {
+    if (context == nullptr || context->name == nullptr) return false;
+    if (context->opCode == OP_MATMUL) {
+        return nameHas(context->name, "block_matmul_w1") ||
+               nameHas(context->name, "block_matmul_w2") ||
+               nameHas(context->name, "block_matmul_w3") ||
+               nameHas(context->name, "block_moe_");
+    }
+    if (context->opCode == OP_MUL || context->opCode == OP_SILU || context->opCode == OP_GELU) {
+        return nameHas(context->name, "block_mul") || nameHas(context->name, "block_act");
+    }
+    return false;
+}
+
+static inline void printTraceFloatPrefix(const char *tag, const float *ptr, NnUint n) {
+    if (tag == nullptr) tag = "vec";
+    if (ptr == nullptr || n == 0u) {
+        std::printf("%s=[]", tag);
+        return;
+    }
+    std::printf("%s=[", tag);
+    for (NnUint i = 0u; i < n; ++i) {
+        std::printf("%s%.6f", (i == 0u ? "" : ","), (double)ptr[i]);
+    }
+    std::printf("]");
+}
+
+static inline const char *migrationSegmentRoleForTrace(const NnSegmentConfig *segmentConfig, const NnCpuOpContext *context) {
+    if (segmentConfig != nullptr && segmentConfig->ops != nullptr) {
+        for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+            if (nameHas(segmentConfig->ops[i].name, "runtime_redundant_")) return "redundant";
+        }
+        return "primary";
+    }
+    if (context == nullptr || context->name == nullptr) return "unknown";
+    if (nameHas(context->name, "runtime_redundant_")) return "redundant";
+    return "primary";
+}
+
 static NnByte *allocAlignedBuffer(NnSize size) {
     NnByte *buffer;
 #ifdef _WIN32
@@ -1937,6 +2007,106 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     //         }
     //     }
     // }
+
+    if (threadIndex == 0u && device != nullptr && migrationOpTraceEnabled()) {
+        static std::atomic<NnUint> tracePrinted{0u};
+        const NnUint limit = migrationOpTraceLimit();
+        const NnUint idx = tracePrinted.fetch_add(1u, std::memory_order_relaxed);
+        if (limit == 0u || idx < limit) {
+            const NnUint nodeIndex = device->getNodeIndex();
+            const NnUint layerIndex = (segmentConfig != nullptr) ? segmentConfig->ops[opIndex].index : 0u;
+
+            NnUint pos = 0xFFFFFFFFu;
+            if (context->opCode == OP_MULTIHEAD_ATT) {
+                const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+                if (cfg != nullptr) pos = loadPosFromPipe(context, cfg->positionPipeIndex);
+            } else if (context->opCode == OP_ROPE) {
+                const auto *cfg = (const NnRopeOpConfig *)context->opConfig;
+                if (cfg != nullptr) pos = loadPosFromPipe(context, cfg->positionPipeIndex);
+            } else if (context->opCode == OP_SHIFT) {
+                const auto *cfg = (const NnShiftOpCodeConfig *)context->opConfig;
+                if (cfg != nullptr) pos = loadPosFromPipe(context, cfg->indexPipeIndex);
+            } else {
+                // FFN ops do not carry a position pipe in op config; read global POS pipe.
+                pos = loadPosFromPipe(context, 0u);
+            }
+
+            if (pos != 0xFFFFFFFFu) {
+                lastPos.store(pos, std::memory_order_release);
+                device->setLastPos(pos);
+            } else {
+                pos = lastPos.load(std::memory_order_acquire);
+                if (pos == 0xFFFFFFFFu) {
+                    pos = device->getLastPos();
+                }
+            }
+
+            const bool isAttn = (context->opCode == OP_MULTIHEAD_ATT) && nameHas(context->name, "block_multihead_att");
+            const bool isFfn = isFfnTraceOp(context);
+            if (isAttn || isFfn) {
+                const int posPrint = (pos == 0xFFFFFFFFu) ? -1 : (int)pos;
+                const char *segRole = migrationSegmentRoleForTrace(segmentConfig, context);
+                std::printf("🧪 [op-trace] node=%u seg=%u role=%s layer=%u pos=%d phase=%s op=%s code=%s inX=%u outX=%u\n",
+                    (unsigned)nodeIndex,
+                    (unsigned)segmentIndex,
+                    segRole,
+                    (unsigned)layerIndex,
+                    posPrint,
+                    isAttn ? "attn" : "ffn",
+                    (context->name ? context->name : "unknown"),
+                    opCodeToString(context->opCode),
+                    (unsigned)context->inputSize.x,
+                    (unsigned)context->outputSize.x);
+
+                if (isAttn && pos != 0xFFFFFFFFu) {
+                    const auto *cfg = (const NnMultiHeadAttOpConfig *)context->opConfig;
+                    if (cfg != nullptr) {
+                        const NnUint kvStride = (cfg->kvStride == 0u) ? cfg->kvDim0 : cfg->kvStride;
+                        const NnUint headDim = cfg->headDim;
+                        const NnUint col0 = cfg->kvStart;
+                        const NnUint dimsEnv = migrationKvTraceDims();
+                        const NnUint dims = (dimsEnv == 0u || headDim == 0u) ? 0u : std::min(headDim, dimsEnv);
+
+                        std::printf("🧪 [op-trace][attn-kv] node=%u layer=%u pos=%u kvStart=%u kvDim0=%u kvStride=%u headDim=%u\n",
+                            (unsigned)nodeIndex,
+                            (unsigned)layerIndex,
+                            (unsigned)pos,
+                            (unsigned)cfg->kvStart,
+                            (unsigned)cfg->kvDim0,
+                            (unsigned)kvStride,
+                            (unsigned)cfg->headDim);
+
+                        if (dims > 0u && kvStride > 0u && (col0 + dims) <= kvStride) {
+                            const float *keyCache = (const float *)context->buffers[cfg->keyCacheBufferIndex];
+                            const float *valueCache = (const float *)context->buffers[cfg->valueCacheBufferIndex];
+                            const float *k0 = keyCache + col0;
+                            const float *v0 = valueCache + col0;
+                            const float *kp = keyCache + pos * kvStride + col0;
+                            const float *vp = valueCache + pos * kvStride + col0;
+
+                            std::printf("🧪 [op-trace][attn-kv] ");
+                            printTraceFloatPrefix("K[t0]", k0, dims);
+                            std::printf(" ");
+                            printTraceFloatPrefix("V[t0]", v0, dims);
+                            std::printf("\n");
+
+                            std::printf("🧪 [op-trace][attn-kv] ");
+                            printTraceFloatPrefix("K[tpos]", kp, dims);
+                            std::printf(" ");
+                            printTraceFloatPrefix("V[tpos]", vp, dims);
+                            std::printf("\n");
+                        } else {
+                            std::printf("🧪 [op-trace][attn-kv] skip sample dims=%u kvStride=%u col0=%u\n",
+                                (unsigned)dims,
+                                (unsigned)kvStride,
+                                (unsigned)col0);
+                        }
+                    }
+                }
+                std::fflush(stdout);
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Debug: KV compute / attention KV range tracing

@@ -196,6 +196,16 @@ typedef struct {
 
 class RootLlmInference {
 public:
+    enum KvTransferSubmitStatus : NnUint {
+        KV_TRANSFER_SUBMIT_OK = 0u,
+        KV_TRANSFER_SUBMIT_NO_NETWORK = 1u,
+        KV_TRANSFER_SUBMIT_NO_TARGET_STAGE = 2u,
+        KV_TRANSFER_SUBMIT_LAYER_NOT_IN_LIST = 3u,
+        KV_TRANSFER_SUBMIT_INVALID_ROW = 4u,
+        KV_TRANSFER_SUBMIT_WAITING_ACK = 5u,
+        KV_TRANSFER_SUBMIT_DUP_LAYER_PENDING = 6u,
+    };
+
     float *logitsPipe;
     const std::vector<LlmPerfPacket>& getLastPerf() const { return lastPerf; }
     NnUint getPosition() const { return controlPacket.position; }
@@ -211,6 +221,7 @@ public:
     int getMigrationAckLayer() const { return migrationAckLayer; }
     bool hasAsyncKvCollector() const;
     bool tryPopAsyncKvRow(RootKvAggRowPacket &packet);
+    KvTransferSubmitStatus submitBoundaryKvTransferDetailed(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
     bool submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
 private:
     float *tokenPipe = nullptr;
@@ -233,6 +244,7 @@ private:
     std::mutex kvTransferMutex;
     std::vector<PendingKvTransferItem> pendingKvTransfers;
     bool waitingKvAck = false;
+    NnUint waitingKvAckExpectedCount = 0u;
     std::vector<NnUint> waitingKvAckLayers;
     std::vector<NnUint> pendingLayerSwitchLayers;
     std::vector<NnUint> migrationLayers;

@@ -136,6 +136,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
     p.enableStageFullWeights = args->enableStageFullWeights ? 1u : 0u;
     p.enableKvRedundancyDuringMigration = args->enableKvRedundancyDuringMigration ? 1u : 0u;
+    p.enableKvAggregate = args->enableKvAggregate ? 1u : 0u;
     p.runtimeRedundantBoundaryLayers = args->runtimeRedundantBoundaryLayers;
     p.runtimeActiveSegEnabled = args->runtimeActiveSegEnabled ? 1u : 0u;
     p.runtimeRedundantSegEnabled = args->runtimeRedundantSegEnabled ? 1u : 0u;
@@ -156,6 +157,9 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     if (args->runtimePrimarySkipLayersStr != nullptr && args->runtimePrimarySkipLayersStr[0] != '\0') {
         p.flags |= LLM_BOOTSTRAP_HAS_PRIMARY_SKIP_LAYERS;
         p.primarySkipLayersLen = (NnUint)std::strlen(args->runtimePrimarySkipLayersStr) + 1u;
+    }
+    if (args->enableKvAggregate) {
+        p.flags |= LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE;
     }
 
     network->write(socketIndex, &p, sizeof(p));
@@ -240,6 +244,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.enablePlanBarrier = false;
     args.enableStageFullWeights = false;
     args.enableKvRedundancyDuringMigration = true;
+    args.enableKvAggregate = false;
+    args.enablePpMigration = false;
     args.runtimeRedundantBoundaryLayers = 1u;
     args.runtimeActiveSegEnabled = true;
     args.runtimeRedundantSegEnabled = false;
@@ -247,10 +253,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
     {
         int envBoundaryLayers = -1;
-        bool hasEnvBoundaryLayers = parseEnvInt("DLLAMA_MIGRATION_LAYER_COUNT", envBoundaryLayers);
-        if (!hasEnvBoundaryLayers) {
-            hasEnvBoundaryLayers = parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", envBoundaryLayers);
-        }
+        bool hasEnvBoundaryLayers = parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", envBoundaryLayers);
         if (hasEnvBoundaryLayers) {
             if (envBoundaryLayers < 0) envBoundaryLayers = 0;
             args.runtimeRedundantBoundaryLayers = (NnUint)envBoundaryLayers;
@@ -320,6 +323,28 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.enableKvRedundancyDuringMigration = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--enable-kv-aggregate") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.enableKvAggregate = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.enableKvAggregate = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--enable-pp-migration") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.enablePpMigration = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.enablePpMigration = true;
                 i += 1;
             }
             continue;
@@ -446,6 +471,11 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
     if (args.nThreads < 1)
         throw std::runtime_error("Number of threads must be at least 1");
+    if (args.enablePpMigration && !args.enableKvAggregate) {
+        args.enableKvAggregate = true;
+        std::printf("⚠️  [pp-migrate] --enable-pp-migration requires KV aggregate; auto enabling --enable-kv-aggregate\n");
+        std::fflush(stdout);
+    }
     return args;
 }
 
@@ -893,7 +923,22 @@ static const NnStageConfig* findStageByIndexLocal(const NnUnevenPartitionPlan* p
     return nullptr;
 }
 
-RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled) {
+static bool stageContainsNodeLocal(const NnStageConfig *stage, NnUint nodeIndex) {
+    if (stage == nullptr) return false;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        if (stage->nodeIndices[i] == nodeIndex) return true;
+    }
+    return false;
+}
+
+static bool areNodesInSameStageLocal(const NnUnevenPartitionPlan *plan, NnUint nodeA, NnUint nodeB) {
+    if (plan == nullptr) return nodeA == nodeB;
+    const NnStageConfig *stageA = findStageForNodeLocal(plan, nodeA);
+    if (stageA == nullptr) return nodeA == nodeB;
+    return stageContainsNodeLocal(stageA, nodeB);
+}
+
+RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
     this->positionPipe = (float *)execution->pipes[net->positionPipeIndex];
@@ -910,60 +955,39 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->lastPlanCmdSeqSent = 0u;
     this->asyncKvCollectLayer = -1;
     this->asyncKvCollectPos = -1;
-    const char *layerEnv = std::getenv("DLLAMA_ASYNC_KV_COLLECT_LAYER");
-    if (layerEnv != nullptr && layerEnv[0] != '\0') {
-        char *end = nullptr;
-        long x = std::strtol(layerEnv, &end, 10);
-        if (end != layerEnv && *end == '\0' && x >= 0) {
-            this->asyncKvCollectLayer = (int)x;
-        }
-    }
-    const char *posEnv = std::getenv("DLLAMA_ASYNC_KV_COLLECT_POS");
-    if (posEnv != nullptr && posEnv[0] != '\0') {
-        char *end = nullptr;
-        long x = std::strtol(posEnv, &end, 10);
-        if (end != posEnv && *end == '\0' && x >= 0) {
-            this->asyncKvCollectPos = (int)x;
-        }
-    }
 
     boundaryLayerForMigration = -1;
     migrationLayers.clear();
     migrationStageStartLayer = -1;
     migrationStageEndLayer = -1;
+    migrationLayerCount = 1;
+    migrationLayerListPinnedByEnv = false;
+    this->ppMigrationEnabled = ppMigrationEnabled;
     migrationBatchSubmitted = false;
     migrationAckSeen = false;
     migrationAckPos = -1;
     migrationAckLayer = -1;
+    lastPpPlanCacheSeqApplied = 0ull;
+    migrationFromNodeIndex = 0u;
     nextStageRootNode = (NnUint)-1;
     kvAckSocketIndex = -1;
-    const char *migrationDirEnv = std::getenv("DLLAMA_MIGRATION_DIRECTION");
-    bool migrateToPrevStage = false;
-    if (migrationDirEnv != nullptr && migrationDirEnv[0] != '\0') {
-        if (std::strcmp(migrationDirEnv, "prev") == 0 || std::strcmp(migrationDirEnv, "backward") == 0 || std::strcmp(migrationDirEnv, "left") == 0) {
-            migrateToPrevStage = true;
-        }
-    }
 
     if (plan != nullptr) {
         const NnStageConfig *myStage = findStageForNodeLocal(plan, 0u);
         if (myStage != nullptr && myStage->endLayer > myStage->startLayer) {
-            boundaryLayerForMigration = migrateToPrevStage ? (int)myStage->startLayer : (int)(myStage->endLayer - 1u);
+            migrationFromNodeIndex = myStage->rootNodeIndex;
+            boundaryLayerForMigration = (int)(myStage->endLayer - 1u);
             migrationStageStartLayer = (int)myStage->startLayer;
             migrationStageEndLayer = (int)myStage->endLayer;
-            const NnUint targetStageIndex = migrateToPrevStage
-                ? (myStage->stageIndex == 0u ? myStage->stageIndex : (myStage->stageIndex - 1u))
-                : (myStage->stageIndex + 1u);
-            const NnStageConfig *targetStage =
-                (migrateToPrevStage && myStage->stageIndex == 0u) ? nullptr : findStageByIndexLocal(plan, targetStageIndex);
+            const NnUint targetStageIndex = myStage->stageIndex + 1u;
+            const NnStageConfig *targetStage = findStageByIndexLocal(plan, targetStageIndex);
             if (targetStage != nullptr) {
                 nextStageRootNode = targetStage->rootNodeIndex;
                 if (network != nullptr) {
                     kvAckSocketIndex = network->getSocketIndexForNode(nextStageRootNode, 0u);
                 }
             } else {
-                std::printf("⚠️  [kv-migrate] migration direction=%s has no target stage from stage=%u\n",
-                    migrateToPrevStage ? "prev" : "next",
+                std::printf("⚠️  [kv-migrate] default migration route(next) has no target stage from stage=%u\n",
                     (unsigned)myStage->stageIndex);
                 std::fflush(stdout);
             }
@@ -971,43 +995,45 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     }
 
     migrationLayers = parseLayerListEnv("DLLAMA_MIGRATION_LAYER_LIST");
+    migrationLayerListPinnedByEnv = !migrationLayers.empty();
+    if (migrationLayerCount < 1) migrationLayerCount = 1;
     if (migrationLayers.empty() && boundaryLayerForMigration >= 0) {
-        int layerCount = 1;
-        (void)parseEnvInt("DLLAMA_MIGRATION_LAYER_COUNT", layerCount);
-        if (layerCount < 1) layerCount = 1;
-        if (migrateToPrevStage) {
-            const int maxLayer = (migrationStageEndLayer > 0) ? (migrationStageEndLayer - 1) : ((header != nullptr) ? ((int)header->nLayers - 1) : boundaryLayerForMigration);
-            for (int i = 0; i < layerCount; ++i) {
-                const int layer = boundaryLayerForMigration + i;
-                if (layer > maxLayer) break;
-                appendUniqueLayer(migrationLayers, (NnUint)layer);
-            }
-        } else {
-            const int minLayer = (migrationStageStartLayer >= 0) ? migrationStageStartLayer : 0;
-            for (int i = 0; i < layerCount; ++i) {
-                const int layer = boundaryLayerForMigration - i;
-                if (layer < minLayer) break;
-                appendUniqueLayer(migrationLayers, (NnUint)layer);
-            }
+        const int minLayer = (migrationStageStartLayer >= 0) ? migrationStageStartLayer : 0;
+        for (int i = 0; i < migrationLayerCount; ++i) {
+            const int layer = boundaryLayerForMigration - i;
+            if (layer < minLayer) break;
+            appendUniqueLayer(migrationLayers, (NnUint)layer);
         }
     }
     std::sort(migrationLayers.begin(), migrationLayers.end());
 
-    if (!migrationLayers.empty()) {
+    if (!migrationLayers.empty() && this->ppMigrationEnabled) {
         std::ostringstream oss;
         for (size_t i = 0; i < migrationLayers.size(); ++i) {
             if (i > 0) oss << ",";
             oss << migrationLayers[i];
         }
-        std::printf("🧭 [kv-migrate] root migration direction=%s targetRoot=%u layers=[%s]\n",
-            migrateToPrevStage ? "prev" : "next",
+        std::printf("🧭 [kv-migrate] root migration route=%u->%u layers=[%s] layerCount=%d pinnedByEnv=%s\n",
+            (unsigned)migrationFromNodeIndex,
             (unsigned)nextStageRootNode,
-            oss.str().c_str());
+            oss.str().c_str(),
+            migrationLayerCount,
+            migrationLayerListPinnedByEnv ? "yes" : "no");
+        std::fflush(stdout);
+    } else if (!this->ppMigrationEnabled) {
+        std::printf("ℹ️  [kv-migrate] PP migration is disabled (enable with --enable-pp-migration)\n");
         std::fflush(stdout);
     }
 
-    if (asyncKvCollectLayer < 0 && boundaryLayerForMigration >= 0) {
+    if (this->ppMigrationEnabled && asyncKvCollectLayer < 0 && boundaryLayerForMigration >= 0) {
         asyncKvCollectLayer = boundaryLayerForMigration;
+    }
+
+    int envPpPos = -1;
+    if (this->ppMigrationEnabled && parseEnvInt("DLLAMA_PP_MIGRATION_POS", envPpPos) && envPpPos >= 0) {
+        asyncKvCollectPos = envPpPos;
+        std::printf("🧭 [kv-migrate] armed by env DLLAMA_PP_MIGRATION_POS=%d\n", asyncKvCollectPos);
+        std::fflush(stdout);
     }
 }
 
@@ -1084,7 +1110,7 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
     item.header.layerIndex = layerIndex;
     item.header.position = position;
     item.header.kvDim = (NnUint)kRow.size();
-    item.header.fromNodeIndex = 0u;
+    item.header.fromNodeIndex = migrationFromNodeIndex;
     item.header.targetNodeIndex = nextStageRootNode;
     item.header.reserved = 0u;
     item.kRow = kRow;
@@ -1123,9 +1149,12 @@ void RootLlmInference::forward() {
             pendingLayerSwitchLayers.clear();
             if (executor != nullptr) {
                 const NnUint selfNodeIndex = 0u;
-                const bool selfIsTarget = (nextStageRootNode == selfNodeIndex);
+                const bool selfIsSource = areNodesInSameStageLocal(plan, selfNodeIndex, migrationFromNodeIndex);
+                const bool selfIsTarget = areNodesInSameStageLocal(plan, selfNodeIndex, nextStageRootNode);
                 for (NnUint layer : switchLayers) {
-                    executor->setPrimaryLayerEnabled(layer, false);
+                    if (selfIsSource) {
+                        executor->setPrimaryLayerEnabled(layer, false);
+                    }
                     if (selfIsTarget) {
                         executor->setRedundantLayerEnabled(layer, true);
                     }
@@ -1183,7 +1212,7 @@ void RootLlmInference::forward() {
                 switchPkt.magic = LLM_LAYER_SWITCH_MAGIC;
                 switchPkt.version = LLM_LAYER_SWITCH_VERSION;
                 switchPkt.boundaryLayer = layer;
-                switchPkt.fromNodeIndex = 0u;
+                switchPkt.fromNodeIndex = migrationFromNodeIndex;
                 switchPkt.toNodeIndex = nextStageRootNode;
                 switchPkt.reserved0 = 0u;
                 switchPkt.reserved1 = 0u;
@@ -1240,6 +1269,156 @@ void RootLlmInference::forward() {
                         (unsigned)waitingKvAckExpectedCount);
                     std::fflush(stdout);
                 }
+            }
+        }
+    }
+
+    if (ppMigrationEnabled) {
+        const PlanCommandSnapshot snap = planCommandCache().load();
+        const PlanCommand &pc = snap.cmd;
+        const bool isNewPpCommand = (snap.cacheSeq != lastPpPlanCacheSeqApplied);
+        const bool isPpMigrationCmd =
+            (pc.cmdKind == 0u) &&
+            ((pc.version == DLLAMA_PLAN_CMD_VERSION_V1) ||
+             (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 0u));
+        if (isNewPpCommand && isValidPlanCommandHeader(pc) && pc.mode != PLAN_CMD_MODE_NONE && isPpMigrationCmd) {
+            if (waitingKvAck) {
+                std::printf("⚠️  [kv-migrate] defer new pp command cacheSeq=%llu: waiting previous ack\n",
+                    (unsigned long long)snap.cacheSeq);
+                std::fflush(stdout);
+            } else {
+            const int cmdLayerCount = (pc.reserved0 > 0u) ? (int)pc.reserved0 : 1;
+            migrationLayerCount = (cmdLayerCount < 1) ? 1 : cmdLayerCount;
+            migrationLayerListPinnedByEnv = false;
+            migrationBatchSubmitted = false;
+            asyncKvCollectPos = -1;
+            asyncKvCollectLayer = -1;
+
+            NnUint routeFromNode = migrationFromNodeIndex;
+            NnUint routeToNode = nextStageRootNode;
+            if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u) {
+                routeFromNode = pc.moves[0].fromNodeIndex;
+                routeToNode = pc.moves[0].toNodeIndex;
+                if (pc.nMoves > 1u) {
+                    std::printf("⚠️  [kv-migrate] PlanCommand has %u moves; PP route uses the first one (%u->%u)\n",
+                        (unsigned)pc.nMoves,
+                        (unsigned)routeFromNode,
+                        (unsigned)routeToNode);
+                    std::fflush(stdout);
+                }
+            } else {
+                routeFromNode = pc.fromNodeIndex;
+                routeToNode = pc.toNodeIndex;
+            }
+
+            const NnStageConfig *fromStage = findStageForNodeLocal(plan, routeFromNode);
+            const NnStageConfig *toStage = findStageForNodeLocal(plan, routeToNode);
+            const bool validRoute =
+                (routeToNode != (NnUint)-1) &&
+                (fromStage != nullptr) &&
+                (toStage != nullptr) &&
+                (fromStage->stageIndex != toStage->stageIndex) &&
+                (fromStage->endLayer > fromStage->startLayer);
+
+            const NnStageConfig *effectiveFromStage = nullptr;
+            const NnStageConfig *effectiveToStage = nullptr;
+            NnUint effectiveFromNode = migrationFromNodeIndex;
+            NnUint effectiveToNode = nextStageRootNode;
+
+            if (!validRoute) {
+                std::printf("⚠️  [kv-migrate] ignore plan route from=%u to=%u (invalid stage route), fallback to current route %u->%u\n",
+                    (unsigned)routeFromNode,
+                    (unsigned)routeToNode,
+                    (unsigned)migrationFromNodeIndex,
+                    (unsigned)nextStageRootNode);
+                std::fflush(stdout);
+                effectiveFromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
+                effectiveToStage = findStageForNodeLocal(plan, nextStageRootNode);
+            } else {
+                migrationFromNodeIndex = routeFromNode;
+                nextStageRootNode = routeToNode;
+                kvAckSocketIndex = (network != nullptr) ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
+                effectiveFromNode = migrationFromNodeIndex;
+                effectiveToNode = nextStageRootNode;
+                effectiveFromStage = fromStage;
+                effectiveToStage = toStage;
+            }
+
+            const bool canApplyRoute =
+                (effectiveToNode != (NnUint)-1) &&
+                (effectiveFromStage != nullptr) &&
+                (effectiveToStage != nullptr) &&
+                (effectiveFromStage->stageIndex != effectiveToStage->stageIndex) &&
+                (effectiveFromStage->endLayer > effectiveFromStage->startLayer);
+
+            if (canApplyRoute) {
+                migrationStageStartLayer = (int)effectiveFromStage->startLayer;
+                migrationStageEndLayer = (int)effectiveFromStage->endLayer;
+
+                const bool migrateToPrev = effectiveToStage->stageIndex < effectiveFromStage->stageIndex;
+                boundaryLayerForMigration = migrateToPrev
+                    ? (int)effectiveFromStage->startLayer
+                    : (int)(effectiveFromStage->endLayer - 1u);
+
+                migrationLayers.clear();
+                if (migrateToPrev) {
+                    const int maxLayer = (int)effectiveFromStage->endLayer - 1;
+                    for (int i = 0; i < migrationLayerCount; ++i) {
+                        const int layer = boundaryLayerForMigration + i;
+                        if (layer > maxLayer) break;
+                        appendUniqueLayer(migrationLayers, (NnUint)layer);
+                    }
+                } else {
+                    const int minLayer = (int)effectiveFromStage->startLayer;
+                    for (int i = 0; i < migrationLayerCount; ++i) {
+                        const int layer = boundaryLayerForMigration - i;
+                        if (layer < minLayer) break;
+                        appendUniqueLayer(migrationLayers, (NnUint)layer);
+                    }
+                }
+                std::sort(migrationLayers.begin(), migrationLayers.end());
+                std::ostringstream layersOss;
+                for (size_t i = 0; i < migrationLayers.size(); ++i) {
+                    if (i > 0) layersOss << ",";
+                    layersOss << migrationLayers[i];
+                }
+                std::printf("🧭 [kv-migrate] apply pp command cacheSeq=%llu layerCount=%d route=%u->%u layers=[%s]\n",
+                    (unsigned long long)snap.cacheSeq,
+                    migrationLayerCount,
+                    (unsigned)effectiveFromNode,
+                    (unsigned)effectiveToNode,
+                    layersOss.str().c_str());
+                std::fflush(stdout);
+            } else {
+                std::printf("⚠️  [kv-migrate] no effective stage route, keep existing layers=[%zu]\n",
+                    migrationLayers.size());
+                std::fflush(stdout);
+            }
+
+            int triggerPos = -1;
+            if (pc.mode == PLAN_CMD_MODE_EXACT && pc.triggerPos != 0xFFFFFFFFu) {
+                triggerPos = (int)pc.triggerPos;
+            } else {
+                NnUint nextPos = controlPacket.position + ((controlPacket.batchSize > 0u) ? controlPacket.batchSize : 1u);
+                if (header != nullptr && header->seqLen > 0u && nextPos >= header->seqLen) {
+                    nextPos = header->seqLen - 1u;
+                }
+                triggerPos = (int)nextPos;
+            }
+
+            if (triggerPos >= 0 && !migrationLayers.empty() && nextStageRootNode != (NnUint)-1) {
+                asyncKvCollectPos = triggerPos;
+                asyncKvCollectLayer = !migrationLayers.empty() ? (int)migrationLayers.back() : -1;
+                std::printf("🧭 [kv-migrate] auto collect armed layer=%d pos=%d mode=%u route=%u->%u layers=%zu\n",
+                    asyncKvCollectLayer,
+                    asyncKvCollectPos,
+                    (unsigned)pc.mode,
+                    (unsigned)migrationFromNodeIndex,
+                    (unsigned)nextStageRootNode,
+                    migrationLayers.size());
+                std::fflush(stdout);
+            }
+                lastPpPlanCacheSeqApplied = snap.cacheSeq;
             }
         }
     }
@@ -1506,6 +1685,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     // IMPORTANT: migration-time KV redundancy safety checks and compute range selection
     // depend on this flag during graph construction.
     setEnableKvRedundancyDuringMigration(args->enableKvRedundancyDuringMigration);
+    // IMPORTANT: KV aggregate pipe build is decided during graph construction.
+    setEnableKvAggregate(args->enableKvAggregate);
     // Runtime redundant plan/gate defaults (consumed by buildLlmNetUneven + NnExecutor).
     setRuntimeRedundantEnv(
         args->runtimeRedundantBoundaryLayers,
@@ -1601,7 +1782,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         loadLlmNetWeight(args->modelPath, &net, &weightLoader);
     }
 
-    RootLlmInference inference(&net, &execution, &executor, network, planPtr.get(), profileEnabled);
+    RootLlmInference inference(&net, &execution, &executor, network, planPtr.get(), profileEnabled, args->enablePpMigration);
 
     // Step 1: seed PlanCommand cache from deprecated env hooks (fallback).
     maybeSeedPlanCommandFromLegacyEnv();
@@ -1666,6 +1847,7 @@ void runWorkerApp(AppCliArgs *args) {
         const bool bootEnablePlanBarrier = boot.enablePlanBarrier != 0u;
         const bool bootEnableStageFullWeights = boot.enableStageFullWeights != 0u;
         const bool bootEnableKvRedundancyDuringMigration = boot.enableKvRedundancyDuringMigration != 0u;
+        const bool bootEnableKvAggregate = boot.enableKvAggregate != 0u;
         const NnUint bootRuntimeRedundantBoundaryLayers = boot.runtimeRedundantBoundaryLayers;
         const bool bootRuntimeActiveSegEnabled = boot.runtimeActiveSegEnabled != 0u;
         const bool bootRuntimeRedundantSegEnabled = boot.runtimeRedundantSegEnabled != 0u;
@@ -1676,6 +1858,8 @@ void runWorkerApp(AppCliArgs *args) {
         setEnableStageFullWeights(bootEnableStageFullWeights);
         // Set migration-time KV redundancy behavior from bootstrap packet
         setEnableKvRedundancyDuringMigration(bootEnableKvRedundancyDuringMigration);
+        // Set KV aggregate graph-build flag from bootstrap packet.
+        setEnableKvAggregate(bootEnableKvAggregate);
         // Apply runtime redundant plan/gate defaults from bootstrap packet.
         setRuntimeRedundantEnv(
             bootRuntimeRedundantBoundaryLayers,
@@ -1797,16 +1981,44 @@ void runWorkerApp(AppCliArgs *args) {
 
                 LlmLayerSwitchPacket switchPkt{};
                 while (inference.consumeLayerSwitch(switchPkt)) {
-                    if (switchPkt.fromNodeIndex == nodeConfig.nodeIndex) {
+                    bool localIsSourceStage = (switchPkt.fromNodeIndex == nodeConfig.nodeIndex);
+                    bool localIsTargetStage = (switchPkt.toNodeIndex == nodeConfig.nodeIndex);
+
+                    if (planPtr != nullptr) {
+                        const NnStageConfig *fromStage = findStageForNodeLocal(planPtr.get(), switchPkt.fromNodeIndex);
+                        const NnStageConfig *toStage = findStageForNodeLocal(planPtr.get(), switchPkt.toNodeIndex);
+
+                        if (fromStage != nullptr) {
+                            localIsSourceStage = false;
+                            for (NnUint i = 0u; i < fromStage->nNodes; ++i) {
+                                if (fromStage->nodeIndices[i] == nodeConfig.nodeIndex) {
+                                    localIsSourceStage = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (toStage != nullptr) {
+                            localIsTargetStage = false;
+                            for (NnUint i = 0u; i < toStage->nNodes; ++i) {
+                                if (toStage->nodeIndices[i] == nodeConfig.nodeIndex) {
+                                    localIsTargetStage = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (localIsSourceStage) {
                         executor.setPrimaryLayerEnabled(switchPkt.boundaryLayer, false);
-                        std::printf("🔁 [worker-switch] node=%u sleep primary layer=%u\n",
+                        std::printf("🔁 [worker-switch] node=%u sleep primary layer=%u (source-stage)\n",
                             (unsigned)nodeConfig.nodeIndex,
                             (unsigned)switchPkt.boundaryLayer);
                         std::fflush(stdout);
                     }
-                    if (switchPkt.toNodeIndex == nodeConfig.nodeIndex) {
+                    if (localIsTargetStage) {
                         executor.setRedundantLayerEnabled(switchPkt.boundaryLayer, true);
-                        std::printf("🔁 [worker-switch] node=%u activate redundant layer=%u\n",
+                        std::printf("🔁 [worker-switch] node=%u activate redundant layer=%u (target-stage)\n",
                             (unsigned)nodeConfig.nodeIndex,
                             (unsigned)switchPkt.boundaryLayer);
                         std::fflush(stdout);

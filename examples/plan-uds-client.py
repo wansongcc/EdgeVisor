@@ -70,6 +70,26 @@ def cmd_set_plan(args: argparse.Namespace) -> Dict[str, Any]:
     return {"op": "set_plan", "cmd": cmd}
 
 
+def cmd_set_pp_migration(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.layer_count < 1:
+        raise SystemExit("--layer-count must be >= 1")
+    cmd: Dict[str, Any] = {
+        "seq": args.seq,
+        "mode": args.mode,
+        "stageIndex": args.stage,
+        "fromNodeIndex": args.from_node,
+        "toNodeIndex": args.to_node,
+        "layerCount": args.layer_count,
+    }
+    if args.mode == "exact":
+        if args.trigger_pos is None:
+            raise SystemExit("exact mode requires --trigger-pos")
+        cmd["triggerPos"] = args.trigger_pos
+        if args.trigger_layer is not None:
+            cmd["triggerLayer"] = args.trigger_layer
+    return {"op": "set_pp_migration", "cmd": cmd}
+
+
 def cmd_layer_prof(args: argparse.Namespace) -> Dict[str, Any]:
     req: Dict[str, Any] = {"op": "layer_prof"}
     if args.path:
@@ -144,6 +164,16 @@ def main() -> int:
     )
     sp.add_argument("--trigger-pos", type=int, default=None)
     sp.add_argument("--trigger-layer", type=int, default=None)
+
+    spp = sub.add_parser("set_pp_migration", help="set PP layer migration trigger/route (global root dispatch)")
+    spp.add_argument("--seq", type=int, default=1)
+    spp.add_argument("--mode", choices=["exact", "next_barrier", "next"], default="next_barrier")
+    spp.add_argument("--stage", type=int, default=0xFFFFFFFF)
+    spp.add_argument("--from", dest="from_node", type=int, default=0)
+    spp.add_argument("--to", dest="to_node", type=int, default=1)
+    spp.add_argument("--layer-count", type=int, default=1)
+    spp.add_argument("--trigger-pos", type=int, default=None)
+    spp.add_argument("--trigger-layer", type=int, default=None)
 
     rg = sub.add_parser("set_runtime_gate", help="toggle primary/redundant segment gate at runtime")
     rg.add_argument("--primary", type=int, choices=[0, 1], required=True, help="enable primary segments (0/1)")
@@ -232,6 +262,8 @@ def main() -> int:
         req = json.loads(args.json)
     elif args.op == "set_plan":
         req = cmd_set_plan(args)
+    elif args.op == "set_pp_migration":
+        req = cmd_set_pp_migration(args)
     elif args.op == "set_runtime_gate":
         req = {
             "op": "set_runtime_gate",

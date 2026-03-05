@@ -194,4 +194,8 @@ bool getEnableStageFullWeights();
 void setEnableKvRedundancyDuringMigration(bool enable);
 bool getEnableKvRedundancyDuringMigration();
 
+// Set KV aggregate graph build flag (called from app/bootstrap)
+void setEnableKvAggregate(bool enable);
+bool getEnableKvAggregate();
+
 #endif

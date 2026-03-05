@@ -25,17 +25,18 @@ std::unique_ptr<RootKvCollector> RootKvCollector::start(RootLlmInference *infere
     return nullptr;
 #else
     if (inference == nullptr) return nullptr;
-    const int pos = kvcParseEnvInt("DLLAMA_ASYNC_KV_COLLECT_POS", -1);
-    if (pos < 0) {
-        std::fprintf(stderr, "[kv-collector] disabled: DLLAMA_ASYNC_KV_COLLECT_POS not set\n");
-        return nullptr;
-    }
 
     std::unique_ptr<RootKvCollector> ctrl(new RootKvCollector(inference));
     RootKvCollector *c = ctrl.get();
     std::thread t([c]() { c->run(); });
     t.detach();
-    std::fprintf(stderr, "[kv-collector] enabled, thread started (target pos=%d, layer=auto/env)\n", pos);
+    const int pos = inference->getAsyncKvCollectPos();
+    const int layer = inference->getAsyncKvCollectLayer();
+    if (pos >= 0 && layer >= 0) {
+        std::fprintf(stderr, "[kv-collector] enabled, thread started (target pos=%d, layer=%d)\n", pos, layer);
+    } else {
+        std::fprintf(stderr, "[kv-collector] enabled, waiting for migration arming from runtime/UDS\n");
+    }
     return ctrl;
 #endif
 }

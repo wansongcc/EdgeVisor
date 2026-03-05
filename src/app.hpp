@@ -48,6 +48,8 @@ public:
     bool enablePlanBarrier; // Enable plan barrier for online migration
     bool enableStageFullWeights; // Enable stage full residency (full weights and buffers)
     bool enableKvRedundancyDuringMigration; // Keep KV redundancy enabled during online migration
+    bool enableKvAggregate; // Build KV aggregate pipes (KC/VC)
+    bool enablePpMigration; // Enable PP layer migration control path
     NnUint runtimeRedundantBoundaryLayers; // Runtime redundant boundary span in layers
     bool runtimeActiveSegEnabled; // Default gate for primary segments
     bool runtimeRedundantSegEnabled; // Default gate for redundant segments
@@ -158,6 +160,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_ENABLE_STAGE_FULL_WEIGHTS = 1u << 3,
     LLM_BOOTSTRAP_ENABLE_KV_REDUNDANCY_DURING_MIGRATION = 1u << 4,
     LLM_BOOTSTRAP_HAS_PRIMARY_SKIP_LAYERS = 1u << 5,
+    LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE = 1u << 6,
 };
 
 typedef struct {
@@ -168,6 +171,7 @@ typedef struct {
     NnUint enablePlanBarrier; // 0/1, enables plan barrier for online migration
     NnUint enableStageFullWeights; // 0/1, enables stage full residency (full weights and buffers)
     NnUint enableKvRedundancyDuringMigration; // 0/1, keeps KV redundancy enabled during migration
+    NnUint enableKvAggregate; // 0/1, builds KV aggregate pipes (KC/VC)
     NnUint runtimeRedundantBoundaryLayers; // boundary span in layers for runtime redundant plan
     NnUint runtimeActiveSegEnabled; // 0/1 default primary segment gate
     NnUint runtimeRedundantSegEnabled; // 0/1 default redundant segment gate
@@ -179,7 +183,7 @@ typedef struct {
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 7u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 8u;
 
 typedef struct {
     NnUint layerIndex;
@@ -216,6 +220,12 @@ public:
     NnUint getSeqLen() const { return header != nullptr ? header->seqLen : 0u; }
     int getAsyncKvCollectLayer() const { return asyncKvCollectLayer; }
     int getAsyncKvCollectPos() const { return asyncKvCollectPos; }
+    NnUint getMigrationFromNodeIndex() const { return migrationFromNodeIndex; }
+    NnUint getMigrationTargetNodeIndex() const { return nextStageRootNode; }
+    const std::vector<NnUint>& getMigrationLayers() const { return migrationLayers; }
+    int getMigrationLayerCount() const { return migrationLayerCount; }
+    bool isMigrationLayerListPinnedByEnv() const { return migrationLayerListPinnedByEnv; }
+    bool isPpMigrationEnabled() const { return ppMigrationEnabled; }
     bool hasMigrationAck() const { return migrationAckSeen; }
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
@@ -250,15 +260,20 @@ private:
     std::vector<NnUint> migrationLayers;
     int migrationStageStartLayer = -1;
     int migrationStageEndLayer = -1;
+    int migrationLayerCount = 1;
+    bool ppMigrationEnabled = false;
     bool migrationBatchSubmitted = false;
+    bool migrationLayerListPinnedByEnv = false;
     int boundaryLayerForMigration = -1;
     bool migrationAckSeen = false;
     int migrationAckPos = -1;
     int migrationAckLayer = -1;
+    unsigned long long lastPpPlanCacheSeqApplied = 0ull;
+    NnUint migrationFromNodeIndex = 0u;
     NnUint nextStageRootNode = (NnUint)-1;
     int kvAckSocketIndex = -1;
 public:
-    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled);
+    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled);
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
     void setToken(NnUint batchIndex, NnUint token);

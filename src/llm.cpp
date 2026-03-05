@@ -18,6 +18,8 @@ static bool g_enablePlanBarrier = false;
 static bool g_enableStageFullWeights = false;
 // Global flag to keep KV redundancy enabled during migration (set from app via bootstrap packet)
 static bool g_enableKvRedundancyDuringMigration = true;
+// Global flag to enable KV aggregate pipes (set from app via bootstrap packet)
+static bool g_enableKvAggregate = false;
 
 static int getenvIntOrDefaultLlm(const char *name, int fallback) {
     const char *v = std::getenv(name);
@@ -50,6 +52,14 @@ void setEnableKvRedundancyDuringMigration(bool enable) {
 
 bool getEnableKvRedundancyDuringMigration() {
     return g_enableKvRedundancyDuringMigration;
+}
+
+void setEnableKvAggregate(bool enable) {
+    g_enableKvAggregate = enable;
+}
+
+bool getEnableKvAggregate() {
+    return g_enableKvAggregate;
 }
 
 static const char *hiddenActToString(LlmHiddenAct act) {
@@ -298,7 +308,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
 
     n.kvAggKPipeIndex = (NnUint)-1;
     n.kvAggVPipeIndex = (NnUint)-1;
-    if (std::getenv("DLLAMA_KV_AGGREGATE") != nullptr) {
+    if (getEnableKvAggregate()) {
         // KC/VC holds the per-token KV vectors for the current batch window.
         // Each row corresponds to POS[batchIndex] (position + batchIndex).
         n.kvAggKPipeIndex = netBuilder.addPipe("KC", size2D(F_32, nBatches, h->kvDim));
@@ -1859,7 +1869,7 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
 
     n.kvAggKPipeIndex = (NnUint)-1;
     n.kvAggVPipeIndex = (NnUint)-1;
-    if (std::getenv("DLLAMA_KV_AGGREGATE") != nullptr) {
+    if (getEnableKvAggregate()) {
         n.kvAggKPipeIndex = netBuilder.addPipe("KC", size2D(F_32, nBatches, h->kvDim));
         n.kvAggVPipeIndex = netBuilder.addPipe("VC", size2D(F_32, nBatches, h->kvDim));
     }

@@ -1379,10 +1379,16 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
             const PlanCommandSnapshot snap = planCommandCache().load();
             const PlanCommand &pc = snap.cmd;
+            const bool hasPlanPayload =
+                (pc.cmdKind == PLAN_CMD_KIND_HEAD ||
+                 pc.cmdKind == PLAN_CMD_KIND_FFN ||
+                 pc.cmdKind == PLAN_CMD_KIND_BOTH ||
+                 (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u));
             const bool hasCmd =
                 (pc.magic == DLLAMA_PLAN_CMD_MAGIC) &&
                 (pc.version == DLLAMA_PLAN_CMD_VERSION_V1 || pc.version == DLLAMA_PLAN_CMD_VERSION_V2) &&
-                (pc.mode == PLAN_CMD_MODE_EXACT || pc.mode == PLAN_CMD_MODE_NEXT_BARRIER);
+                (pc.mode == PLAN_CMD_MODE_EXACT || pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) &&
+                hasPlanPayload;
 
             const NnUint layerIndex = (segmentConfig != nullptr) ? segmentConfig->ops[opIndex].index : 0u;
             const float posF = *(const float *)(context->input[0]);

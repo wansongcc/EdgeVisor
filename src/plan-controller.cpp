@@ -270,7 +270,8 @@ static json cmdToJson(const PlanCommand &c) {
         {"toNodeIndex", c.toNodeIndex},
         {"cmdKind", c.cmdKind},
         {"nHeadsToMove", c.nHeadsToMove},
-        {"nFfnToMove", c.nFfnToMove}
+        {"nFfnToMove", c.nFfnToMove},
+        {"reserved0", c.reserved0}
     };
 
     if (c.version == DLLAMA_PLAN_CMD_VERSION_V2 && c.nMoves != 0u) {
@@ -455,6 +456,47 @@ void PlanUdsController::run() {
 
                 const uint64_t cacheSeq = planCommandCache().store(cmd);
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}};
+            } else if (op == "set_pp_migration") {
+                if (!req.contains("cmd")) throw std::runtime_error("missing cmd");
+                const json &jcmd = req.at("cmd");
+
+                PlanCommand cmd = makeEmptyPlanCommand();
+                cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
+                cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+                cmd.seq = parseU32(jcmd, "seq", 0u);
+
+                const std::string modeStr = jcmd.value("mode", "");
+                if (!parseMode(modeStr, cmd.mode)) {
+                    throw std::runtime_error("bad mode (use exact/next_barrier)");
+                }
+
+                cmd.stageIndex = parseU32(jcmd, "stageIndex", 0xFFFFFFFFu);
+                cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
+                cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 1u);
+
+                // cmdKind=0 + no moves => reserved for PP layer migration control path.
+                cmd.cmdKind = 0u;
+                cmd.nHeadsToMove = 0u;
+                cmd.nFfnToMove = 0u;
+                cmd.nMoves = 0u;
+                cmd.reserved0 = parseU32(jcmd, "layerCount", 1u);
+                if (cmd.reserved0 == 0u) {
+                    throw std::runtime_error("layerCount must be >= 1");
+                }
+
+                if (cmd.mode == PLAN_CMD_MODE_EXACT) {
+                    if (!jcmd.contains("triggerPos")) {
+                        throw std::runtime_error("exact mode requires triggerPos");
+                    }
+                    cmd.triggerPos = parseU32(jcmd, "triggerPos", 0xFFFFFFFFu);
+                    cmd.triggerLayer = parseU32(jcmd, "triggerLayer", 0xFFFFFFFFu);
+                } else {
+                    cmd.triggerPos = 0xFFFFFFFFu;
+                    cmd.triggerLayer = 0xFFFFFFFFu;
+                }
+
+                const uint64_t cacheSeq = planCommandCache().store(cmd);
+                resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}, {"ppMigration", true}, {"layerCount", cmd.reserved0}};
             } else if (op == "set_runtime_gate") {
                 if (inference_ == nullptr) throw std::runtime_error("inference not available");
                 const bool primaryEnabled = parseBool(req, "primaryEnabled", true);
@@ -478,6 +520,21 @@ void PlanUdsController::run() {
                     resp["position"] = inference_->getPosition();
                     resp["batchSize"] = inference_->getBatchSize();
                     resp["perfSamples"] = (uint32_t)inference_->getLastPerf().size();
+                    json pp = json::object();
+                    pp["fromNodeIndex"] = inference_->getMigrationFromNodeIndex();
+                    pp["toNodeIndex"] = inference_->getMigrationTargetNodeIndex();
+                    pp["collectPos"] = inference_->getAsyncKvCollectPos();
+                    pp["armedTriggerPos"] = inference_->getAsyncKvCollectPos();
+                    pp["collectLayer"] = inference_->getAsyncKvCollectLayer();
+                    pp["enabled"] = inference_->isPpMigrationEnabled();
+                    pp["layerCount"] = inference_->getMigrationLayerCount();
+                    pp["layerListPinnedByEnv"] = inference_->isMigrationLayerListPinnedByEnv();
+                    json layers = json::array();
+                    for (NnUint layer : inference_->getMigrationLayers()) {
+                        layers.push_back(layer);
+                    }
+                    pp["layers"] = layers;
+                    resp["ppMigration"] = pp;
                 }
             } else if (op == "perf") {
                 resp = json{{"ok", true}};

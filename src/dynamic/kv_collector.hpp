@@ -6,7 +6,8 @@ class RootLlmInference;
 
 class RootKvCollector {
 public:
-    // Enabled by setting env: DLLAMA_ASYNC_KV_COLLECT_LAYER=<layer>
+    // Collector thread starts with root inference and waits until migration is armed
+    // by runtime/UDS command flow (or env fallback trigger position).
     static std::unique_ptr<RootKvCollector> start(RootLlmInference *inference);
 
     ~RootKvCollector();

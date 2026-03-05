@@ -256,6 +256,11 @@ private:
     bool waitingKvAck = false;
     NnUint waitingKvAckExpectedCount = 0u;
     std::vector<NnUint> waitingKvAckLayers;
+    NnUint waitingKvAckReceivedCount = 0u;
+    std::vector<NnUint> waitingKvAckReceivedLayers;
+    std::vector<NnUint> waitingKvAckNodes;
+    std::vector<NnUint> waitingKvAckNodeExpected;
+    std::vector<NnUint> waitingKvAckNodeReceived;
     std::vector<NnUint> pendingLayerSwitchLayers;
     std::vector<NnUint> migrationLayers;
     int migrationStageStartLayer = -1;

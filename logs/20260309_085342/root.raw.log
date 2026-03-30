@@ -1,0 +1,107 @@
+nNodes=1
+nNodes=2
+🔍 [DEBUG] parseStageDefs received: "1:1"
+⚖️  [Auto-Split] Stage 0 (Weight 2.00): Assigned 28 layers
+🔍 [Node 0 DEBUG] RoPE Q Slice: qStart=0 qLen=1536 kvStart=0 kvLen=512 headDim=128
+🔍 [Node 0 DEBUG] RoPE K Slice (redundant): qStart=0 qLen=768 kvStart=0 kvLen=768 headDim=128
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 0 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=0 qSliceD0=1536 kvStart=0 kvDim0=512 kvStride=1024 (kv-redundant)
+🔍 [Node 1 DEBUG] RoPE Q Slice: qStart=1536 qLen=1536 kvStart=512 kvLen=512 headDim=128
+🔍 [Node 1 DEBUG] RoPE K Slice (redundant): qStart=256 qLen=768 kvStart=256 kvLen=768 headDim=128
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+ [Node 1 DEBUG] MHA: nHeads=24 nHeads0=12 qStart=1536 qSliceD0=1536 kvStart=512 kvDim0=512 kvStride=1024 (kv-redundant)
+🧩 [runtime-plan] static layer plan ready: layers=28 stages=1 activeMarks=28 redundantMarks=0
+⚖️  Uneven partitioning strategy enabled: 1:1
+
+🔍 [DEBUG] Pipeline Partition Plan Verification:
+===================================================
+🌎 Global Stats: Total Nodes: 2, Total Stages: 1
+
+➡️  [Stage 0]
+    ├─ Range:      Layers 0 to 27 (Count: 28)
+    ├─ Root Node:  0
+    ├─ Member Nodes: [ 0 1 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 0: Heads=12, KV=4, Dim=1536
+       • Node 1: Heads=12, KV=4, Dim=1536
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+===================================================
+
+📄 AddBos: 0
+📄 BosId: 128000 (<|begin_of_text|>)
+📄 EosId: 128001 (<|end_of_text|>) 128009 (<|eot_id|>) 
+📄 RegularVocabSize: 128000
+📄 SpecialVocabSize: 256
+💡 Arch: Llama
+💡 HiddenAct: Silu
+💡 Dim: 3072
+💡 HeadDim: 128
+💡 QDim: 3072
+💡 KvDim: 1024
+💡 HiddenDim: 8192
+💡 VocabSize: 128256
+💡 nLayers: 28
+💡 nHeads: 24
+💡 nKvHeads: 8
+💡 OrigSeqLen: 131072
+💡 SeqLen: 2048
+💡 NormEpsilon: 0.000010
+💡 RopeType: Llama3.1
+💡 RopeTheta: 500000
+💡 RopeScaling: f=32.0, l=1.0, h=4.0, o=8192
+📀 RequiredMemory: 3736 MB
+⭕ Socket[0]: connecting to rpi-trixie5:9999 worker
+Cannot connect to rpi-trixie5:9999 (Connection refused)
+🚨 Critical error: Cannot connect

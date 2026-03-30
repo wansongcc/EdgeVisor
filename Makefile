@@ -13,6 +13,10 @@ CXXFLAGS += -DDLLAMA_CONTROL_LOG=$(DLLAMA_CONTROL_LOG)
 DEBUG_OP_INPUT_OUTPUT ?= 0
 CXXFLAGS += -DDEBUG_OP_INPUT_OUTPUT=$(DEBUG_OP_INPUT_OUTPUT)
 
+# Compile-time gate for attention debug code blocks in nn-cpu/nn-cpu-ops.
+DLLAMA_DEBUG_ATTN ?= 0
+CXXFLAGS += -DDLLAMA_DEBUG_ATTN=$(DLLAMA_DEBUG_ATTN)
+
 ifndef TERMUX_VERSION
 	CXXFLAGS += -march=native -mtune=native
 endif

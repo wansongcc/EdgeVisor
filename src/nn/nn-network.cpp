@@ -15,6 +15,7 @@ typedef SSIZE_T ssize_t;
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
@@ -68,6 +69,14 @@ static inline bool isEagainError() {
     #else
     return SOCKET_LAST_ERRCODE == EAGAIN;
     #endif
+}
+
+static inline bool debugLogitsGatherSliceStatsEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_LOGITS_GATHER_SLICES");
+    if (v == nullptr) return false;
+    if (v[0] == '0') return false;
+    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+    return true;
 }
 
 static inline unsigned int getIoEagainYieldEvery() {
@@ -276,6 +285,26 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
     for (NnUint i = 0; i < nNodes; ++i) {
         offsets[i] = 0;
         sizes[i] = 0;
+    }
+
+    // Explicitly requested stacked-by-node layout (e.g. ZQ residual pipe):
+    // offset(node) = node * slotBytes, size(node) = slotBytes.
+    if (forcedTag == NN_SLICE_STACKED_BY_NODE && nNodes > 0 && (totalBytes % nNodes) == 0) {
+        const NnSize slotBytes = totalBytes / nNodes;
+        if (stageForSplit != nullptr && stageForSplit->nodeIndices != nullptr) {
+            for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                const NnUint node = stageForSplit->nodeIndices[k];
+                if (node >= nNodes) continue;
+                offsets[node] = (NnSize)node * slotBytes;
+                sizes[node] = slotBytes;
+            }
+        } else {
+            for (NnUint node = 0; node < nNodes; ++node) {
+                offsets[node] = (NnSize)node * slotBytes;
+                sizes[node] = slotBytes;
+            }
+        }
+        return;
     }
 
     if (plan && plan->nNodes == nNodes) {
@@ -1600,6 +1629,74 @@ static void syncNodeSlices(
             }
         }
 #endif
+
+        // Root-side diagnostics for logits gather: print per-node received slice stats.
+        if (isLogitsGather && amIRoot && threadIndex == 0 && floatType == F_32 && debugLogitsGatherSliceStatsEnabled()) {
+            const NnStageConfig *lastStage = (plan != nullptr && plan->nStages > 0 && plan->stages != nullptr)
+                ? (&plan->stages[plan->nStages - 1u])
+                : nullptr;
+            if (lastStage != nullptr) {
+                for (NnUint i = 0; i < lastStage->nNodes; ++i) {
+                    const NnUint node = lastStage->nodeIndices[i];
+                    const NnSize offB = sliceOffsets[node];
+                    const NnSize lenB = sliceSizes[node];
+                    if (lenB == 0u) {
+                        std::printf("[logits-gather-slice] root=%u fromNode=%u offB=%zu lenB=0 (skip)\n",
+                            (unsigned)myNodeIndex,
+                            (unsigned)node,
+                            (size_t)offB);
+                        continue;
+                    }
+                    if ((lenB % sizeof(float)) != 0u) {
+                        std::printf("[logits-gather-slice] root=%u fromNode=%u offB=%zu lenB=%zu (non-f32-aligned)\n",
+                            (unsigned)myNodeIndex,
+                            (unsigned)node,
+                            (size_t)offB,
+                            (size_t)lenB);
+                        continue;
+                    }
+
+                    const NnUint n = (NnUint)(lenB / sizeof(float));
+                    const float *p = (const float *)(buffer + offB);
+                    if (n == 0u || p == nullptr) continue;
+
+                    float vMin = p[0];
+                    float vMax = p[0];
+                    NnUint vMaxIdx = 0u;
+                    NnUint nNan = 0u;
+                    NnUint nInf = 0u;
+                    NnUint nZero = 0u;
+                    double meanAbs = 0.0;
+                    for (NnUint k = 0u; k < n; ++k) {
+                        const float v = p[k];
+                        if (v == 0.0f) nZero += 1u;
+                        if (std::isnan(v)) { nNan += 1u; continue; }
+                        if (!std::isfinite(v)) { nInf += 1u; continue; }
+                        if (v < vMin) vMin = v;
+                        if (v > vMax) { vMax = v; vMaxIdx = k; }
+                        meanAbs += std::fabs((double)v);
+                    }
+
+                    // Convert byte offset to vocab offset in F32 units.
+                    const NnUint vocabOff = (NnUint)(offB / sizeof(float));
+                    std::printf("[logits-gather-slice] root=%u fromNode=%u off=%u len=%u range=[%.2f, %.2f] localMaxIdx=%u globalMaxIdx=%u meanAbs=%.4f zero=%u/%u nan=%u inf=%u\n",
+                        (unsigned)myNodeIndex,
+                        (unsigned)node,
+                        (unsigned)vocabOff,
+                        (unsigned)n,
+                        vMin,
+                        vMax,
+                        (unsigned)vMaxIdx,
+                        (unsigned)(vocabOff + vMaxIdx),
+                        (double)(n > 0u ? meanAbs / (double)n : 0.0),
+                        (unsigned)nZero,
+                        (unsigned)n,
+                        (unsigned)nNan,
+                        (unsigned)nInf);
+                }
+                std::fflush(stdout);
+            }
+        }
     }
 }
 
@@ -1969,6 +2066,13 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         if (pipeConfig->name != nullptr) {
             if (std::strcmp(pipeConfig->name, "KC") == 0 || std::strcmp(pipeConfig->name, "VC") == 0) {
                 forcedTag = NN_SLICE_KV_HEAD;
+            } else if (std::strcmp(pipeConfig->name, "ZQ") == 0) {
+                // ZQ is written via PNTR_BATCHED_SLICE + NN_SLICE_STACKED_BY_NODE.
+                // Sync must use the same global-node slot mapping to avoid offset drift.
+                forcedTag = NN_SLICE_STACKED_BY_NODE;
+            } else if (std::strcmp(pipeConfig->name, "LG") == 0) {
+                // Keep logits gather deterministic on vocab split.
+                forcedTag = NN_SLICE_VOCAB;
             }
         }
 

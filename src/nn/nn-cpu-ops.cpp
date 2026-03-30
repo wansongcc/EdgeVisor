@@ -1664,10 +1664,11 @@ static void topk_F32(const float *x, NnUint *y, NnSize size, NnUint k) {
         y[i] = items[i];
 }
 
-//
-
 static void mergeAddForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    assert(context->outputSize.x > 0u);
+    ASSERT_EQ(context->inputSize.x % context->outputSize.x, 0u);
     NnUint nSlices = context->inputSize.x / context->outputSize.x;
+    assert(nSlices > 0u);
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *output = (float *)context->output[batchIndex];
@@ -1688,8 +1689,11 @@ static void mergeAddForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint 
 static void mergeAddForward_Q80_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     assert(context->inputSize.floatType == F_Q80);
     assert(context->outputSize.floatType == F_32);
+    assert(context->outputSize.x > 0u);
+    ASSERT_EQ(context->inputSize.x % context->outputSize.x, 0u);
 
     NnUint nSlices = context->inputSize.x / context->outputSize.x;
+    assert(nSlices > 0u);
     NnUint xSize = context->outputSize.x / Q80_BLOCK_SIZE;
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *output = (float *)context->output[batchIndex];
@@ -2665,6 +2669,14 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
                             (const void *)query,
                             (const void *)qVec,
                             (const void *)keyCache);
+                        printf("🧪 [att][qkv][map] qBuf=%u kBuf=%u vBuf=%u qStart=%u kvStart=%u qStride=%u kvStride=%u\n",
+                            (unsigned)config->queryBufferIndex,
+                            (unsigned)config->keyCacheBufferIndex,
+                            (unsigned)config->valueCacheBufferIndex,
+                            (unsigned)config->qStart,
+                            (unsigned)config->kvStart,
+                            (unsigned)qStride,
+                            (unsigned)kvStride);
 
                         printf("🧪 [att][qk] qHead=%u kvHead=%u headDim=%u ",
                             (unsigned)globalQHead,
@@ -2697,9 +2709,20 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
                         std::vector<NnUint> idxs;
                         if (attQkPosSel >= 0) {
                             const NnUint p = (NnUint)attQkPosSel;
-                            if (p < len) idxs.push_back(p);
+                            if (p < len) {
+                                idxs.push_back(p);
+                            } else {
+                                printf("🧪 [att][qk][skip] forcedPos=%ld not ready yet (curPos=%u len=%u)\n",
+                                    (long)attQkPosSel,
+                                    (unsigned)pos,
+                                    (unsigned)len);
+                            }
                         } else {
                             selectTopKIndices(row, len, attQkTopKSel, idxs);
+                        }
+
+                        if (idxs.empty()) {
+                            return;
                         }
 
                         NnUint col0 = 0u;
@@ -2718,8 +2741,10 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
                             const NnUint p = idxs[t];
                             const float w = row[p];
                             const float *kVec = &keyCache[p * kvStride + col0];
+                            const float *vVec = &valueCache[p * kvStride + col0];
                             const float dot = dotProduct_F32(qVec, kVec, headDim);
                             const double kNorm = std::sqrt(l2NormSq_F32(kVec, headDim));
+                            const double vNorm = std::sqrt(l2NormSq_F32(vVec, headDim));
 
                             printf("🧪 [att][qk] pos=%u w=%.6f colStart=%u dot=%.6f dotScaled=%.6f kNorm=%.6f ",
                                 (unsigned)p,
@@ -2729,6 +2754,9 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
                                 (double)((double)dot * invSqrtHd),
                                 (double)kNorm);
                             printVecDims("K", kVec, headDim, dimsToPrint);
+                            printf(" ");
+                            printVecDims("V", vVec, headDim, dimsToPrint);
+                            printf(" vNorm=%.6f", (double)vNorm);
                             printf("\n");
                         }
                     }

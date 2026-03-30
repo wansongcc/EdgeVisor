@@ -15,6 +15,10 @@
 #include <string>
 #include <iostream>
 #include <deque>
+#include <vector>
+#include <unordered_map>
+#include <fstream>
+#include <sstream>
 
 static void computeLogitsStats(const float* logits, NnUint vocabSize,
                               bool &hasNaN, bool &hasInf,
@@ -35,6 +39,326 @@ static void computeLogitsStats(const float* logits, NnUint vocabSize,
         if (v > maxLogit) { maxLogit = v; maxIndex = (int)i; }
         if (v < minLogit) minLogit = v;
     }
+}
+
+static bool debugRootLogitsSplitEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_ROOT_LOGITS_SPLIT");
+    if (v == nullptr) return false;
+    if (v[0] == '0') return false;
+    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+    return true;
+}
+
+static void computeLogitsStatsRange(const float* logits, NnUint lo, NnUint hi,
+                                   bool &hasNaN, bool &hasInf,
+                                   float &minLogit, float &maxLogit,
+                                   int &maxIndex, NnUint &zeroCount) {
+    hasNaN = false;
+    hasInf = false;
+    minLogit = 1e9f;
+    maxLogit = -1e9f;
+    maxIndex = -1;
+    zeroCount = 0u;
+    if (logits == nullptr || lo >= hi) return;
+    for (NnUint i = lo; i < hi; ++i) {
+        const float v = logits[i];
+        if (v == 0.0f) zeroCount += 1u;
+        if (std::isnan(v)) { hasNaN = true; continue; }
+        if (std::isinf(v)) { hasInf = true; continue; }
+        if (v > maxLogit) { maxLogit = v; maxIndex = (int)i; }
+        if (v < minLogit) minLogit = v;
+    }
+}
+
+static void printRootLogitsSplitStats(const char* phase, NnUint pos, const float* logits, NnUint vocabSize) {
+    if (!debugRootLogitsSplitEnabled()) return;
+    if (logits == nullptr || vocabSize == 0u) return;
+
+    const NnUint mid = vocabSize / 2u;
+
+    bool hasNaN0 = false;
+    bool hasInf0 = false;
+    float min0 = 0.0f;
+    float max0 = 0.0f;
+    int maxIdx0 = -1;
+    NnUint zero0 = 0u;
+    computeLogitsStatsRange(logits, 0u, mid, hasNaN0, hasInf0, min0, max0, maxIdx0, zero0);
+
+    bool hasNaN1 = false;
+    bool hasInf1 = false;
+    float min1 = 0.0f;
+    float max1 = 0.0f;
+    int maxIdx1 = -1;
+    NnUint zero1 = 0u;
+    computeLogitsStatsRange(logits, mid, vocabSize, hasNaN1, hasInf1, min1, max1, maxIdx1, zero1);
+
+    std::printf("[root-logits-split] phase=%s pos=%u low=[0,%u) range=[%.2f, %.2f] maxIdx=%d zero=%u/%u nan=%u inf=%u | high=[%u,%u) range=[%.2f, %.2f] maxIdx=%d zero=%u/%u nan=%u inf=%u\n",
+        (phase != nullptr ? phase : "?"),
+        (unsigned)pos,
+        (unsigned)mid,
+        min0,
+        max0,
+        maxIdx0,
+        (unsigned)zero0,
+        (unsigned)mid,
+        hasNaN0 ? 1u : 0u,
+        hasInf0 ? 1u : 0u,
+        (unsigned)mid,
+        (unsigned)vocabSize,
+        min1,
+        max1,
+        maxIdx1,
+        (unsigned)zero1,
+        (unsigned)(vocabSize - mid),
+        hasNaN1 ? 1u : 0u,
+        hasInf1 ? 1u : 0u);
+}
+
+static bool debugSyncTopkEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK");
+    if (v == nullptr) return false;
+    if (v[0] == '0') return false;
+    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+    return true;
+}
+
+static NnUint debugSyncTopkK() {
+    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK_K");
+    if (v == nullptr || v[0] == '\0') return 10u;
+    long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 10u;
+    if (n > 200) return 200u;
+    return (NnUint)n;
+}
+
+static const char* debugSyncTopkTag() {
+    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK_TAG");
+    return (v == nullptr || v[0] == '\0') ? "unknown" : v;
+}
+
+static const char* debugSyncTopkMode() {
+    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK_MODE");
+    return (v == nullptr || v[0] == '\0') ? "print" : v;
+}
+
+static const char* debugSyncTopkFile() {
+    return std::getenv("DLLAMA_DEBUG_SYNC_TOPK_FILE");
+}
+
+static bool debugSyncTopkModeIs(const char* mode) {
+    const char *m = debugSyncTopkMode();
+    return (std::strcmp(m, mode) == 0);
+}
+
+struct SyncTopkEntry {
+    std::vector<int> ids;
+    std::vector<float> vals;
+};
+
+struct SyncTopkBaseline {
+    bool loaded = false;
+    std::string loadedPath;
+    std::unordered_map<std::string, SyncTopkEntry> byKey;
+};
+
+static std::string makeSyncTopkKey(const char* phase, NnUint pos, NnUint batchIndex) {
+    return std::string(phase ? phase : "?") + "#" + std::to_string((unsigned)pos) + "#" + std::to_string((unsigned)batchIndex);
+}
+
+static void computeTopKIdsVals(const float* logits, NnUint vocabSize, NnUint k, std::vector<int>& ids, std::vector<float>& vals) {
+    ids.clear();
+    vals.clear();
+    if (logits == nullptr || vocabSize == 0u || k == 0u) return;
+    const NnUint kk = std::min(vocabSize, k);
+
+    struct Item { float v; int i; };
+    std::vector<Item> top;
+    top.reserve((size_t)kk);
+
+    for (NnUint i = 0u; i < vocabSize; ++i) {
+        const float v = logits[i];
+        if (top.size() < kk) {
+            top.push_back(Item{v, (int)i});
+            if (top.size() == kk) {
+                std::sort(top.begin(), top.end(), [](const Item& a, const Item& b) { return a.v > b.v; });
+            }
+            continue;
+        }
+        if (v <= top.back().v) continue;
+        NnUint lo = 0u;
+        NnUint hi = kk;
+        while (lo < hi) {
+            const NnUint mid = (lo + hi) / 2u;
+            if (v > top[mid].v) hi = mid;
+            else lo = mid + 1u;
+        }
+        for (NnUint j = kk - 1u; j > lo; --j) top[j] = top[j - 1u];
+        top[lo] = Item{v, (int)i};
+    }
+
+    ids.reserve((size_t)kk);
+    vals.reserve((size_t)kk);
+    for (const auto &it : top) {
+        ids.push_back(it.i);
+        vals.push_back(it.v);
+    }
+}
+
+static SyncTopkBaseline& syncTopkBaseline() {
+    static SyncTopkBaseline s;
+    return s;
+}
+
+static void loadSyncTopkBaselineIfNeeded(const char* path) {
+    if (path == nullptr || path[0] == '\0') return;
+    SyncTopkBaseline &b = syncTopkBaseline();
+    if (b.loaded && b.loadedPath == path) return;
+
+    b.loaded = true;
+    b.loadedPath = path;
+    b.byKey.clear();
+
+    std::ifstream in(path);
+    if (!in.is_open()) return;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        std::string phase;
+        unsigned pos = 0u;
+        unsigned batchIndex = 0u;
+        unsigned k = 0u;
+        if (!(iss >> phase >> pos >> batchIndex >> k)) continue;
+
+        SyncTopkEntry e;
+        e.ids.reserve(k);
+        e.vals.reserve(k);
+        for (unsigned i = 0u; i < k; ++i) {
+            std::string tok;
+            if (!(iss >> tok)) break;
+            const size_t p = tok.find(':');
+            if (p == std::string::npos) continue;
+            int id = 0;
+            float val = 0.0f;
+            try {
+                id = std::stoi(tok.substr(0, p));
+                val = std::stof(tok.substr(p + 1u));
+            } catch (...) {
+                continue;
+            }
+            e.ids.push_back(id);
+            e.vals.push_back(val);
+        }
+        if (!e.ids.empty()) {
+            b.byKey[makeSyncTopkKey(phase.c_str(), (NnUint)pos, (NnUint)batchIndex)] = std::move(e);
+        }
+    }
+}
+
+static void appendSyncTopkRecord(const char* path, const char* phase, NnUint pos, NnUint batchIndex,
+                                 const std::vector<int>& ids, const std::vector<float>& vals) {
+    if (path == nullptr || path[0] == '\0' || ids.empty() || vals.empty()) return;
+    FILE *f = std::fopen(path, "a");
+    if (f == nullptr) return;
+    const NnUint n = std::min((NnUint)ids.size(), (NnUint)vals.size());
+    std::fprintf(f, "%s %u %u %u", (phase ? phase : "?"), (unsigned)pos, (unsigned)batchIndex, (unsigned)n);
+    for (NnUint i = 0u; i < n; ++i) {
+        std::fprintf(f, " %d:%.9g", ids[i], (double)vals[i]);
+    }
+    std::fprintf(f, "\n");
+    std::fclose(f);
+}
+
+static int findRank(const std::vector<int>& ids, int id) {
+    for (NnUint i = 0u; i < (NnUint)ids.size(); ++i) {
+        if (ids[i] == id) return (int)i;
+    }
+    return -1;
+}
+
+static void printSyncTopkTrace(const char* phase, NnUint pos, NnUint batchIndex,
+                               const std::vector<int>& ids, const std::vector<float>& vals) {
+    if (!debugSyncTopkEnabled()) return;
+    if (ids.empty() || vals.empty()) return;
+
+    const char* tag = debugSyncTopkTag();
+    const NnUint n = std::min((NnUint)ids.size(), (NnUint)vals.size());
+    std::printf("[sync-topk] tag=%s mode=%s phase=%s pos=%u batch=%u k=%u top1=%d(%.6g) topk=",
+        tag,
+        debugSyncTopkMode(),
+        (phase ? phase : "?"),
+        (unsigned)pos,
+        (unsigned)batchIndex,
+        (unsigned)n,
+        ids[0],
+        (double)vals[0]);
+    for (NnUint i = 0u; i < n; ++i) {
+        std::printf("%s%d:%.6g", (i == 0u ? "[" : ","), ids[i], (double)vals[i]);
+    }
+    std::printf("]\n");
+
+    const char* file = debugSyncTopkFile();
+    if (debugSyncTopkModeIs("record")) {
+        appendSyncTopkRecord(file, phase, pos, batchIndex, ids, vals);
+        return;
+    }
+    if (!debugSyncTopkModeIs("compare")) return;
+
+    loadSyncTopkBaselineIfNeeded(file);
+    SyncTopkBaseline &b = syncTopkBaseline();
+    const auto it = b.byKey.find(makeSyncTopkKey(phase, pos, batchIndex));
+    if (it == b.byKey.end()) {
+        std::printf("[sync-topk-diff] tag=%s phase=%s pos=%u batch=%u baseline=missing\n",
+            tag,
+            (phase ? phase : "?"),
+            (unsigned)pos,
+            (unsigned)batchIndex);
+        return;
+    }
+
+    const SyncTopkEntry &base = it->second;
+    const NnUint nBase = (NnUint)base.ids.size();
+    NnUint overlap = 0u;
+    for (NnUint i = 0u; i < n; ++i) {
+        for (NnUint j = 0u; j < nBase; ++j) {
+            if (ids[i] == base.ids[j]) {
+                overlap += 1u;
+                break;
+            }
+        }
+    }
+
+    const int baseTop1 = (nBase > 0u) ? base.ids[0] : -1;
+    const float baseTop1Val = (nBase > 0u && !base.vals.empty()) ? base.vals[0] : 0.0f;
+    const int curTop1 = ids[0];
+    const float curTop1Val = vals[0];
+    const int baseTop1NowRank = findRank(ids, baseTop1);
+    const int curTop1BaseRank = findRank(base.ids, curTop1);
+
+    std::printf("[sync-topk-diff] tag=%s phase=%s pos=%u batch=%u overlap=%u/%u top1Match=%u baseTop1=%d(%.6g) curTop1=%d(%.6g) baseTop1NowRank=%d curTop1BaseRank=%d\n",
+        tag,
+        (phase ? phase : "?"),
+        (unsigned)pos,
+        (unsigned)batchIndex,
+        (unsigned)overlap,
+        (unsigned)std::min(n, nBase),
+        (unsigned)((baseTop1 == curTop1) ? 1u : 0u),
+        baseTop1,
+        (double)baseTop1Val,
+        curTop1,
+        (double)curTop1Val,
+        baseTop1NowRank,
+        curTop1BaseRank);
+}
+
+static void debugSyncTopkTrace(const float* logits, NnUint vocabSize, const char* phase, NnUint pos, NnUint batchIndex) {
+    if (!debugSyncTopkEnabled()) return;
+    if (logits == nullptr || vocabSize == 0u) return;
+    std::vector<int> ids;
+    std::vector<float> vals;
+    computeTopKIdsVals(logits, vocabSize, debugSyncTopkK(), ids, vals);
+    printSyncTopkTrace(phase, pos, batchIndex, ids, vals);
 }
 
 #ifndef DLLAMA_DEBUG_TOPK_LOGITS
@@ -327,6 +651,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             minLogit, maxLogit, maxIndex,
             (unsigned)zeroCount, (unsigned)vocabSize,
             sentBytes, recvBytes);
+        printRootLogitsSplitStats("eval", pos, logitsRow, vocabSize);
+        debugSyncTopkTrace(logitsRow, vocabSize, "eval", pos, statBatch);
         evalTotalTime += evalTime + syncTime;
     }
 
@@ -359,6 +685,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 statsOk ? "✅ OK" : "❌ FAIL",
                 minLogit, maxLogit, maxIndex,
                 (unsigned)zeroCount, (unsigned)context->header->vocabSize);
+            printRootLogitsSplitStats("pred", pos, context->inference->logitsPipe, context->header->vocabSize);
+            debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
         }
 
         if (context->args->benchmark) {

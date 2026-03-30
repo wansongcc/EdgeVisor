@@ -30,6 +30,127 @@ static int getenvIntOrDefaultLlm(const char *name, int fallback) {
     return (int)x;
 }
 
+static bool graphBuildDumpEnabled() {
+    const char *v = std::getenv("DLLAMA_DEBUG_GRAPH_BUILD");
+    if (v == nullptr) return false;
+    if (v[0] == '0') return false;
+    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+    return true;
+}
+
+static int graphBuildDumpLayerFilter() {
+    return getenvIntOrDefaultLlm("DLLAMA_DEBUG_GRAPH_BUILD_LAYER", 0);
+}
+
+static int graphBuildDumpNodeFilter() {
+    return getenvIntOrDefaultLlm("DLLAMA_DEBUG_GRAPH_BUILD_NODE", -1);
+}
+
+static const char *pointerSourceToString(NnPointerSource src) {
+    switch (src) {
+        case SRC_BUFFER: return "BUFFER";
+        case SRC_PIPE: return "PIPE";
+        default: return "SRC?";
+    }
+}
+
+static const char *pointerTypeToString(NnPointerType t) {
+    switch (t) {
+        case PNTR_RAW: return "RAW";
+        case PNTR_BATCH: return "BATCH";
+        case PNTR_BATCHED_SLICE: return "BATCHED_SLICE";
+        default: return "TYPE?";
+    }
+}
+
+static void printPointerConfigBrief(const char *label, const NnPointerConfig &p) {
+    std::printf(" %s={src=%s idx=%u type=%s tag=%s}",
+        (label != nullptr ? label : "pntr"),
+        pointerSourceToString(p.source),
+        (unsigned)p.pointerIndex,
+        pointerTypeToString(p.type),
+        sliceTagToString(p.sliceTag));
+}
+
+static void printSegmentBuildOps(
+    NnUint nodeIndex,
+    NnUint stageIndex,
+    const char *segKind,
+    NnUint layerIndex,
+    const NnSegmentConfig &seg) {
+
+    std::printf("[graph-build] node=%u stage=%u kind=%s layer=%u nOps=%u nSyncs=%u\n",
+        (unsigned)nodeIndex,
+        (unsigned)stageIndex,
+        (segKind != nullptr ? segKind : "unknown"),
+        (unsigned)layerIndex,
+        (unsigned)seg.nOps,
+        (unsigned)seg.nSyncs);
+
+    for (NnUint i = 0u; i < seg.nOps; ++i) {
+        const NnOpConfig &op = seg.ops[i];
+        std::printf("[graph-build-op] node=%u stage=%u kind=%s layer=%u i=%u name=%s code=%s",
+            (unsigned)nodeIndex,
+            (unsigned)stageIndex,
+            (segKind != nullptr ? segKind : "unknown"),
+            (unsigned)layerIndex,
+            (unsigned)i,
+            (op.name != nullptr ? op.name : "?"),
+            opCodeToString(op.code));
+        printPointerConfigBrief("in", op.input);
+        printPointerConfigBrief("out", op.output);
+        std::printf(" w={t=%u z=%u y=%u x=%u bytes=%zu}",
+            (unsigned)op.weightSize.floatType,
+            (unsigned)op.weightSize.z,
+            (unsigned)op.weightSize.y,
+            (unsigned)op.weightSize.x,
+            (size_t)op.weightSize.nBytes);
+
+        if (op.code == OP_MATMUL && op.config != nullptr && op.configSize >= sizeof(NnMatmulOpConfig)) {
+            const NnMatmulOpConfig *cfg = (const NnMatmulOpConfig *)op.config;
+            std::printf(" matmul={view=%u inStart=%u outStart=%u inTag=%s outTag=%s aView(off=%u,sizeX=%u) cView(off=%u,sizeX=%u)}",
+                (unsigned)cfg->view,
+                (unsigned)cfg->inStart,
+                (unsigned)cfg->outStart,
+                sliceTagToString(cfg->inSliceTag),
+                sliceTagToString(cfg->outSliceTag),
+                (unsigned)cfg->aView.offset,
+                (unsigned)cfg->aView.sizeX,
+                (unsigned)cfg->cView.offset,
+                (unsigned)cfg->cView.sizeX);
+        }
+
+        if (op.code == OP_MULTIHEAD_ATT && op.config != nullptr && op.configSize >= sizeof(NnMultiHeadAttOpConfig)) {
+            const NnMultiHeadAttOpConfig *cfg = (const NnMultiHeadAttOpConfig *)op.config;
+            std::printf(" att={nHeads0=%u qStart=%u qStride=%u kvStart=%u kvStride=%u}",
+                (unsigned)cfg->nHeads0,
+                (unsigned)cfg->qStart,
+                (unsigned)cfg->qStride,
+                (unsigned)cfg->kvStart,
+                (unsigned)cfg->kvStride);
+        }
+
+        if (op.code == OP_SHIFT && op.config != nullptr && op.configSize >= sizeof(NnShiftOpCodeConfig)) {
+            const NnShiftOpCodeConfig *cfg = (const NnShiftOpCodeConfig *)op.config;
+            std::printf(" shift={dstColStart=%u dstRowStride=%u dstColStartUnit=%u}",
+                (unsigned)cfg->dstColStart,
+                (unsigned)cfg->dstRowStride,
+                (unsigned)cfg->dstColStartUnit);
+        }
+
+        if (op.code == OP_MUL && op.config != nullptr && op.configSize >= sizeof(NnMulOpCodeConfig)) {
+            const NnMulOpCodeConfig *cfg = (const NnMulOpCodeConfig *)op.config;
+            std::printf(" mul={mulBuf=%u view(off=%u,sizeX=%u,strideX=%u)}",
+                (unsigned)cfg->multiplierBufferIndex,
+                (unsigned)cfg->view.offset,
+                (unsigned)cfg->view.sizeX,
+                (unsigned)cfg->view.strideX);
+        }
+
+        std::printf("\n");
+    }
+}
+
 void setEnablePlanBarrier(bool enable) {
     g_enablePlanBarrier = enable;
 }
@@ -856,6 +977,32 @@ static NnNodeConfig buildLlmNodeInternal(
     NnRowMatmulSliceUneven wclsSlice = sliceRowMatmulLogitsUneven(h->weightType, h->dim, h->vocabSize, plan, nodeIndex);
 
     NnRopeSliceUneven unevenRope = sliceRopeUneven(h->ropeType, h->seqLen, h->kvDim, h->nKvHeads, h->headDim, h->ropeTheta, plan, nodeIndex);
+
+    if (graphBuildDumpEnabled()) {
+        const int nodeFilter = graphBuildDumpNodeFilter();
+        const bool passNode = (nodeFilter < 0) || ((int)nodeIndex == nodeFilter);
+        if (passNode) {
+            std::printf("[graph-build-split] node=%u stage=%u q=[%u,%u) kOwned=[%u,%u) kCompute=[%u,%u) kvCache=[%u,%u) ffn=[%u,%u) vocab=[%u,%u) fullAtt=%u fullFfn=%u fullLogits=%u kvRedundant=%u\n",
+                (unsigned)nodeIndex,
+                (unsigned)((myStage != nullptr) ? myStage->stageIndex : 0xFFFFFFFFu),
+                (unsigned)qSlice.inStart,
+                (unsigned)(qSlice.inStart + qSlice.inLen),
+                (unsigned)kOwnedSlice.inStart,
+                (unsigned)(kOwnedSlice.inStart + kOwnedSlice.inLen),
+                (unsigned)kSlice.inStart,
+                (unsigned)(kSlice.inStart + kSlice.inLen),
+                (unsigned)kvCacheSlice.kvStart,
+                (unsigned)(kvCacheSlice.kvStart + kvCacheSlice.kvLen),
+                (unsigned)w1Slice.inStart,
+                (unsigned)(w1Slice.inStart + w1Slice.inLen),
+                (unsigned)wclsSlice.inStart,
+                (unsigned)(wclsSlice.inStart + wclsSlice.inLen),
+                fullAttBuffers ? 1u : 0u,
+                fullFfnBuffers ? 1u : 0u,
+                fullLogitsBuffers ? 1u : 0u,
+                enableKvRedundancy ? 1u : 0u);
+        }
+    }
     
     // 适配旧版 Rope Config
     // Build separate RoPE slices/caches for Q and K so KV redundancy can extend kvDimStart/kvDim0
@@ -927,6 +1074,7 @@ static NnNodeConfig buildLlmNodeInternal(
     const bool segBuildPrint = (std::getenv("DLLAMA_SEG_BUILD_PRINT") != nullptr);
     const NnUint logStageIndex = (myStage != nullptr) ? myStage->stageIndex : 0xFFFFFFFFu;
     auto addSegmentLogged = [&](NnSegmentConfigBuilder &builder, const char *segKind, NnUint layerIndex) {
+        NnSegmentConfig seg = builder.build();
         if (segBuildPrint) {
             printf("🧱 [seg-build] node=%u stage=%u kind=%s layer=%u\n",
                 (unsigned)nodeIndex,
@@ -934,7 +1082,18 @@ static NnNodeConfig buildLlmNodeInternal(
                 (segKind != nullptr ? segKind : "unknown"),
                 (unsigned)layerIndex);
         }
-        nodeBuilder.addSegment(builder.build());
+
+        if (graphBuildDumpEnabled()) {
+            const int nodeFilter = graphBuildDumpNodeFilter();
+            const int layerFilter = graphBuildDumpLayerFilter();
+            const bool passNode = (nodeFilter < 0) || ((int)nodeIndex == nodeFilter);
+            const bool passLayer = (layerFilter < 0) || ((int)layerIndex == layerFilter);
+            if (passNode && passLayer) {
+                printSegmentBuildOps(nodeIndex, logStageIndex, segKind, layerIndex, seg);
+            }
+        }
+
+        nodeBuilder.addSegment(seg);
     };
 
     int kvAggCollectLayer = getenvIntOrDefaultLlm("DLLAMA_ASYNC_KV_COLLECT_LAYER", -1);

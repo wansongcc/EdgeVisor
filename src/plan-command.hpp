@@ -129,4 +129,57 @@ private:
 // Process-local singleton cache.
 PlanCommandCache &planCommandCache();
 
+// Apply summary for OP_PLAN_APPLY observations (best-effort, latest-wins).
+static constexpr uint32_t DLLAMA_PLAN_APPLY_REASON_MAX = 160u;
+
+struct PlanApplySummary {
+    uint32_t valid;      // 0=no data, 1=has data
+    uint32_t ok;         // 0=reject/fail, 1=applied/accepted
+    uint32_t nodeIndex;
+    uint32_t stageIndex;
+    uint32_t epoch;
+    uint32_t layerIndex;
+    uint32_t position;
+    uint32_t cmdKind;
+    uint32_t planSeq;    // legacy cmd.seq; cmdlist uses seq forwarded by barrier
+    uint32_t fromNodeIndex;
+    uint32_t toNodeIndex;
+    uint32_t nMoves;
+    uint64_t tsMs;
+    char reason[DLLAMA_PLAN_APPLY_REASON_MAX];
+};
+
+static inline PlanApplySummary makeEmptyPlanApplySummary() {
+    PlanApplySummary s;
+    std::memset(&s, 0, sizeof(s));
+    return s;
+}
+
+struct PlanApplySummarySnapshot {
+    uint64_t cacheSeq;
+    PlanApplySummary summary;
+};
+
+class PlanApplySummaryCache {
+public:
+    PlanApplySummaryCache();
+
+    PlanApplySummarySnapshot load() const;
+    uint64_t store(const PlanApplySummary &summary);
+    uint64_t clear();
+
+private:
+    mutable std::atomic<uint64_t> seq_;
+    PlanApplySummary summary_;
+};
+
+PlanApplySummaryCache &planApplySummaryCache();
+
+// PlanCommand publication watermark (process-local):
+// - Updated by root/worker control-plane when a PlanCommand is actually delivered.
+// - Used by OP_PLAN_BARRIER stage-root to avoid emitting a command that workers
+//   have not received yet.
+void setPlanCommandPublishedSeq(uint32_t seq);
+uint32_t getPlanCommandPublishedSeq();
+
 #endif

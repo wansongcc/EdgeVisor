@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -299,6 +300,85 @@ static bool parseMode(const std::string &s, uint32_t &out) {
     return false;
 }
 
+static uint64_t nowUnixMs() {
+    const auto now = std::chrono::system_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
+static json splitToJson(const NnDimSplit &split, uint32_t nNodes) {
+    json starts = json::array();
+    json lengths = json::array();
+    if (split.starts == nullptr || split.lengths == nullptr) {
+        return json{{"starts", nullptr}, {"lengths", nullptr}};
+    }
+    for (uint32_t i = 0; i < nNodes; ++i) {
+        starts.push_back(split.starts[i]);
+        lengths.push_back(split.lengths[i]);
+    }
+    return json{{"starts", starts}, {"lengths", lengths}};
+}
+
+static json planSnapshotToJson(const RootLlmInference *inference) {
+    const NnUnevenPartitionPlan *plan = (inference != nullptr) ? inference->getPartitionPlan() : nullptr;
+    if (plan == nullptr) {
+        throw std::runtime_error("partition plan is not available");
+    }
+
+    json out = json::object();
+    out["tsMs"] = nowUnixMs();
+    out["nNodes"] = plan->nNodes;
+    out["nStages"] = plan->nStages;
+    out["position"] = (inference != nullptr) ? inference->getPosition() : 0u;
+    out["batchSize"] = (inference != nullptr) ? inference->getBatchSize() : 0u;
+
+    json stages = json::array();
+    for (uint32_t i = 0; i < plan->nStages; ++i) {
+        const NnStageConfig &st = plan->stages[i];
+        json nodes = json::array();
+        for (uint32_t r = 0; r < st.nNodes; ++r) {
+            nodes.push_back(st.nodeIndices[r]);
+        }
+        stages.push_back(json{
+            {"stageIndex", st.stageIndex},
+            {"rootNodeIndex", st.rootNodeIndex},
+            {"startLayer", st.startLayer},
+            {"endLayer", st.endLayer},
+            {"nodes", nodes},
+        });
+    }
+    out["stages"] = stages;
+
+    out["splits"] = json{
+        {"headSplit", splitToJson(plan->headSplit, plan->nNodes)},
+        {"ffnSplit", splitToJson(plan->ffnSplit, plan->nNodes)},
+        {"kvHeadSplit", splitToJson(plan->kvHeadSplit, plan->nNodes)},
+        {"kvHeadComputeSplit", splitToJson(plan->kvHeadComputeSplit, plan->nNodes)},
+    };
+    return out;
+}
+
+static json planApplySummaryToJson(const PlanApplySummarySnapshot &snap) {
+    const PlanApplySummary &s = snap.summary;
+    json out = json{
+        {"cacheSeq", snap.cacheSeq},
+        {"valid", s.valid != 0u},
+        {"ok", s.ok != 0u},
+        {"nodeIndex", s.nodeIndex},
+        {"stageIndex", s.stageIndex},
+        {"epoch", s.epoch},
+        {"layerIndex", s.layerIndex},
+        {"position", s.position},
+        {"cmdKind", s.cmdKind},
+        {"planSeq", s.planSeq},
+        {"fromNodeIndex", s.fromNodeIndex},
+        {"toNodeIndex", s.toNodeIndex},
+        {"nMoves", s.nMoves},
+        {"tsMs", s.tsMs},
+        {"reason", std::string(s.reason)},
+    };
+    return out;
+}
+
 std::unique_ptr<PlanUdsController> PlanUdsController::start(const std::string &socketPath, RootLlmInference *inference) {
 #ifdef _WIN32
     (void)socketPath;
@@ -556,6 +636,13 @@ void PlanUdsController::run() {
                 // Reads the mmap snapshot file written by stage root and returns JSON.
                 resp = json{{"ok", true}};
                 resp["layer_prof"] = readLayerPerfSnapshotJson(req);
+            } else if (op == "plan_snapshot") {
+                if (inference_ == nullptr) throw std::runtime_error("inference not available");
+                resp = json{{"ok", true}};
+                resp["plan_snapshot"] = planSnapshotToJson(inference_);
+            } else if (op == "last_apply") {
+                resp = json{{"ok", true}};
+                resp["last_apply"] = planApplySummaryToJson(planApplySummaryCache().load());
             } else if (op == "ping") {
                 resp = json{{"ok", true}};
             } else {

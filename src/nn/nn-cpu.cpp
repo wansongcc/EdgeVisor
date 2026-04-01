@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <limits>
 #include <atomic>
+#include <chrono>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -24,6 +25,45 @@
 #define DEBUG_CPU_OP_QUANTS false
 
 #define BUFFER_ALIGNMENT 64
+
+static uint64_t planNowMs() {
+    const auto now = std::chrono::system_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
+static void storePlanApplySummary(
+    bool ok,
+    const char *reason,
+    NnUint nodeIndex,
+    NnUint stageIndex,
+    NnUint epoch,
+    NnUint layerIndex,
+    NnUint position,
+    NnUint cmdKind,
+    NnUint planSeq,
+    NnUint fromNodeIndex,
+    NnUint toNodeIndex,
+    NnUint nMoves) {
+    PlanApplySummary s = makeEmptyPlanApplySummary();
+    s.valid = 1u;
+    s.ok = ok ? 1u : 0u;
+    s.nodeIndex = nodeIndex;
+    s.stageIndex = stageIndex;
+    s.epoch = epoch;
+    s.layerIndex = layerIndex;
+    s.position = position;
+    s.cmdKind = cmdKind;
+    s.planSeq = planSeq;
+    s.fromNodeIndex = fromNodeIndex;
+    s.toNodeIndex = toNodeIndex;
+    s.nMoves = nMoves;
+    s.tsMs = planNowMs();
+    if (reason != nullptr) {
+        std::strncpy(s.reason, reason, DLLAMA_PLAN_APPLY_REASON_MAX - 1u);
+        s.reason[DLLAMA_PLAN_APPLY_REASON_MAX - 1u] = '\0';
+    }
+    planApplySummaryCache().store(s);
+}
 
 #if DLLAMA_DEBUG_ATTN
 
@@ -1413,6 +1453,12 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
             bool trigger = false;
             if (hasCmd && isStageRoot) {
+                const unsigned int publishedSeq = getPlanCommandPublishedSeq();
+                if (pc.seq == 0u || pc.seq > publishedSeq) {
+                    // A newer command reached local cache but has not been published to workers
+                    // for this forward yet. Defer emit to keep all stage nodes consistent.
+                    trigger = false;
+                } else {
                 // One-shot guard: only emit once per command seq.
                 const unsigned int lastEmitted = device->getLastPlanCmdSeqEmitted();
                 if (pc.seq != 0u && pc.seq <= lastEmitted) {
@@ -1422,6 +1468,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                     trigger = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
                 } else if (pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) {
                     trigger = true;
+                }
                 }
                 }
             }
@@ -1505,7 +1552,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     if (context->opCode == OP_PLAN_APPLY) {
         if (threadIndex == 0u && device != nullptr && context->input != nullptr) {
             const auto *cfg = (const NnPlanApplyOpCodeConfig *)context->opConfig;
-            (void)cfg;
+            const NnUint stageIndex = (cfg != nullptr) ? cfg->onlyStageIndex : 0u;
 
             const unsigned int curEpoch = device->getPlanEpoch();
             const float *in0 = (const float *)context->input[0];
@@ -1517,11 +1564,27 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
             const unsigned int layerIndex = (in0[5] >= 0.0f) ? (unsigned int)in0[5] : 0u;
             const unsigned int pos = (in0[6] >= 0.0f) ? (unsigned int)in0[6] : 0u;
             const unsigned int ffnMove = (in0[7] >= 0.0f) ? (unsigned int)in0[7] : 0u;
+            const NnUint myNode = device->getNodeIndex();
+
+            auto reportApply = [&](bool ok, const char *reason, NnUint seq, NnUint from, NnUint to, NnUint nMoves) {
+                storePlanApplySummary(
+                    ok,
+                    reason,
+                    myNode,
+                    stageIndex,
+                    (NnUint)msgEpoch,
+                    (NnUint)layerIndex,
+                    (NnUint)pos,
+                    (NnUint)cmd,
+                    seq,
+                    from,
+                    to,
+                    nMoves);
+            };
 
             if ((cmd == 1u || cmd == 2u || cmd == 3u || cmd == 4u) && msgEpoch > curEpoch) {
                 auto *plan = const_cast<NnUnevenPartitionPlan *>(device->getPartitionPlan());
                 if (plan != nullptr && plan->nStages > 0) {
-                    const NnUint myNode = device->getNodeIndex();
                     const NnStageConfig *myStage = findStageForNode(plan, myNode);
                     if (myStage != nullptr && myStage->stageIndex == ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex) {
                         const NnStageConfig *st = &plan->stages[((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex];
@@ -1611,6 +1674,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)pc2.version,
                                     (unsigned)pc2.mode);
                                 std::fflush(stdout);
+                                reportApply(false, "cmdlist missing/mismatch", wantSeq, (NnUint)fromNode, (NnUint)toNode, 0u);
                                 return;
                             }
                             if (!planCommandHasMoveList(pc2)) {
@@ -1622,6 +1686,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)pos,
                                     (unsigned)pc2.seq);
                                 std::fflush(stdout);
+                                reportApply(false, "cmdlist has no moves", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, 0u);
                                 return;
                             }
 
@@ -1639,6 +1704,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)maxMovesAllowed,
                                     (unsigned)stageNodes);
                                 std::fflush(stdout);
+                                reportApply(false, "reject: nMoves exceeds maxAllowed", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
                                 return;
                             }
 
@@ -1677,6 +1743,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)layerIndex,
                                     (unsigned)pos);
                                 std::fflush(stdout);
+                                reportApply(false, "reject: bad move", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
                                 return;
                             }
 
@@ -1697,6 +1764,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         (unsigned)layerIndex,
                                         (unsigned)pos);
                                     std::fflush(stdout);
+                                    reportApply(false, "reject: kvHead underflow", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
                                     return;
                                 }
                                 for (NnUint i = 0; i < st->nNodes; ++i) {
@@ -1717,7 +1785,10 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 }
                             } else {
                                 // Non-GQA: treat headMove as Q heads.
-                                if (!plan->headSplit.starts || !plan->headSplit.lengths) return;
+                                if (!plan->headSplit.starts || !plan->headSplit.lengths) {
+                                    reportApply(false, "reject: missing head split arrays", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
+                                    return;
+                                }
                                 for (NnUint i = 0; i < st->nNodes; ++i) {
                                     const NnUint n = st->nodeIndices[i];
                                     const int d = deltaHeadOrKv[n];
@@ -1733,6 +1804,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         (unsigned)layerIndex,
                                         (unsigned)pos);
                                     std::fflush(stdout);
+                                    reportApply(false, "reject: head underflow", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
                                     return;
                                 }
                                 for (NnUint i = 0; i < st->nNodes; ++i) {
@@ -1746,7 +1818,10 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                             }
 
                             // Apply FFN deltas.
-                            if (!plan->ffnSplit.starts || !plan->ffnSplit.lengths) return;
+                            if (!plan->ffnSplit.starts || !plan->ffnSplit.lengths) {
+                                reportApply(false, "reject: missing ffn split arrays", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
+                                return;
+                            }
                             for (NnUint i = 0; i < st->nNodes; ++i) {
                                 const NnUint n = st->nodeIndices[i];
                                 const int d = deltaFfn[n];
@@ -1762,6 +1837,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)layerIndex,
                                     (unsigned)pos);
                                 std::fflush(stdout);
+                                reportApply(false, "reject: ffn underflow", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
                                 return;
                             }
                             bool ffnChanged = false;
@@ -1790,6 +1866,9 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 std::fflush(stdout);
                                 logLocalWorkSplit("cmdlist");
                                 device->setPlanEpoch(msgEpoch);
+                                reportApply(true, "applied: cmdlist", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
+                            } else {
+                                reportApply(true, "no-op: cmdlist", (NnUint)pc2.seq, (NnUint)fromNode, (NnUint)toNode, (NnUint)pc2.nMoves);
                             }
                             return;
                         }
@@ -1806,6 +1885,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)fromNode,
                                     (unsigned)toNode);
                                 std::fflush(stdout);
+                                reportApply(false, "reject: legacy move not adjacent", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                 return;
                             }
                             // Keep previous behavior for single-edge mode.
@@ -1824,6 +1904,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         (unsigned)layerIndex,
                                         (unsigned)pos);
                                     std::fflush(stdout);
+                                    reportApply(false, "reject: missing head split arrays", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                     legacyNoOp = true;
                                     return;
                                 }
@@ -1838,6 +1919,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                             (unsigned)layerIndex,
                                             (unsigned)pos);
                                         std::fflush(stdout);
+                                        reportApply(false, "reject: KV redundancy disabled", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                         legacyNoOp = true;
                                         return;
                                     }
@@ -1852,6 +1934,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                             (unsigned)kvMove,
                                             (unsigned)NN_KV_REDUNDANCY_PAD_HEADS);
                                         std::fflush(stdout);
+                                        reportApply(false, "reject: KV move exceeds pad", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                         legacyNoOp = true;
                                         return;
                                     }
@@ -1866,6 +1949,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                             (unsigned)plan->kvHeadSplit.lengths[fromNode],
                                             (unsigned)kvMove);
                                         std::fflush(stdout);
+                                        reportApply(false, "reject: kvHead insufficient", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                         legacyNoOp = true;
                                         return;
                                     }
@@ -1892,6 +1976,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         (unsigned)plan->headSplit.lengths[fromNode],
                                         (unsigned)qMove);
                                     std::fflush(stdout);
+                                    reportApply(false, "reject: head insufficient", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                     legacyNoOp = true;
                                     return;
                                 }
@@ -1911,6 +1996,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         (unsigned)layerIndex,
                                         (unsigned)pos);
                                     std::fflush(stdout);
+                                    reportApply(false, "reject: missing ffn split arrays", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                     legacyNoOp = true;
                                     return;
                                 }
@@ -1925,6 +2011,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         (unsigned)plan->ffnSplit.lengths[fromNode],
                                         (unsigned)ffnMove);
                                     std::fflush(stdout);
+                                    reportApply(false, "reject: ffn insufficient", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                                     legacyNoOp = true;
                                     return;
                                 }
@@ -1954,6 +2041,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 std::fflush(stdout);
                                 logLocalWorkSplit("legacy");
                                 device->setPlanEpoch(msgEpoch);
+                                reportApply(true, "applied: legacy", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                             } else if (!legacyNoOp) {
                                 // This happens if cmd asks to move 0, or cmd kind is unknown.
                                 printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u no-op (kind=%s headMove=%u ffnMove=%u from=%u to=%u)\n",
@@ -1968,6 +2056,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)fromNode,
                                     (unsigned)toNode);
                                 std::fflush(stdout);
+                                reportApply(true, "no-op: legacy", 0u, (NnUint)fromNode, (NnUint)toNode, 0u);
                             }
                         }
                     }

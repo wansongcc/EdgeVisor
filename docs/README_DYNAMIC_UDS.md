@@ -163,6 +163,61 @@ Root 进程启动后会监听该 Unix Domain Socket。
 - `attnUs/ffnUs`：该层 attention/ffn 计算耗时（微秒）。
 - `commUs`：若实现/启用通信拆分统计，则为该层通信耗时（微秒）；为 0 表示未提供或不可用。
 
+### 3.4 `op=plan_snapshot`（只读：当前 stage/split 快照）
+
+用途：外部优化器获取“当前真实切分状态”，避免仅依赖启动参数推断。
+
+请求：
+
+```json
+{"op":"plan_snapshot"}
+```
+
+响应（示例）：
+
+```json
+{
+  "ok": true,
+  "plan_snapshot": {
+    "nNodes": 4,
+    "nStages": 2,
+    "stages": [{"stageIndex":0,"rootNodeIndex":0,"startLayer":0,"endLayer":16,"nodes":[0,1]}],
+    "splits": {
+      "headSplit": {"starts":[0,8,0,0],"lengths":[8,8,0,0]},
+      "ffnSplit": {"starts":[0,2048,0,0],"lengths":[2048,2048,0,0]},
+      "kvHeadSplit": {"starts":[0,4,0,0],"lengths":[4,4,0,0]},
+      "kvHeadComputeSplit": {"starts":[0,2,0,0],"lengths":[6,6,0,0]}
+    }
+  }
+}
+```
+
+### 3.5 `op=last_apply`（只读：最近一次 apply 摘要）
+
+用途：外部优化器感知最近一次 `OP_PLAN_APPLY` 的成功/拒绝结果与原因。
+
+请求：
+
+```json
+{"op":"last_apply"}
+```
+
+响应（示例）：
+
+```json
+{
+  "ok": true,
+  "last_apply": {
+    "valid": true,
+    "ok": false,
+    "reason": "reject: bad move",
+    "planSeq": 12,
+    "stageIndex": 0,
+    "nodeIndex": 1
+  }
+}
+```
+
 ---
 
 ## 4. 如何下发 plan 修改指令
@@ -274,6 +329,8 @@ export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock perf
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock layer_prof --layer 0 --stage 0 --root 0
+python3 examples/plan-uds-client.py /tmp/dllama_plan.sock plan_snapshot
+python3 examples/plan-uds-client.py /tmp/dllama_plan.sock last_apply
 ```
 
 ### 5.3 watch + 自动触发 set_plan（差值阈值）
@@ -313,4 +370,3 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock watch_layer_prof \
 
 这通常是约束不满足（例如 from/to 不相邻、节点不在同一 stage、KV 安全限制等）。
 按 reject 文本修正 `fromNodeIndex/toNodeIndex` 或降低移动量。
-

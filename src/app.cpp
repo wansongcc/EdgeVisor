@@ -1243,6 +1243,8 @@ void RootLlmInference::forward() {
         network->writeAll(&out, sizeof(LlmControlPacket));
         if (planChanged) {
             network->writeAll(&snap.cmd, sizeof(PlanCommand));
+            // Mark this command as published-to-workers for this process.
+            setPlanCommandPublishedSeq(snap.cmd.seq);
         }
         if (sendKvTransfer) {
             LlmKvTransferBatchHeader bh{};
@@ -1657,6 +1659,8 @@ bool WorkerLlmInference::tryReadControlPacket() {
             if (controlPacket.planCmdSeq != lastPlanCmdSeqRecv) {
                 planCommandCache().store(cmd);
                 lastPlanCmdSeqRecv = controlPacket.planCmdSeq;
+                // This process has received/published this command.
+                setPlanCommandPublishedSeq(cmd.seq);
             }
         } else {
             printf("⚠️  [Worker] Bad PlanCommand packet (magic=0x%08x version=%u)\n", cmd.magic, cmd.version);

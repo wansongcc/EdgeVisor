@@ -120,7 +120,7 @@ export DLLAMA_POISON_CHECK_LIMIT=50
     - `export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
     - `./dllama inference --enable-plan-barrier ...`
 
-UDS 协议为“单行 JSON 请求 → 单行 JSON 响应”（每次连接只处理 1 条请求）。支持的 `op`：`ping` / `status` / `perf` / `set_plan` / `set_pp_migration` / `clear`。
+UDS 协议为“单行 JSON 请求 → 单行 JSON 响应”（每次连接只处理 1 条请求）。支持的 `op`：`ping` / `status` / `perf` / `layer_prof` / `plan_snapshot` / `last_apply` / `set_plan` / `set_pp_migration` / `clear`。
 
 示例（使用仓库自带客户端 [examples/plan-uds-client.py](../examples/plan-uds-client.py)）：
 

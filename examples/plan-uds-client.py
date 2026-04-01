@@ -127,6 +127,8 @@ def main() -> int:
     sub.add_parser("ping")
     sub.add_parser("status")
     sub.add_parser("perf")
+    sub.add_parser("plan_snapshot")
+    sub.add_parser("last_apply")
     sub.add_parser("clear")
     lp = sub.add_parser("layer_prof", help="query layer-prof snapshot via UDS")
     lp.add_argument("--path", default=None, help="snapshot path (overrides env/default)")

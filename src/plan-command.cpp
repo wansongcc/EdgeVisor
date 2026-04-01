@@ -1,6 +1,8 @@
 #include "plan-command.hpp"
 
 static PlanCommandCache g_planCmdCache;
+static PlanApplySummaryCache g_planApplySummaryCache;
+static std::atomic<uint32_t> g_planCmdPublishedSeq{0u};
 
 PlanCommandCache::PlanCommandCache() {
     seq_.store(0u, std::memory_order_relaxed);
@@ -52,4 +54,47 @@ bool PlanCommandCache::consumeIfCacheSeq(uint64_t cacheSeq) {
 
 PlanCommandCache &planCommandCache() {
     return g_planCmdCache;
+}
+
+PlanApplySummaryCache::PlanApplySummaryCache() {
+    seq_.store(0u, std::memory_order_relaxed);
+    summary_ = makeEmptyPlanApplySummary();
+}
+
+PlanApplySummarySnapshot PlanApplySummaryCache::load() const {
+    PlanApplySummarySnapshot snap;
+    while (true) {
+        uint64_t s0 = seq_.load(std::memory_order_acquire);
+        if (s0 & 1u) continue;
+        PlanApplySummary s = summary_;
+        uint64_t s1 = seq_.load(std::memory_order_acquire);
+        if (s0 == s1 && ((s1 & 1u) == 0u)) {
+            snap.cacheSeq = s1;
+            snap.summary = s;
+            return snap;
+        }
+    }
+}
+
+uint64_t PlanApplySummaryCache::store(const PlanApplySummary &summary) {
+    uint64_t s = seq_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    (void)s;
+    summary_ = summary;
+    return seq_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+}
+
+uint64_t PlanApplySummaryCache::clear() {
+    return store(makeEmptyPlanApplySummary());
+}
+
+PlanApplySummaryCache &planApplySummaryCache() {
+    return g_planApplySummaryCache;
+}
+
+void setPlanCommandPublishedSeq(uint32_t seq) {
+    g_planCmdPublishedSeq.store(seq, std::memory_order_release);
+}
+
+uint32_t getPlanCommandPublishedSeq() {
+    return g_planCmdPublishedSeq.load(std::memory_order_acquire);
 }

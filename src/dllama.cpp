@@ -15,6 +15,7 @@
 #include <string>
 #include <iostream>
 #include <deque>
+#include <utility>
 
 static void computeLogitsStats(const float* logits, NnUint vocabSize,
                               bool &hasNaN, bool &hasInf,
@@ -579,6 +580,207 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     }
 }
 
+// Staggered multi-task pipeline mode.
+// Tasks progress in a warmup/steady/drain schedule (staggered launch), and each task
+// keeps an independent KV position stream via setBatchPositions().
+static void inferenceRunTaskBatch(AppInferenceContext *context, const char* prompt, NnUint steps, NnUint taskBatch) {
+    if (prompt == nullptr)
+        throw std::runtime_error("Prompt is required");
+    if (steps == 0)
+        throw std::runtime_error("Number of steps is required");
+    if (taskBatch < 1)
+        throw std::runtime_error("Task batch must be >= 1");
+    if (taskBatch > context->args->nBatches)
+        throw std::runtime_error("Task batch must be <= n-batches");
+
+    std::vector<int> inputTokensVec(std::strlen(prompt) + 3);
+    int *inputTokens = inputTokensVec.data();
+    int nInputTokens = 0;
+    context->tokenizer->encode(const_cast<char*>(prompt), inputTokens, &nInputTokens, true, true);
+
+    if (nInputTokens > context->header->seqLen)
+        throw std::runtime_error("The number of prompt tokens is greater than the sequence length");
+    if ((NnUint)nInputTokens > steps)
+        throw std::runtime_error("The number of prompt tokens is greater than the number of steps");
+    const NnUint nEvalTokensPerTask = (NnUint)(nInputTokens - 1);
+    const NnUint nPredTokensPerTask = steps - nEvalTokensPerTask;
+    const NnUint seqStride = std::max(steps, (NnUint)nInputTokens) + 8u;
+    if ((unsigned long long)seqStride * (unsigned long long)taskBatch > (unsigned long long)context->header->seqLen) {
+        throw std::runtime_error("task-batch KV reservation exceeds sequence length; reduce steps/task-batch");
+    }
+
+    NnSize sentBytes = 0;
+    NnSize recvBytes = 0;
+    NnUint evalTotalTime = 0;
+    NnUint predTotalTime = 0;
+    NnUint evalTokenTotal = 0u;
+    NnUint predTokenTotal = 0u;
+
+    printf("🚀 [task-batch] staggered pipeline mode: taskBatch=%u nBatches=%u steps=%u stride=%u\n",
+        (unsigned)taskBatch, (unsigned)context->args->nBatches, (unsigned)steps, (unsigned)seqStride);
+    printf("🚀 [task-batch] prompt=%s\n", prompt);
+
+    struct TaskState {
+        NnUint kvBase = 0u;
+        NnUint nextPos = 0u;
+        NnUint predDone = 0u;
+        int promptCursor = 0;
+        int token = 0;
+        bool started = false;
+        bool finished = false;
+    };
+
+    std::vector<TaskState> tasks(taskBatch);
+    for (NnUint t = 0u; t < taskBatch; ++t) {
+        tasks[t].kvBase = t * seqStride;
+        tasks[t].nextPos = tasks[t].kvBase;
+        tasks[t].promptCursor = 0;
+        tasks[t].token = inputTokens[nInputTokens - 1];
+    }
+
+    context->tokenizer->resetDecoder();
+    const NnUint vocabSize = context->header->vocabSize;
+
+    NnUint startedCount = 0u;
+    NnUint finishedCount = 0u;
+    NnUint tick = 0u;
+    while (finishedCount < taskBatch) {
+        // Staggered launch: start one new task each tick until we reach taskBatch.
+        if (startedCount < taskBatch) {
+            tasks[startedCount].started = true;
+            startedCount += 1u;
+        }
+
+        std::vector<NnUint> activeTaskIds;
+        activeTaskIds.reserve(taskBatch);
+        for (NnUint t = 0u; t < taskBatch; ++t) {
+            if (tasks[t].started && !tasks[t].finished) activeTaskIds.push_back(t);
+        }
+        if (activeTaskIds.empty()) break;
+
+        context->inference->setBatchSize((NnUint)activeTaskIds.size());
+        std::vector<NnUint> positions(activeTaskIds.size(), 0u);
+        std::vector<int> inTokens(activeTaskIds.size(), 0);
+        std::vector<std::pair<NnUint, NnUint>> predSlots; // (batchIndex, taskId)
+        predSlots.reserve(activeTaskIds.size());
+
+        NnUint evalInThisTick = 0u;
+        NnUint predInThisTick = 0u;
+        for (size_t bi = 0; bi < activeTaskIds.size(); ++bi) {
+            TaskState &st = tasks[activeTaskIds[bi]];
+            positions[bi] = st.nextPos;
+            st.nextPos += 1u;
+
+            if (st.promptCursor < nInputTokens - 1) {
+                inTokens[bi] = inputTokens[st.promptCursor];
+                st.promptCursor += 1;
+                evalInThisTick += 1u;
+            } else if (st.predDone < nPredTokensPerTask) {
+                inTokens[bi] = st.token;
+                predSlots.push_back(std::make_pair((NnUint)bi, activeTaskIds[bi]));
+                predInThisTick += 1u;
+            } else {
+                // Reached target steps for this task.
+                st.finished = true;
+            }
+        }
+
+        // All tasks may complete right before this forward.
+        if (evalInThisTick == 0u && predInThisTick == 0u) {
+            finishedCount = 0u;
+            for (NnUint t = 0u; t < taskBatch; ++t) {
+                if (tasks[t].finished) finishedCount += 1u;
+            }
+            continue;
+        }
+
+        context->inference->setBatchPositions(positions);
+        for (size_t bi = 0; bi < inTokens.size(); ++bi) {
+            context->inference->setToken((NnUint)bi, (NnUint)inTokens[bi]);
+        }
+        context->inference->forward();
+
+        float *logits = context->inference->logitsPipe;
+        for (const auto &slot : predSlots) {
+            const NnUint batchIndex = slot.first;
+            const NnUint taskId = slot.second;
+            tasks[taskId].token = context->sampler->sample(logits + (size_t)batchIndex * (size_t)vocabSize);
+            tasks[taskId].predDone += 1u;
+            if (tasks[taskId].predDone >= nPredTokensPerTask) {
+                tasks[taskId].finished = true;
+            }
+        }
+        if (nPredTokensPerTask == 0u) {
+            for (NnUint t = 0u; t < taskBatch; ++t) {
+                if (tasks[t].started && tasks[t].promptCursor >= nInputTokens - 1) {
+                    tasks[t].finished = true;
+                }
+            }
+        }
+
+        char *piece0 = nullptr;
+        if (tasks[0].predDone > 0u) {
+            piece0 = context->tokenizer->decode(tasks[0].token);
+        }
+
+        if (context->network != nullptr)
+            context->network->getStats(&sentBytes, &recvBytes);
+
+        const NnUint execTime = context->executor->getTotalTime(STEP_EXECUTE_OP);
+        const NnUint syncTime = context->executor->getTotalTime(STEP_SYNC_NODES);
+        const NnUint totalTime = execTime + syncTime;
+        if (evalInThisTick > 0u) {
+            evalTotalTime += totalTime;
+            evalTokenTotal += evalInThisTick;
+        }
+        if (predInThisTick > 0u) {
+            predTotalTime += totalTime;
+            predTokenTotal += predInThisTick;
+        }
+
+        printf("🔶 PipeB%5u ms Sync%5u ms | tick=%u active=%u evalTok=%u predTok=%u | Sent%6zu kB Recv%6zu kB | task0=%s\n",
+            execTime / 1000,
+            syncTime / 1000,
+            (unsigned)tick,
+            (unsigned)activeTaskIds.size(),
+            (unsigned)evalInThisTick,
+            (unsigned)predInThisTick,
+            sentBytes / 1024,
+            recvBytes / 1024,
+            piece0 == nullptr ? "~" : piece0);
+        fflush(stdout);
+
+        finishedCount = 0u;
+        for (NnUint t = 0u; t < taskBatch; ++t) {
+            if (tasks[t].finished) finishedCount += 1u;
+        }
+        tick += 1u;
+    }
+
+    const NnUint nEvalTokensTotal = nEvalTokensPerTask * taskBatch;
+    const NnUint nPredTokensTotal = nPredTokensPerTask * taskBatch;
+    const float evalTotalTimeMs = evalTotalTime / 1000.0f;
+    const float predTotalTimeMs = predTotalTime / 1000.0f;
+    const float evalDen = std::max(1e-6f, evalTotalTimeMs);
+    const float predDen = std::max(1e-6f, predTotalTimeMs);
+
+    printf("\n");
+    printf("Task-Batch Evaluation\n");
+    printf("   nBatches(capacity): %u\n", context->args->nBatches);
+    printf("   taskBatch(active):  %u\n", taskBatch);
+    printf("   tokens/task:        %u\n", nEvalTokensPerTask);
+    printf("   tokens(total):      %u (actual=%u)\n", nEvalTokensTotal, evalTokenTotal);
+    printf("   tokens/s(total):    %3.2f (%3.2f ms/tok-total)\n",
+        (std::max(1u, evalTokenTotal) * 1000.0f) / evalDen,
+        evalDen / std::max(1u, evalTokenTotal));
+    printf("Prediction\n");
+    printf("   tokens/task:        %u\n", nPredTokensPerTask);
+    printf("   tokens(total):      %u (actual=%u)\n", nPredTokensTotal, predTokenTotal);
+    printf("   tokens/s(total):    %3.2f (%3.2f ms/tok-total)\n",
+        (std::max(1u, predTokenTotal) * 1000.0f) / predDen,
+        predDen / std::max(1u, predTokenTotal));
+}
+
 static bool isInteractiveQuitLine(const std::string& s) {
     return s == ":q" || s == ":quit" || s == "q" || s == "quit" || s == "exit";
 }
@@ -603,6 +805,10 @@ static bool parseStepsCommand(const std::string& line, NnUint& outSteps) {
 
 static void inference(AppInferenceContext *context) {
     if (!context->args->interactive) {
+        if (context->args->taskBatch > 1u) {
+            inferenceRunTaskBatch(context, context->args->prompt, context->args->steps, context->args->taskBatch);
+            return;
+        }
         inferenceRunOnce(context, context->args->prompt, context->args->steps);
         return;
     }

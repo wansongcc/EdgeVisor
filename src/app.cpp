@@ -218,6 +218,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.help = false;
     args.mode = nullptr;
     args.nBatches = 32;
+    args.taskBatch = 1;
     args.nThreads = 1;
     args.modelPath = nullptr;
     args.tokenizerPath = nullptr;
@@ -434,6 +435,10 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.port = atoi(value);
         } else if (std::strcmp(name, "--nthreads") == 0) {
             args.nThreads = atoi(value);
+        } else if (std::strcmp(name, "--n-batches") == 0) {
+            args.nBatches = (NnUint)atoi(value);
+        } else if (std::strcmp(name, "--task-batch") == 0) {
+            args.taskBatch = (NnUint)atoi(value);
         } else if (std::strcmp(name, "--steps") == 0) {
             args.steps = atoi(value);
         } else if (std::strcmp(name, "--temperature") == 0) {
@@ -471,6 +476,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
     if (args.nThreads < 1)
         throw std::runtime_error("Number of threads must be at least 1");
+    if (args.nBatches < 1)
+        throw std::runtime_error("Number of batches must be at least 1");
+    if (args.taskBatch < 1)
+        throw std::runtime_error("Task batch must be at least 1");
+    if (args.taskBatch > args.nBatches)
+        throw std::runtime_error("Task batch must be <= n-batches");
     if (args.enablePpMigration && !args.enableKvAggregate) {
         args.enableKvAggregate = true;
         std::printf("⚠️  [pp-migrate] --enable-pp-migration requires KV aggregate; auto enabling --enable-kv-aggregate\n");
@@ -1045,15 +1056,37 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
 void RootLlmInference::setBatchSize(NnUint batchSize) {
     execution->setBatchSize(batchSize);
     controlPacket.batchSize = batchSize;
+    if (batchPositionVector.size() != (size_t)batchSize) {
+        batchPositionVector.resize((size_t)batchSize, 0u);
+    }
 }
 
 void RootLlmInference::setPosition(NnUint position) {
     assert(position >= 0);
     assert(position + execution->batchSize - 1 < header->seqLen);
 
+    useBatchPositionVector = false;
     controlPacket.position = position;
     for (NnUint i = 0; i < execution->batchSize; i++)
         positionPipe[i] = (float)(position + i);
+}
+
+void RootLlmInference::setBatchPositions(const std::vector<NnUint> &positions) {
+    if (positions.size() != (size_t)execution->batchSize) {
+        throw std::runtime_error("Batch positions size must match batch size");
+    }
+    for (size_t i = 0; i < positions.size(); ++i) {
+        if (positions[i] >= header->seqLen) {
+            throw std::runtime_error("Batch position exceeds sequence length");
+        }
+    }
+
+    batchPositionVector = positions;
+    useBatchPositionVector = true;
+    controlPacket.position = positions.empty() ? 0u : positions[0];
+    for (size_t i = 0; i < positions.size(); ++i) {
+        positionPipe[i] = (float)positions[i];
+    }
 }
 
 void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
@@ -1236,11 +1269,19 @@ void RootLlmInference::forward() {
         } else {
             out.flags &= ~LLM_CTRL_HAS_PLAN_CMD;
         }
+        if (useBatchPositionVector) {
+            out.flags |= LLM_CTRL_HAS_POSITION_VECTOR;
+        } else {
+            out.flags &= ~LLM_CTRL_HAS_POSITION_VECTOR;
+        }
         if (sendKvTransfer) out.flags |= LLM_CTRL_HAS_KV_TRANSFER;
         if (sendLayerSwitch) out.flags |= LLM_CTRL_HAS_LAYER_SWITCH;
 
         logRootControlSend(out);
         network->writeAll(&out, sizeof(LlmControlPacket));
+        if (useBatchPositionVector && !batchPositionVector.empty()) {
+            network->writeAll(batchPositionVector.data(), batchPositionVector.size() * sizeof(NnUint));
+        }
         if (planChanged) {
             network->writeAll(&snap.cmd, sizeof(PlanCommand));
             // Mark this command as published-to-workers for this process.
@@ -1625,6 +1666,7 @@ void RootLlmInference::finish() {
         LlmControlPacket out = controlPacket;
         out.flags = controlPacket.flags & LLM_CTRL_PROFILE;
         out.flags &= ~LLM_CTRL_HAS_PLAN_CMD;
+        out.flags &= ~LLM_CTRL_HAS_POSITION_VECTOR;
         out.planCmdSeq = 0u;
         logRootControlSend(out);
         network->writeAll(&out, sizeof(LlmControlPacket));
@@ -1648,6 +1690,18 @@ bool WorkerLlmInference::tryReadControlPacket() {
         printf("📨 [Worker] Recv Control: Batch=0 (stop)\n");
         isFinished = true;
         return true;
+    }
+
+    if ((controlPacket.flags & LLM_CTRL_HAS_POSITION_VECTOR) != 0u) {
+        std::vector<NnUint> positions((size_t)controlPacket.batchSize, 0u);
+        network->read(ROOT_SOCKET_INDEX, positions.data(), positions.size() * sizeof(NnUint));
+        for (NnUint i = 0; i < controlPacket.batchSize; ++i) {
+            positionPipe[i] = (float)positions[i];
+        }
+    } else {
+        for (NnUint i = 0; i < controlPacket.batchSize; i++) {
+            positionPipe[i] = (float)(controlPacket.position + i);
+        }
     }
 
     // Optional PlanCommand packet piggybacked after control packet.
@@ -1721,9 +1775,10 @@ bool WorkerLlmInference::tryReadControlPacket() {
         }
     }
 
-    printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);
-    for (NnUint i = 0; i < controlPacket.batchSize; i++)
-        positionPipe[i] = (float)(controlPacket.position + i);
+    printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u%s\n",
+        controlPacket.batchSize,
+        controlPacket.position,
+        ((controlPacket.flags & LLM_CTRL_HAS_POSITION_VECTOR) != 0u) ? " [vec]" : "");
     execution->setBatchSize(controlPacket.batchSize);
     return true;
 }

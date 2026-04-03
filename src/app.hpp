@@ -19,6 +19,7 @@ public:
     char *mode;
     NnUint nThreads;
     NnUint nBatches;
+    NnUint taskBatch;
     bool info;
     bool help;
 
@@ -75,6 +76,7 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_HAS_PLAN_CMD = 1u << 1,
     LLM_CTRL_HAS_KV_TRANSFER = 1u << 2,
     LLM_CTRL_HAS_LAYER_SWITCH = 1u << 3,
+    LLM_CTRL_HAS_POSITION_VECTOR = 1u << 4,
 };
 
 typedef struct {
@@ -246,6 +248,8 @@ private:
     bool profileEnabled = false;
     const NnUnevenPartitionPlan* plan = nullptr;
     std::vector<LlmPerfPacket> lastPerf;
+    std::vector<NnUint> batchPositionVector;
+    bool useBatchPositionVector = false;
     NnUint lastPlanCmdSeqSent = 0u;
     int asyncKvCollectLayer = -1;
     int asyncKvCollectPos = -1;
@@ -281,6 +285,7 @@ public:
     RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled);
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
+    void setBatchPositions(const std::vector<NnUint> &positions);
     void setToken(NnUint batchIndex, NnUint token);
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);

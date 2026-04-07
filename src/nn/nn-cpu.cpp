@@ -1,6 +1,7 @@
 #include "nn-cpu.hpp"
 #include "nn-cpu-ops.hpp"
 #include "nn-core.hpp"
+#include "nn-logits-debug.hpp"
 #include "plan-command.hpp"
 #include "llm.hpp"
 #include <cassert>
@@ -752,6 +753,182 @@ static inline NnUint migrationKvTraceDims() {
     return (NnUint)n;
 }
 
+static inline long migrationKvTraceLayer() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_KV_TRACE_LAYER");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline long migrationKvTracePos() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_KV_TRACE_POS");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline long migrationKvTraceKvHead() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_KV_TRACE_KVHEAD");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline const char *migrationKvTraceKvHeadsSpec() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_KV_TRACE_KVHEADS");
+    if (v == nullptr || v[0] == '\0') return nullptr;
+    return v;
+}
+
+static inline bool migrationValueMatchesSelection(NnUint value, const char *spec, long singleSel) {
+    if (spec == nullptr || spec[0] == '\0') {
+        return (singleSel < 0) ? true : ((NnUint)singleSel == value);
+    }
+
+    const char *p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (*p == '\0') break;
+
+        char *end = nullptr;
+        long a = std::strtol(p, &end, 10);
+        if (end == p) {
+            while (*p && *p != ',' && *p != ' ' && *p != '\t') ++p;
+            continue;
+        }
+        p = end;
+
+        long b = a;
+        if (*p == '-') {
+            ++p;
+            char *end2 = nullptr;
+            b = std::strtol(p, &end2, 10);
+            if (end2 != p) {
+                p = end2;
+            } else {
+                b = a;
+            }
+        }
+
+        if (a < 0) a = 0;
+        if (b < 0) b = 0;
+        if (a > b) std::swap(a, b);
+        if ((long)value >= a && (long)value <= b) return true;
+
+        while (*p && *p != ',' && *p != ' ' && *p != '\t') ++p;
+    }
+    return false;
+}
+
+static inline bool migrationKvHeadMatchesSelection(NnUint globalKvHead, const char *spec, long singleSel) {
+    return migrationValueMatchesSelection(globalKvHead, spec, singleSel);
+}
+
+static inline bool migrationBatchTraceEnabled() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_BATCH_TRACE");
+    if (v == nullptr) return false;
+    if (v[0] == '0') return false;
+    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
+    return true;
+}
+
+static inline NnUint migrationBatchTraceLimit() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_BATCH_TRACE_LIMIT");
+    if (v == nullptr) return 0u;
+    long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1000000) return 1000000u;
+    return (NnUint)n;
+}
+
+static inline NnUint migrationBatchTraceDims() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_BATCH_TRACE_DIMS");
+    if (v == nullptr) return 8u;
+    long n = std::strtol(v, nullptr, 10);
+    if (n <= 0) return 0u;
+    if (n > 1024) return 1024u;
+    return (NnUint)n;
+}
+
+static inline long migrationBatchTraceLayer() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_BATCH_TRACE_LAYER");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline long migrationBatchTracePos() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_BATCH_TRACE_POS");
+    if (v == nullptr) return -1;
+    return std::strtol(v, nullptr, 10);
+}
+
+static inline const char *migrationBatchTraceOpsSpec() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_BATCH_TRACE_OPS");
+    if (v == nullptr || v[0] == '\0') return nullptr;
+    return v;
+}
+
+static inline const char *migrationBatchTraceBatchesSpec() {
+    const char *v = std::getenv("DLLAMA_MIGRATION_BATCH_TRACE_BATCHES");
+    if (v == nullptr || v[0] == '\0') return nullptr;
+    return v;
+}
+
+static inline bool migrationNameMatchesSelection(const char *name, const char *spec) {
+    if (name == nullptr) return false;
+    if (spec == nullptr || spec[0] == '\0') return true;
+
+    const char *p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (*p == '\0') break;
+
+        const char *start = p;
+        while (*p && *p != ',') ++p;
+
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) --end;
+        if (end > start) {
+            const size_t len = (size_t)(end - start);
+            if (len > 0u) {
+                std::string needle(start, len);
+                if (std::strstr(name, needle.c_str()) != nullptr)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+static inline float traceSampleAt(const NnByte *ptr, NnFloatType floatType, NnUint index) {
+    if (ptr == nullptr) return 0.0f;
+    switch (floatType) {
+        case F_32:
+            return ((const float *)ptr)[index];
+        case F_16:
+            return CONVERT_F16_TO_F32(((const NnFp16 *)ptr)[index]);
+        case F_Q80: {
+            const NnUint blockIndex = index / Q80_BLOCK_SIZE;
+            const NnUint elemIndex = index % Q80_BLOCK_SIZE;
+            const NnBlockQ80 *blocks = (const NnBlockQ80 *)ptr;
+            const float d = CONVERT_F16_TO_F32(blocks[blockIndex].d);
+            return d * (float)blocks[blockIndex].qs[elemIndex];
+        }
+        default:
+            return 0.0f;
+    }
+}
+
+static inline void printTraceTypedPrefix(const char *tag, const NnByte *ptr, NnFloatType floatType, NnUint n) {
+    if (tag == nullptr) tag = "vec";
+    if (ptr == nullptr || n == 0u) {
+        std::printf("%s=[]", tag);
+        return;
+    }
+    std::printf("%s=[", tag);
+    for (NnUint i = 0u; i < n; ++i) {
+        std::printf("%s%.6f", (i == 0u ? "" : ","), (double)traceSampleAt(ptr, floatType, i));
+    }
+    std::printf("]");
+}
+
 static inline bool nameHas(const char *name, const char *needle) {
     if (name == nullptr || needle == nullptr) return false;
     return std::strstr(name, needle) != nullptr;
@@ -966,6 +1143,8 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
         opContext->nBatches = netConfig->nBatches;
         opContext->pipes = netExecution->pipes;
         opContext->pipeConfigs = netConfig->pipes;
+        opContext->nPipes = netConfig->nPipes;
+        opContext->partitionPlan = partitionPlan;
         opContext->buffers = buffers;
         opContext->bufferConfigs = nodeConfig->buffers;
         opContext->bufferFlags = bufferFlags;
@@ -1065,6 +1244,16 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
         *pntrSize = *sourceSize;
 
         if (pointerConfig->type == PNTR_BATCHED_SLICE) {
+            const bool lgResolveDbg = lgDebugEnabled() && (
+                (pointerConfig->source == SRC_BUFFER &&
+                 pointerConfig->pointerIndex < nodeConfig->nBuffers &&
+                 nodeConfig->buffers[pointerConfig->pointerIndex].name != nullptr &&
+                 std::strcmp(nodeConfig->buffers[pointerConfig->pointerIndex].name, "lg") == 0) ||
+                (pointerConfig->source == SRC_PIPE &&
+                 pointerConfig->pointerIndex < netConfig->nPipes &&
+                 netConfig->pipes[pointerConfig->pointerIndex].name != nullptr &&
+                 std::strcmp(netConfig->pipes[pointerConfig->pointerIndex].name, "LG") == 0));
+
             // ====================================================
             // [重写] 智能非均匀切分逻辑
             // ====================================================
@@ -1292,6 +1481,28 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
                     (size_t)((const NnByte *)ret0 - (const NnByte *)base0));
             }
 #endif
+
+            if (lgResolveDbg) {
+                const void *base0 = (const void *)&source[0];
+                const void *ret0 = (const void *)pntr[0];
+                std::printf(
+                    "[LGDBG] tag=LG_RESOLVE node=%u src=%s idx=%u tagName=%s splitFound=%u match=%s splitTotal=%u mult=%u off=%u len=%u totalX=%u base=%p ret=%p deltaB=%zu\n",
+                    (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+                    (pointerConfig->source == SRC_BUFFER ? "BUFFER" : "PIPE"),
+                    (unsigned)pointerConfig->pointerIndex,
+                    sliceTagToString(pointerConfig->sliceTag),
+                    splitFound ? 1u : 0u,
+                    (matchedName ? matchedName : "-"),
+                    (unsigned)matchedSplitTotal,
+                    (unsigned)matchedMultiplier,
+                    (unsigned)myOffset,
+                    (unsigned)myLength,
+                    (unsigned)sourceSize->x,
+                    base0,
+                    ret0,
+                    (size_t)((const NnByte *)ret0 - (const NnByte *)base0));
+                std::fflush(stdout);
+            }
 
         }
         return pntr;
@@ -2014,11 +2225,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     //     }
     // }
 
-    if (threadIndex == 0u && device != nullptr && migrationOpTraceEnabled()) {
-        static std::atomic<NnUint> tracePrinted{0u};
-        const NnUint limit = migrationOpTraceLimit();
-        const NnUint idx = tracePrinted.fetch_add(1u, std::memory_order_relaxed);
-        if (limit == 0u || idx < limit) {
+    const bool opTraceEnabled = migrationOpTraceEnabled();
+    const bool batchTraceEnabled = migrationBatchTraceEnabled();
+    if (threadIndex == 0u && device != nullptr && (opTraceEnabled || batchTraceEnabled)) {
+        if (!opTraceEnabled || []() -> bool {
+                static std::atomic<NnUint> tracePrinted{0u};
+                const NnUint limit = migrationOpTraceLimit();
+                const NnUint idx = tracePrinted.fetch_add(1u, std::memory_order_relaxed);
+                return (limit == 0u || idx < limit);
+            }()) {
             const NnUint nodeIndex = device->getNodeIndex();
             const NnUint layerIndex = (segmentConfig != nullptr) ? segmentConfig->ops[opIndex].index : 0u;
 
@@ -2047,9 +2262,81 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                 }
             }
 
+            if (batchTraceEnabled) {
+                static std::atomic<NnUint> batchTracePrinted{0u};
+                const NnUint batchTraceLimit = migrationBatchTraceLimit();
+                const NnUint batchTraceIdx = batchTracePrinted.fetch_add(1u, std::memory_order_relaxed);
+                const bool batchTraceWithinLimit = (batchTraceLimit == 0u || batchTraceIdx < batchTraceLimit);
+                const long traceLayerSel = migrationBatchTraceLayer();
+                const long tracePosSel = migrationBatchTracePos();
+                const char *traceOpsSpec = migrationBatchTraceOpsSpec();
+                const char *traceBatchesSpec = migrationBatchTraceBatchesSpec();
+                const bool traceLayerOk =
+                    (traceLayerSel < 0) ||
+                    ((NnUint)traceLayerSel == layerIndex);
+                const bool tracePosOk =
+                    (tracePosSel < 0) ||
+                    (pos != 0xFFFFFFFFu && (NnUint)tracePosSel == pos);
+                const bool traceOpOk = migrationNameMatchesSelection(context->name, traceOpsSpec);
+
+                if (batchTraceWithinLimit && traceLayerOk && tracePosOk && traceOpOk) {
+                    const NnUint inDims = std::min(context->inputSize.x, migrationBatchTraceDims());
+                    const NnUint outDims = std::min(context->outputSize.x, migrationBatchTraceDims());
+                    auto rowBytesOrZero = [](NnFloatType type, NnUint sizeX) -> size_t {
+                        if (type == F_Q80) {
+                            if ((sizeX % Q80_BLOCK_SIZE) != 0u) return 0u;
+                        }
+                        return (size_t)getBytes(type, sizeX);
+                    };
+
+                    std::printf("🧪 [batch-trace] node=%u seg=%u layer=%u pos=%d op=%s code=%s batchSize=%u inType=%u outType=%u inX=%u outX=%u\n",
+                        (unsigned)nodeIndex,
+                        (unsigned)segmentIndex,
+                        (unsigned)layerIndex,
+                        (pos == 0xFFFFFFFFu) ? -1 : (int)pos,
+                        (context->name ? context->name : "unknown"),
+                        opCodeToString(context->opCode),
+                        (unsigned)batchSize,
+                        (unsigned)context->inputSize.floatType,
+                        (unsigned)context->outputSize.floatType,
+                        (unsigned)context->inputSize.x,
+                        (unsigned)context->outputSize.x);
+
+                    if (batchSize >= 2u) {
+                        const ptrdiff_t inDelta = (ptrdiff_t)(context->input[1] - context->input[0]);
+                        const ptrdiff_t outDelta = (ptrdiff_t)(context->output[1] - context->output[0]);
+                        const size_t expectIn = rowBytesOrZero(context->inputSize.floatType, context->inputSize.x);
+                        const size_t expectOut = rowBytesOrZero(context->outputSize.floatType, context->outputSize.x);
+                        std::printf("🧪 [batch-trace] ptrDelta in=%td expectIn=%zu out=%td expectOut=%zu\n",
+                            inDelta,
+                            expectIn,
+                            outDelta,
+                            expectOut);
+                    }
+
+                    for (NnUint batchIndex = 0u; batchIndex < batchSize; ++batchIndex) {
+                        if (!migrationValueMatchesSelection(batchIndex, traceBatchesSpec, -1))
+                            continue;
+                        const NnByte *inPtr = context->input[batchIndex];
+                        const NnByte *outPtr = context->output[batchIndex];
+                        std::printf("🧪 [batch-trace] batch=%u inPtr=%p outPtr=%p\n",
+                            (unsigned)batchIndex,
+                            (const void *)inPtr,
+                            (const void *)outPtr);
+                        std::printf("🧪 [batch-trace] ");
+                        printTraceTypedPrefix("IN", inPtr, context->inputSize.floatType, inDims);
+                        if (outDims > 0u) {
+                            std::printf(" ");
+                            printTraceTypedPrefix("OUT_PRE", outPtr, context->outputSize.floatType, outDims);
+                        }
+                        std::printf("\n");
+                    }
+                }
+            }
+
             const bool isAttn = (context->opCode == OP_MULTIHEAD_ATT) && nameHas(context->name, "block_multihead_att");
             const bool isFfn = isFfnTraceOp(context);
-            if (isAttn || isFfn) {
+            if (opTraceEnabled && (isAttn || isFfn)) {
                 const int posPrint = (pos == 0xFFFFFFFFu) ? -1 : (int)pos;
                 const char *segRole = migrationSegmentRoleForTrace(segmentConfig, context);
                 std::printf("🧪 [op-trace] node=%u seg=%u role=%s layer=%u pos=%d phase=%s op=%s code=%s inX=%u outX=%u\n",
@@ -2072,40 +2359,129 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                         const NnUint col0 = cfg->kvStart;
                         const NnUint dimsEnv = migrationKvTraceDims();
                         const NnUint dims = (dimsEnv == 0u || headDim == 0u) ? 0u : std::min(headDim, dimsEnv);
+                        const long traceLayerSel = migrationKvTraceLayer();
+                        const long tracePosSel = migrationKvTracePos();
+                        const long traceKvHeadSel = migrationKvTraceKvHead();
+                        const char *traceKvHeadsSpec = migrationKvTraceKvHeadsSpec();
+                        const bool traceKvHeadExplicit =
+                            (traceKvHeadSel >= 0) ||
+                            (traceKvHeadsSpec != nullptr && traceKvHeadsSpec[0] != '\0');
+                        const bool traceFilterEnabled =
+                            (traceLayerSel >= 0) ||
+                            (tracePosSel >= 0) ||
+                            traceKvHeadExplicit;
+                        const bool traceLayerOk =
+                            (traceLayerSel < 0) ||
+                            ((NnUint)traceLayerSel == layerIndex);
+                        const bool tracePosOk =
+                            (tracePosSel < 0) ||
+                            ((NnUint)tracePosSel == pos);
+                        const bool shouldPrintKvTrace =
+                            !traceFilterEnabled || (traceLayerOk && tracePosOk);
 
-                        std::printf("🧪 [op-trace][attn-kv] node=%u layer=%u pos=%u kvStart=%u kvDim0=%u kvStride=%u headDim=%u\n",
-                            (unsigned)nodeIndex,
-                            (unsigned)layerIndex,
-                            (unsigned)pos,
-                            (unsigned)cfg->kvStart,
-                            (unsigned)cfg->kvDim0,
-                            (unsigned)kvStride,
-                            (unsigned)cfg->headDim);
-
-                        if (dims > 0u && kvStride > 0u && (col0 + dims) <= kvStride) {
-                            const float *keyCache = (const float *)context->buffers[cfg->keyCacheBufferIndex];
-                            const float *valueCache = (const float *)context->buffers[cfg->valueCacheBufferIndex];
-                            const float *k0 = keyCache + col0;
-                            const float *v0 = valueCache + col0;
-                            const float *kp = keyCache + pos * kvStride + col0;
-                            const float *vp = valueCache + pos * kvStride + col0;
-
-                            std::printf("🧪 [op-trace][attn-kv] ");
-                            printTraceFloatPrefix("K[t0]", k0, dims);
-                            std::printf(" ");
-                            printTraceFloatPrefix("V[t0]", v0, dims);
-                            std::printf("\n");
-
-                            std::printf("🧪 [op-trace][attn-kv] ");
-                            printTraceFloatPrefix("K[tpos]", kp, dims);
-                            std::printf(" ");
-                            printTraceFloatPrefix("V[tpos]", vp, dims);
-                            std::printf("\n");
-                        } else {
-                            std::printf("🧪 [op-trace][attn-kv] skip sample dims=%u kvStride=%u col0=%u\n",
-                                (unsigned)dims,
+                        if (shouldPrintKvTrace) {
+                            std::printf("🧪 [op-trace][attn-kv] node=%u layer=%u pos=%u kvStart=%u kvDim0=%u kvStride=%u headDim=%u\n",
+                                (unsigned)nodeIndex,
+                                (unsigned)layerIndex,
+                                (unsigned)pos,
+                                (unsigned)cfg->kvStart,
+                                (unsigned)cfg->kvDim0,
                                 (unsigned)kvStride,
-                                (unsigned)col0);
+                                (unsigned)cfg->headDim);
+
+                            if (dims > 0u && kvStride > 0u && (col0 + dims) <= kvStride) {
+                                const float *keyCache = (const float *)context->buffers[cfg->keyCacheBufferIndex];
+                                const float *valueCache = (const float *)context->buffers[cfg->valueCacheBufferIndex];
+
+                                if (traceKvHeadExplicit &&
+                                    headDim != 0u &&
+                                    (cfg->kvStart % headDim) == 0u &&
+                                    (cfg->kvDim0 % headDim) == 0u) {
+                                    const NnUint kvHeadStart = cfg->kvStart / headDim;
+                                    const NnUint kvHeadLen = cfg->kvDim0 / headDim;
+                                    bool printedAny = false;
+
+                                    for (NnUint localKv = 0u; localKv < kvHeadLen; ++localKv) {
+                                        const NnUint globalKvHead = kvHeadStart + localKv;
+                                        if (!migrationKvHeadMatchesSelection(globalKvHead, traceKvHeadsSpec, traceKvHeadSel))
+                                            continue;
+
+                                        const NnUint headCol0 = cfg->kvStart + localKv * headDim;
+                                        if ((headCol0 + dims) > kvStride) {
+                                            std::printf("🧪 [op-trace][attn-kv] skip kvHead=%u dims=%u kvStride=%u col0=%u\n",
+                                                (unsigned)globalKvHead,
+                                                (unsigned)dims,
+                                                (unsigned)kvStride,
+                                                (unsigned)headCol0);
+                                            continue;
+                                        }
+
+                                        const float *k0 = keyCache + headCol0;
+                                        const float *v0 = valueCache + headCol0;
+                                        const float *k1 = keyCache + kvStride + headCol0;
+                                        const float *v1 = valueCache + kvStride + headCol0;
+                                        const float *kp = keyCache + pos * kvStride + headCol0;
+                                        const float *vp = valueCache + pos * kvStride + headCol0;
+
+                                        printedAny = true;
+                                        std::printf("🧪 [op-trace][attn-kv] node=%u layer=%u pos=%u kvHead=%u colStart=%u dims=%u\n",
+                                            (unsigned)nodeIndex,
+                                            (unsigned)layerIndex,
+                                            (unsigned)pos,
+                                            (unsigned)globalKvHead,
+                                            (unsigned)headCol0,
+                                            (unsigned)dims);
+
+                                        std::printf("🧪 [op-trace][attn-kv] ");
+                                        printTraceFloatPrefix("K[t0]", k0, dims);
+                                        std::printf(" ");
+                                        printTraceFloatPrefix("V[t0]", v0, dims);
+                                        std::printf("\n");
+
+                                        if (pos >= 1u) {
+                                            std::printf("🧪 [op-trace][attn-kv] ");
+                                            printTraceFloatPrefix("K[t1]", k1, dims);
+                                            std::printf(" ");
+                                            printTraceFloatPrefix("V[t1]", v1, dims);
+                                            std::printf("\n");
+                                        }
+
+                                        std::printf("🧪 [op-trace][attn-kv] ");
+                                        printTraceFloatPrefix("K[tpos]", kp, dims);
+                                        std::printf(" ");
+                                        printTraceFloatPrefix("V[tpos]", vp, dims);
+                                        std::printf("\n");
+                                    }
+
+                                    if (!printedAny) {
+                                        std::printf("🧪 [op-trace][attn-kv] skip no matched kvHead in localRange=[%u,%u)\n",
+                                            (unsigned)kvHeadStart,
+                                            (unsigned)(kvHeadStart + kvHeadLen));
+                                    }
+                                } else {
+                                    const float *k0 = keyCache + col0;
+                                    const float *v0 = valueCache + col0;
+                                    const float *kp = keyCache + pos * kvStride + col0;
+                                    const float *vp = valueCache + pos * kvStride + col0;
+
+                                    std::printf("🧪 [op-trace][attn-kv] ");
+                                    printTraceFloatPrefix("K[t0]", k0, dims);
+                                    std::printf(" ");
+                                    printTraceFloatPrefix("V[t0]", v0, dims);
+                                    std::printf("\n");
+
+                                    std::printf("🧪 [op-trace][attn-kv] ");
+                                    printTraceFloatPrefix("K[tpos]", kp, dims);
+                                    std::printf(" ");
+                                    printTraceFloatPrefix("V[tpos]", vp, dims);
+                                    std::printf("\n");
+                                }
+                            } else {
+                                std::printf("🧪 [op-trace][attn-kv] skip sample dims=%u kvStride=%u col0=%u\n",
+                                    (unsigned)dims,
+                                    (unsigned)kvStride,
+                                    (unsigned)col0);
+                            }
                         }
                     }
                 }

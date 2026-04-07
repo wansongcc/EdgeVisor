@@ -12,6 +12,7 @@ typedef SSIZE_T ssize_t;
 #endif
 #include "nn-network.hpp"
 #include "nn-core.hpp"
+#include "nn-logits-debug.hpp"
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -1281,7 +1282,9 @@ static void syncNodeSlices(
     const NnUnevenPartitionPlan *plan,
     const NnStageConfig *stage, // 指定同步组
     NnSliceTag forcedTag, // disambiguate split kind when needed
-    NnUint totalElements = 0 // [New] Total elements for Q80 matching
+    NnUint totalElements = 0, // [New] Total elements for Q80 matching
+    int debugPos = -1,
+    int debugBatch = -1
 ) {
     // ---------------------------------------------------------
     // 0. [核心修改] 确定当前组的 Root 身份
@@ -1435,6 +1438,10 @@ static void syncNodeSlices(
     const NnSize mySliceOffset = sliceOffsets[myNodeIndex];
     NnByte *mySliceData = &buffer[mySliceOffset];
     const NnSize mySliceSize = sliceSizes[myNodeIndex];
+    const bool lgSyncDbg = lgDebugShouldLog(debugPos, debugBatch) &&
+        forcedTag == NN_SLICE_VOCAB &&
+        floatType == F_32 &&
+        totalElements > 0u;
 
     // --- 发送阶段 (Send) ---
     bool iShouldSend = true;
@@ -1448,6 +1455,33 @@ static void syncNodeSlices(
     // NOTE: isLogitsGather already computed above for stage-aware slicing.
 
     if (iShouldSend) {
+        if (lgSyncDbg && mySliceSize > 0u) {
+            const NnUint globalOff = (NnUint)(mySliceOffset / sizeof(float));
+            const NnUint len = (NnUint)(mySliceSize / sizeof(float));
+            for (NnUint i = 0; i < nSocketsPerThread; ++i) {
+                const NnUint idx = startIdx + i;
+                std::printf(
+                    "[LGDBG] tag=LG_SEND_META node=%u pos=%d batch=%d target=%u sock=%d off=%u len=%u\n",
+                    (unsigned)myNodeIndex,
+                    debugPos,
+                    debugBatch,
+                    (unsigned)targetNodeIndices[idx],
+                    targetSockets[idx],
+                    (unsigned)globalOff,
+                    (unsigned)len);
+                dumpLogitsSliceStats(
+                    "LG_SEND",
+                    (int)myNodeIndex,
+                    debugPos,
+                    debugBatch,
+                    (const float *)mySliceData,
+                    (unsigned)globalOff,
+                    (unsigned)len,
+                    (unsigned)totalElements);
+            }
+            std::fflush(stdout);
+        }
+
         // 通信预览（载荷字节/哈希）：默认关闭
 #if NN_NETWORK_COMM_DATA_LOG
         if (threadIndex == 0 && mySliceSize > 0) {
@@ -1566,6 +1600,35 @@ static void syncNodeSlices(
     }
 
     if (iShouldRecv) {
+        if (lgSyncDbg) {
+            for (NnUint i = 0; i < nSocketsPerThread; ++i) {
+                const NnUint idx = startIdx + i;
+                const NnUint targetNode = targetNodeIndices[idx];
+                const NnSize sliceSize = sliceSizes[targetNode];
+                if (sliceSize == 0u) continue;
+                const NnUint globalOff = (NnUint)(sliceOffsets[targetNode] / sizeof(float));
+                const NnUint len = (NnUint)(sliceSize / sizeof(float));
+                std::printf(
+                    "[LGDBG] tag=LG_RECV_META node=%u pos=%d batch=%d src=%u sock=%d off=%u len=%u\n",
+                    (unsigned)myNodeIndex,
+                    debugPos,
+                    debugBatch,
+                    (unsigned)targetNode,
+                    targetSockets[idx],
+                    (unsigned)globalOff,
+                    (unsigned)len);
+                dumpLogitsSliceStats(
+                    "LG_RECV",
+                    (int)myNodeIndex,
+                    debugPos,
+                    debugBatch,
+                    (const float *)&buffer[sliceOffsets[targetNode]],
+                    (unsigned)globalOff,
+                    (unsigned)len,
+                    (unsigned)totalElements);
+            }
+            std::fflush(stdout);
+        }
 
         // 通信预览（载荷字节/哈希）：默认关闭
 #if NN_NETWORK_COMM_DATA_LOG
@@ -1962,13 +2025,16 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
             printf("\n");
         };
 
-        // Force KV-head slicing for KV aggregation pipes.
-        // This avoids ambiguous AUTO matching and ensures slices are derived from kvHeadSplit
-        // (including the multiplier = seqLen * headDim when totalElements == seqLen * kvDim).
+        // Force explicit slice tags for communication pipes that would otherwise rely on
+        // heuristic matching. LG is especially important here: if logits gather falls back
+        // to AUTO, root and worker may agree on "valid" slice lengths while disagreeing on
+        // the actual vocab offset semantics, which corrupts the sampled token stream.
         NnSliceTag forcedTag = NN_SLICE_AUTO;
         if (pipeConfig->name != nullptr) {
             if (std::strcmp(pipeConfig->name, "KC") == 0 || std::strcmp(pipeConfig->name, "VC") == 0) {
                 forcedTag = NN_SLICE_KV_HEAD;
+            } else if (std::strcmp(pipeConfig->name, "LG") == 0) {
+                forcedTag = NN_SLICE_VOCAB;
             }
         }
 
@@ -1983,6 +2049,9 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
 
         for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
+            const int debugPos = lgDebugEnabled()
+                ? lgDebugLoadPosFromPipes(execution->pipes, netConfig->pipes, netConfig->nPipes, batchIndex)
+                : -1;
 
             if (syncTrace && (syncTraceAllThreads || threadIndex == 0) && batchIndex == 0) {
                 const char *pipeName = pipeConfig->name ? pipeConfig->name : "(null)";
@@ -2008,10 +2077,10 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage, plan);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeStr = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements, debugPos, (int)batchIndex);
             }else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeStr = "SYNC_LOGITS";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements, debugPos, (int)batchIndex);
             } 
             else if (syncConfig->syncType == SYNC_PP_SEND) {
                 syncTypeStr = "PP_SEND";

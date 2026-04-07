@@ -585,9 +585,18 @@ NnUnevenPartitionPlan createPartitionPlan(
             fillDimSplitForStage(plan.dimSplit, currentNodeOffset, globalDim, def.tpRatios, 32);
 
             // Vocab (Logits)
-            // 虽然只有 Last Stage 真正计算 Logits，但为了逻辑统一，
-            // 我们为所有 Stage 都计算 Vocab Split (Loader 会根据层号自动跳过非 Logits 层)
-            fillDimSplitForStage(plan.vocabSplit, currentNodeOffset, globalVocabSize, def.tpRatios, 32);
+            // 只有 Last Stage 真正计算 Logits，其他 Stage 不应该持有 vocab shard。
+            // 让非 Last Stage 的 lengths 保持为 0，可以避免后续 pointer/sync 逻辑
+            // 把这些节点误判为 logits owner，从而把 LG pipe 按错误的 vocab slice 去解释。
+            if (s == plan.nStages - 1) {
+                fillDimSplitForStage(plan.vocabSplit, currentNodeOffset, globalVocabSize, def.tpRatios, 32);
+            } else {
+                for (NnUint i = 0; i < config.nNodes; i++) {
+                    const NnUint globalIdx = currentNodeOffset + i;
+                    plan.vocabSplit.starts[globalIdx] = 0u;
+                    plan.vocabSplit.lengths[globalIdx] = 0u;
+                }
+            }
 
             // 推进偏移量
             currentNodeOffset += config.nNodes;

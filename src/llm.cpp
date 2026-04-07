@@ -1,6 +1,7 @@
 #include "nn/nn-core.hpp"
 #include "nn/nn-config-builder.hpp"
 #include "nn/nn-cpu.hpp"
+#include "nn/nn-logits-debug.hpp"
 #include "nn/nn-network-local.hpp"
 #include "nn/nn-network.hpp"
 #include "mmap.hpp"
@@ -855,6 +856,40 @@ static NnNodeConfig buildLlmNodeInternal(
     NnRowMatmulSliceUneven w3Slice = sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, nodeIndex);
     NnRowMatmulSliceUneven wclsSlice = sliceRowMatmulLogitsUneven(h->weightType, h->dim, h->vocabSize, plan, nodeIndex);
 
+    if (lgDebugEnabled()) {
+        const bool amStageRoot = (myStage != nullptr) ? (myStage->rootNodeIndex == nodeIndex) : (nodeIndex == 0u);
+        std::printf(
+            "[LGDBG] tag=LG_STARTUP node=%u stage=%d isRoot=%u stageFullWeights=%u fullLogitsBuffers=%u lgPipeX=%u vocabStart=%u vocabLen=%u tpNodes=",
+            (unsigned)nodeIndex,
+            (myStage != nullptr) ? (int)myStage->stageIndex : -1,
+            amStageRoot ? 1u : 0u,
+            stageFullWeights ? 1u : 0u,
+            fullLogitsBuffers ? 1u : 0u,
+            (unsigned)h->vocabSize,
+            (unsigned)wclsSlice.inStart,
+            (unsigned)wclsSlice.inLen);
+        if (myStage != nullptr && myStage->nodeIndices != nullptr) {
+            for (NnUint i = 0; i < myStage->nNodes; ++i) {
+                const NnUint peer = myStage->nodeIndices[i];
+                NnUint peerStart = 0u;
+                NnUint peerLen = 0u;
+                lgDebugGetVocabShard(plan, peer, &peerStart, &peerLen);
+                std::printf("%u[%u:%u]%s",
+                    (unsigned)peer,
+                    (unsigned)peerStart,
+                    (unsigned)peerLen,
+                    (i + 1u < myStage->nNodes) ? "," : "");
+            }
+        } else {
+            std::printf("%u[%u:%u]",
+                (unsigned)nodeIndex,
+                (unsigned)wclsSlice.inStart,
+                (unsigned)wclsSlice.inLen);
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+    }
+
     NnRopeSliceUneven unevenRope = sliceRopeUneven(h->ropeType, h->seqLen, h->kvDim, h->nKvHeads, h->headDim, h->ropeTheta, plan, nodeIndex);
     
     // 适配旧版 Rope Config
@@ -1075,21 +1110,24 @@ static NnNodeConfig buildLlmNodeInternal(
         return cfg;
     };
 
-    // 4. Start Segment (Embedding)
-    NnSegmentConfigBuilder start;
+    // 4. Start Segments (Token Sync -> Embedding)
+    //
+    // IMPORTANT:
+    // The executor schedules all ops in a segment first, then runs the segment sync step.
+    // Therefore a single segment cannot express "sync TOK, then run embedding". Split the
+    // start path into two segments so stage-0 workers do not embed stale zeroed TOK values.
     if (isFirstStage) {
-        // [修改] First Stage 所有节点都负责 Embedding
-        // 1. 先同步 Token (广播: Root -> Stage 0 Workers)
-        // 注意：这里假设 SYNC_WITH_ROOT 能正确处理 Node 0 到 Stage 0 其他节点的广播
-        start.addSync(n->tokenPipeIndex, SYNC_WITH_ROOT);
+        NnSegmentConfigBuilder startSync;
+        startSync.addSync(n->tokenPipeIndex, SYNC_WITH_ROOT);
+        addSegmentLogged(startSync, "start_sync", 0u);
 
-        // 2. 所有节点本地计算 Embedding (避免传输大的 Embedding 向量)
-        start.addOp(OP_EMBEDDING, "embedding", 0, 
+        NnSegmentConfigBuilder startEmbed;
+        startEmbed.addOp(OP_EMBEDDING, "embedding", 0,
             pointerBatchConfig(SRC_PIPE, n->tokenPipeIndex),
-            pointerBatchConfig(SRC_PIPE, n->xPipeIndex), 
+            pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
             n->tokenEmbeddingSize, NnEmbeddingOpConfig{});
+        addSegmentLogged(startEmbed, "start_embed", 0u);
     }
-    addSegmentLogged(start, "start", 0u);
 
     if (!isFirstStage) {
         // 创建一个专门的 Segment 来处理接收

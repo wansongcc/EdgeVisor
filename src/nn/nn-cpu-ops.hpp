@@ -23,6 +23,8 @@ typedef struct {
     NnBufferConfig *bufferConfigs;
     NnByte **pipes;
     NnPipeConfig *pipeConfigs;
+    NnUint nPipes;
+    const NnUnevenPartitionPlan *partitionPlan;
     void *opConfig;
 
     NnByte **input;

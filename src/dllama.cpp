@@ -2,6 +2,7 @@
 #include "nn/nn-config-builder.hpp"
 #include "nn/nn-cpu.hpp"
 #include "nn/nn-cpu-ops.hpp"
+#include "nn/nn-logits-debug.hpp"
 #include "nn/nn-network-local.hpp"
 #include "nn/nn-network.hpp"
 #include "nn/nn-executor.hpp"
@@ -35,6 +36,49 @@ static void computeLogitsStats(const float* logits, NnUint vocabSize,
         if (v > maxLogit) { maxLogit = v; maxIndex = (int)i; }
         if (v < minLogit) minLogit = v;
     }
+}
+
+static void dumpRootLogitsShards(const AppInferenceContext* context, const float* logits, NnUint vocabSize, NnUint pos) {
+    if (!lgDebugShouldLog((int)pos, 0)) return;
+    if (context == nullptr || logits == nullptr || vocabSize == 0u) return;
+
+    const NnUnevenPartitionPlan *plan =
+        (context->nodeConfig != nullptr) ? context->nodeConfig->partitionPlan : nullptr;
+    if (plan != nullptr && plan->vocabSplit.starts != nullptr && plan->vocabSplit.lengths != nullptr) {
+        for (NnUint node = 0; node < plan->nNodes; ++node) {
+            const NnUint off = plan->vocabSplit.starts[node];
+            const NnUint len = plan->vocabSplit.lengths[node];
+            if (len == 0u || off >= vocabSize) continue;
+            const NnUint clippedLen = std::min(len, vocabSize - off);
+            std::printf(
+                "[LGDBG] tag=LG_ROOT_SHARD_META root=%u pos=%u batch=0 shardNode=%u off=%u len=%u\n",
+                (context->nodeConfig != nullptr) ? context->nodeConfig->nodeIndex : 0u,
+                (unsigned)pos,
+                (unsigned)node,
+                (unsigned)off,
+                (unsigned)clippedLen);
+            dumpLogitsSliceStats(
+                "LG_ROOT_SHARD",
+                (int)node,
+                (int)pos,
+                0,
+                logits + off,
+                (unsigned)off,
+                (unsigned)clippedLen,
+                (unsigned)vocabSize);
+        }
+    }
+
+    dumpLogitsSliceStats(
+        "LG_ROOT_FULL",
+        (context->nodeConfig != nullptr) ? (int)context->nodeConfig->nodeIndex : 0,
+        (int)pos,
+        0,
+        logits,
+        0u,
+        (unsigned)vocabSize,
+        (unsigned)vocabSize);
+    std::fflush(stdout);
 }
 
 #ifndef DLLAMA_DEBUG_TOPK_LOGITS
@@ -359,6 +403,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 statsOk ? "✅ OK" : "❌ FAIL",
                 minLogit, maxLogit, maxIndex,
                 (unsigned)zeroCount, (unsigned)context->header->vocabSize);
+            dumpRootLogitsShards(context, context->inference->logitsPipe, context->header->vocabSize, pos);
         }
 
         if (context->args->benchmark) {

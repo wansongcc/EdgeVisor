@@ -14,12 +14,490 @@
     #include <immintrin.h>
 #endif
 #include "nn-cpu-ops.hpp"
+#include "nn-logits-debug.hpp"
 #include "nn-quants.hpp"
 #include "llamafile/sgemm.hpp"
 
 #ifndef DLLAMA_DEBUG_ATTN
 #define DLLAMA_DEBUG_ATTN 0
 #endif
+
+static inline bool lgDebugIsFinalMatmul(const NnCpuOpContext *context) {
+    return context != nullptr &&
+           context->name != nullptr &&
+           std::strcmp(context->name, "final_matmul_logits") == 0;
+}
+
+static inline bool lgDebugIsFinalCast(const NnCpuOpContext *context) {
+    return context != nullptr &&
+           context->name != nullptr &&
+           std::strcmp(context->name, "final_cast_logits") == 0;
+}
+
+static inline bool lgDebugIsFinalNormPre(const NnCpuOpContext *context) {
+    return context != nullptr &&
+           context->name != nullptr &&
+           std::strcmp(context->name, "final_norm_pre") == 0;
+}
+
+static inline bool lgDebugIsFinalNorm(const NnCpuOpContext *context) {
+    return context != nullptr &&
+           context->name != nullptr &&
+           std::strcmp(context->name, "final_norm") == 0;
+}
+
+static inline bool lgDebugIsFinalCastY(const NnCpuOpContext *context) {
+    return context != nullptr &&
+           context->name != nullptr &&
+           std::strcmp(context->name, "final_cast_y") == 0;
+}
+
+static inline bool lgDebugIsEmbedding(const NnCpuOpContext *context) {
+    return context != nullptr &&
+           context->name != nullptr &&
+           std::strcmp(context->name, "embedding") == 0;
+}
+
+static inline bool lgDebugIsStartXCast(const NnCpuOpContext *context) {
+    if (context == nullptr || context->name == nullptr) return false;
+    return std::strcmp(context->name, "block_cast_x") == 0 ||
+           std::strcmp(context->name, "block_cast_x_pp") == 0;
+}
+
+static inline bool lgDebugZeroStartXEnabled() {
+    return lgDebugParseBoolEnv("DLLAMA_DEBUG_ZERO_XBUFFER");
+}
+
+static inline bool lgDebugIsResidualMerge(const NnCpuOpContext *context) {
+    if (context == nullptr || context->name == nullptr) return false;
+    return std::strcmp(context->name, "block_merge_add") == 0 ||
+           std::strcmp(context->name, "block_merge_add2") == 0 ||
+           std::strcmp(context->name, "final_merge_add") == 0;
+}
+
+static inline void lgDebugGetShardBounds(
+    const NnCpuOpContext *context,
+    NnUint fallbackLen,
+    NnUint *outStart,
+    NnUint *outLen) {
+    NnUint shardStart = 0u;
+    NnUint shardLen = fallbackLen;
+    if (context != nullptr) {
+        NnUint startTmp = 0u;
+        NnUint lenTmp = 0u;
+        if (lgDebugGetVocabShard(context->partitionPlan, context->nodeIndex, &startTmp, &lenTmp)) {
+            shardStart = startTmp;
+            if (lenTmp > 0u) shardLen = lenTmp;
+        }
+    }
+    if (outStart) *outStart = shardStart;
+    if (outLen) *outLen = shardLen;
+}
+
+static inline int lgDebugCurrentPos(const NnCpuOpContext *context, NnUint batchIndex) {
+    if (context == nullptr) return -1;
+    return lgDebugLoadPosFromPipes(context->pipes, context->pipeConfigs, context->nPipes, batchIndex);
+}
+
+static inline std::uint64_t lgDebugHashBytes(const void *base, size_t len) {
+    if (base == nullptr || len == 0u) return 0ull;
+    const unsigned char *p = (const unsigned char *)base;
+    std::uint64_t h = 1469598103934665603ull;
+    const size_t n = std::min<size_t>(len, (size_t)65536);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= (std::uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static inline std::uint64_t lgDebugHashBytesTail(const void *base, size_t len) {
+    if (base == nullptr || len == 0u) return 0ull;
+    const unsigned char *p = (const unsigned char *)base;
+    const size_t n = std::min<size_t>(len, (size_t)65536);
+    const size_t start = len - n;
+    std::uint64_t h = 1469598103934665603ull;
+    for (size_t i = start; i < len; ++i) {
+        h ^= (std::uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static inline void lgDebugWarnApproximateSnapshotOnce(const char *opName, NnUint nThreads) {
+    if (nThreads <= 1u) return;
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if (warned.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        std::printf(
+            "[LGDBG] tag=LG_WARN mode=best_effort reason=multi_thread_snapshot op=%s nThreads=%u hint=run_single_thread_for_exact_matmul_cast\n",
+            (opName != nullptr ? opName : "(null)"),
+            (unsigned)nThreads);
+        std::fflush(stdout);
+    }
+}
+
+static inline void lgDebugDumpFloatVector(
+    const char *tag,
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    const float *base,
+    NnUint len) {
+    if (context == nullptr || base == nullptr || len == 0u) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLog(pos, (int)batchIndex)) return;
+
+    float mn = base[0];
+    float mx = base[0];
+    unsigned zero = 0u;
+    for (NnUint i = 0; i < len; ++i) {
+        const float v = base[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        if (v == 0.0f) ++zero;
+    }
+
+    std::printf(
+        "[LGDBG] tag=%s node=%u pos=%d batch=%u len=%u range=[%.6f,%.6f] zero=%u/%u hash256=0x%016llx "
+        "head={%.6f,%.6f,%.6f,%.6f} tail={%.6f,%.6f,%.6f,%.6f}\n",
+        (tag != nullptr ? tag : "(null)"),
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (unsigned)len,
+        mn,
+        mx,
+        zero,
+        (unsigned)len,
+        (unsigned long long)lgDebugHashSlice256(base, (unsigned)len),
+        lgDebugSliceValueAt(base, (unsigned)len, 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, 1u),
+        lgDebugSliceValueAt(base, (unsigned)len, 2u),
+        lgDebugSliceValueAt(base, (unsigned)len, 3u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 4u ? (unsigned)(len - 4u) : 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 3u ? (unsigned)(len - 3u) : 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 2u ? (unsigned)(len - 2u) : 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 1u ? (unsigned)(len - 1u) : 0u));
+}
+
+static inline void lgDebugDumpQ80Vector(
+    const char *tag,
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    const NnBlockQ80 *base,
+    NnUint len) {
+    if (context == nullptr || base == nullptr || len == 0u) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLog(pos, (int)batchIndex)) return;
+
+    const NnUint nBlocks = len / Q80_BLOCK_SIZE;
+    if (nBlocks == 0u) return;
+    unsigned nonZeroBlocks = 0u;
+    const NnUint scanBlocks = std::min(nBlocks, 16u);
+    for (NnUint b = 0u; b < scanBlocks; ++b) {
+        for (NnUint i = 0u; i < Q80_BLOCK_SIZE; ++i) {
+            if (base[b].qs[i] != 0) {
+                ++nonZeroBlocks;
+                break;
+            }
+        }
+    }
+    const NnBlockQ80 &first = base[0];
+    const NnBlockQ80 &last = base[nBlocks - 1u];
+    std::printf(
+        "[LGDBG] tag=%s node=%u pos=%d batch=%u len=%u blocks=%u hashHead=0x%016llx hashTail=0x%016llx nonZeroBlocks=%u/%u "
+        "first={d=%.6f q0=%d q1=%d q2=%d q3=%d} last={d=%.6f q0=%d q1=%d q2=%d q3=%d}\n",
+        (tag != nullptr ? tag : "(null)"),
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (unsigned)len,
+        (unsigned)nBlocks,
+        (unsigned long long)lgDebugHashBytes(base, (size_t)nBlocks * sizeof(NnBlockQ80)),
+        (unsigned long long)lgDebugHashBytesTail(base, (size_t)nBlocks * sizeof(NnBlockQ80)),
+        nonZeroBlocks,
+        (unsigned)scanBlocks,
+        (double)CONVERT_F16_TO_F32(first.d),
+        (int)first.qs[0], (int)first.qs[1], (int)first.qs[2], (int)first.qs[3],
+        (double)CONVERT_F16_TO_F32(last.d),
+        (int)last.qs[0], (int)last.qs[1], (int)last.qs[2], (int)last.qs[3]);
+}
+
+static inline void lgDebugDumpScalar(
+    const char *tag,
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    float value) {
+    if (context == nullptr) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLog(pos, (int)batchIndex)) return;
+    std::printf(
+        "[LGDBG] tag=%s node=%u pos=%d batch=%u value=%.9f\n",
+        (tag != nullptr ? tag : "(null)"),
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (double)value);
+}
+
+static inline bool lgDebugShouldLogStartPath(NnUint batchIndex) {
+    if (!lgDebugEnabled()) return false;
+    return lgDebugShouldLogBatch((int)batchIndex);
+}
+
+static inline void lgDebugDumpFloatVectorStartPath(
+    const char *tag,
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    const float *base,
+    NnUint len) {
+    if (context == nullptr || base == nullptr || len == 0u) return;
+    if (!lgDebugShouldLogStartPath(batchIndex)) return;
+
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    float mn = base[0];
+    float mx = base[0];
+    unsigned zero = 0u;
+    for (NnUint i = 0; i < len; ++i) {
+        const float v = base[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        if (v == 0.0f) ++zero;
+    }
+
+    std::printf(
+        "[LGDBG] tag=%s node=%u pos=%d batch=%u len=%u range=[%.6f,%.6f] zero=%u/%u hash256=0x%016llx "
+        "head={%.6f,%.6f,%.6f,%.6f} tail={%.6f,%.6f,%.6f,%.6f}\n",
+        (tag != nullptr ? tag : "(null)"),
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (unsigned)len,
+        mn,
+        mx,
+        zero,
+        (unsigned)len,
+        (unsigned long long)lgDebugHashSlice256(base, (unsigned)len),
+        lgDebugSliceValueAt(base, (unsigned)len, 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, 1u),
+        lgDebugSliceValueAt(base, (unsigned)len, 2u),
+        lgDebugSliceValueAt(base, (unsigned)len, 3u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 4u ? (unsigned)(len - 4u) : 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 3u ? (unsigned)(len - 3u) : 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 2u ? (unsigned)(len - 2u) : 0u),
+        lgDebugSliceValueAt(base, (unsigned)len, len > 1u ? (unsigned)(len - 1u) : 0u));
+}
+
+static inline void lgDebugDumpQ80VectorStartPath(
+    const char *tag,
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    const NnBlockQ80 *base,
+    NnUint len) {
+    if (context == nullptr || base == nullptr || len == 0u) return;
+    if (!lgDebugShouldLogStartPath(batchIndex)) return;
+
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    const NnUint nBlocks = len / Q80_BLOCK_SIZE;
+    if (nBlocks == 0u) return;
+    unsigned nonZeroBlocks = 0u;
+    const NnUint scanBlocks = std::min(nBlocks, 16u);
+    for (NnUint b = 0u; b < scanBlocks; ++b) {
+        for (NnUint i = 0u; i < Q80_BLOCK_SIZE; ++i) {
+            if (base[b].qs[i] != 0) {
+                ++nonZeroBlocks;
+                break;
+            }
+        }
+    }
+    const NnBlockQ80 &first = base[0];
+    const NnBlockQ80 &last = base[nBlocks - 1u];
+    std::printf(
+        "[LGDBG] tag=%s node=%u pos=%d batch=%u len=%u blocks=%u hashHead=0x%016llx hashTail=0x%016llx nonZeroBlocks=%u/%u "
+        "first={d=%.6f q0=%d q1=%d q2=%d q3=%d} last={d=%.6f q0=%d q1=%d q2=%d q3=%d}\n",
+        (tag != nullptr ? tag : "(null)"),
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (unsigned)len,
+        (unsigned)nBlocks,
+        (unsigned long long)lgDebugHashBytes(base, (size_t)nBlocks * sizeof(NnBlockQ80)),
+        (unsigned long long)lgDebugHashBytesTail(base, (size_t)nBlocks * sizeof(NnBlockQ80)),
+        nonZeroBlocks,
+        (unsigned)scanBlocks,
+        (double)CONVERT_F16_TO_F32(first.d),
+        (int)first.qs[0], (int)first.qs[1], (int)first.qs[2], (int)first.qs[3],
+        (double)CONVERT_F16_TO_F32(last.d),
+        (int)last.qs[0], (int)last.qs[1], (int)last.qs[2], (int)last.qs[3]);
+}
+
+static inline void lgDebugDumpTokenMeta(
+    const char *tag,
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    NnUint token) {
+    if (context == nullptr) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLogStartPath(batchIndex)) return;
+    std::printf(
+        "[LGDBG] tag=%s node=%u pos=%d batch=%u token=%u\n",
+        (tag != nullptr ? tag : "(null)"),
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (unsigned)token);
+}
+
+static inline void lgDebugDumpStartXMeta(
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    bool zeroInit,
+    NnUint offset,
+    NnUint len) {
+    if (context == nullptr) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLogStartPath(batchIndex)) return;
+    std::printf(
+        "[LGDBG] tag=LG_START_X_META node=%u pos=%d batch=%u op=%s zeroInit=%u offset=%u len=%u\n",
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (context->name != nullptr ? context->name : "(null)"),
+        zeroInit ? 1u : 0u,
+        (unsigned)offset,
+        (unsigned)len);
+}
+
+static inline void lgDebugDumpMergeSliceMeta(
+    const char *tag,
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    NnUint sliceIndex,
+    NnUint nSlices) {
+    if (context == nullptr) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLog(pos, (int)batchIndex)) return;
+    std::printf(
+        "[LGDBG] tag=%s node=%u pos=%d batch=%u op=%s slice=%u/%u\n",
+        (tag != nullptr ? tag : "(null)"),
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (context->name != nullptr ? context->name : "(null)"),
+        (unsigned)sliceIndex,
+        (unsigned)nSlices);
+}
+
+static inline void lgDebugDumpMatmulWeightWindow(
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    NnUint activeExpertIndex,
+    NnUint aLen,
+    NnUint cLen) {
+    if (context == nullptr) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLog(pos, (int)batchIndex)) return;
+
+    const NnMatmulOpConfig *config = (const NnMatmulOpConfig *)context->opConfig;
+    const NnSize expertBase = (NnSize)activeExpertIndex * context->weightSize.nBytesXY;
+    NnSize begin = expertBase;
+    NnSize end = expertBase + context->weightSize.nBytesXY;
+    const NnSize rowStrideBytes = getBytes(context->weightSize.floatType, context->weightSize.y);
+    if (config->view == 1u || config->view == 2u) {
+        begin = expertBase + (NnSize)config->outStart * rowStrideBytes;
+        end = begin + (NnSize)cLen * rowStrideBytes;
+    }
+    const NnSize windowBytes = (end > begin) ? (end - begin) : 0u;
+    const NnByte *fullBase = context->weight + expertBase;
+    const NnByte *windowBase = context->weight + begin;
+
+    std::printf(
+        "[LGDBG] tag=LG_WEIGHT_META node=%u pos=%d batch=%u ft=%d view=%u expert=%u aLen=%u cLen=%u outStart=%u inStart=%u "
+        "fullBytes=%zu fullHeadHash=0x%016llx fullTailHash=0x%016llx winBegin=%zu winBytes=%zu winHeadHash=0x%016llx winTailHash=0x%016llx ptr=%p\n",
+        (unsigned)context->nodeIndex,
+        pos,
+        (unsigned)batchIndex,
+        (int)context->weightSize.floatType,
+        (unsigned)config->view,
+        (unsigned)activeExpertIndex,
+        (unsigned)aLen,
+        (unsigned)cLen,
+        (unsigned)config->outStart,
+        (unsigned)config->inStart,
+        (size_t)context->weightSize.nBytesXY,
+        (unsigned long long)lgDebugHashBytes(fullBase, context->weightSize.nBytesXY),
+        (unsigned long long)lgDebugHashBytesTail(fullBase, context->weightSize.nBytesXY),
+        (size_t)begin,
+        (size_t)windowBytes,
+        (unsigned long long)lgDebugHashBytes(windowBase, windowBytes),
+        (unsigned long long)lgDebugHashBytesTail(windowBase, windowBytes),
+        (const void *)windowBase);
+}
+
+static inline void lgDebugDumpFinalMatmulRow(
+    const NnCpuOpContext *context,
+    NnUint batchIndex,
+    const float *rowBase,
+    NnUint localOffset,
+    NnUint len) {
+    if (context == nullptr || rowBase == nullptr || len == 0u) return;
+    const int pos = lgDebugCurrentPos(context, batchIndex);
+    if (!lgDebugShouldLog(pos, (int)batchIndex)) return;
+
+    NnUint shardStart = 0u;
+    NnUint shardLen = 0u;
+    lgDebugGetShardBounds(context, len, &shardStart, &shardLen);
+    const NnUint globalOff = shardStart + localOffset;
+    const NnUint vocabSize = lgDebugLgPipeVocabSize(context->pipeConfigs, context->nPipes);
+    dumpLogitsSliceStats(
+        "LG_MATMUL_OUT",
+        (int)context->nodeIndex,
+        pos,
+        (int)batchIndex,
+        rowBase,
+        (unsigned)globalOff,
+        (unsigned)len,
+        (unsigned)vocabSize);
+}
+
+static inline void lgDebugDumpFinalCastRows(
+    const NnCpuOpContext *context,
+    NnUint batchSize,
+    NnUint offset,
+    NnUint len) {
+    if (context == nullptr || len == 0u) return;
+    NnUint shardStart = 0u;
+    NnUint shardLen = 0u;
+    lgDebugGetShardBounds(context, len, &shardStart, &shardLen);
+    const NnUint globalOff = shardStart + offset;
+    const NnUint vocabSize = lgDebugLgPipeVocabSize(context->pipeConfigs, context->nPipes);
+
+    for (NnUint batchIndex = 0; batchIndex < batchSize; ++batchIndex) {
+        const int pos = lgDebugCurrentPos(context, batchIndex);
+        if (!lgDebugShouldLog(pos, (int)batchIndex)) continue;
+
+        const float *src = ((const float *)context->input[batchIndex]) + offset;
+        const float *dst = ((const float *)context->output[batchIndex]) + offset;
+        dumpLogitsSliceStats(
+            "LG_CAST_SRC",
+            (int)context->nodeIndex,
+            pos,
+            (int)batchIndex,
+            src,
+            (unsigned)globalOff,
+            (unsigned)len,
+            (unsigned)vocabSize);
+        dumpLogitsSliceStats(
+            "LG_CAST_DST",
+            (int)context->nodeIndex,
+            pos,
+            (int)batchIndex,
+            dst,
+            (unsigned)globalOff,
+            (unsigned)len,
+            (unsigned)vocabSize);
+    }
+}
 
 #if DLLAMA_DEBUG_ATTN
 
@@ -1668,10 +2146,19 @@ static void topk_F32(const float *x, NnUint *y, NnSize size, NnUint k) {
 
 static void mergeAddForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     NnUint nSlices = context->inputSize.x / context->outputSize.x;
+    const bool lgMergeDbg = lgDebugEnabled() && lgDebugIsResidualMerge(context);
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *output = (float *)context->output[batchIndex];
         float *input = (float *)context->input[batchIndex];
+        if (lgMergeDbg && threadIndex == 0u) {
+            lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+            lgDebugDumpMergeSliceMeta("LG_MERGE_BASE_META", context, batchIndex, 0u, nSlices);
+            lgDebugDumpFloatVector("LG_MERGE_BASE", context, batchIndex, output, context->outputSize.x);
+            for (NnUint sliceIndex = 0; sliceIndex < nSlices; ++sliceIndex) {
+                lgDebugDumpMergeSliceMeta("LG_MERGE_IN_META", context, batchIndex, sliceIndex, nSlices);
+            }
+        }
         for (NnUint sliceIndex = 0; sliceIndex < nSlices; sliceIndex++) {
             float *i = &input[sliceIndex * context->outputSize.x];
             DEBUG_VECTOR(context, "input", i);
@@ -1682,6 +2169,11 @@ static void mergeAddForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint 
                 nThreads,
                 threadIndex);
         }
+        if (lgMergeDbg && threadIndex == 0u) {
+            lgDebugDumpMergeSliceMeta("LG_MERGE_OUT_META", context, batchIndex, 0u, nSlices);
+            lgDebugDumpFloatVector("LG_MERGE_OUT", context, batchIndex, output, context->outputSize.x);
+            std::fflush(stdout);
+        }
     }
 }
 
@@ -1691,9 +2183,24 @@ static void mergeAddForward_Q80_F32(NnUint nThreads, NnUint threadIndex, NnUint 
 
     NnUint nSlices = context->inputSize.x / context->outputSize.x;
     NnUint xSize = context->outputSize.x / Q80_BLOCK_SIZE;
+    const bool lgMergeDbg = lgDebugEnabled() && lgDebugIsResidualMerge(context);
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *output = (float *)context->output[batchIndex];
         NnBlockQ80 *input = (NnBlockQ80 *)context->input[batchIndex];
+        if (lgMergeDbg && threadIndex == 0u) {
+            lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+            lgDebugDumpMergeSliceMeta("LG_MERGE_BASE_META", context, batchIndex, 0u, nSlices);
+            lgDebugDumpFloatVector("LG_MERGE_BASE", context, batchIndex, output, context->outputSize.x);
+            for (NnUint sliceIndex = 0; sliceIndex < nSlices; ++sliceIndex) {
+                lgDebugDumpMergeSliceMeta("LG_MERGE_IN_META", context, batchIndex, sliceIndex, nSlices);
+                lgDebugDumpQ80Vector(
+                    "LG_MERGE_IN_Q80",
+                    context,
+                    batchIndex,
+                    &input[sliceIndex * xSize],
+                    context->outputSize.x);
+            }
+        }
         for (NnUint sliceIndex = 0; sliceIndex < nSlices; sliceIndex++) {
             add_Q80_F32(
                 output,
@@ -1701,6 +2208,11 @@ static void mergeAddForward_Q80_F32(NnUint nThreads, NnUint threadIndex, NnUint 
                 context->outputSize.x,
                 nThreads,
                 threadIndex);
+        }
+        if (lgMergeDbg && threadIndex == 0u) {
+            lgDebugDumpMergeSliceMeta("LG_MERGE_OUT_META", context, batchIndex, 0u, nSlices);
+            lgDebugDumpFloatVector("LG_MERGE_OUT", context, batchIndex, output, context->outputSize.x);
+            std::fflush(stdout);
         }
     }
 }
@@ -1730,6 +2242,23 @@ static void initEmbeddingForward(NnCpuOpContext *context) {
 
 static void embeddingForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     NnSize dimSize = getBytes(F_32, context->outputSize.x);
+    const bool lgEmbedDbg = lgDebugEnabled() && lgDebugIsEmbedding(context);
+
+    if (lgEmbedDbg) {
+        // Keep embedding debug exact and deterministic instead of snapshotting a parallel copy mid-flight.
+        if (threadIndex != 0u) return;
+        for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+            const NnUint token = (NnUint)*((float *)context->input[batchIndex]);
+            std::memcpy(
+                context->output[batchIndex],
+                &context->weight[token * dimSize],
+                dimSize);
+            lgDebugDumpTokenMeta("LG_EMBED_META", context, batchIndex, token);
+            lgDebugDumpFloatVectorStartPath("LG_EMBED_OUT", context, batchIndex, (const float *)context->output[batchIndex], context->outputSize.x);
+        }
+        std::fflush(stdout);
+        return;
+    }
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         NnUint token = (NnUint)*((float *)context->input[batchIndex]);
@@ -1744,6 +2273,24 @@ static void embeddingForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, Nn
 
 static void embeddingForward_F32_F32_Q80(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     NnSize dimSize = getBytes(F_32, context->outputSize.x);
+    const bool lgEmbedDbg = lgDebugEnabled() && lgDebugIsEmbedding(context);
+
+    if (lgEmbedDbg) {
+        if (threadIndex != 0u) return;
+        for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+            const NnUint token = (NnUint)*((float *)context->input[batchIndex]);
+            quantizeF32toQ80(
+                (float *)&context->weight[token * dimSize],
+                (NnBlockQ80 *)context->output[batchIndex],
+                context->outputSize.x,
+                1u,
+                0u);
+            lgDebugDumpTokenMeta("LG_EMBED_META", context, batchIndex, token);
+            lgDebugDumpQ80VectorStartPath("LG_EMBED_OUT", context, batchIndex, (const NnBlockQ80 *)context->output[batchIndex], context->outputSize.x);
+        }
+        std::fflush(stdout);
+        return;
+    }
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         NnUint token = (NnUint)*((float *)context->input[batchIndex]);
@@ -1767,6 +2314,7 @@ static void initInvRmsForward(NnCpuOpContext *context) {
 static void invRmsForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnInvRmsOpConfig *config = (NnInvRmsOpConfig *)context->opConfig;
     const NnUint colSize = context->inputSize.x / config->nColumns;
+    const bool lgFinalNormPreDbg = lgDebugEnabled() && lgDebugIsFinalNormPre(context);
 
     // INV_RMS is a reduction. In this engine it is always computed over the full global
     // hidden size for each column (no view slicing).
@@ -1781,6 +2329,9 @@ static void invRmsForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint ba
             const float rms = invRms_F32(&input[colStart], colSize, config->epsilon);
             output[colIndex] = rms;
             DEBUG_SCALAR(context, "output", rms);
+            if (lgFinalNormPreDbg && colIndex == 0u) {
+                lgDebugDumpScalar("LG_FINAL_NORM_PRE", context, batchIndex, rms);
+            }
         }
     }
 }
@@ -1805,6 +2356,7 @@ static void rmsNormForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUi
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->inputSize.z, 1u);
     ASSERT_EQ(context->outputSize.z, 1u);
+    const bool lgFinalNormDbg = lgDebugEnabled() && lgDebugIsFinalNorm(context);
 
     const NnRmsNormOpConfig *config = (NnRmsNormOpConfig *)context->opConfig;
     const float *weight = (float *)context->weight;
@@ -1816,6 +2368,10 @@ static void rmsNormForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUi
         const float *input = (const float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
         DEBUG_VECTOR(context, "input", input);
+        if (lgFinalNormDbg && threadIndex == 0u) {
+            lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+            lgDebugDumpFloatVector("LG_FINAL_NORM_IN", context, batchIndex, input, context->inputSize.x);
+        }
 
         // Always write the full global hidden size.
         for (NnUint xIndex = threadIndex; xIndex < context->outputSize.x; xIndex += nThreads) {
@@ -1827,6 +2383,10 @@ static void rmsNormForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUi
         }
 
         DEBUG_VECTOR(context, "output", output);
+        if (lgFinalNormDbg && threadIndex == 0u) {
+            lgDebugDumpFloatVector("LG_FINAL_NORM_OUT", context, batchIndex, output, context->outputSize.x);
+            std::fflush(stdout);
+        }
     }
 }
 
@@ -1954,6 +2514,7 @@ static inline void debugMatmulWeightReadRangeOnce(
 
 static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
+    const bool lgMatmulDbg = lgDebugEnabled() && lgDebugIsFinalMatmul(context);
     if (config->view != 0u)
         return false;
     if (config->aView.offset != 0u || config->aView.sizeX != 0u)
@@ -1998,6 +2559,13 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
 
     const NnUint n = context->weightSize.y / getBlockSize(context->inputSize.floatType);
     const NnUint d = context->weightSize.x;
+    if (lgMatmulDbg && threadIndex == 0u) {
+        lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+        for (NnUint y = 0u; y < batchSize; ++y) {
+            lgDebugDumpMatmulWeightWindow(context, y, 0u, context->inputSize.x, context->outputSize.x);
+        }
+    }
+
     const bool ok = llamafile_sgemm(
         d, batchSize, n,
         context->weight, n,
@@ -2038,6 +2606,18 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
     }
 #endif
 
+    if (ok && lgMatmulDbg && threadIndex == 0u) {
+        lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+        {
+            const float *outBase = (const float *)context->output[0];
+            for (NnUint y = 0u; y < batchSize; ++y) {
+                const float *row = outBase + (NnSize)y * (NnSize)context->outputSize.x;
+                lgDebugDumpFinalMatmulRow(context, y, row, 0u, context->outputSize.x);
+            }
+            std::fflush(stdout);
+        }
+    }
+
     return ok;
 }
 
@@ -2046,6 +2626,7 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
         return;
 
     const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
+    const bool lgMatmulDbg = lgDebugEnabled() && lgDebugIsFinalMatmul(context);
     const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
     const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
 
@@ -2080,6 +2661,10 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
 
             if (threadIndex == 0u) {
                 debugMatmulWeightReadRangeOnce(context, config, activeExpertIndex, cLen);
+            }
+            if (lgMatmulDbg && threadIndex == 0u) {
+                lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+                lgDebugDumpMatmulWeightWindow(context, y, activeExpertIndex, aLen, cLen);
             }
 
             if (config->view == 0u) {
@@ -2136,6 +2721,12 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
                 }
             }
 #endif
+
+            if (lgMatmulDbg && threadIndex == 0u) {
+                lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+                lgDebugDumpFinalMatmulRow(context, y, output, cView->offset, cLen);
+                std::fflush(stdout);
+            }
         }
     }
 }
@@ -2145,6 +2736,7 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
         return;
 
     const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
+    const bool lgMatmulDbg = lgDebugEnabled() && lgDebugIsFinalMatmul(context);
     const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
     const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
 
@@ -2183,6 +2775,11 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
 
             if (threadIndex == 0u) {
                 debugMatmulWeightReadRangeOnce(context, config, activeExpertIndex, cLen);
+            }
+            if (lgMatmulDbg && threadIndex == 0u) {
+                lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+                lgDebugDumpQ80Vector("LG_MATMUL_IN_Q80", context, y, x, aLen);
+                lgDebugDumpMatmulWeightWindow(context, y, activeExpertIndex, aLen, cLen);
             }
 
             if (config->view == 0u) {
@@ -2241,6 +2838,12 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
                 }
             }
 #endif
+
+            if (lgMatmulDbg && threadIndex == 0u) {
+                lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+                lgDebugDumpFinalMatmulRow(context, y, output, cView->offset, cLen);
+                std::fflush(stdout);
+            }
         }
     }
 }
@@ -2892,6 +3495,22 @@ static void initCastForward(NnCpuOpContext *context) {
 
 static void castForward_ANY(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnCastOpCodeConfig *config = (NnCastOpCodeConfig *)context->opConfig;
+    const bool lgCastDbg = lgDebugEnabled() &&
+        lgDebugIsFinalCast(context) &&
+        context->inputSize.floatType == F_32 &&
+        context->outputSize.floatType == F_32;
+    const bool lgCastYDbg = lgDebugEnabled() &&
+        lgDebugIsFinalCastY(context) &&
+        context->inputSize.floatType == F_32 &&
+        context->outputSize.floatType == F_32;
+    const bool lgStartXDbg = lgDebugEnabled() &&
+        lgDebugIsStartXCast(context) &&
+        context->inputSize.floatType == F_32 &&
+        context->outputSize.floatType == F_32;
+    const bool zeroStartX = lgDebugIsStartXCast(context) &&
+        lgDebugZeroStartXEnabled() &&
+        context->inputSize.floatType == F_32 &&
+        context->outputSize.floatType == F_32;
 
     const NnTensorView *view = &config->view;
     const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
@@ -2923,6 +3542,45 @@ static void castForward_ANY(NnUint nThreads, NnUint threadIndex, NnUint batchSiz
 
     const NnSize offsetBytes = getBytes(context->outputSize.floatType, offset);
     const NnSize dimBytes = getBytes(context->outputSize.floatType, len);
+    const NnSize fullRowBytes = getBytes(context->outputSize.floatType, context->outputSize.x);
+
+    if (lgStartXDbg || zeroStartX) {
+        // Serialize the first xBuffer write so zero-init and LG_START_X reflect the exact post-copy state.
+        if (threadIndex == 0u) {
+            for (NnUint z = 0u; z < context->inputSize.z; z++) {
+                const NnUint zOffset = z * context->inputSize.y;
+                for (NnUint y = 0u; y < batchSize; y++) {
+                    NnByte *oBase = context->output[zOffset + y];
+                    NnByte *iBase = context->input[zOffset + y];
+
+                    if (zeroStartX) {
+                        std::memset(oBase, 0, fullRowBytes);
+                    }
+
+                    if (blockSize > 1u || strideX == 1u) {
+                        std::memcpy(oBase + offsetBytes, iBase + offsetBytes, dimBytes);
+                    } else {
+                        float *o = (float *)oBase;
+                        const float *i = (const float *)iBase;
+                        for (NnUint t = 0u; t < len; ++t) {
+                            const NnUint xIndex = offset + t * strideX;
+                            o[xIndex] = i[xIndex];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (lgStartXDbg && threadIndex == 0u) {
+            for (NnUint batchIndex = 0; batchIndex < batchSize; ++batchIndex) {
+                const float *dst = ((const float *)context->output[batchIndex]) + offset;
+                lgDebugDumpStartXMeta(context, batchIndex, zeroStartX, offset, len);
+                lgDebugDumpFloatVectorStartPath("LG_START_X", context, batchIndex, dst, len);
+            }
+            std::fflush(stdout);
+        }
+        return;
+    }
 
     for (NnUint z = 0u; z < context->inputSize.z; z++) {
         const NnUint zOffset = z * context->inputSize.y;
@@ -2961,11 +3619,27 @@ static void castForward_ANY(NnUint nThreads, NnUint threadIndex, NnUint batchSiz
             }
         }
     }
+
+    if ((lgCastDbg || lgCastYDbg) && threadIndex == 0u) {
+        lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+        if (lgCastDbg) {
+            lgDebugDumpFinalCastRows(context, batchSize, offset, len);
+        } else {
+            for (NnUint batchIndex = 0; batchIndex < batchSize; ++batchIndex) {
+                const float *src = ((const float *)context->input[batchIndex]) + offset;
+                const float *dst = ((const float *)context->output[batchIndex]) + offset;
+                lgDebugDumpFloatVector("LG_CASTY_SRC", context, batchIndex, src, len);
+                lgDebugDumpFloatVector("LG_CASTY_DST", context, batchIndex, dst, len);
+            }
+        }
+        std::fflush(stdout);
+    }
 }
 
 static void castForward_F32_Q80(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_Q80);
+    const bool lgCastYDbg = lgDebugEnabled() && lgDebugIsFinalCastY(context);
 
     const NnCastOpCodeConfig *config = (NnCastOpCodeConfig *)context->opConfig;
     const NnTensorView *view = &config->view;
@@ -2993,6 +3667,17 @@ static void castForward_F32_Q80(NnUint nThreads, NnUint threadIndex, NnUint batc
                 nThreads,
                 threadIndex);
         }
+    }
+
+    if (lgCastYDbg && threadIndex == 0u) {
+        lgDebugWarnApproximateSnapshotOnce(context->name, nThreads);
+        for (NnUint batchIndex = 0; batchIndex < batchSize; ++batchIndex) {
+            const float *src = ((const float *)context->input[batchIndex]) + offset;
+            const NnBlockQ80 *dst = ((const NnBlockQ80 *)context->output[batchIndex]) + (offset / Q80_BLOCK_SIZE);
+            lgDebugDumpFloatVector("LG_CASTY_SRC", context, batchIndex, src, len);
+            lgDebugDumpQ80Vector("LG_CASTY_DST", context, batchIndex, dst, len);
+        }
+        std::fflush(stdout);
     }
 }
 
@@ -3083,6 +3768,7 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
     // MHA reads only owned kvHeadSplit but SHIFT may write a wider range.
     const bool kvPerHeadDbg = kvCachePerHeadEnabled() && kvCachePerHeadShiftEnabled() && kvCachePerHeadPassesFilter(context->name);
     const NnUint kvPerHeadLimit = kvCachePerHeadLimit();
+    const NnUint kvPerHeadBatchSel = kvCachePerHeadBatch();
     const long kvPerHeadKvHeadSel = kvCachePerHeadSelectKvHead();
     const long kvPerHeadPosSel = kvCachePerHeadSelectPos();
     const NnUint kvPerHeadDimsSel = kvCachePerHeadDims();
@@ -3122,7 +3808,7 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
 
 #if DLLAMA_DEBUG_ATTN
             // Print after the write so we read from the actual cache.
-            if (kvPerHeadDbg && threadIndex == 0u) {
+            if (kvPerHeadDbg && threadIndex == 0u && batchIndex == kvPerHeadBatchSel) {
                 if (kvPerHeadPosSel < 0 || (NnUint)kvPerHeadPosSel == (NnUint)index) {
                     const NnUint printed = kvShiftPrinted.fetch_add(1u, std::memory_order_relaxed);
                     if (kvPerHeadLimit == 0u || printed < kvPerHeadLimit) {

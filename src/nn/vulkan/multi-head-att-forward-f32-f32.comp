@@ -26,6 +26,10 @@ layout(binding = 3) readonly uniform configBuffer {
     uint seqLen;
     uint qSliceD0;
     uint kvDim0;
+    uint qStart;
+    uint qStride;
+    uint kvStart;
+    uint kvStride;
     uint positionPipeIndex;
     uint queryBufferIndex;
     uint keyCacheBufferIndex;
@@ -54,20 +58,24 @@ void main() {
     barrier();
 
     const uint kvMul = nHeads / nKvHeads;
-    const uint headIndex = h / kvMul;
+    const uint qHeadStart = qStart / headDim;
+    const uint kvHeadStart = kvStart / headDim;
+    const uint globalQHead = qHeadStart + h;
+    const uint globalKvHead = globalQHead / kvMul;
+    const uint localKvHead = globalKvHead - kvHeadStart;
     const float invHeadDimRoot = 1.0f / sqrt(float(headDim));
 
     const BatchInfo info = infos[batchIndex];
     const uint position = sharedPosition;
 
     const uint attOffset = batchIndex * nHeads0 * seqLen + h * seqLen;
-    const uint qOffset = batchIndex * qSliceD0 + h * headDim;
-    const uint kvOffset = headIndex * headDim;
+    const uint qOffset = batchIndex * qStride + qStart + h * headDim;
+    const uint kvOffset = kvStart + localKvHead * headDim;
     const uint yOffset = info.outputOffset + h * headDim;
 
     float ms = -1e10f;
     for (uint p = threadIndex; p <= position; p += N_THREADS) {
-        const uint kOffset = kvOffset + p * kvDim0;
+        const uint kOffset = kvOffset + p * kvStride;
 
         float score = 0.0f;
         for (uint i = 0; i < headDim; i++) {
@@ -119,7 +127,7 @@ void main() {
         const uint vOffset = kvOffset + i;
         for (uint p = 0; p <= position; p += 1) {
             const float a = att[attOffset + p];
-            const float v = valueCache[vOffset + p * kvDim0];
+            const float v = valueCache[vOffset + p * kvStride];
             sum += v * a;
         }
         y[yOffset + i] = sum * yScale;

@@ -6,6 +6,8 @@ layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint N_BATCHES = 32;
 layout(constant_id = 1) const uint N_Z = 1;
+layout(constant_id = 2) const uint WEIGHT_ROW_STRIDE = 0;
+layout(constant_id = 3) const uint WEIGHT_OUTPUT_SIZE_X = 0;
 
 struct BatchInfo {
     uint inputOffset;
@@ -22,6 +24,9 @@ layout(binding = 4) readonly uniform opConfigBuffer {
     uint nExperts;
     uint nActiveExperts;
     uint activeExpertIndexesBufferIndex;
+    uint view;
+    uint inStart;
+    uint outStart;
 };
 layout(binding = 5) readonly buffer activeExpertIndexesBuffer { float activeExpertIndexes[]; };
 
@@ -38,10 +43,15 @@ void main() {
     const uint dim = slice + (workGroupIndex < rest ? 1 : 0);
     const uint offset = workGroupIndex * slice + min(workGroupIndex, rest);
 
+    const uint weightRowStride = WEIGHT_ROW_STRIDE == 0 ? info.inputSizeX : WEIGHT_ROW_STRIDE;
+    const uint weightOutputRows = WEIGHT_OUTPUT_SIZE_X == 0 ? info.outputSizeX : WEIGHT_OUTPUT_SIZE_X;
+    const uint inputColStart = view == 2 ? inStart : 0;
+    const uint outputRowStart = view == 1 ? outStart : 0;
+
     const uint expertIndex = nExperts == 0
         ? 0
         : uint(activeExpertIndexes[batchIndex * nActiveExperts + zIndex]);
-    const uint expertOffset = expertIndex * info.inputSizeX * info.outputSizeX;
+    const uint expertOffset = expertIndex * weightRowStride * weightOutputRows;
 
     const uint inputSizeX = info.inputSizeX;
     const uint xOffset = info.inputOffset;
@@ -49,7 +59,7 @@ void main() {
 
     for (uint i = threadIndex; i < dim; i += N_THREADS) {
         const uint d = offset + i;
-        const uint wOffset = expertOffset + d * inputSizeX;
+        const uint wOffset = expertOffset + (outputRowStart + d) * weightRowStride + inputColStart;
 
         float sum = 0.0f;
         for (uint j = 0; j < inputSizeX; j++) {

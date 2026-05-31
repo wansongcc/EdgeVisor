@@ -28,8 +28,7 @@ std::unique_ptr<RootKvCollector> RootKvCollector::start(RootLlmInference *infere
 
     std::unique_ptr<RootKvCollector> ctrl(new RootKvCollector(inference));
     RootKvCollector *c = ctrl.get();
-    std::thread t([c]() { c->run(); });
-    t.detach();
+    ctrl->worker_ = std::thread([c]() { c->run(); });
     const int pos = inference->getAsyncKvCollectPos();
     const int layer = inference->getAsyncKvCollectLayer();
     if (pos >= 0 && layer >= 0) {
@@ -45,7 +44,10 @@ RootKvCollector::RootKvCollector(RootLlmInference *inference)
     : inference_(inference) {}
 
 RootKvCollector::~RootKvCollector() {
-    stop_ = true;
+    stop_.store(true);
+    if (worker_.joinable()) {
+        worker_.join();
+    }
 }
 
 void RootKvCollector::run() {
@@ -61,7 +63,7 @@ void RootKvCollector::run() {
     bool collectorReady = false;
     bool rowDumped = false;
 
-    while (!stop_) {
+    while (!stop_.load()) {
         try {
             if (inference_ == nullptr) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(pollMs));

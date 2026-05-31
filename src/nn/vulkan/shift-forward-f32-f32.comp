@@ -20,6 +20,9 @@ layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
 layout(binding = 3) readonly uniform configBuffer {
     uint indexPipeIndex;
+    uint dstColStart;
+    uint dstRowStride;
+    uint dstColStartUnit;
 };
 layout(binding = 4) readonly buffer indexBuffer { float indexes[]; };
 
@@ -31,8 +34,10 @@ void main() {
 
     const BatchInfo info = infos[batchIndex];
     const uint offset = chunkIndex * CHUNK_SIZE;
-    const uint xOffset = info.inputOffset + offset;;
-    const uint yOffset = index * info.inputSizeX + offset;
+    const uint xOffset = info.inputOffset + offset;
+    const uint rowStride = dstRowStride == 0 ? info.inputSizeX : dstRowStride;
+    const uint colStart = dstRowStride == 0 ? 0 : dstColStart;
+    const uint yOffset = index * rowStride + colStart + offset;
 
     [[unroll]] for (uint i = 0; i < CHUNK_SIZE; i++) {
         y[yOffset + i] = x[xOffset + i];

@@ -495,9 +495,7 @@ void NnExecutor::refreshPointers() {
         NnDeviceSegment *segment = segments[segmentIndex].get();
         if (segment == nullptr)
             continue;
-        if (auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(segment)) {
-            cpuSeg->refreshPointers();
-        }
+        segment->refreshPointers();
     }
 }
 
@@ -509,11 +507,7 @@ void NnExecutor::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
         NnDeviceSegment *segment = segments[segmentIndex].get();
         if (segment == nullptr)
             continue;
-        if (auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(segment)) {
-            if (cpuSeg->device != nullptr) {
-                cpuSeg->device->setPartitionPlan(plan);
-            }
-        }
+        segment->setPartitionPlan(plan);
     }
 }
 
@@ -599,7 +593,12 @@ bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvD
         NnDeviceSegment *baseSeg = segments[s].get();
         if (baseSeg == nullptr) continue;
         auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(baseSeg);
-        if (cpuSeg == nullptr || cpuSeg->device == nullptr) continue;
+        if (cpuSeg == nullptr || cpuSeg->device == nullptr) {
+            if (baseSeg->exportLayerKvRow(layerIndex, position, kvDim, kRow, vRow)) {
+                readAny = true;
+            }
+            continue;
+        }
 
         NnSegmentConfig *seg = &nodeConfig->segments[s];
         for (NnUint i = 0; i < seg->nOps; ++i) {
@@ -670,7 +669,12 @@ bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const
         NnDeviceSegment *baseSeg = segments[s].get();
         if (baseSeg == nullptr) continue;
         auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(baseSeg);
-        if (cpuSeg == nullptr || cpuSeg->device == nullptr) continue;
+        if (cpuSeg == nullptr || cpuSeg->device == nullptr) {
+            if (baseSeg->applyTransferredKvRow(layerIndex, position, kRow, vRow)) {
+                wroteAny = true;
+            }
+            continue;
+        }
 
         NnSegmentConfig *seg = &nodeConfig->segments[s];
         for (NnUint i = 0; i < seg->nOps; ++i) {

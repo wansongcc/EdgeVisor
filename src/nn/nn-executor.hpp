@@ -13,6 +13,10 @@ public:
     virtual ~NnDeviceSegment() {};
     virtual void loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) = 0;
     virtual void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) = 0;
+    virtual void setPartitionPlan(const NnUnevenPartitionPlan * /*plan*/) {}
+    virtual void refreshPointers() {}
+    virtual bool exportLayerKvRow(NnUint /*layerIndex*/, NnUint /*position*/, NnUint /*kvDim*/, std::vector<float> & /*kRow*/, std::vector<float> & /*vRow*/) { return false; }
+    virtual bool applyTransferredKvRow(NnUint /*layerIndex*/, NnUint /*position*/, const std::vector<float> & /*kRow*/, const std::vector<float> & /*vRow*/) { return false; }
 };
 
 class NnDevice {

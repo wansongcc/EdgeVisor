@@ -546,6 +546,41 @@ static const char *chatTemplateTypeToString(const ChatTemplateType type) {
     return "unknown";
 }
 
+static const char *findStopPiece(const TokenizerChatStops *stops, const char *piece) {
+    if (stops == nullptr || piece == nullptr) return nullptr;
+    for (size_t i = 0; i < stops->nStops; ++i) {
+        if (stops->stops[i] != nullptr && std::strcmp(stops->stops[i], piece) == 0) {
+            return stops->stops[i];
+        }
+    }
+    return nullptr;
+}
+
+const char *selectChatTemplateEos(const Tokenizer *tokenizer, const TokenizerChatStops *stops, ChatTemplateType type) {
+    const char *fallback = (stops != nullptr && stops->nStops > 0) ? stops->stops[0] : "";
+    const char *chatTemplate = (tokenizer != nullptr) ? tokenizer->chatTemplate : nullptr;
+
+    const bool isLlama3 =
+        type == TEMPLATE_LLAMA3 ||
+        (type == TEMPLATE_UNKNOWN && chatTemplate != nullptr &&
+         std::strstr(chatTemplate, "<|start_header_id|>") != nullptr);
+    if (isLlama3) {
+        const char *eot = findStopPiece(stops, "<|eot_id|>");
+        if (eot != nullptr) return eot;
+    }
+
+    const bool isChatMl =
+        type == TEMPLATE_CHATML ||
+        (type == TEMPLATE_UNKNOWN && chatTemplate != nullptr &&
+         std::strstr(chatTemplate, "<|im_start|>") != nullptr);
+    if (isChatMl) {
+        const char *imEnd = findStopPiece(stops, "<|im_end|>");
+        if (imEnd != nullptr) return imEnd;
+    }
+
+    return fallback;
+}
+
 ChatTemplateGenerator::ChatTemplateGenerator(const ChatTemplateType type, const char* chatTemplate, const char* eos)
     : buffer() 
 {
@@ -620,9 +655,9 @@ GeneratedChat ChatTemplateGenerator::generate(unsigned int nItems, ChatItem* ite
             } else if (items[i].role == "assistant") {
                 buffer += "<|im_start|>assistant\n" + items[i].message + "<|im_end|>\n";
             }
-            if (appendGenerationPrompt)
-                buffer += "<|im_start|>assistant\n";
         }
+        if (appendGenerationPrompt)
+            buffer += "<|im_start|>assistant\n";
     }
 
     const char *content = buffer.c_str();

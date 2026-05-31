@@ -309,8 +309,7 @@ std::unique_ptr<PlanUdsController> PlanUdsController::start(const std::string &s
 
     // Launch background thread (C++11: no init-capture).
     PlanUdsController *c = ctrl.get();
-    std::thread t([c]() { c->run(); });
-    t.detach();
+    ctrl->worker_ = std::thread([c]() { c->run(); });
 
     return ctrl;
 #endif
@@ -321,8 +320,21 @@ PlanUdsController::PlanUdsController(const std::string &socketPath, RootLlmInfer
 
 PlanUdsController::~PlanUdsController() {
 #ifndef _WIN32
-    stop_ = true;
+    stop_.store(true);
+    if (!socketPath_.empty()) {
+        int wakeFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (wakeFd >= 0) {
+            sockaddr_un addr{};
+            addr.sun_family = AF_UNIX;
+            std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socketPath_.c_str());
+            (void)::connect(wakeFd, (sockaddr *)&addr, sizeof(addr));
+            ::close(wakeFd);
+        }
+    }
     closeServer();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
 #endif
 }
 
@@ -377,11 +389,15 @@ void PlanUdsController::run() {
     serverFd_ = fd;
     std::fprintf(stderr, "[plan-uds] listening on %s\n", socketPath_.c_str());
 
-    while (!stop_) {
+    while (!stop_.load()) {
         int cfd = ::accept(fd, nullptr, nullptr);
         if (cfd < 0) {
-            if (stop_) break;
+            if (stop_.load()) break;
             continue;
+        }
+        if (stop_.load()) {
+            ::close(cfd);
+            break;
         }
 
         std::string line;

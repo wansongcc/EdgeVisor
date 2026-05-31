@@ -1,8 +1,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 
 class RootLlmInference;
 
@@ -29,6 +31,7 @@ private:
 	std::string socketPath_;
 	RootLlmInference *inference_ = nullptr;
 
-	bool stop_ = false;
+	std::atomic<bool> stop_{false};
+	std::thread worker_;
 };
 

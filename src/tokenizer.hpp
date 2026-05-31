@@ -107,6 +107,8 @@ enum ChatTemplateType {
     TEMPLATE_CHATML = 4,
 };
 
+const char *selectChatTemplateEos(const Tokenizer *tokenizer, const TokenizerChatStops *stops, ChatTemplateType type);
+
 struct ChatItem {
     std::string role;
     std::string message;

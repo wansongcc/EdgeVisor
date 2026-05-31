@@ -537,7 +537,8 @@ static void server(AppInferenceContext *context) {
     NnSocket serverSocket(createServerSocket(context->args->port));
 
     TokenizerChatStops stops(context->tokenizer);
-    ChatTemplateGenerator templateGenerator(context->args->chatTemplateType, context->tokenizer->chatTemplate, stops.stops[0]);
+    const char *templateEos = selectChatTemplateEos(context->tokenizer, &stops, context->args->chatTemplateType);
+    ChatTemplateGenerator templateGenerator(context->args->chatTemplateType, context->tokenizer->chatTemplate, templateEos);
     EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
     ApiServer api(context->inference, context->tokenizer, context->sampler, context->args, context->header, &eosDetector, &templateGenerator);
 

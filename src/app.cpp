@@ -878,7 +878,7 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     if (args->gpuIndex >= 0) {
 #if defined(DLLAMA_VULKAN)
         devices.push_back(NnExecutorDevice(
-            new NnVulkanDevice(args->gpuIndex, netConfig, nodeConfig, netExecution),
+            new NnVulkanDevice(args->gpuIndex, netConfig, nodeConfig, netExecution, plan),
             args->gpuSegmentFrom,
             args->gpuSegmentTo
         ));

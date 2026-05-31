@@ -1,8 +1,10 @@
 #ifndef PLAN_CONTROLLER_HPP
 #define PLAN_CONTROLLER_HPP
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 
 class RootLlmInference;
 
@@ -24,7 +26,8 @@ private:
     RootLlmInference *inference_;
 
     int serverFd_ = -1;
-    bool stop_ = false;
+    std::atomic<bool> stop_{false};
+    std::thread worker_;
 
     void closeServer();
 };

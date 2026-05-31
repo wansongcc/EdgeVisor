@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <thread>
 
 class RootLlmInference;
 
@@ -21,5 +23,6 @@ private:
     void run();
 
     RootLlmInference *inference_ = nullptr;
-    bool stop_ = false;
+    std::atomic<bool> stop_{false};
+    std::thread worker_;
 };

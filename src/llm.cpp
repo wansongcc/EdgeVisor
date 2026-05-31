@@ -1237,16 +1237,18 @@ static NnNodeConfig buildLlmNodeInternal(
     // 4. Start Segment (Embedding)
     NnSegmentConfigBuilder start;
     if (isFirstStage) {
-        // [修改] First Stage 所有节点都负责 Embedding
-        // 1. 先同步 Token (广播: Root -> Stage 0 Workers)
-        // 注意：这里假设 SYNC_WITH_ROOT 能正确处理 Node 0 到 Stage 0 其他节点的广播
-        start.addSync(n->tokenPipeIndex, SYNC_WITH_ROOT);
-
-        // 2. 所有节点本地计算 Embedding (避免传输大的 Embedding 向量)
-        start.addOp(OP_EMBEDDING, "embedding", 0, 
-            pointerBatchConfig(SRC_PIPE, n->tokenPipeIndex),
-            pointerBatchConfig(SRC_PIPE, n->xPipeIndex), 
-            n->tokenEmbeddingSize, NnEmbeddingOpConfig{});
+        // Segment syncs run after all ops in this executor. Therefore the
+        // stage root computes the embedding first, then broadcasts X to peers.
+        const bool amStageRoot = (myStage == nullptr)
+            ? (nodeIndex == 0u)
+            : (nodeIndex == myStage->rootNodeIndex);
+        if (amStageRoot) {
+            start.addOp(OP_EMBEDDING, "embedding", 0,
+                pointerBatchConfig(SRC_PIPE, n->tokenPipeIndex),
+                pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
+                n->tokenEmbeddingSize, NnEmbeddingOpConfig{});
+        }
+        start.addSync(n->xPipeIndex, SYNC_WITH_ROOT);
     }
     addSegmentLogged(start, "start", 0u);
 
@@ -1882,20 +1884,27 @@ static NnNodeConfig buildLlmNodeInternal(
     if (!isLastStage) {
         NnSegmentConfigBuilder ppSendSeg;
 
-        // 1. Snapshot: copy stage output to dedicated PP cache buffer.
-        // NOTE: xBufferIndex already holds the final stage output after the last layer FFN merge.
-        ppSendSeg.addOp(OP_CAST, "pp_stage_merge", endLayer-1,
+        // 1. Apply the final FFN residual at the PP boundary. Normal intra-stage
+        // layers merge FFN output at the next layer's attention entry; a stage
+        // boundary has no next local layer, so do it before sending X onward.
+        ppSendSeg.addOp(OP_MERGE_ADD, "pp_stage_merge", endLayer-1,
+            pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
+            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            size0(), NnMergeAddOpCodeConfig{});
+
+        // 2. Snapshot: copy stage output to dedicated PP cache buffer.
+        ppSendSeg.addOp(OP_CAST, "pp_stage_cache", endLayer-1,
             pointerBatchConfig(SRC_BUFFER, xBufferIndex),
             pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
             size0(), NnCastOpCodeConfig{});
 
-        // 2. Cast: 固定从 PP stage cache buffer 读取后写入 X Pipe (复用通信管道)
+        // 3. Cast: 固定从 PP stage cache buffer 读取后写入 X Pipe (复用通信管道)
         ppSendSeg.addOp(OP_CAST, "pp_cast_out", endLayer-1,
             pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
             pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
             size0(), NnCastOpCodeConfig{});
             
-        // 3. Send: 触发 PP 发送
+        // 4. Send: 触发 PP 发送
         ppSendSeg.addSync(n->xPipeIndex, SYNC_PP_SEND);
         
         addSegmentLogged(ppSendSeg, "pp_send", (endLayer > 0u ? endLayer - 1u : 0u));
@@ -2228,10 +2237,13 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     LlmHeader *h = net->header;
 
     // --- 1. Embedding ---
-    if (isFirstStage) {
+    const bool isStageRoot = (myStage == nullptr)
+        ? (nodeIndex == 0u)
+        : (nodeIndex == myStage->rootNodeIndex);
+    if (isFirstStage && isStageRoot) {
         b += loader->loadRoot("embedding", 0, net->tokenEmbeddingSize.nBytes, b);
     } else {
-        b += net->tokenEmbeddingSize.nBytes; 
+        b += net->tokenEmbeddingSize.nBytes;
     }
 
     // --- 2. 逐层加载 ---

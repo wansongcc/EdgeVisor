@@ -3,6 +3,7 @@
 
 #include <vulkan/vulkan.hpp>
 #include <vector>
+#include <atomic>
 #include "nn-executor.hpp"
 #include "nn-cpu-ops.hpp"
 
@@ -99,6 +100,11 @@ public:
     NnUint resolveBufferBatchWidth(NnPointerConfig *config);
     NnVulkanBuffer *resolvePipeByIndex(NnUint pipeIndex);
     NnVulkanBuffer *resolveBufferByIndex(NnUint bufferIndex);
+    NnUint getBufferCount() const;
+    const NnSize3D *getBufferSize(NnUint bufferIndex) const;
+    void setPartitionPlan(const NnUnevenPartitionPlan *plan);
+    const NnUnevenPartitionPlan *getPartitionPlan() const;
+    NnUint getNodeIndex() const;
 };
 
 class NnVulkanDevice : public NnDevice {
@@ -109,12 +115,22 @@ private:
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
     NnNetExecution *netExecution;
+    const NnUnevenPartitionPlan *partitionPlan;
+    std::atomic_uint planEpoch{0u};
+    std::atomic_uint lastPlanCmdSeqEmitted{0u};
 public:
     NnVulkanDeviceData data;
-    NnVulkanDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution);
+    NnVulkanDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan = nullptr);
     ~NnVulkanDevice() override;
     NnUint maxNThreads() override;
     NnDeviceSegment *createSegment(NnUint segmentIndex) override;
+    void setPartitionPlan(const NnUnevenPartitionPlan *plan);
+    const NnUnevenPartitionPlan *getPartitionPlan() const { return partitionPlan; }
+    unsigned int getPlanEpoch() const { return planEpoch.load(std::memory_order_acquire); }
+    void setPlanEpoch(unsigned int e) { planEpoch.store(e, std::memory_order_release); }
+    unsigned int getLastPlanCmdSeqEmitted() const { return lastPlanCmdSeqEmitted.load(std::memory_order_acquire); }
+    void setLastPlanCmdSeqEmitted(unsigned int s) { lastPlanCmdSeqEmitted.store(s, std::memory_order_release); }
+    NnUint getNodeIndex() const { return nodeConfig ? nodeConfig->nodeIndex : 0u; }
 };
 
 class NnVulkanDeviceSegmentData {
@@ -150,6 +166,7 @@ private:
     NnUint segmentIndex;
     NnSegmentConfig *segmentConfig;
     NnNetExecution *netExecution;
+    NnVulkanDevice *ownerDevice;
     std::unique_ptr<NnVulkanDeviceSegmentData> segmentData;
 
     std::vector<vk::ShaderModule> shaderModules;
@@ -163,11 +180,17 @@ private:
     vk::CommandBuffer commandBuffer;
     std::vector<std::vector<NnVulkanBuffer *>> buffersToSync;
     NnUint lastBatchSize;
+    bool commandBufferDirty;
+    std::atomic_uint planEpochReady{0u};
 public:
-    NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanStagingCopier *copier, NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnNetConfig *netConfig, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);
+    NnVulkanDeviceSegment(NnVulkanDevice *ownerDevice, NnVulkanContext *context, NnVulkanStagingCopier *copier, NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnNetConfig *netConfig, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);
     ~NnVulkanDeviceSegment() override;
     void loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) override;
     void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) override;
+    void setPartitionPlan(const NnUnevenPartitionPlan *plan) override;
+    void refreshPointers() override;
+    bool exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow) override;
+    bool applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) override;
 };
 
 #endif

@@ -478,18 +478,45 @@ static void debugVocabCoverage(const float* logits, NnUint vocabSize, const char
 }
 #endif
 
+static bool promptLooksChatFormatted(const char *prompt) {
+    if (prompt == nullptr) return false;
+    return std::strstr(prompt, "<|start_header_id|>") != nullptr ||
+        std::strstr(prompt, "[INST]") != nullptr ||
+        std::strstr(prompt, "<｜User｜>") != nullptr ||
+        std::strstr(prompt, "<|im_start|>") != nullptr;
+}
+
+static std::string buildInferencePrompt(AppInferenceContext *context, const char *prompt, TokenizerChatStops *stops) {
+    if (context == nullptr || context->tokenizer == nullptr || prompt == nullptr) {
+        return prompt == nullptr ? std::string() : std::string(prompt);
+    }
+    if (promptLooksChatFormatted(prompt) || context->tokenizer->chatTemplate == nullptr || stops == nullptr || stops->nStops == 0) {
+        return std::string(prompt);
+    }
+
+    const char *templateEos = selectChatTemplateEos(context->tokenizer, stops, context->args->chatTemplateType);
+    ChatTemplateGenerator generator(context->args->chatTemplateType, context->tokenizer->chatTemplate, templateEos);
+    ChatItem item{"user", prompt};
+    GeneratedChat generated = generator.generate(1u, &item, true);
+    return std::string(generated.content, generated.length);
+}
+
 static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, NnUint steps) {
     if (prompt == nullptr)
         throw std::runtime_error("Prompt is required");
     if (steps == 0)
         throw std::runtime_error("Number of steps is required");
 
-    std::vector<int> inputTokensVec(std::strlen(prompt) + 3);
+    TokenizerChatStops stops(context->tokenizer);
+    EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
+    std::string effectivePrompt = buildInferencePrompt(context, prompt, &stops);
+
+    std::vector<int> inputTokensVec(effectivePrompt.size() + 3);
     int *inputTokens = inputTokensVec.data();
 
     NnUint pos = 0;
     int nInputTokens;
-    context->tokenizer->encode(const_cast<char*>(prompt), inputTokens, &nInputTokens, true, true);
+    context->tokenizer->encode(const_cast<char*>(effectivePrompt.c_str()), inputTokens, &nInputTokens, true, true);
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
     if (context->tokenizer->vocabSize != context->header->vocabSize) {
@@ -553,7 +580,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     }
 
     int token = inputTokens[pos];
-    printf("%s\n", prompt);
+    printf("%s\n", effectivePrompt.c_str());
     for (;;) {
         long remainingTokens = nInputTokens - 1 - (long)pos;
         if (remainingTokens <= 0)
@@ -825,6 +852,11 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         token = context->sampler->sample(context->inference->logitsPipe);
 
         char *piece = context->tokenizer->decode(token);
+        EosDetectorType eosType = eosDetector.append(token, piece);
+        char *delta = nullptr;
+        if (eosType == NOT_EOS || eosType == EOS) {
+            delta = eosDetector.getDelta();
+        }
 
         if (context->network != nullptr)
             context->network->getStats(&sentBytes, &recvBytes);
@@ -837,9 +869,16 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             (unsigned)pos,
             sentBytes / 1024,
             recvBytes / 1024,
-            piece == nullptr ? "~" : piece);
+            delta == nullptr ? (eosType == EOS ? "[EOS]" : "") : delta);
         fflush(stdout);
+        if (eosType == NOT_EOS || eosType == EOS) {
+            eosDetector.reset();
+        }
         predTotalTime += predTime + syncTime;
+        if (eosType == EOS) {
+            pos++;
+            break;
+        }
     }
 
     NnUint nEvalTokens = nInputTokens - 1;
@@ -1252,7 +1291,8 @@ static void chat(AppInferenceContext *context) {
     char prompt[2048];
 
     TokenizerChatStops stops(context->tokenizer);
-    ChatTemplateGenerator templateGenerator(context->args->chatTemplateType, context->tokenizer->chatTemplate, stops.stops[0]);
+    const char *templateEos = selectChatTemplateEos(context->tokenizer, &stops, context->args->chatTemplateType);
+    ChatTemplateGenerator templateGenerator(context->args->chatTemplateType, context->tokenizer->chatTemplate, templateEos);
     EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
 
     const NnUint sysPromptLength = readStdin("💻 System prompt (optional): ", prompt, sizeof(prompt));

@@ -15,6 +15,8 @@ layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint N_BATCHES = 32;
 layout(constant_id = 1) const uint N_Z = 1;
 layout(constant_id = 2) const uint N_THREADS = 32;
+layout(constant_id = 3) const uint WEIGHT_ROW_STRIDE_BLOCKS = 0;
+layout(constant_id = 4) const uint WEIGHT_OUTPUT_SIZE_X = 0;
 
 struct BatchInfo {
     uint inputOffset;
@@ -41,6 +43,9 @@ layout(binding = 4) readonly uniform opConfigBuffer {
     uint nExperts;
     uint nActiveExperts;
     uint activeExpertIndexesBufferIndex;
+    uint view;
+    uint inStart;
+    uint outStart;
 };
 layout(binding = 5) readonly buffer activeExpertIndexesBuffer { float activeExpertIndexes[]; };
 
@@ -55,13 +60,17 @@ void main() {
     const uint b = zIndex * N_BATCHES + batchIndex;
     const BatchInfo info = infos[b];
 
+    const uint weightRowStride = WEIGHT_ROW_STRIDE_BLOCKS == 0 ? info.inputSizeX : WEIGHT_ROW_STRIDE_BLOCKS;
+    const uint weightOutputRows = WEIGHT_OUTPUT_SIZE_X == 0 ? info.outputSizeX : WEIGHT_OUTPUT_SIZE_X;
+    const uint inputColStart = view == 2 ? inStart / Q80_Q40_BLOCK_SIZE : 0;
+    const uint outputRowStart = view == 1 ? outStart : 0;
+
     const uint expertIndex = nExperts == 0
         ? 0
         : uint(activeExpertIndexes[batchIndex * nActiveExperts + zIndex]);
-    const uint expertOffset = expertIndex * info.inputSizeX * info.outputSizeX;
+    const uint expertOffset = expertIndex * weightRowStride * weightOutputRows;
 
     const uint inputOffset = info.inputOffset;
-    const uint inputSizeX = info.inputSizeX;
     const uint d = TILE_SIZE_D * workGroupIndex;
 
     vec4 xTemp[Q80_Q40_BLOCK_SIZE / 4];
@@ -71,7 +80,12 @@ void main() {
     }
 
     [[unroll]] for (uint it = 0; it < TILE_SIZE_X; it++) {
-        const uint xi = inputOffset + threadIndex + it * N_THREADS;
+        const uint localColBlock = threadIndex + it * N_THREADS;
+        if (localColBlock >= info.inputSizeX) {
+            continue;
+        }
+
+        const uint xi = inputOffset + localColBlock;
         const float xScale = float(x[xi].d);
         [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
             xTemp[j] = vec4(
@@ -83,21 +97,24 @@ void main() {
         }
 
         [[unroll]] for (uint dt = 0; dt < TILE_SIZE_D; dt++) {
-            const uint wi = expertOffset + (d + dt) * inputSizeX + threadIndex + it * N_THREADS;
-            const BlockQ40 wBlock = weight[wi];
+            if (d + dt < info.outputSizeX) {
+                const uint weightRow = outputRowStart + d + dt;
+                const uint wi = expertOffset + weightRow * weightRowStride + inputColStart + localColBlock;
+                const BlockQ40 wBlock = weight[wi];
 
-            float s = 0.0f;
-            [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
-                uint w0 = wBlock.qs[j * 2];
-                uint w1 = wBlock.qs[j * 2 + 1];
-                s += dot(xTemp[j], vec4(
-                    int(w0 & 0xFu) - 8,
-                    int(w0 >> 4) - 8,
-                    int(w1 & 0xFu) - 8,
-                    int(w1 >> 4) - 8
-                ));
+                float s = 0.0f;
+                [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
+                    uint w0 = wBlock.qs[j * 2];
+                    uint w1 = wBlock.qs[j * 2 + 1];
+                    s += dot(xTemp[j], vec4(
+                        int(w0 & 0xFu) - 8,
+                        int(w0 >> 4) - 8,
+                        int(w1 & 0xFu) - 8,
+                        int(w1 >> 4) - 8
+                    ));
+                }
+                sums[threadIndex * TILE_SIZE_D + dt] += s * xScale * wBlock.d;
             }
-            sums[threadIndex * TILE_SIZE_D + dt] += s * xScale * wBlock.d;
         }
     }
 
@@ -116,10 +133,12 @@ void main() {
         barrier();
     }
     for (uint dt = threadIndex; dt < TILE_SIZE_D; dt += N_THREADS) {
-        float s = 0.0;
-        for (uint j = 1; j <= i; j++) {
-            s += sums[(j - 1) * TILE_SIZE_D + dt];
+        if (d + dt < info.outputSizeX) {
+            float s = 0.0;
+            for (uint j = 1; j <= i; j++) {
+                s += sums[(j - 1) * TILE_SIZE_D + dt];
+            }
+            y[outputOffset + d + dt] = float(s);
         }
-        y[outputOffset + d + dt] = float(s);
     }
 }

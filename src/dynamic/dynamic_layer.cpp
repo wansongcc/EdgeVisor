@@ -292,8 +292,7 @@ std::unique_ptr<DynamicLayerController> DynamicLayerController::start(const std:
 
 	std::unique_ptr<DynamicLayerController> ctrl(new DynamicLayerController(socketPath, inference));
 	DynamicLayerController *c = ctrl.get();
-	std::thread t([c]() { c->run(); });
-	t.detach();
+	ctrl->worker_ = std::thread([c]() { c->run(); });
 	std::fprintf(stderr, "[dyn-layer] enabled, scheduler thread started (socket=%s)\n", socketPath.c_str());
 	return ctrl;
 #endif
@@ -303,7 +302,10 @@ DynamicLayerController::DynamicLayerController(const std::string &socketPath, Ro
 	: socketPath_(socketPath), inference_(inference) {}
 
 DynamicLayerController::~DynamicLayerController() {
-	stop_ = true;
+	stop_.store(true);
+	if (worker_.joinable()) {
+		worker_.join();
+	}
 }
 
 static const NnStageConfig *dynFindStage(const NnUnevenPartitionPlan *plan, uint32_t stageIndex) {
@@ -334,7 +336,7 @@ void DynamicLayerController::run() {
 	uint32_t seq = (uint32_t)std::max(1, dynParseEnvInt("DLLAMA_DYN_SEQ_START", 1));
 	bool forcedUsed = false;
 
-	while (!stop_) {
+	while (!stop_.load()) {
 		try {
 			const NnUnevenPartitionPlan *plan = (inference_ != nullptr) ? inference_->getPartitionPlan() : nullptr;
 			if (plan == nullptr) {

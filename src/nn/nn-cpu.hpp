@@ -86,9 +86,10 @@ public:
     ~NnCpuDeviceSegment() override;
     void loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) override;
     void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) override;
+    void setPartitionPlan(const NnUnevenPartitionPlan *plan) override;
 
-    // CPU-only: re-resolve PNTR_* pointers/sizes after partition plan updates.
-    void refreshPointers();
+    // Re-resolve PNTR_* pointers/sizes after partition plan updates.
+    void refreshPointers() override;
 };
 
 #endif

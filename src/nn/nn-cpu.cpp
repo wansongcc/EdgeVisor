@@ -1809,6 +1809,12 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
     }
 }
 
+void NnCpuDeviceSegment::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
+    if (device != nullptr) {
+        device->setPartitionPlan(plan);
+    }
+}
+
 void NnCpuDeviceSegment::loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) {
     assert(opIndex >= 0u);
     assert(opIndex < nOps);
@@ -3513,17 +3519,30 @@ void NnCpuDeviceSegment::refreshPointers() {
         if (plan != nullptr) {
             if (opContext->opCode == OP_MULTIHEAD_ATT) {
                 auto *cfg = (NnMultiHeadAttOpConfig *)opContext->opConfig;
+                const bool fullAttBuffer =
+                    opConfig->input.type == PNTR_BATCHED_SLICE ||
+                    opConfig->output.type == PNTR_BATCHED_SLICE;
                 if (plan->headSplit.starts && plan->headSplit.lengths) {
                     cfg->nHeads0 = plan->headSplit.lengths[nodeIndex];
-                    cfg->qStart = plan->headSplit.starts[nodeIndex] * cfg->headDim;
                     cfg->qSliceD0 = cfg->nHeads0 * cfg->headDim;
-                    cfg->qStride = cfg->nHeads * cfg->headDim;
+                    if (fullAttBuffer) {
+                        cfg->qStart = plan->headSplit.starts[nodeIndex] * cfg->headDim;
+                        cfg->qStride = cfg->nHeads * cfg->headDim;
+                    } else {
+                        cfg->qStart = 0u;
+                        cfg->qStride = cfg->qSliceD0;
+                    }
                 }
                 if (plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths) {
                     const NnUint kvHeads0 = plan->kvHeadSplit.lengths[nodeIndex];
-                    cfg->kvStart = plan->kvHeadSplit.starts[nodeIndex] * cfg->headDim;
                     cfg->kvDim0 = kvHeads0 * cfg->headDim;
-                    cfg->kvStride = cfg->nKvHeads * cfg->headDim;
+                    if (fullAttBuffer) {
+                        cfg->kvStart = plan->kvHeadSplit.starts[nodeIndex] * cfg->headDim;
+                        cfg->kvStride = cfg->nKvHeads * cfg->headDim;
+                    } else {
+                        cfg->kvStart = 0u;
+                        cfg->kvStride = cfg->kvDim0;
+                    }
                 }
             } else if (opContext->opCode == OP_SHIFT) {
                 auto *cfg = (NnShiftOpCodeConfig *)opContext->opConfig;

@@ -1,0 +1,39 @@
+{
+  "net": "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_net",
+  "root": "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n0",
+  "workers": [
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n1",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n2",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n3",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n4",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n5",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n6",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n7"
+  ],
+  "all_names": [
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n0",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n1",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n2",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n3",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n4",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n5",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n6",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n7"
+  ],
+  "sock_host": "/home/cc/yhbian/B01/vg_boundary_results/vg_absorb_20260527_080453/s/b01_89c6d7d172e8.sock",
+  "test_dir": "/home/cc/yhbian/B01/vg_boundary_results/vg_absorb_20260527_080453/vg_absorption_ablation/3B/compute_and_bandwidth_skew_no_vg_pp_no_absorb",
+  "model": "3B",
+  "variant": "compute_and_bandwidth_skew_no_vg_pp_no_absorb",
+  "exp": "vg_absorption_ablation",
+  "root_cmd": "./dllama inference --prompt 'The capital of France is' --steps 24 --model /models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m --tokenizer /models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 1024 --benchmark --workers b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n1:9999 b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n2:9999 b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n3:9999 b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n4:9999 b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n5:9999 b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n6:9999 b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n7:9999 --ratios '1@4*1@4*1@4*1@4*1@3*1@3*1@3*1@3' ",
+  "active_workers": [
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n1",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n2",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n3",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n4",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n5",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n6",
+    "b01ab_vg_absorb_20260527_080453_vg_absorption_ab_n7"
+  ],
+  "standby_workers": []
+}

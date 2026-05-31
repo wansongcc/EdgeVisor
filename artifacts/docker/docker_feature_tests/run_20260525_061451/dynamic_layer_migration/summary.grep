@@ -1,0 +1,56 @@
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🧩 [runtime-plan] static layer plan ready: layers=28 stages=2 activeMarks=28 redundantMarks=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:   [PP] Node 0: Runtime-role loading primary=20 redundant=1
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🧭 [kv-migrate] root migration route=0->2 layers=[19] layerCount=1 pinnedByEnv=no
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🧭 [kv-migrate] apply pp command cacheSeq=2 layerCount=1 route=0->2 layers=[19]
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🧭 [kv-migrate] auto collect armed layer=19 pos=4 mode=2 route=0->2 layers=1
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🧩 [kv-migrate] prepared history batch exported=5 queued=5 layers=1 posRange=[0,4] targetRoot=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=0 fromNode=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=1 fromNode=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=2 fromNode=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=3 fromNode=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=4 fromNode=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=0 fromNode=3
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=1 fromNode=3
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=2 fromNode=3
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=3 fromNode=3
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack received layer=19 pos=4 fromNode=3
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:🔁 [kv-migrate] ack batch complete layers=1 -> switch ownership
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:Evaluation
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:Prediction
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/root.log:⏱️  [Stage/Node Profile Summary]
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker1.log:🧩 [runtime-plan] static layer plan ready: layers=28 stages=2 activeMarks=28 redundantMarks=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker1.log:   [PP] Node 1: Runtime-role loading primary=20 redundant=1
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [runtime-plan] static layer plan ready: layers=28 stages=2 activeMarks=28 redundantMarks=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:   [PP] Node 2: Runtime-role loading primary=8 redundant=1
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=0 kBuf=24 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=0 vBuf=25 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write-check] node=2 layer=19 pos=0 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=1 kBuf=24 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=1 vBuf=25 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write-check] node=2 layer=19 pos=1 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=2 kBuf=24 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=2 vBuf=25 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write-check] node=2 layer=19 pos=2 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=3 kBuf=24 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=3 vBuf=25 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write-check] node=2 layer=19 pos=3 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=4 kBuf=24 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write] node=2 seg=2 layer=19 pos=4 vBuf=25 bufX=1024 srcRange=[0,512) dstRange=[0,512)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker2.log:🧩 [kv-write-check] node=2 layer=19 pos=4 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [runtime-plan] static layer plan ready: layers=28 stages=2 activeMarks=28 redundantMarks=2
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:   [PP] Node 3: Runtime-role loading primary=8 redundant=1
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=0 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=0 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write-check] node=3 layer=19 pos=0 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=1 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=1 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write-check] node=3 layer=19 pos=1 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=2 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=2 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write-check] node=3 layer=19 pos=2 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=3 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=3 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write-check] node=3 layer=19 pos=3 kvDim=1024 status=ok
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=4 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write] node=3 seg=2 layer=19 pos=4 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_layer_migration/logs/worker3.log:🧩 [kv-write-check] node=3 layer=19 pos=4 kvDim=1024 status=ok

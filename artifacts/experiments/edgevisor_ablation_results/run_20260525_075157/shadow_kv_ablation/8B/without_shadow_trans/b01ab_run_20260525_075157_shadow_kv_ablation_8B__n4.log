@@ -1,0 +1,182 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+Listening on 0.0.0.0:9999...
+⭕ The root node has connected
+⭕ peerWorkers: 6
+⭕ NodeIndex: 3
+⭕ Socket[0]: accepted root node
+⭕ Waiting worker-pair accept: localWorker=3 expecting one of [0..2]
+⭕ Socket[1]: accepted worker(globalNode=1, workerIndex=0)
+⭕ Waiting worker-pair accept: localWorker=3 expecting one of [0..2]
+⭕ Socket[2]: accepted worker(globalNode=2, workerIndex=1)
+⭕ Waiting worker-pair accept: localWorker=3 expecting one of [0..2]
+⭕ Socket[3]: accepted worker(globalNode=3, workerIndex=2)
+⭕ Connect worker-pair: localWorker=3 -> expectedPeerWorker=4 (b01ab_run_20260525_075157_shadow_kv_ablation_8B__n5:9999)
+⭕ Socket[4]: connected to worker(globalNode=5, workerIndex=4)
+⭕ Connect worker-pair: localWorker=3 -> expectedPeerWorker=5 (b01ab_run_20260525_075157_shadow_kv_ablation_8B__n6:9999)
+⭕ Socket[5]: connected to worker(globalNode=6, workerIndex=5)
+⭕ Connect worker-pair: localWorker=3 -> expectedPeerWorker=6 (b01ab_run_20260525_075157_shadow_kv_ablation_8B__n7:9999)
+⭕ Socket[6]: connected to worker(globalNode=7, workerIndex=6)
+⭕ Network is initialized
+📀 RequiredMemory: 702 MB
+🔍 [DEBUG] parseStageDefs received: "1:1:1*1:1:1*1:1"
+⚖️  [Auto-Split] Stage 0 (Weight 3.00): Assigned 12 layers
+⚖️  [Auto-Split] Stage 1 (Weight 3.00): Assigned 12 layers
+⚖️  [Auto-Split] Stage 2 (Weight 2.00): Assigned 8 layers
+🧠 CPU: avx2 avx512f
+🧱 [executor-init] node=4 segment=0 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=4 segment=1 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=2 createExec=0 createSync=1
+🧱 [executor-init] node=4 segment=2 kind=attn role=redundant enabled=0 activeLayer=11 redundantLayer=11 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=3 kind=ffn role=redundant enabled=0 activeLayer=11 redundantLayer=11 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=4 kind=attn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=5 kind=ffn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=6 kind=other role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=7 kind=other role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=8 kind=attn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=9 kind=ffn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=10 kind=other role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=11 kind=other role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=12 kind=attn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=13 kind=ffn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=14 kind=other role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=15 kind=other role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=16 kind=attn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=17 kind=ffn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=18 kind=other role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=19 kind=other role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=20 kind=attn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=21 kind=ffn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=22 kind=other role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=23 kind=other role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=24 kind=attn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=25 kind=ffn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=26 kind=other role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=27 kind=other role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=28 kind=attn role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=29 kind=ffn role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=30 kind=other role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=31 kind=other role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=32 kind=attn role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=33 kind=ffn role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=34 kind=other role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=35 kind=other role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=36 kind=attn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=37 kind=ffn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=38 kind=other role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=39 kind=other role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=40 kind=attn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=41 kind=ffn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=42 kind=other role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=43 kind=other role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=44 kind=attn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=45 kind=ffn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=46 kind=other role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=47 kind=other role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=48 kind=attn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=49 kind=ffn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=50 kind=other role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=51 kind=other role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=52 kind=attn role=redundant enabled=0 activeLayer=24 redundantLayer=24 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=53 kind=ffn role=redundant enabled=0 activeLayer=24 redundantLayer=24 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=4 segment=54 kind=other role=unguarded enabled=1 activeLayer=23 redundantLayer=-1 nOps=2 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=4 segment=55 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🚀 Worker 4: Local Loading Mode from /models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m
+⚠️ [seg-build] Adding redundant weight holder for layer 11 before startLayer 12
+⚠️ [seg-build] Adding redundant weight holder for layer 11 before startLayer 12
+⚠️ [seg-build] Adding redundant weight holder for layer 11 before startLayer 12
+⚠️ [seg-build] Adding redundant weight holder for layer 23 before startLayer 24
+⚠️ [seg-build] Adding redundant weight holder for layer 23 before startLayer 24
+🧩 [runtime-plan] static layer plan ready: layers=32 stages=3 activeMarks=32 redundantMarks=4
+   [PP] Node 4: Responsible for Layers 12-24 
+   [PP] Node 4: Runtime-role loading primary=12 redundant=2
+💿 Loading weights for Node 4 (Layers [12, 24))...
+✅ Worker 4: Weights loaded locally.
+📨 [Worker] Recv Control: Batch=4, Pos=0
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=4
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=5
+📨 [Worker] Recv Control: Batch=1, Pos=6
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=7
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=8
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=9
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=10
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=11
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=12
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=13
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=14
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=15
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=16
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=17
+📨 [Worker] Recv Control: Batch=1, Pos=18
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=19
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=20
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=21
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=22
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=23
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=24
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=25
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=26
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=27
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=28
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=29
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=30
+🚁 Network is in non-blocking mode
+🚁 Network is in blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=31
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=32
+🧠 [kvcache][dump] node=4 layer=15 pos=32 k=/tmp/dllama_kvcache_layer15_pos32_node4_k.bin (ok) v=/tmp/dllama_kvcache_layer15_pos32_node4_v.bin (ok)

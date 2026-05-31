@@ -1,0 +1,17 @@
+{
+  "cacheSeq": 4,
+  "cmd": {
+    "cmdKind": 1,
+    "fromNodeIndex": 4,
+    "mode": "exact",
+    "nFfnToMove": 0,
+    "nHeadsToMove": 1,
+    "reserved0": 0,
+    "seq": 2,
+    "stageIndex": 1,
+    "toNodeIndex": 5,
+    "triggerLayer": 12,
+    "triggerPos": 32
+  },
+  "ok": true
+}

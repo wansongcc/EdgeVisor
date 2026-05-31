@@ -1,0 +1,15 @@
+➡️  [Stage 0]
+       • Node 0: Heads=6, KV=2, Dim=768
+       • Node 1: Heads=18, KV=6, Dim=2304
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+➡️  [Stage 1]
+       • Node 2: Heads=18, KV=6, Dim=2304
+       • Node 3: Heads=6, KV=2, Dim=768
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+Evaluation
+Prediction
+⏱️  [Stage/Node Profile Summary]
+  • Stage 0 Node 0: per-fwd total=466.15 ms (exec=106.59 sync=359.56) | per-tok total=291.34 ms (exec= 66.62 sync=224.72) | fwd=5 tok=8
+  • Stage 0 Node 1: per-fwd total=215.08 ms (exec=199.91 sync= 15.17) | per-tok total=134.43 ms (exec=124.94 sync=  9.48) | fwd=5 tok=8
+  • Stage 1 Node 2: per-fwd total=466.45 ms (exec=149.36 sync=317.09) | per-tok total=291.53 ms (exec= 93.35 sync=198.18) | fwd=5 tok=8
+  • Stage 1 Node 3: per-fwd total=427.53 ms (exec= 55.95 sync=371.58) | per-tok total=267.20 ms (exec= 34.97 sync=232.24) | fwd=5 tok=8

@@ -1,0 +1,81 @@
+{
+  "run_id": "vg_ablation_skew_20260527_080133",
+  "purpose": "VG ablation: no skew, compute skew, bandwidth skew, and combined skew.",
+  "model": "3B",
+  "steps": 8,
+  "max_seq_len": 1024,
+  "vg_topology": "1:1:1*1:1:1*1:1",
+  "pp_balanced": "1@4*1@4*1@4*1@4*1@3*1@3*1@3*1@3",
+  "pp_weak_node_light": "1@4*1@4*1@4*1@4*1@1*1@4*1@4*1@3",
+  "weak_node": 4,
+  "high_bw_mbps": 1000,
+  "weak_bw_mbps": 2,
+  "weak_delay_ms": 80,
+  "scenarios": [
+    {
+      "scenario": "no_skew_reference",
+      "cpu_limits": [
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "weak_network": false,
+      "pp_ratios": "1@4*1@4*1@4*1@4*1@3*1@3*1@3*1@3",
+      "hypothesis": "VG should win/compete when bandwidth is high and compute skew is small."
+    },
+    {
+      "scenario": "compute_skew",
+      "cpu_limits": [
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        0.3,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "weak_network": false,
+      "pp_ratios": "1@4*1@4*1@4*1@4*1@1*1@4*1@4*1@3",
+      "hypothesis": "PP fallback should improve when a very slow device becomes a VG-internal TP straggler."
+    },
+    {
+      "scenario": "bandwidth_skew",
+      "cpu_limits": [
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "weak_network": true,
+      "pp_ratios": "1@4*1@4*1@4*1@4*1@1*1@4*1@4*1@3",
+      "hypothesis": "PP fallback should improve if traffic to/from a VG-internal device is weak and PP can reduce that device's work."
+    },
+    {
+      "scenario": "compute_and_bandwidth_skew",
+      "cpu_limits": [
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        0.3,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "weak_network": true,
+      "pp_ratios": "1@4*1@4*1@4*1@4*1@1*1@4*1@4*1@3",
+      "hypothesis": "PP fallback should be best when compute and bandwidth skews hit the same VG-internal device."
+    }
+  ],
+  "network_note": "Weak-network scenarios use per-destination tc: all other containers shape egress traffic whose destination is weak-node IP; weak node shapes all egress."
+}

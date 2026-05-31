@@ -1,0 +1,2 @@
+experiment,model,variant,context_len,root_exit,eval_tokens_s,pred_tokens_s,post_recovery_tokens_s,avg_pred_ms_after_apply,reject_count,output_dir
+shadow_kv_ablation,3B,with_shadow_kv,4096,0,0.0,0.0,0.5170982622776817,1933.8684210526317,0,/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_083941/shadow_kv_ablation/3B/with_shadow_kv

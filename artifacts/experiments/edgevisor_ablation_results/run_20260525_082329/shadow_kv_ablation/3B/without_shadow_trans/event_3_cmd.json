@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/home/cc/yhbian/B01/EdgeVisor/examples/plan-uds-client.py", line 291, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/cc/yhbian/B01/EdgeVisor/examples/plan-uds-client.py", line 284, in main
+    resp = uds_request(args.socket, req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/cc/yhbian/B01/EdgeVisor/examples/plan-uds-client.py", line 13, in uds_request
+    s.connect(socket_path)
+FileNotFoundError: [Errno 2] No such file or directory

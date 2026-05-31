@@ -1,0 +1,30 @@
+{
+  "run_id": "vg_absorb_20260527_080453",
+  "purpose": "Pure VG ablation: with VG local absorption vs no-VG PP under identical waves.",
+  "model": "3B",
+  "steps": 24,
+  "event_pos": 8,
+  "weak_node": 4,
+  "vg_ratios": "1:1:1*1:1:1*1:1",
+  "no_vg_pp_ratios": "1@4*1@4*1@4*1@4*1@3*1@3*1@3*1@3",
+  "scenarios": [
+    {
+      "scenario": "compute_skew",
+      "compute": true,
+      "bandwidth": false
+    },
+    {
+      "scenario": "bandwidth_skew",
+      "compute": false,
+      "bandwidth": true
+    },
+    {
+      "scenario": "compute_and_bandwidth_skew",
+      "compute": true,
+      "bandwidth": true
+    }
+  ],
+  "with_vg_absorb": "3/3/2 VG; after wave on Node4, issue set_plan stage=1 from Node4 to Node3, moving 1 head.",
+  "no_vg_pp_no_absorb": "No VG; singleton PP stages; same wave remains on Node4 stage, no local head migration.",
+  "bandwidth_skew": "per-destination tc to/from Node4: 2 Mbps + 80 ms delay"
+}

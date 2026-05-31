@@ -1,0 +1,47 @@
+{
+  "run_id": "vg_boundary_20260527_072745",
+  "output": "/home/cc/yhbian/B01/vg_boundary_results/vg_boundary_20260527_072745",
+  "rows": 6,
+  "comparisons": [
+    {
+      "scenario": "high_bw_low_skew",
+      "bandwidth_mbps": 1000,
+      "cpu_limits": "2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0",
+      "vg_wall_ms": 2935.344,
+      "pp_wall_ms": 4475.739,
+      "vg_minus_pp_wall_ms": -1540.395,
+      "vg_pred_tokens_s": 6.9808,
+      "pp_pred_tokens_s": 2.81889,
+      "vg_vs_pp_tokens_s_delta_pct": 147.644,
+      "verdict": "VG better/competitive",
+      "hypothesis": "VG should be competitive or better: TP communication is cheap and skew is small."
+    },
+    {
+      "scenario": "low_bw_low_skew",
+      "bandwidth_mbps": 10,
+      "cpu_limits": "2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0",
+      "vg_wall_ms": 3957.82,
+      "pp_wall_ms": 6240.996,
+      "vg_minus_pp_wall_ms": -2283.175,
+      "vg_pred_tokens_s": 3.91389,
+      "pp_pred_tokens_s": 1.99203,
+      "vg_vs_pp_tokens_s_delta_pct": 96.477,
+      "verdict": "VG better/competitive",
+      "hypothesis": "PP should become competitive/better: TP has more intra-stage communication pressure."
+    },
+    {
+      "scenario": "high_bw_high_skew",
+      "bandwidth_mbps": 1000,
+      "cpu_limits": "2.0,2.0,2.0,2.0,0.3,2.0,2.0,2.0",
+      "vg_wall_ms": 6842.809,
+      "pp_wall_ms": 5823.439,
+      "vg_minus_pp_wall_ms": 1019.37,
+      "vg_pred_tokens_s": 1.36799,
+      "pp_pred_tokens_s": 1.96367,
+      "vg_vs_pp_tokens_s_delta_pct": -30.335,
+      "verdict": "PP better",
+      "hypothesis": "PP should be better: a very slow node inside a VG becomes a TP straggler; PP can isolate it with fewer layers."
+    }
+  ],
+  "failed_rows": []
+}

@@ -1,0 +1,4 @@
+out=/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451
+image=dllama-exp-env:latest
+model=/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+tokenizer=/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t

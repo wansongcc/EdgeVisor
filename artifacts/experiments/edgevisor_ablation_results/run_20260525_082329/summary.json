@@ -1,0 +1,22 @@
+{
+  "events": 18,
+  "runs": 6,
+  "microbench": 0,
+  "failed_runs": [
+    {
+      "experiment": "shadow_kv_ablation",
+      "model": "3B",
+      "variant": "without_shadow_trans",
+      "context_len": 4096,
+      "root_exit": 139,
+      "eval_tokens_s": 0.0,
+      "pred_tokens_s": 0.0,
+      "post_recovery_tokens_s": 0.9705858564072146,
+      "avg_pred_ms_after_apply": 1030.3055555555557,
+      "reject_count": 0,
+      "output_dir": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_082329/shadow_kv_ablation/3B/without_shadow_trans"
+    }
+  ],
+  "reject_runs": [],
+  "output": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_082329"
+}

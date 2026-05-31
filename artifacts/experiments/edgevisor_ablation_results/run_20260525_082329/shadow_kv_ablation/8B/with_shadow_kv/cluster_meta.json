@@ -1,0 +1,40 @@
+{
+  "net": "b01ab_run_20260525_082329_shadow_kv_ablation_8B__net",
+  "root": "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n0",
+  "workers": [
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n1",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n2",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n3",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n4",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n5",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n6",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n7"
+  ],
+  "all_names": [
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n0",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n1",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n2",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n3",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n4",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n5",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n6",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n7"
+  ],
+  "sock_host": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_082329/s/b01_f4ecd91dc0c0.sock",
+  "test_dir": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_082329/shadow_kv_ablation/8B/with_shadow_kv",
+  "model": "8B",
+  "variant": "with_shadow_kv",
+  "exp": "shadow_kv_ablation",
+  "root_cmd": "./dllama inference --prompt 'The capital of France is' --steps 48 --model /models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m --tokenizer /models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 2048 --benchmark --workers b01ab_run_20260525_082329_shadow_kv_ablation_8B__n1:9999 --ratios 1:1 --enable-plan-barrier --enable-kv-redundancy-during-migration 1 --kv-redundancy 2",
+  "active_workers": [
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n1"
+  ],
+  "standby_workers": [
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n2",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n3",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n4",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n5",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n6",
+    "b01ab_run_20260525_082329_shadow_kv_ablation_8B__n7"
+  ]
+}

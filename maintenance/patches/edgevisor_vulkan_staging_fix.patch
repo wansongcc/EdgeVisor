@@ -1,0 +1,10 @@
+diff --git a/src/nn/nn-vulkan.cpp b/src/nn/nn-vulkan.cpp
+--- a/src/nn/nn-vulkan.cpp
++++ b/src/nn/nn-vulkan.cpp
+@@ -249,7 +249,6 @@ void NnVulkanStagingCopier::executeCopyCommand(vk::Buffer& target, const NnSize
+     assert(context->device.waitForFences({ fence }, true, uint64_t(-1)) == vk::Result::eSuccess);
+ 
+     context->device.destroyFence(fence);
+-    context->device.destroyFence(fence);
+     context->device.freeCommandBuffers(context->commandPool, 1, &commandBuffer);
+ }

@@ -1,0 +1,39 @@
+{
+  "net": "b01ab_pc_20260526_031516_pointer_swizzling_contr_net",
+  "root": "b01ab_pc_20260526_031516_pointer_swizzling_contr_n0",
+  "workers": [
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n1",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n2",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n3",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n4",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n5",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n6",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n7"
+  ],
+  "all_names": [
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n0",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n1",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n2",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n3",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n4",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n5",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n6",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n7"
+  ],
+  "sock_host": "/home/cc/yhbian/B01/ptr_ctrl/pc_20260526_031516/s/b01_f5b163bd2055.sock",
+  "test_dir": "/home/cc/yhbian/B01/ptr_ctrl/pc_20260526_031516/pointer_swizzling_controlled/8B/without_pointer_operator_rebind",
+  "model": "8B",
+  "variant": "without_pointer_operator_rebind",
+  "exp": "pointer_swizzling_controlled",
+  "root_cmd": "./dllama inference --prompt 'The capital of France is' --steps 64 --model /models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m --tokenizer /models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 2048 --benchmark --workers b01ab_pc_20260526_031516_pointer_swizzling_contr_n1:9999 b01ab_pc_20260526_031516_pointer_swizzling_contr_n2:9999 b01ab_pc_20260526_031516_pointer_swizzling_contr_n3:9999 b01ab_pc_20260526_031516_pointer_swizzling_contr_n4:9999 b01ab_pc_20260526_031516_pointer_swizzling_contr_n5:9999 b01ab_pc_20260526_031516_pointer_swizzling_contr_n6:9999 b01ab_pc_20260526_031516_pointer_swizzling_contr_n7:9999 --ratios '1:1:1*1:1:1*1:1' --enable-plan-barrier --enable-kv-redundancy-during-migration 1 --kv-redundancy 2",
+  "active_workers": [
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n1",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n2",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n3",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n4",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n5",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n6",
+    "b01ab_pc_20260526_031516_pointer_swizzling_contr_n7"
+  ],
+  "standby_workers": []
+}

@@ -1,0 +1,34 @@
+{
+  "batchSize": 4,
+  "cacheSeq": 0,
+  "cmd": {
+    "cmdKind": 0,
+    "fromNodeIndex": 0,
+    "mode": "none",
+    "nFfnToMove": 0,
+    "nHeadsToMove": 0,
+    "reserved0": 0,
+    "seq": 0,
+    "stageIndex": 4294967295,
+    "toNodeIndex": 0,
+    "triggerLayer": 4294967295,
+    "triggerPos": 4294967295
+  },
+  "enablePlanBarrier": true,
+  "ok": true,
+  "perfSamples": 0,
+  "position": 0,
+  "ppMigration": {
+    "armedTriggerPos": -1,
+    "collectLayer": 19,
+    "collectPos": -1,
+    "enabled": true,
+    "fromNodeIndex": 0,
+    "layerCount": 1,
+    "layerListPinnedByEnv": false,
+    "layers": [
+      19
+    ],
+    "toNodeIndex": 2
+  }
+}

@@ -1,145 +1,181 @@
-![Distributed Llama](.github/cover.png)
+# EdgeVisor GPU Version
 
-# Distributed Llama
+EdgeVisor GPU Version 是在 Distributed Llama 基础上扩展的 CPU/GPU 分布式 LLM 推理实验工程。当前版本保留原有单机推理、非均匀静态张量并行、UDS 控制的动态迁移、GPU Vulkan 后端以及 PP/TP 组合实验能力，同时把项目脚本、历史产物、测试记录和维护补丁按工程化目录重新整理。
 
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/b4rtaz/distributed-llama/.github%2Fworkflows%2Fmain.yml?style=flat-square)](https://github.com/b4rtaz/distributed-llama/actions) [![License: MIT](https://img.shields.io/github/license/mashape/apistatus.svg?style=flat-square)](/LICENSE) [![Discord](https://discordapp.com/api/guilds/1245814812353495070/widget.png?style=shield)](https://n4no.com/projects/distributedLlama/discord.php)
+## 目录结构
 
-Connect home devices into a powerful cluster to accelerate LLM inference. More devices mean faster performance, leveraging tensor parallelism and high-speed synchronization over Ethernet.
-
-Supports Linux, macOS, and Windows. Optimized for ARM and x86_64 AVX2 CPUs.
-
-**How to Run**
-- [💻 How to Run on Linux, MacOS or Windows](./docs/HOW_TO_RUN_LINUX_MACOS_WIN.md)
-- [🍓 How to Run on Raspberry Pi](./docs/HOW_TO_RUN_RASPBERRYPI.md)
-- [🧠 How to Run on GPU](./docs/HOW_TO_RUN_GPU.md)
-- [🧷 Environment Variable Switches](./docs/README_ENV_VARS.md)
-- [🧭 Online Migration (PlanCommand + UDS)](./docs/HOW_TO_ONLINE_MIGRATION.md)
-- [⚖️ Uneven TP/PP Startup Configuration](./doc/UNEVEN_TP_PP_CONFIG.md)
-
-**News**
-- 16 Sep 2025 - Qwen 3 MoE models are now supported on Vulkan.
-- 5 Sep 2025 - Qwen 3 MoE models are now supported on CPU.
-- 3 Aug 2025 - Qwen 3 0.6B, 1.7B, 8B and 14B models are now supported.
-- 23 Mar 2025 - [🌋 Experimental Vulkan support](https://github.com/b4rtaz/distributed-llama/releases/tag/v0.13.0)
-- 12 Feb 2025 - 🚧 Merged the [fundamental codebase refactor](https://github.com/b4rtaz/distributed-llama/releases/tag/v0.12.0)
-- 9 Jan 2025 - [🍎 Llama 3.3 70B on 4 x Mac Mini M4 Pro 24GB RAM](https://github.com/b4rtaz/distributed-llama/discussions/147)
-
-### 🔥 Setup Root Node by Single Command
-
-Python 3 and C++ compiler required. The command will download the model and the tokenizer.
-
-| Model                             | Size     | Command                                              |
-| --------------------------------- | -------- | ---------------------------------------------------- |
-| Llama 3.1 8B Instruct Q40         | 6.32 GB  | `python launch.py llama3_1_8b_instruct_q40`          |
-| Llama 3.1 405B Instruct Q40       | 238 GB   | `python launch.py llama3_1_405b_instruct_q40`.       |
-| Llama 3.2 1B Instruct Q40         | 1.7 GB   | `python launch.py llama3_2_1b_instruct_q40`          |
-| Llama 3.2 3B Instruct Q40         | 3.4 GB   | `python launch.py llama3_2_3b_instruct_q40`          |
-| Llama 3.3 70B Instruct Q40        | 40 GB    | `python launch.py llama3_3_70b_instruct_q40`         |
-| DeepSeek R1 Distill Llama 8B Q40  | 6.32 GB  | `python launch.py deepseek_r1_distill_llama_8b_q40`  |
-| Qwen 3 0.6B Q40                   | 0.9 GB   | `python launch.py qwen3_0.6b_q40`                    |
-| Qwen 3 1.7B Q40                   | 2.2 GB   | `python launch.py qwen3_1.7b_q40`                    |
-| Qwen 3 8B Q40                     | 6.7 GB   | `python launch.py qwen3_8b_q40`                      |
-| Qwen 3 14B Q40                    | 10.9 GB  | `python launch.py qwen3_14b_q40`                     |
-| Qwen 3 30B A3B Q40                | 17.0 GB  | `python launch.py qwen3_30b_a3b_q40`                 |
-
-### 🛠️ Convert Model Manually
-
-* [🤗 How to Convert Hugging Face Model](./docs/HOW_TO_CONVERT_HF_MODEL.md)
-
-### 🚧 Known Limitations
-
-* You can run Distributed Llama only on 1, 2, 4... 2^n nodes.
-* The maximum number of nodes is equal to the number of KV heads in the model [#70](https://github.com/b4rtaz/distributed-llama/issues/70).
-* Only the following quantizations are supported [#183](https://github.com/b4rtaz/distributed-llama/issues/183):
-  * `q40` model with `q80` `buffer-float-type`
-  * `f32` model with `f32` `buffer-float-type`
-
-### 👷 Architecture
-
-````
-[🔀 SWITCH OR ROUTER]
-      | | | |
-      | | | |_______ 🔸 device1 (ROOT)     10.0.0.1
-      | | |_________ 🔹 device2 (WORKER 1) 10.0.0.2:9999
-      | |___________ 🔹 device3 (WORKER 2) 10.0.0.3:9999
-      |_____________ 🔹 device4 (WORKER 3) 10.0.0.4:9999
-                        ...
-````
-
-The project is split up into two parts:
-* **🔸 Root node** - it's responsible for loading the model and weights and forward them to workers. Also, it synchronizes the state of the neural network. The root node is also a worker, it processes own slice of the neural network.
-* **🔹 Worker node** - it processes own slice of the neural network. It doesn't require any configuration related to the model.
-
-You always need the root node and you can add 2^n - 1 worker nodes to speed up the inference. The RAM usage of the neural network is split up across all nodes. The root node requires a bit more RAM than worker nodes.
-
-### 🎹 Commands
-
-* `dllama inference` - run the inference with a simple benchmark,
-* `dllama chat` - run the CLI chat,
-* `dllama worker` - run the worker node,
-* `dllama-api` - run the API server.
-
-<details>
-
-<summary>🎹 Supported Arguments</summary>
-
-<br />Inference, Chat, API
-
-| Argument                     | Description                                                      | Example                                |
-| ---------------------------- | ---------------------------------------------------------------- | -------------------------------------- |
-| `--model <path>`             | Path to model.                                                   | `dllama_model_meta-llama-3-8b_q40.m`   |
-| `--tokenizer <path>`         | Tokenizer to model.                                              | `dllama_tokenizer_llama3.t`            |
-| `--buffer-float-type <type>` | Float precision of synchronization.                              | `q80`                                  |
-| `--workers <workers>`        | Addresses of workers (ip:port), separated by space.              | `10.0.0.1:9999 10.0.0.2:9999`          |
-| `--max-seq-len <n>`          | The maximum sequence length, it helps to reduce the RAM usage.   | `4096`                                 |
-
-Inference, Chat, Worker, API
-
-| Argument                     | Description                                                           | Example                             |
-| ---------------------------- | --------------------------------------------------------------------- | ----------------------------------- |
-| `--nthreads <n>`             | Amount of threads. Don't set a higher value than number of CPU cores. | `4`                                 |
-
-Worker, API
-
-| Argument                     | Description                       | Example           |
-| ---------------------------- | --------------------------------- | ----------------- |
-| `--port <port>`              | Binding port.                     | `9999`            |
-
-Inference
-
-| Argument                     | Description                    | Example            |
-| ---------------------------- | ------------------------------ | ------------------ |
-| `--prompt <prompt>`          | Initial prompt.                | `"Hello World"`    |
-| `--steps <steps>`            | Number of tokens to generate.  | `256`              |
-
-</details>
-
-## 📊 Measurements
-
-Please check the [discussions](https://github.com/b4rtaz/distributed-llama/discussions) section, where many measurements were published on different configurations.
-
-## ✋ Contribution
-
-Feel free to contribute to this project. For small changes, simply create a new merge request. For larger changes, please create an issue to discuss your plans. Please follow these guidelines when contributing:
-
-* Make only minimal changes and avoid modifying files that are not necessary.
-* Ensure the code is compatible across all supported systems and CPUs.
-* This repository is maintained in English.
-
-## 💡 License
-
-This project is released under the MIT license.
-
-## 📖 Citation
-
+```text
+EdgeVisor_GPU_Version/
+├── EdgeVisor/                 # 核心 C++/Vulkan 推理引擎，保留原 Distributed Llama 构建方式
+│   ├── src/                   # 推理、网络同步、动态迁移、tokenizer、Vulkan/CPU backend
+│   ├── examples/              # UDS client 和原始示例
+│   ├── docs/                  # 引擎级使用说明
+│   └── Makefile               # 核心二进制构建入口
+├── config/env.sh              # 统一模型路径、tokenizer、日志目录、Vulkan 依赖环境
+├── scripts/                   # 维护后的脚本入口
+│   ├── semantic/              # CPU/GPU 语义回归与分布式推理脚本
+│   ├── gpu/                   # GPU PP、补丁回归和调试脚本
+│   └── build.sh               # 标准构建脚本
+├── tests/semantic/            # 六项 benchmark 回归和测试记录生成器
+├── docs/test_records/         # 本次/后续验收测试记录输出目录
+├── maintenance/               # 历史补丁、临时修复脚本、调试配置归档
+├── artifacts/                 # 历史日志、实验结果、docker 运行记录归档
+├── tools/                     # 本地 Vulkan 依赖等辅助工具
+├── build.sh                   # 兼容的一键构建入口
+└── run_*.sh                   # 顶层兼容 wrapper，转发到 scripts/ 下的维护脚本
 ```
-@misc{dllama,
-  author = {Bartłomiej Tadych},
-  title = {Distributed Llama},
-  year = {2024},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/b4rtaz/distributed-llama}},
-  commit = {7eb77ca93ec0d502e28d36b6fb20039b449cbea4}
-}
+
+顶层 `run_semantic_*.sh` 和 `run_gpu_*.sh` 文件仍然保留，用作兼容入口；真实维护位置在 `scripts/semantic/` 和 `scripts/gpu/`。
+
+## 环境约束
+
+默认远端模型路径为：
+
+```bash
+/home/cc/dllama/distributed-llama/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+/home/cc/dllama/distributed-llama/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
 ```
+
+GPU 测试只使用 GPU0、GPU1、GPU2。不要在命令中使用 `--gpu-index 3`，也不要终止 GPU3 上的进程。
+
+可通过环境变量覆盖默认配置：
+
+```bash
+export EDGEVISOR_MODEL3=/path/to/dllama_model.m
+export EDGEVISOR_TOKENIZER=/path/to/dllama_tokenizer.t
+export EDGEVISOR_LOG_ROOT=/path/to/runtime_logs
+```
+
+## 构建
+
+推荐使用项目根目录入口：
+
+```bash
+cd /path/to/EdgeVisor_GPU_Version
+bash build.sh
+```
+
+等价于：
+
+```bash
+source config/env.sh
+cd "$EDGEVISOR_ENGINE_DIR"
+make DLLAMA_VULKAN=1 dllama
+```
+
+如果只需要 CPU 构建，可执行：
+
+```bash
+DLLAMA_VULKAN=0 bash build.sh
+```
+
+## 六项验收回归
+
+完整回归包括：
+
+1. CPU 单机测试
+2. GPU 单机测试
+3. CPU 非均匀静态测试
+4. GPU 非均匀静态测试
+5. CPU 非均匀动态迁移测试
+6. GPU 非均匀动态迁移测试
+
+执行：
+
+```bash
+cd /path/to/EdgeVisor_GPU_Version
+bash run_six_benchmark_tests.sh
+```
+
+默认输出到：
+
+```bash
+runtime_logs/benchmark_docs_YYYYmmdd_HHMMSS/
+```
+
+生成测试记录：
+
+```bash
+python3 tests/semantic/generate_test_records.py \
+  --logs runtime_logs/benchmark_docs_YYYYmmdd_HHMMSS \
+  --out docs/test_records \
+  --project-root "$PWD"
+```
+
+每个测试记录包含实际 init 输入、动态迁移 UDS 输入、UDS 返回、token 原始输出、`--benchmark` 的 `Prediction tokens/s` 和 Stage/Node profile。
+
+## 常用兼容脚本
+
+```bash
+bash run_semantic_cpu_tp_static.sh
+bash run_semantic_gpu_tp_static.sh
+bash run_semantic_cpu_dynamic_heads.sh
+bash run_semantic_gpu_dynamic_heads.sh
+bash run_gpu_pp_migration.sh
+```
+
+这些命令会转发到 `scripts/` 下的维护脚本。日志默认仍由各脚本写入自身配置的目录；标准化六项验收建议优先使用 `run_six_benchmark_tests.sh`。
+
+## UDS 动态迁移
+
+UDS 客户端位于：
+
+```bash
+EdgeVisor/examples/plan-uds-client.py
+```
+
+Heads/FFN 迁移示例：
+
+```bash
+python3 EdgeVisor/examples/plan-uds-client.py SOCKET set_plan \
+  --seq 501 \
+  --mode next_barrier \
+  --stage 0 \
+  --from 1 \
+  --to 2 \
+  --kind 1 \
+  --heads 1 \
+  --ffn 0
+```
+
+`--kind 1` 表示 heads，`--kind 2` 表示 FFN，`--kind 3` 表示二者同时迁移。
+
+PP layer 迁移示例：
+
+```bash
+python3 EdgeVisor/examples/plan-uds-client.py SOCKET set_pp_migration \
+  --seq 1 \
+  --mode next_barrier \
+  --from 0 \
+  --to 1 \
+  --layer-count 1 \
+  --trigger-pos 0
+```
+
+## 已保留的功能范围
+
+- Llama3 chat template 使用 `<|eot_id|>` 作为消息结束符。
+- CPU/GPU 单机语义推理。
+- CPU/GPU 非均匀 TP 静态推理，支持 `--ratios "2:3:3"`。
+- CPU/GPU UDS 控制的 heads 动态迁移，支持 plan barrier、stage full weights 和 KV redundancy。
+- GPU Vulkan q80/q40 matmul 支持在线 repartition 后输入宽度变化。
+- PP stage 边界发送前合并 residual，并保证非首个 PP stage 的 Vulkan preSync position 正确上传。
+
+## 历史产物和维护文件
+
+历史日志和实验结果不再混放在项目顶层：
+
+```text
+artifacts/logs/
+artifacts/experiments/
+artifacts/docker/
+```
+
+历史补丁、一次性修复脚本和调试配置归档在：
+
+```text
+maintenance/patches/
+maintenance/debug/
+```
+
+这些文件用于追溯，不作为日常运行入口。

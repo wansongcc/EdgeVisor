@@ -1,0 +1,65 @@
+Listening on 0.0.0.0:19301...
+⭕ The root node has connected
+⭕ peerWorkers: 1
+⭕ NodeIndex: 0
+⭕ Socket[0]: accepted root node
+⭕ Connect worker-pair: localWorker=0 -> expectedPeerWorker=1 (127.0.0.1:19302)
+⭕ Socket[1]: connected to worker(globalNode=2, workerIndex=1)
+⭕ Network is initialized
+📀 RequiredMemory: 745 MB
+🔍 [DEBUG] parseStageDefs received: "1@8*1@10*1@10"
+🌋 Device: Tesla T4
+🌋 DeviceApiVersion: 1.4.303
+🌋 MaxComputeSharedMemory: 48 kB
+🌋 NonCoherentAtomSize: 64 bytes
+🌋 Heap[0]: 15360 MB
+🌋 Heap[2]: 246 MB
+🧱 [executor-init] node=1 segment=0 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=1 segment=1 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=2 createExec=0 createSync=1
+🧱 [executor-init] node=1 segment=2 kind=attn role=redundant enabled=0 activeLayer=7 redundantLayer=7 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=3 kind=ffn role=redundant enabled=0 activeLayer=7 redundantLayer=7 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=1 segment=4 kind=attn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=5 kind=ffn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=6 kind=attn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=7 kind=ffn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=8 kind=attn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=9 kind=ffn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=10 kind=attn role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=11 kind=ffn role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=12 kind=attn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=13 kind=ffn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=14 kind=attn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=15 kind=ffn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=16 kind=attn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=17 kind=ffn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=18 kind=attn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=19 kind=ffn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=20 kind=attn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=21 kind=ffn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=22 kind=attn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=17 nSyncs=3 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=23 kind=ffn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=24 kind=attn role=redundant enabled=0 activeLayer=18 redundantLayer=18 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=25 kind=ffn role=redundant enabled=0 activeLayer=18 redundantLayer=18 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=1 segment=26 kind=other role=unguarded enabled=1 activeLayer=17 redundantLayer=-1 nOps=2 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=27 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🚀 Worker 1: Local Loading Mode from /home/cc/dllama/distributed-llama/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+⚠️ [seg-build] Adding redundant weight holder for layer 7 before startLayer 8
+⚠️ [seg-build] Adding redundant weight holder for layer 17 before startLayer 18
+🧩 [runtime-plan] static layer plan ready: layers=28 stages=3 activeMarks=28 redundantMarks=4
+   [PP] Node 1: Responsible for Layers 8-18 
+   [PP] Node 1: Runtime-role loading primary=10 redundant=2
+💿 Loading weights for Node 1 (Layers [8, 18))...
+✅ Worker 1: Weights loaded locally.
+📨 [Worker] Recv Control: Batch=1, Pos=0
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=1
+📨 [Worker] Recv Control: Batch=1, Pos=2
+🧩 [kv-write-gpu] node=1 seg=2 layer=7 pos=0 kBuf=25 range=[0,1024)
+🧩 [kv-write-gpu] node=1 seg=2 layer=7 pos=0 vBuf=26 range=[0,1024)
+🧩 [kv-write-check] node=1 layer=7 pos=0 kvDim=1024 status=ok
+🧩 [kv-write-gpu] node=1 seg=2 layer=7 pos=1 kBuf=25 range=[0,1024)
+🧩 [kv-write-gpu] node=1 seg=2 layer=7 pos=1 vBuf=26 range=[0,1024)
+🧩 [kv-write-check] node=1 layer=7 pos=1 kvDim=1024 status=ok
+📨 [Worker] Recv Control: Batch=1, Pos=3
+🛂 [layer-gate] node=1 role=redundant layer=7 enabled=1 matchedSegs=2
+🔁 [worker-switch] node=1 activate redundant layer=7 (target-stage)

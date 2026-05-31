@@ -1,0 +1,6 @@
+experiment,model,variant,context_len,root_exit,eval_tokens_s,pred_tokens_s,post_recovery_tokens_s,avg_pred_ms_after_apply,reject_count,output_dir
+shadow_kv_ablation,3B,with_shadow_kv,4096,0,0.0,0.0,1.538336976763015,650.0526315789474,0,/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_075157/shadow_kv_ablation/3B/with_shadow_kv
+shadow_kv_ablation,3B,without_shadow_trans,4096,0,0.0,0.0,1.3626556644838943,733.8611111111111,0,/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_075157/shadow_kv_ablation/3B/without_shadow_trans
+shadow_kv_ablation,3B,without_shadow_recompute,4096,0,0.0,0.0,1.1312890741292052,883.9473684210526,0,/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_075157/shadow_kv_ablation/3B/without_shadow_recompute
+shadow_kv_ablation,8B,with_shadow_kv,4096,0,0.0,0.0,0.6625634230118738,1509.2894736842106,0,/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_075157/shadow_kv_ablation/8B/with_shadow_kv
+shadow_kv_ablation,8B,without_shadow_trans,4096,0,0.0,0.0,0.34388534676654836,2907.945945945946,0,/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_075157/shadow_kv_ablation/8B/without_shadow_trans

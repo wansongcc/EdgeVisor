@@ -1,0 +1,279 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+Listening on 0.0.0.0:9999...
+⭕ The root node has connected
+⭕ peerWorkers: 2
+⭕ NodeIndex: 2
+⭕ Socket[0]: accepted root node
+⭕ Waiting worker-pair accept: localWorker=2 expecting one of [0..1]
+⭕ Socket[1]: accepted worker(globalNode=1, workerIndex=0)
+⭕ Waiting worker-pair accept: localWorker=2 expecting one of [0..1]
+⭕ Socket[2]: accepted worker(globalNode=2, workerIndex=1)
+⭕ Network is initialized
+📀 RequiredMemory: 749 MB
+🔍 [DEBUG] parseStageDefs received: "1:1@20*1:1@8"
+🧠 CPU: avx2 avx512f
+🧱 [executor-init] node=3 segment=0 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=3 segment=1 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=2 createExec=0 createSync=1
+🧱 [executor-init] node=3 segment=2 kind=attn role=redundant enabled=0 activeLayer=19 redundantLayer=19 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=3 kind=ffn role=redundant enabled=0 activeLayer=19 redundantLayer=19 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=4 kind=attn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=5 kind=ffn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=6 kind=other role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=7 kind=other role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=8 kind=attn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=9 kind=ffn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=10 kind=other role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=11 kind=other role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=12 kind=attn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=13 kind=ffn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=14 kind=other role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=15 kind=other role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=16 kind=attn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=17 kind=ffn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=18 kind=other role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=19 kind=other role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=20 kind=attn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=21 kind=ffn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=22 kind=other role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=23 kind=other role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=24 kind=attn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=25 kind=ffn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=26 kind=other role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=27 kind=other role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=28 kind=attn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=29 kind=ffn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=30 kind=other role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=31 kind=other role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=32 kind=attn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=17 nSyncs=3 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=33 kind=ffn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=34 kind=other role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=3 segment=35 kind=other role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=3 segment=36 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=6 nSyncs=1 createExec=1 createSync=1
+🚀 Worker 3: Local Loading Mode from /models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+⚠️ [seg-build] Adding redundant weight holder for layer 19 before startLayer 20
+⚠️ [seg-build] Adding redundant weight holder for layer 19 before startLayer 20
+🧩 [runtime-plan] static layer plan ready: layers=28 stages=2 activeMarks=28 redundantMarks=2
+   [PP] Node 3: Responsible for Layers 20-28 [Last]
+   [PP] Node 3: Stage full-weight loading ENABLED
+   [PP] Node 3: Runtime-role loading primary=8 redundant=1
+💿 Loading weights for Node 3 (Layers [20, 28))...
+✅ Worker 3: Weights loaded locally.
+📨 [Worker] Recv Control: Batch=4, Pos=0
+🚁 Network is in non-blocking mode
+📨 [Worker] Recv Control: Batch=1, Pos=4
+📨 [Worker] Recv Control: Batch=1, Pos=5
+🧩 [kv-write] node=3 seg=2 layer=19 pos=0 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write] node=3 seg=2 layer=19 pos=0 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write-check] node=3 layer=19 pos=0 kvDim=1024 status=ok
+🧩 [kv-write] node=3 seg=2 layer=19 pos=1 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write] node=3 seg=2 layer=19 pos=1 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write-check] node=3 layer=19 pos=1 kvDim=1024 status=ok
+🧩 [kv-write] node=3 seg=2 layer=19 pos=2 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write] node=3 seg=2 layer=19 pos=2 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write-check] node=3 layer=19 pos=2 kvDim=1024 status=ok
+🧩 [kv-write] node=3 seg=2 layer=19 pos=3 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write] node=3 seg=2 layer=19 pos=3 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write-check] node=3 layer=19 pos=3 kvDim=1024 status=ok
+🧩 [kv-write] node=3 seg=2 layer=19 pos=4 kBuf=24 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write] node=3 seg=2 layer=19 pos=4 vBuf=25 bufX=1024 srcRange=[512,1024) dstRange=[512,1024)
+🧩 [kv-write-check] node=3 layer=19 pos=4 kvDim=1024 status=ok
+📨 [Worker] Recv Control: Batch=1, Pos=6
+🛂 [layer-gate] node=3 role=redundant layer=19 enabled=1 matchedSegs=2
+🔁 [worker-switch] node=3 activate redundant layer=19 (target-stage)
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=6 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=7
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=7 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=8
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=8 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=9
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=9 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=10
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=10 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=11
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=11 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=12
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=12 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=13
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=13 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=14
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=14 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=15
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=15 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=16
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=16 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=17
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=17 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=18
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=18 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=19
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=19 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=20
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=20 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=21
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=21 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=22
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=22 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=23
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=23 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=24
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=24 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=25
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=25 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=26
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=26 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=27
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=27 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=28
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=28 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=29
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=29 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=30
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=30 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=31
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=31 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=32
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=32 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=33
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=33 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=34
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=34 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=35
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=35 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=36
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=36 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=37
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=37 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=38
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=38 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=39
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=39 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=40
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=40 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=41
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=41 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=42
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=42 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=43
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=43 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=44
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=44 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=45
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=45 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=46
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=46 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=47
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=47 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=48
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=48 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=49
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=49 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=50
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=50 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=51
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=51 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=52
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=52 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=53
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=53 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=54
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=54 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=55
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=55 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=56
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=56 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=57
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=57 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=58
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=58 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=59
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=59 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=60
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=60 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=61
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=61 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=62
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=62 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=63
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=63 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=64
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=64 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=65
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=65 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=66
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=66 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=67
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=67 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=68
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=68 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=69
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=69 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=70
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=70 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=71
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=71 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=72
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=72 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=73
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=73 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=74
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=74 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=75
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=75 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=76
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=76 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=77
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=77 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=78
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=78 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=79
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=79 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=80
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=80 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=81
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=81 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=82
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=82 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=83
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=83 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=84
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=84 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=85
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=85 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=86
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=86 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=87
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=87 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=88
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=88 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=89
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=89 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=90
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=90 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=91
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=91 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=92
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=92 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=93
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=93 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=94
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=94 op=block_multihead_att opname=runtime_redundant_att_in_left path=active
+📨 [Worker] Recv Control: Batch=1, Pos=95
+✅ [redundant-infer] node=3 seg=2 layer=19 pos=95 op=block_multihead_att opname=runtime_redundant_att_in_left path=active

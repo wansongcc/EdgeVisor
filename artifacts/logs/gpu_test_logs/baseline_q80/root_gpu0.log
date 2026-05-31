@@ -1,0 +1,1 @@
+dllama: src/nn/nn-vulkan.cpp:685: std::vector<unsigned int> resolveShaderConstants(const NnOpConfig*, NnUint, NnSize3D, NnSize3D): Assertion `inputSize.x % (Q40_BLOCK_SIZE * tileSizeX) == 0' failed.

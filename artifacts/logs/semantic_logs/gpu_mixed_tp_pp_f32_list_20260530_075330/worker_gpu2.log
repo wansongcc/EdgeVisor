@@ -1,0 +1,23 @@
+Listening on 0.0.0.0:20012...
+⭕ The root node has connected
+⭕ peerWorkers: 1
+⭕ NodeIndex: 1
+⭕ Socket[0]: accepted root node
+⭕ Waiting worker-pair accept: localWorker=1 expecting one of [0..0]
+⭕ Socket[1]: accepted worker(globalNode=1, workerIndex=0)
+⭕ Network is initialized
+📀 RequiredMemory: 724 MB
+🔍 [DEBUG] parseStageDefs received: "1:2*1"
+⚖️  [Auto-Split] Stage 0 (Weight 3.00): Assigned 21 layers
+⚖️  [Auto-Split] Stage 1 (Weight 1.00): Assigned 7 layers
+🌋 Device: Tesla T4
+🌋 DeviceApiVersion: 1.4.303
+🌋 MaxComputeSharedMemory: 48 kB
+🌋 NonCoherentAtomSize: 64 bytes
+🌋 Heap[0]: 15360 MB
+🌋 Heap[2]: 246 MB
+🧱 [executor-init] node=2 segment=0 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=2 segment=1 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=2 createExec=0 createSync=1
+🧱 [executor-init] node=2 segment=2 kind=attn role=redundant enabled=0 activeLayer=20 redundantLayer=20 nOps=13 nSyncs=1 createExec=1 createSync=1
+⭕ Network is closed
+🚨 Critical error: Unsupported shader: MATMUL/F32_Q40_F32

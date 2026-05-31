@@ -1,0 +1,96 @@
+{
+  "run_id": "vg_boundary_coarse_20260527_073240",
+  "output": "/home/cc/yhbian/B01/vg_boundary_results/vg_boundary_coarse_20260527_073240",
+  "rows": [
+    {
+      "run_id": "vg_boundary_coarse_20260527_073240",
+      "topology": "vg_332_all8",
+      "ratios": "1:1:1*1:1:1*1:1",
+      "active_workers": 7,
+      "note": "all 8 nodes, 3/3/2 VG with TP inside stages",
+      "bandwidth_mbps": 1,
+      "steps": 6,
+      "root_exit": 0,
+      "wall_ms": 20644.927740097046,
+      "avg_pred_ms": 2588.5,
+      "effective_tokens_s": 0.38632412594166504,
+      "output_dir": "/home/cc/yhbian/B01/vg_boundary_results/vg_boundary_coarse_20260527_073240/vg_boundary_coarse/3B/vg_332_all8"
+    },
+    {
+      "run_id": "vg_boundary_coarse_20260527_073240",
+      "topology": "pp_8stage_all8",
+      "ratios": "1@4*1@4*1@4*1@4*1@3*1@3*1@3*1@3",
+      "active_workers": 7,
+      "note": "all 8 nodes, no VG, singleton PP stages",
+      "bandwidth_mbps": 1,
+      "steps": 6,
+      "root_exit": 0,
+      "wall_ms": 24950.05440711975,
+      "avg_pred_ms": 4291.5,
+      "effective_tokens_s": 0.2330187580100198,
+      "output_dir": "/home/cc/yhbian/B01/vg_boundary_results/vg_boundary_coarse_20260527_073240/vg_boundary_coarse/3B/pp_8stage_all8"
+    },
+    {
+      "run_id": "vg_boundary_coarse_20260527_073240",
+      "topology": "pp_3stage_strong",
+      "ratios": "1@10*1@9*1@9",
+      "active_workers": 2,
+      "note": "coarse PP fallback using only root + 2 strong workers",
+      "bandwidth_mbps": 1,
+      "steps": 6,
+      "root_exit": 0,
+      "wall_ms": 24681.011199951172,
+      "avg_pred_ms": 4291.5,
+      "effective_tokens_s": 0.2330187580100198,
+      "output_dir": "/home/cc/yhbian/B01/vg_boundary_results/vg_boundary_coarse_20260527_073240/vg_boundary_coarse/3B/pp_3stage_strong"
+    }
+  ],
+  "comparisons": [
+    {
+      "baseline": "vg_332_all8",
+      "candidate": "pp_8stage_all8",
+      "baseline_wall_ms": 20644.928,
+      "candidate_wall_ms": 24950.054,
+      "candidate_minus_baseline_wall_ms": 4305.127,
+      "baseline_tokens_s": 0.38632,
+      "candidate_tokens_s": 0.23302,
+      "candidate_vs_baseline_tokens_s_delta_pct": -39.683,
+      "verdict": "VG_better"
+    },
+    {
+      "baseline": "vg_332_all8",
+      "candidate": "pp_3stage_strong",
+      "baseline_wall_ms": 20644.928,
+      "candidate_wall_ms": 24681.011,
+      "candidate_minus_baseline_wall_ms": 4036.083,
+      "baseline_tokens_s": 0.38632,
+      "candidate_tokens_s": 0.23302,
+      "candidate_vs_baseline_tokens_s_delta_pct": -39.683,
+      "verdict": "VG_better"
+    }
+  ],
+  "design": {
+    "bandwidth_mbps": 1,
+    "steps": 6,
+    "topologies": [
+      [
+        "vg_332_all8",
+        "1:1:1*1:1:1*1:1",
+        7,
+        "all 8 nodes, 3/3/2 VG with TP inside stages"
+      ],
+      [
+        "pp_8stage_all8",
+        "1@4*1@4*1@4*1@4*1@3*1@3*1@3*1@3",
+        7,
+        "all 8 nodes, no VG, singleton PP stages"
+      ],
+      [
+        "pp_3stage_strong",
+        "1@10*1@9*1@9",
+        2,
+        "coarse PP fallback using only root + 2 strong workers"
+      ]
+    ]
+  }
+}

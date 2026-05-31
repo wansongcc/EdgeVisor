@@ -1,0 +1,279 @@
+Listening on 0.0.0.0:20031...
+⭕ The root node has connected
+⭕ peerWorkers: 0
+⭕ NodeIndex: 0
+⭕ Socket[0]: accepted root node
+⭕ Network is initialized
+📀 RequiredMemory: 952 MB
+🌋 Device: Tesla T4
+🌋 DeviceApiVersion: 1.4.303
+🌋 MaxComputeSharedMemory: 48 kB
+🌋 NonCoherentAtomSize: 64 bytes
+🌋 Heap[0]: 15360 MB
+🌋 Heap[2]: 246 MB
+🧱 [executor-init] node=1 segment=0 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=1 createExec=0 createSync=1
+🧱 [executor-init] node=1 segment=1 kind=attn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=2 kind=ffn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=3 kind=attn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=4 kind=ffn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=5 kind=attn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=6 kind=ffn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=7 kind=attn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=8 kind=ffn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=9 kind=attn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=10 kind=ffn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=11 kind=attn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=12 kind=ffn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=13 kind=attn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=14 kind=ffn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=15 kind=attn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=16 kind=ffn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=17 kind=attn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=18 kind=ffn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=19 kind=attn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=20 kind=ffn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=21 kind=attn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=22 kind=ffn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=23 kind=attn role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=24 kind=ffn role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=25 kind=attn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=26 kind=ffn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=27 kind=attn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=28 kind=ffn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=29 kind=attn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=30 kind=ffn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=31 kind=attn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=32 kind=ffn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=33 kind=attn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=34 kind=ffn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=35 kind=attn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=36 kind=ffn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=37 kind=attn role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=38 kind=ffn role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=39 kind=attn role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=40 kind=ffn role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=41 kind=attn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=42 kind=ffn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=43 kind=attn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=44 kind=ffn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=45 kind=attn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=46 kind=ffn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=47 kind=attn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=48 kind=ffn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=49 kind=attn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=50 kind=ffn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=51 kind=attn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=52 kind=ffn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=53 kind=attn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=54 kind=ffn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=55 kind=attn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=56 kind=ffn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=1 segment=57 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=6 nSyncs=1 createExec=1 createSync=1
+📡 Worker 1: Waiting for weights from Root...
+💿 Loaded         block_matmul_q   0,         2592 kB
+💿 Loaded         block_matmul_k   0,          864 kB
+💿 Loaded         block_matmul_v   0,          864 kB
+💿 Loaded        block_matmul_wo   0,         2592 kB
+💿 Loaded        block_matmul_w1   0,         6912 kB
+💿 Loaded        block_matmul_w2   0,         6912 kB
+💿 Loaded        block_matmul_w3   0,         6912 kB
+💿 Loaded           block_norm_0   0,           12 kB
+💿 Loaded           block_norm_1   0,           12 kB
+💿 Loaded         block_matmul_q   1,         2592 kB
+💿 Loaded         block_matmul_k   1,          864 kB
+💿 Loaded         block_matmul_v   1,          864 kB
+💿 Loaded        block_matmul_wo   1,         2592 kB
+💿 Loaded        block_matmul_w1   1,         6912 kB
+💿 Loaded        block_matmul_w2   1,         6912 kB
+💿 Loaded        block_matmul_w3   1,         6912 kB
+💿 Loaded           block_norm_0   1,           12 kB
+💿 Loaded           block_norm_1   1,           12 kB
+💿 Loaded         block_matmul_q   2,         2592 kB
+💿 Loaded         block_matmul_k   2,          864 kB
+💿 Loaded         block_matmul_v   2,          864 kB
+💿 Loaded        block_matmul_wo   2,         2592 kB
+💿 Loaded        block_matmul_w1   2,         6912 kB
+💿 Loaded        block_matmul_w2   2,         6912 kB
+💿 Loaded        block_matmul_w3   2,         6912 kB
+💿 Loaded           block_norm_0   2,           12 kB
+💿 Loaded           block_norm_1   2,           12 kB
+💿 Loaded         block_matmul_q   3,         2592 kB
+💿 Loaded         block_matmul_k   3,          864 kB
+💿 Loaded         block_matmul_v   3,          864 kB
+💿 Loaded        block_matmul_wo   3,         2592 kB
+💿 Loaded        block_matmul_w1   3,         6912 kB
+💿 Loaded        block_matmul_w2   3,         6912 kB
+💿 Loaded        block_matmul_w3   3,         6912 kB
+💿 Loaded           block_norm_0   3,           12 kB
+💿 Loaded           block_norm_1   3,           12 kB
+💿 Loaded         block_matmul_q   4,         2592 kB
+💿 Loaded         block_matmul_k   4,          864 kB
+💿 Loaded         block_matmul_v   4,          864 kB
+💿 Loaded        block_matmul_wo   4,         2592 kB
+💿 Loaded        block_matmul_w1   4,         6912 kB
+💿 Loaded        block_matmul_w2   4,         6912 kB
+💿 Loaded        block_matmul_w3   4,         6912 kB
+💿 Loaded           block_norm_0   4,           12 kB
+💿 Loaded           block_norm_1   4,           12 kB
+💿 Loaded         block_matmul_q   5,         2592 kB
+💿 Loaded         block_matmul_k   5,          864 kB
+💿 Loaded         block_matmul_v   5,          864 kB
+💿 Loaded        block_matmul_wo   5,         2592 kB
+💿 Loaded        block_matmul_w1   5,         6912 kB
+💿 Loaded        block_matmul_w2   5,         6912 kB
+💿 Loaded        block_matmul_w3   5,         6912 kB
+💿 Loaded           block_norm_0   5,           12 kB
+💿 Loaded           block_norm_1   5,           12 kB
+💿 Loaded         block_matmul_q   6,         2592 kB
+💿 Loaded         block_matmul_k   6,          864 kB
+💿 Loaded         block_matmul_v   6,          864 kB
+💿 Loaded        block_matmul_wo   6,         2592 kB
+💿 Loaded        block_matmul_w1   6,         6912 kB
+💿 Loaded        block_matmul_w2   6,         6912 kB
+💿 Loaded        block_matmul_w3   6,         6912 kB
+💿 Loaded           block_norm_0   6,           12 kB
+💿 Loaded           block_norm_1   6,           12 kB
+💿 Loaded         block_matmul_q   7,         2592 kB
+💿 Loaded         block_matmul_k   7,          864 kB
+💿 Loaded         block_matmul_v   7,          864 kB
+💿 Loaded        block_matmul_wo   7,         2592 kB
+💿 Loaded        block_matmul_w1   7,         6912 kB
+💿 Loaded        block_matmul_w2   7,         6912 kB
+💿 Loaded        block_matmul_w3   7,         6912 kB
+💿 Loaded           block_norm_0   7,           12 kB
+💿 Loaded           block_norm_1   7,           12 kB
+💿 Loaded         block_matmul_q   8,         2592 kB
+💿 Loaded         block_matmul_k   8,          864 kB
+💿 Loaded         block_matmul_v   8,          864 kB
+💿 Loaded        block_matmul_wo   8,         2592 kB
+💿 Loaded        block_matmul_w1   8,         6912 kB
+💿 Loaded        block_matmul_w2   8,         6912 kB
+💿 Loaded        block_matmul_w3   8,         6912 kB
+💿 Loaded           block_norm_0   8,           12 kB
+💿 Loaded           block_norm_1   8,           12 kB
+💿 Loaded         block_matmul_q   9,         2592 kB
+💿 Loaded         block_matmul_k   9,          864 kB
+💿 Loaded         block_matmul_v   9,          864 kB
+💿 Loaded        block_matmul_wo   9,         2592 kB
+💿 Loaded        block_matmul_w1   9,         6912 kB
+💿 Loaded        block_matmul_w2   9,         6912 kB
+💿 Loaded        block_matmul_w3   9,         6912 kB
+💿 Loaded           block_norm_0   9,           12 kB
+💿 Loaded           block_norm_1   9,           12 kB
+💿 Loaded         block_matmul_q  10,         2592 kB
+💿 Loaded         block_matmul_k  10,          864 kB
+💿 Loaded         block_matmul_v  10,          864 kB
+💿 Loaded        block_matmul_wo  10,         2592 kB
+💿 Loaded        block_matmul_w1  10,         6912 kB
+💿 Loaded        block_matmul_w2  10,         6912 kB
+💿 Loaded        block_matmul_w3  10,         6912 kB
+💿 Loaded           block_norm_0  10,           12 kB
+💿 Loaded           block_norm_1  10,           12 kB
+💿 Loaded         block_matmul_q  11,         2592 kB
+💿 Loaded         block_matmul_k  11,          864 kB
+💿 Loaded         block_matmul_v  11,          864 kB
+💿 Loaded        block_matmul_wo  11,         2592 kB
+💿 Loaded        block_matmul_w1  11,         6912 kB
+💿 Loaded        block_matmul_w2  11,         6912 kB
+💿 Loaded        block_matmul_w3  11,         6912 kB
+💿 Loaded           block_norm_0  11,           12 kB
+💿 Loaded           block_norm_1  11,           12 kB
+💿 Loaded         block_matmul_q  12,         2592 kB
+💿 Loaded         block_matmul_k  12,          864 kB
+💿 Loaded         block_matmul_v  12,          864 kB
+💿 Loaded        block_matmul_wo  12,         2592 kB
+💿 Loaded        block_matmul_w1  12,         6912 kB
+💿 Loaded        block_matmul_w2  12,         6912 kB
+💿 Loaded        block_matmul_w3  12,         6912 kB
+💿 Loaded           block_norm_0  12,           12 kB
+💿 Loaded           block_norm_1  12,           12 kB
+💿 Loaded         block_matmul_q  13,         2592 kB
+💿 Loaded         block_matmul_k  13,          864 kB
+💿 Loaded         block_matmul_v  13,          864 kB
+💿 Loaded        block_matmul_wo  13,         2592 kB
+💿 Loaded        block_matmul_w1  13,         6912 kB
+💿 Loaded        block_matmul_w2  13,         6912 kB
+💿 Loaded        block_matmul_w3  13,         6912 kB
+💿 Loaded           block_norm_0  13,           12 kB
+💿 Loaded           block_norm_1  13,           12 kB
+💿 Loaded         block_matmul_q  14,         2592 kB
+💿 Loaded         block_matmul_k  14,          864 kB
+💿 Loaded         block_matmul_v  14,          864 kB
+💿 Loaded        block_matmul_wo  14,         2592 kB
+💿 Loaded        block_matmul_w1  14,         6912 kB
+💿 Loaded        block_matmul_w2  14,         6912 kB
+💿 Loaded        block_matmul_w3  14,         6912 kB
+💿 Loaded           block_norm_0  14,           12 kB
+💿 Loaded           block_norm_1  14,           12 kB
+💿 Loaded         block_matmul_q  15,         2592 kB
+💿 Loaded         block_matmul_k  15,          864 kB
+💿 Loaded         block_matmul_v  15,          864 kB
+💿 Loaded        block_matmul_wo  15,         2592 kB
+💿 Loaded        block_matmul_w1  15,         6912 kB
+💿 Loaded        block_matmul_w2  15,         6912 kB
+💿 Loaded        block_matmul_w3  15,         6912 kB
+💿 Loaded           block_norm_0  15,           12 kB
+💿 Loaded           block_norm_1  15,           12 kB
+💿 Loaded         block_matmul_q  16,         2592 kB
+💿 Loaded         block_matmul_k  16,          864 kB
+💿 Loaded         block_matmul_v  16,          864 kB
+💿 Loaded        block_matmul_wo  16,         2592 kB
+💿 Loaded        block_matmul_w1  16,         6912 kB
+💿 Loaded        block_matmul_w2  16,         6912 kB
+💿 Loaded        block_matmul_w3  16,         6912 kB
+💿 Loaded           block_norm_0  16,           12 kB
+💿 Loaded           block_norm_1  16,           12 kB
+💿 Loaded         block_matmul_q  17,         2592 kB
+💿 Loaded         block_matmul_k  17,          864 kB
+💿 Loaded         block_matmul_v  17,          864 kB
+💿 Loaded        block_matmul_wo  17,         2592 kB
+💿 Loaded        block_matmul_w1  17,         6912 kB
+💿 Loaded        block_matmul_w2  17,         6912 kB
+💿 Loaded        block_matmul_w3  17,         6912 kB
+💿 Loaded           block_norm_0  17,           12 kB
+💿 Loaded           block_norm_1  17,           12 kB
+💿 Loaded         block_matmul_q  18,         2592 kB
+💿 Loaded         block_matmul_k  18,          864 kB
+💿 Loaded         block_matmul_v  18,          864 kB
+💿 Loaded        block_matmul_wo  18,         2592 kB
+💿 Loaded        block_matmul_w1  18,         6912 kB
+💿 Loaded        block_matmul_w2  18,         6912 kB
+💿 Loaded        block_matmul_w3  18,         6912 kB
+💿 Loaded           block_norm_0  18,           12 kB
+💿 Loaded           block_norm_1  18,           12 kB
+💿 Loaded         block_matmul_q  19,         2592 kB
+💿 Loaded         block_matmul_k  19,          864 kB
+💿 Loaded         block_matmul_v  19,          864 kB
+💿 Loaded        block_matmul_wo  19,         2592 kB
+💿 Loaded        block_matmul_w1  19,         6912 kB
+💿 Loaded        block_matmul_w2  19,         6912 kB
+💿 Loaded        block_matmul_w3  19,         6912 kB
+💿 Loaded           block_norm_0  19,           12 kB
+💿 Loaded           block_norm_1  19,           12 kB
+💿 Loaded         block_matmul_q  20,         2592 kB
+💿 Loaded         block_matmul_k  20,          864 kB
+💿 Loaded         block_matmul_v  20,          864 kB
+💿 Loaded        block_matmul_wo  20,         2592 kB
+💿 Loaded        block_matmul_w1  20,         6912 kB
+💿 Loaded        block_matmul_w2  20,         6912 kB
+💿 Loaded        block_matmul_w3  20,         6912 kB
+💿 Loaded           block_norm_0  20,           12 kB
+💿 Loaded           block_norm_1  20,           12 kB
+💿 Loaded         block_matmul_q  21,         2592 kB
+💿 Loaded         block_matmul_k  21,          864 kB
+💿 Loaded         block_matmul_v  21,          864 kB
+💿 Loaded        block_matmul_wo  21,         2592 kB
+💿 Loaded        block_matmul_w1  21,         6912 kB
+💿 Loaded        block_matmul_w2  21,         6912 kB
+💿 Loaded        block_matmul_w3  21,         6912 kB
+💿 Loaded           block_norm_0  21,           12 kB
+💿 Loaded           block_norm_1  21,           12 kB
+💿 Loaded         block_matmul_q  22,         2592 kB
+💿 Loaded         block_matmul_k  22,          864 kB
+💿 Loaded         block_matmul_v  22,          864 kB
+💿 Loaded        block_matmul_wo  22,         2592 kB
+💿 Loaded        block_matmul_w1  22,         6912 kB
+💿 Loaded        block_matmul_w2  22,         6912 kB
+💿 Loaded        block_matmul_w3  22,         6912 kB
+💿 Loaded           block_norm_0  22,           12 kB
+💿 Loaded  

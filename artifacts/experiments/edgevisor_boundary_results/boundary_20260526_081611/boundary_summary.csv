@@ -1,0 +1,2 @@
+model,context_len,bandwidth_mbps,with_shadow_wall_ms,without_shadow_transfer_wall_ms,without_shadow_state_ms,net_delta_ms_positive_means_edgevisor_slower,redundancy_overhead_ms_est,threshold_context_tokens_est,with_shadow_pred_tokens_s,without_shadow_pred_tokens_s,throughput_delta_pct,verdict,with_apply_seen,without_apply_seen,with_root_exit,without_root_exit
+3B,128,1000,50499.646,58116.03,244.467,-7616.384,-7371.917,,0.0,0.0,,EdgeVisor wins/ties,True,True,0,0

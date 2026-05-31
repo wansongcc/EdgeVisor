@@ -1,0 +1,42 @@
+{
+  "run_id": "boundary_20260526_081611",
+  "purpose": "Find boundary conditions where Shadow KV/EdgeVisor redundancy is not a universal win.",
+  "topology": "8 Docker containers, active 3/3/2 VG layout, ratios=1:1:1*1:1:1*1:1",
+  "high_stable_bandwidth_mbps": 1000,
+  "live_contexts": [
+    128
+  ],
+  "micro_contexts": [
+    128,
+    512
+  ],
+  "micro_bandwidths_mbps": [
+    1000
+  ],
+  "shadow_kv_redundancy": 2,
+  "no_shadow_kv_redundancy": 0,
+  "migration": "Stage1 Node4 -> Node3, move 1 KV/GQA head via UDS next_barrier; no perturbation is injected.",
+  "models": {
+    "3B": {
+      "path": "/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m",
+      "layers": 28,
+      "kv_heads": 8,
+      "q_heads": 24,
+      "head_dim": 128,
+      "dim": 3072
+    },
+    "8B": {
+      "path": "/models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m",
+      "layers": 32,
+      "kv_heads": 8,
+      "q_heads": 32,
+      "head_dim": 128,
+      "dim": 4096
+    }
+  },
+  "notes": [
+    "with_shadow_kv avoids state transfer but keeps redundant KV compute enabled.",
+    "without_shadow_transfer disables extra KV compute with kv-redundancy=0, performs real TCP transfer, then issues the same UDS migration.",
+    "Model text quality is not evaluated; apply/run completion and timing are the metrics."
+  ]
+}

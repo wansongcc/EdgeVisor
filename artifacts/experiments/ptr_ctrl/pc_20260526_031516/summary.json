@@ -1,0 +1,38 @@
+{
+  "run_id": "pc_20260526_031516",
+  "output": "/home/cc/yhbian/B01/ptr_ctrl/pc_20260526_031516",
+  "rows": 18,
+  "failed_rows": [],
+  "design": {
+    "ratios": "1:1:1*1:1:1*1:1",
+    "vg_groups": {
+      "VG0": [
+        0,
+        1,
+        2
+      ],
+      "VG1": [
+        3,
+        4,
+        5
+      ],
+      "VG2": [
+        6,
+        7
+      ]
+    },
+    "active_worker_count": 7,
+    "migration_sequence": "Stage1 Node4: 4->3, 4->5, 4->3",
+    "trigger_positions": [
+      16,
+      32,
+      48
+    ],
+    "controlled_metrics": [
+      "T_bind_ms",
+      "T_cmd_ack_ms",
+      "T_cmd_to_apply_ms",
+      "T_total_controlled_ms"
+    ]
+  }
+}

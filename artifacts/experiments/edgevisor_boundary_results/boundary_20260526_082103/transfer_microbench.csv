@@ -1,0 +1,3 @@
+run_id,model,context_len,bandwidth_mbps,repeat,state_bytes,t_transfer_ms,transfer_mbps,ok,output_dir
+boundary_20260526_082103,3B,128,1000,1,1179648,114.77446556091309,82.22372418707974,True,/home/cc/yhbian/B01/edgevisor_boundary_results/boundary_20260526_082103/transfer_microbench/3B
+boundary_20260526_082103,3B,512,1000,1,4718592,140.411376953125,268.84385595479245,True,/home/cc/yhbian/B01/edgevisor_boundary_results/boundary_20260526_082103/transfer_microbench/3B

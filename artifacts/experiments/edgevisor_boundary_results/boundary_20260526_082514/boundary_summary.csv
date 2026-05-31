@@ -1,0 +1,7 @@
+model,context_len,bandwidth_mbps,with_shadow_wall_ms,without_shadow_transfer_wall_ms,without_shadow_state_ms,net_delta_ms_positive_means_edgevisor_slower,redundancy_overhead_ms_est,threshold_context_tokens_est,with_shadow_effective_tokens_s,without_shadow_effective_tokens_s,throughput_delta_pct,static_no_edgevisor_wall_ms,edgevisor_vs_static_delta_ms,static_effective_tokens_s,edgevisor_vs_static_throughput_delta_pct,verdict,with_apply_seen,without_apply_seen,with_root_exit,without_root_exit
+3B,128,1000,38625.1,40336.659,146.731,-1711.56,-1564.828,,0.8506,0.8167,4.153,36242.42,2382.68,0.8954,-5.006,EdgeVisor loses vs static baseline,True,True,0,0
+3B,512,1000,65390.708,41651.669,177.609,23739.039,23916.649,68945.2,0.4071,0.7857,-48.182,48039.496,17351.212,0.615,-33.801,EdgeVisor loses vs no-shadow transfer,True,True,0,0
+3B,2048,1000,39008.002,46123.705,382.922,-7115.703,-6732.781,,0.8161,0.6463,26.275,27562.18,11445.822,1.4144,-42.3,EdgeVisor loses vs static baseline,True,True,0,0
+8B,128,1000,88941.808,86278.644,225.834,2663.164,2888.998,1637.4,0.293,0.3162,-7.352,47213.444,41728.363,0.6378,-54.065,EdgeVisor loses vs no-shadow transfer,True,True,0,0
+8B,512,1000,143199.198,90343.346,273.62,52855.853,53129.472,99416.3,0.1759,0.2854,-38.358,54591.078,88608.12,0.5322,-66.943,EdgeVisor loses vs no-shadow transfer,True,True,0,0
+8B,2048,1000,112890.671,95130.329,477.222,17760.342,18237.564,78266.6,0.2309,0.2604,-11.337,60880.46,52010.211,0.4515,-48.864,EdgeVisor loses vs no-shadow transfer,True,True,0,0

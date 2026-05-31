@@ -1,0 +1,8 @@
+exp=/home/cc/yhbian/B01/docker_distributed_runs/run_20260525_055245
+image=dllama-exp-env:latest
+network=b01_ev_net_1779688365
+worker=b01_ev_worker_1779688365
+root=b01_ev_root_1779688365
+model=/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+tokenizer=/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
+uid_gid=1013:1014

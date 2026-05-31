@@ -1,0 +1,8 @@
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/root.log:🧭 [plan][emit] node=0 stage=0 layer=12 pos=0 epoch=1 kind=head move=1 from=0 to=1
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/root.log:🧭 [plan][apply] node=0 stage=0 epoch=1 layer=12 pos=0 kind=head headMove=1 ffnMove=0 from=0 to=1 (gqaGroup=3)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/root.log:📊 [plan][work] node=0 stage=0 epoch=1 layer=12 pos=0 kvHeads=3 qHeads=9 ffnDim=4096 reason=legacy
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/root.log:Evaluation
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/root.log:Prediction
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/root.log:⏱️  [Stage/Node Profile Summary]
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/worker.log:🧭 [plan][apply] node=1 stage=0 epoch=1 layer=12 pos=0 kind=head headMove=1 ffnMove=0 from=0 to=1 (gqaGroup=3)
+/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/dynamic_head_migration/logs/worker.log:📊 [plan][work] node=1 stage=0 epoch=1 layer=12 pos=0 kvHeads=5 qHeads=15 ffnDim=4096 reason=legacy

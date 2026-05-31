@@ -1,0 +1,231 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+nNodes=7
+nNodes=8
+🔍 [DEBUG] parseStageDefs received: "1:1:1*1:1:1*1:1"
+⚖️  [Auto-Split] Stage 0 (Weight 3.00): Assigned 11 layers
+⚖️  [Auto-Split] Stage 1 (Weight 3.00): Assigned 11 layers
+⚖️  [Auto-Split] Stage 2 (Weight 2.00): Assigned 6 layers
+⚡ KV Redundancy: "0,0,0,0,0,0,0,0"
+⚠️ [seg-build] Adding redundant weight holder for layer 10 before startLayer 11
+⚠️ [seg-build] Adding redundant weight holder for layer 10 before startLayer 11
+⚠️ [seg-build] Adding redundant weight holder for layer 10 before startLayer 11
+⚠️ [seg-build] Adding redundant weight holder for layer 21 before startLayer 22
+⚠️ [seg-build] Adding redundant weight holder for layer 21 before startLayer 22
+🧩 [runtime-plan] static layer plan ready: layers=28 stages=3 activeMarks=28 redundantMarks=4
+⚖️  Uneven partitioning strategy enabled: 1:1:1*1:1:1*1:1
+
+🔍 [DEBUG] Pipeline Partition Plan Verification:
+===================================================
+🌎 Global Stats: Total Nodes: 8, Total Stages: 3
+
+➡️  [Stage 0]
+    ├─ Range:      Layers 0 to 10 (Count: 11)
+    ├─ Root Node:  0
+    ├─ Member Nodes: [ 0 1 2 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 0: Heads=9, KV=3, Dim=1024
+       • Node 1: Heads=9, KV=3, Dim=1024
+       • Node 2: Heads=6, KV=2, Dim=1024
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+
+➡️  [Stage 1]
+    ├─ Range:      Layers 11 to 21 (Count: 11)
+    ├─ Root Node:  3
+    ├─ Member Nodes: [ 3 4 5 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 3: Heads=9, KV=3, Dim=1024
+       • Node 4: Heads=9, KV=3, Dim=1024
+       • Node 5: Heads=6, KV=2, Dim=1024
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+
+➡️  [Stage 2]
+    ├─ Range:      Layers 22 to 27 (Count: 6)
+    ├─ Root Node:  6
+    ├─ Member Nodes: [ 6 7 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 6: Heads=12, KV=4, Dim=1536
+       • Node 7: Heads=12, KV=4, Dim=1536
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+===================================================
+
+📄 AddBos: 0
+📄 BosId: 128000 (<|begin_of_text|>)
+📄 EosId: 128001 (<|end_of_text|>) 128009 (<|eot_id|>) 
+📄 RegularVocabSize: 128000
+📄 SpecialVocabSize: 256
+💡 Arch: Llama
+💡 HiddenAct: Silu
+💡 Dim: 3072
+💡 HeadDim: 128
+💡 QDim: 3072
+💡 KvDim: 1024
+💡 HiddenDim: 8192
+💡 VocabSize: 128256
+💡 nLayers: 28
+💡 nHeads: 24
+💡 nKvHeads: 8
+💡 OrigSeqLen: 131072
+💡 SeqLen: 2048
+💡 NormEpsilon: 0.000010
+💡 RopeType: Llama3.1
+💡 RopeTheta: 500000
+💡 RopeScaling: f=32.0, l=1.0, h=4.0, o=8192
+📀 RequiredMemory: 2399 MB
+⭕ Socket[0]: connecting to b01ab_boundary_20260526_082514_edgevisor_boundar_n1:9999 worker
+⭕ Socket[0]: connected
+⭕ Socket[1]: connecting to b01ab_boundary_20260526_082514_edgevisor_boundar_n2:9999 worker
+⭕ Socket[1]: connected
+⭕ Socket[2]: connecting to b01ab_boundary_20260526_082514_edgevisor_boundar_n3:9999 worker
+⭕ Socket[2]: connected
+⭕ Socket[3]: connecting to b01ab_boundary_20260526_082514_edgevisor_boundar_n4:9999 worker
+⭕ Socket[3]: connected
+⭕ Socket[4]: connecting to b01ab_boundary_20260526_082514_edgevisor_boundar_n5:9999 worker
+⭕ Socket[4]: connected
+⭕ Socket[5]: connecting to b01ab_boundary_20260526_082514_edgevisor_boundar_n6:9999 worker
+⭕ Socket[5]: connected
+⭕ Socket[6]: connecting to b01ab_boundary_20260526_082514_edgevisor_boundar_n7:9999 worker
+⭕ Socket[6]: connected
+⭕ Network is initialized
+🧠 CPU: avx2 avx512f
+🧱 [executor-init] node=0 segment=0 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=1 kind=attn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=2 kind=ffn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=3 kind=other role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=4 kind=other role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=5 kind=attn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=6 kind=ffn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=7 kind=other role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=8 kind=other role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=9 kind=attn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=10 kind=ffn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=11 kind=other role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=12 kind=other role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=13 kind=attn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=14 kind=ffn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=15 kind=other role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=16 kind=other role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=17 kind=attn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=18 kind=ffn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=19 kind=other role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=20 kind=other role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=21 kind=attn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=22 kind=ffn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=23 kind=other role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=24 kind=other role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=25 kind=attn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=26 kind=ffn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=27 kind=other role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=28 kind=other role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=29 kind=attn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=30 kind=ffn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=31 kind=other role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=32 kind=other role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=33 kind=attn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=34 kind=ffn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=35 kind=other role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=36 kind=other role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=37 kind=attn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=38 kind=ffn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=39 kind=other role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=40 kind=other role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=41 kind=attn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+[kv-collector] enabled, waiting for migration arming from runtime/UDS
+[plan-uds] listening on /uds/b01_b7ad04779aaa.sock
+🧱 [executor-init] node=0 segment=42 kind=ffn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=43 kind=other role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=44 kind=other role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=45 kind=attn role=redundant enabled=0 activeLayer=11 redundantLayer=11 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=46 kind=ffn role=redundant enabled=0 activeLayer=11 redundantLayer=11 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=47 kind=other role=unguarded enabled=1 activeLayer=10 redundantLayer=-1 nOps=2 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=48 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=0 segment=49 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=1 createExec=0 createSync=1
+🚀 Local Loading Mode (Root): Loading weights locally...
+   [PP] Node 0: Responsible for Layers 0-11 [First]
+   [PP] Node 0: Stage full-weight loading ENABLED
+   [PP] Node 0: Runtime-role loading primary=11 redundant=1
+💿 Loading weights for Node 0 (Layers [0, 11))...
+✅ Root: Weights loaded locally.
+ℹ️  [kv-migrate] PP migration is disabled (enable with --enable-pp-migration)
+🚁 Network is in non-blocking mode
+The capital of France is
+🔷️ Eval  277 ms Sync 3450 ms | Sent   611 kB Recv  2565 kB | (4 tokens)
+🧪 [Root Logits] (eval batchIndex=3) Valid: ✅ OK | Range: [-10.82, 9.06] | MaxIdx: 2 | Zero: 0/128256 | NetDelta: S=626576 R=2627344
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-12.90, 9.92] | MaxIdx: 1255 | Zero: 0/128256
+🔶 Pred  272 ms Sync 1512 ms | pos=4 | Sent   153 kB Recv   642 kB | hill
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-11.49, 7.45] | MaxIdx: 337 | Zero: 0/128256
+🔶 Pred   78 ms Sync 1136 ms | pos=5 | Sent   153 kB Recv   642 kB | comb
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.01, 8.33] | MaxIdx: 83 | Zero: 0/128256
+🔶 Pred   75 ms Sync 1445 ms | pos=6 | Sent   153 kB Recv   642 kB | ball
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.50, 8.95] | MaxIdx: 543 | Zero: 0/128256
+🔶 Pred   74 ms Sync 1537 ms | pos=7 | Sent   162 kB Recv   642 kB | av
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.38, 7.92] | MaxIdx: 2617 | Zero: 0/128256
+🔶 Pred   93 ms Sync 1067 ms | pos=8 | Sent   153 kB Recv   642 kB | yn
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.12, 7.69] | MaxIdx: 2617 | Zero: 0/128256
+🔶 Pred  167 ms Sync 1644 ms | pos=9 | Sent   153 kB Recv   642 kB | ering
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.03, 8.30] | MaxIdx: 367 | Zero: 0/128256
+🔶 Pred  143 ms Sync 1638 ms | pos=10 | Sent   153 kB Recv   642 kB | itation
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.19, 7.85] | MaxIdx: 271 | Zero: 0/128256
+🔶 Pred  156 ms Sync 1320 ms | pos=11 | Sent   153 kB Recv   642 kB | ver
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-4.96, 8.01] | MaxIdx: 1073 | Zero: 0/128256
+🔶 Pred   84 ms Sync 1629 ms | pos=12 | Sent   153 kB Recv   642 kB | ary
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.32, 10.87] | MaxIdx: 349 | Zero: 0/128256
+🔶 Pred   73 ms Sync 1226 ms | pos=13 | Sent   153 kB Recv   642 kB | std
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.38, 8.47] | MaxIdx: 271 | Zero: 0/128256
+🔶 Pred   85 ms Sync 1599 ms | pos=14 | Sent   153 kB Recv   642 kB | today
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.35, 8.76] | MaxIdx: 271 | Zero: 0/128256
+🔶 Pred   99 ms Sync 1108 ms | pos=15 | Sent   153 kB Recv   642 kB | l
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-4.95, 8.48] | MaxIdx: 271 | Zero: 0/128256
+🔶 Pred   70 ms Sync 1430 ms | pos=16 | Sent   153 kB Recv   642 kB | eter
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.02, 10.18] | MaxIdx: 483 | Zero: 0/128256
+🔶 Pred   70 ms Sync 1604 ms | pos=17 | Sent   153 kB Recv   642 kB | any
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.94, 10.36] | MaxIdx: 278 | Zero: 0/128256
+🔶 Pred  159 ms Sync 1637 ms | pos=18 | Sent   153 kB Recv   642 kB | als
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.32, 9.96] | MaxIdx: 271 | Zero: 0/128256
+🔶 Pred   97 ms Sync 1490 ms | pos=19 | Sent   153 kB Recv   642 kB | ear
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.17, 10.04] | MaxIdx: 352 | Zero: 0/128256
+🔶 Pred   98 ms Sync 1307 ms | pos=20 | Sent   153 kB Recv   642 kB | her
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.20, 9.30] | MaxIdx: 483 | Zero: 0/128256
+🔶 Pred   84 ms Sync 1612 ms | pos=21 | Sent   153 kB Recv   642 kB | ily
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-5.47, 8.78] | MaxIdx: 271 | Zero: 0/128256
+🔶 Pred   89 ms Sync 1184 ms | pos=22 | Sent   153 kB Recv   642 kB | section
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.02, 8.64] | MaxIdx: 271 | Zero: 0/128256
+🔶 Pred   80 ms Sync 1550 ms | pos=23 | Sent   153 kB Recv   642 kB | le
+
+Evaluation
+   nBatches: 32
+    nTokens: 4
+   tokens/s: 1.07 (932.15 ms/tok)
+Prediction
+    nTokens: 20
+   tokens/s: 0.65 (1542.17 ms/tok)
+
+⏱️  [Stage/Node Profile Summary]
+  • Stage 0 Node 0: per-fwd total=1646.28 ms (exec=115.95 sync=1530.33) | per-tok total=1440.50 ms (exec=101.46 sync=1339.04) | fwd=21 tok=24
+  • Stage 0 Node 1: per-fwd total=240.21 ms (exec=119.81 sync=120.40) | per-tok total=210.18 ms (exec=104.84 sync=105.35) | fwd=21 tok=24
+  • Stage 0 Node 2: per-fwd total=239.12 ms (exec=158.52 sync= 80.60) | per-tok total=209.23 ms (exec=138.70 sync= 70.53) | fwd=21 tok=24
+  • Stage 1 Node 3: per-fwd total=1172.17 ms (exec=102.71 sync=1069.46) | per-tok total=1025.65 ms (exec= 89.87 sync=935.78) | fwd=21 tok=24
+  • Stage 1 Node 4: per-fwd total=1154.08 ms (exec=258.83 sync=895.25) | per-tok total=1009.82 ms (exec=226.48 sync=783.34) | fwd=21 tok=24
+  • Stage 1 Node 5: per-fwd total=1171.84 ms (exec=154.07 sync=1017.78) | per-tok total=1025.36 ms (exec=134.81 sync=890.55) | fwd=21 tok=24
+  • Stage 2 Node 6: per-fwd total=1579.80 ms (exec=142.29 sync=1437.51) | per-tok total=1382.33 ms (exec=124.50 sync=1257.82) | fwd=21 tok=24
+  • Stage 2 Node 7: per-fwd total=1636.00 ms (exec=440.58 sync=1195.43) | per-tok total=1431.50 ms (exec=385.50 sync=1046.00) | fwd=21 tok=24
+
+Hint: prompt eval uses batchSize>1, so per-token is usually the meaningful metric for rebalancing.
+⭕ Network is closed

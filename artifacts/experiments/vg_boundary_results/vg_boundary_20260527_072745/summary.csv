@@ -1,0 +1,4 @@
+scenario,bandwidth_mbps,cpu_limits,vg_wall_ms,pp_wall_ms,vg_minus_pp_wall_ms,vg_pred_tokens_s,pp_pred_tokens_s,vg_vs_pp_tokens_s_delta_pct,verdict,hypothesis
+high_bw_low_skew,1000,"2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0",2935.344,4475.739,-1540.395,6.9808,2.81889,147.644,VG better/competitive,VG should be competitive or better: TP communication is cheap and skew is small.
+low_bw_low_skew,10,"2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0",3957.82,6240.996,-2283.175,3.91389,1.99203,96.477,VG better/competitive,PP should become competitive/better: TP has more intra-stage communication pressure.
+high_bw_high_skew,1000,"2.0,2.0,2.0,2.0,0.3,2.0,2.0,2.0",6842.809,5823.439,1019.37,1.36799,1.96367,-30.335,PP better,PP should be better: a very slow node inside a VG becomes a TP straggler; PP can isolate it with fewer layers.

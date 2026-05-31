@@ -1,0 +1,6 @@
+== dynamic layer migration ==
+network=b01_feat_layer_net_1779689736_layer
+root=b01_feat_layer_root_1779689736_layer
+workers=b01_feat_layer_w1_1779689736_layer,b01_feat_layer_w2_1779689736_layer,b01_feat_layer_w3_1779689736_layer
+ratios=1:1@20*1:1@8
+socket=/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/sockets/layer_1779689736_layer.sock

@@ -1,0 +1,39 @@
+{
+  "net": "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_net",
+  "root": "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n0",
+  "workers": [
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n1",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n2",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n3",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n4",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n5",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n6",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n7"
+  ],
+  "all_names": [
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n0",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n1",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n2",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n3",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n4",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n5",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n6",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n7"
+  ],
+  "sock_host": "/home/cc/yhbian/B01/vg_boundary_results/vg_boundary_20260527_072745/s/b01_a434ca4dbace.sock",
+  "test_dir": "/home/cc/yhbian/B01/vg_boundary_results/vg_boundary_20260527_072745/vg_boundary/3B/low_bw_low_skew_vg_332",
+  "model": "3B",
+  "variant": "low_bw_low_skew_vg_332",
+  "exp": "vg_boundary",
+  "root_cmd": "./dllama inference --prompt 'The capital of France is' --steps 8 --model /models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m --tokenizer /models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 1024 --benchmark --workers b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n1:9999 b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n2:9999 b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n3:9999 b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n4:9999 b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n5:9999 b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n6:9999 b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n7:9999 --ratios '1:1:1*1:1:1*1:1' ",
+  "active_workers": [
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n1",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n2",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n3",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n4",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n5",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n6",
+    "b01ab_vg_boundary_20260527_072745_vg_boundary_3B_n7"
+  ],
+  "standby_workers": []
+}

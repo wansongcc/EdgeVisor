@@ -1,0 +1,63 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+
+Listening on 0.0.0.0:9999...
+⭕ The root node has connected
+⭕ peerWorkers: 6
+⭕ NodeIndex: 5
+⭕ Socket[0]: accepted root node
+⭕ Waiting worker-pair accept: localWorker=5 expecting one of [0..4]
+⭕ Socket[1]: accepted worker(globalNode=1, workerIndex=0)
+⭕ Waiting worker-pair accept: localWorker=5 expecting one of [0..4]
+⭕ Socket[2]: accepted worker(globalNode=2, workerIndex=1)
+⭕ Waiting worker-pair accept: localWorker=5 expecting one of [0..4]
+⭕ Socket[3]: accepted worker(globalNode=3, workerIndex=2)
+⭕ Waiting worker-pair accept: localWorker=5 expecting one of [0..4]
+⭕ Socket[4]: accepted worker(globalNode=4, workerIndex=3)
+⭕ Waiting worker-pair accept: localWorker=5 expecting one of [0..4]
+⭕ Socket[5]: accepted worker(globalNode=5, workerIndex=4)
+⭕ Connect worker-pair: localWorker=5 -> expectedPeerWorker=6 (b01ab_boundary_20260526_082103_edgevisor_boundar_n7:9999)
+⭕ Socket[6]: connected to worker(globalNode=7, workerIndex=6)
+⭕ Network is initialized
+📀 RequiredMemory: 398 MB
+🔍 [DEBUG] parseStageDefs received: "1:1:1*1:1:1*1:1"
+⚖️  [Auto-Split] Stage 0 (Weight 3.00): Assigned 11 layers
+⚖️  [Auto-Split] Stage 1 (Weight 3.00): Assigned 11 layers
+⚖️  [Auto-Split] Stage 2 (Weight 2.00): Assigned 6 layers
+🧠 CPU: avx2 avx512f
+🧱 [executor-init] node=6 segment=0 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=6 segment=1 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=2 createExec=0 createSync=1
+🧱 [executor-init] node=6 segment=2 kind=attn role=redundant enabled=0 activeLayer=21 redundantLayer=21 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=3 kind=ffn role=redundant enabled=0 activeLayer=21 redundantLayer=21 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=6 segment=4 kind=attn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=5 kind=ffn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=6 kind=attn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=7 kind=ffn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=8 kind=attn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=9 kind=ffn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=10 kind=attn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=11 kind=ffn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=12 kind=attn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=13 kind=ffn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=14 kind=attn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=15 kind=ffn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=6 segment=16 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=6 nSyncs=1 createExec=1 createSync=1
+🚀 Worker 6: Local Loading Mode from /models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+⚠️ [seg-build] Adding redundant weight holder for layer 10 before startLayer 11
+⚠️ [seg-build] Adding redundant weight holder for layer 10 before startLayer 11

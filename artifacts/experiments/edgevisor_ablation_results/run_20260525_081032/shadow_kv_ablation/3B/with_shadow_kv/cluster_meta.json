@@ -1,0 +1,29 @@
+{
+  "net": "b01ab_run_20260525_081032_shadow_kv_ablation_3B__net",
+  "root": "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n0",
+  "workers": [
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n1",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n2",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n3",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n4",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n5",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n6",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n7"
+  ],
+  "all_names": [
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n0",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n1",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n2",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n3",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n4",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n5",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n6",
+    "b01ab_run_20260525_081032_shadow_kv_ablation_3B__n7"
+  ],
+  "sock_host": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_081032/s/b01_7b4095db56ec.sock",
+  "test_dir": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_081032/shadow_kv_ablation/3B/with_shadow_kv",
+  "model": "3B",
+  "variant": "with_shadow_kv",
+  "exp": "shadow_kv_ablation",
+  "root_cmd": "./dllama inference --prompt 'The capital of France is' --steps 48 --model /models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m --tokenizer /models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 2048 --benchmark --workers b01ab_run_20260525_081032_shadow_kv_ablation_3B__n1:9999 b01ab_run_20260525_081032_shadow_kv_ablation_3B__n2:9999 b01ab_run_20260525_081032_shadow_kv_ablation_3B__n3:9999 b01ab_run_20260525_081032_shadow_kv_ablation_3B__n4:9999 b01ab_run_20260525_081032_shadow_kv_ablation_3B__n5:9999 b01ab_run_20260525_081032_shadow_kv_ablation_3B__n6:9999 b01ab_run_20260525_081032_shadow_kv_ablation_3B__n7:9999 --ratios '1:1:1*1:1:1*1:1' --enable-plan-barrier --enable-kv-redundancy-during-migration 1 --kv-redundancy 2"
+}

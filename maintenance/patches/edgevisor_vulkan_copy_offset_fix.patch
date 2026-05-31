@@ -1,0 +1,24 @@
+diff --git a/src/nn/nn-vulkan.cpp b/src/nn/nn-vulkan.cpp
+--- a/src/nn/nn-vulkan.cpp
++++ b/src/nn/nn-vulkan.cpp
+@@ -223,16 +223,18 @@ void NnVulkanStagingCopier::addCopyCommand(vk::CommandBuffer& commandBuffer, vk
+     assert(size == allocatedSize);
+ 
+     VkBufferCopy copyRegion;
+-	copyRegion.size = size;
+-    copyRegion.srcOffset = 0u;
+-    copyRegion.dstOffset = offset;
++    copyRegion.size = size;
+     switch (direction) {
+     case COPY_TO_DEVICE:
++        copyRegion.srcOffset = 0u;
++        copyRegion.dstOffset = offset;
+         vkCmdCopyBuffer(commandBuffer, hostBuffer, target, 1, &copyRegion);
+         break;
+     case COPY_FROM_DEVICE:
++        copyRegion.srcOffset = offset;
++        copyRegion.dstOffset = 0u;
+         vkCmdCopyBuffer(commandBuffer, target, hostBuffer, 1, &copyRegion);
+         break;
+     }
+ }

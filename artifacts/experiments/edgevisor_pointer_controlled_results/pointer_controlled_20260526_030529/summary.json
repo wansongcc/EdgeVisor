@@ -1,0 +1,38 @@
+{
+  "run_id": "pointer_controlled_20260526_030529",
+  "output": "/home/cc/yhbian/B01/edgevisor_pointer_controlled_results/pointer_controlled_20260526_030529",
+  "rows": 0,
+  "failed_rows": [],
+  "design": {
+    "ratios": "1:1:1*1:1:1*1:1",
+    "vg_groups": {
+      "VG0": [
+        0,
+        1,
+        2
+      ],
+      "VG1": [
+        3,
+        4,
+        5
+      ],
+      "VG2": [
+        6,
+        7
+      ]
+    },
+    "active_worker_count": 7,
+    "migration_sequence": "Stage1 Node4: 4->3, 4->5, 4->3",
+    "trigger_positions": [
+      12,
+      24,
+      36
+    ],
+    "controlled_metrics": [
+      "T_bind_ms",
+      "T_cmd_ack_ms",
+      "T_cmd_to_apply_ms",
+      "T_total_controlled_ms"
+    ]
+  }
+}

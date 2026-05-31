@@ -1,0 +1,22 @@
+{
+  "events": 24,
+  "runs": 14,
+  "microbench": 36,
+  "failed_runs": [
+    {
+      "experiment": "context_length_sensitivity",
+      "model": "8B",
+      "variant": "state_microbench",
+      "context_len": 0,
+      "root_exit": 139,
+      "eval_tokens_s": 0.0,
+      "pred_tokens_s": 0.0,
+      "post_recovery_tokens_s": 0.5543127511729654,
+      "avg_pred_ms_after_apply": 1804.0357142857142,
+      "reject_count": 0,
+      "output_dir": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_084241/context_length_sensitivity/8B/state_microbench"
+    }
+  ],
+  "reject_runs": [],
+  "output": "/home/cc/yhbian/B01/edgevisor_ablation_results/run_20260525_084241"
+}

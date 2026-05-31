@@ -1,0 +1,143 @@
+nNodes=2
+nNodes=3
+🔍 [DEBUG] parseStageDefs received: "1@8*1@10*1@10"
+⚠️ [seg-build] Adding redundant weight holder for layer 7 before startLayer 8
+⚠️ [seg-build] Adding redundant weight holder for layer 17 before startLayer 18
+🧩 [runtime-plan] static layer plan ready: layers=28 stages=3 activeMarks=28 redundantMarks=4
+⚖️  Uneven partitioning strategy enabled: 1@8*1@10*1@10
+
+🔍 [DEBUG] Pipeline Partition Plan Verification:
+===================================================
+🌎 Global Stats: Total Nodes: 3, Total Stages: 3
+
+➡️  [Stage 0]
+    ├─ Range:      Layers 0 to 7 (Count: 8)
+    ├─ Root Node:  0
+    ├─ Member Nodes: [ 0 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 0: Heads=24, KV=8, Dim=3072
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+
+➡️  [Stage 1]
+    ├─ Range:      Layers 8 to 17 (Count: 10)
+    ├─ Root Node:  1
+    ├─ Member Nodes: [ 1 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 1: Heads=24, KV=8, Dim=3072
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+
+➡️  [Stage 2]
+    ├─ Range:      Layers 18 to 27 (Count: 10)
+    ├─ Root Node:  2
+    ├─ Member Nodes: [ 2 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 2: Heads=24, KV=8, Dim=3072
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+===================================================
+
+📄 AddBos: 0
+📄 BosId: 128000 (<|begin_of_text|>)
+📄 EosId: 128001 (<|end_of_text|>) 128009 (<|eot_id|>) 
+📄 RegularVocabSize: 128000
+📄 SpecialVocabSize: 256
+💡 Arch: Llama
+💡 HiddenAct: Silu
+💡 Dim: 3072
+💡 HeadDim: 128
+💡 QDim: 3072
+💡 KvDim: 1024
+💡 HiddenDim: 8192
+💡 VocabSize: 128256
+💡 nLayers: 28
+💡 nHeads: 24
+💡 nKvHeads: 8
+💡 OrigSeqLen: 131072
+💡 SeqLen: 512
+💡 NormEpsilon: 0.000010
+💡 RopeType: Llama3.1
+💡 RopeTheta: 500000
+💡 RopeScaling: f=32.0, l=1.0, h=4.0, o=8192
+📀 RequiredMemory: 2074 MB
+⭕ Socket[0]: connecting to 127.0.0.1:19201 worker
+⭕ Socket[0]: connected
+⭕ Socket[1]: connecting to 127.0.0.1:19202 worker
+⭕ Socket[1]: connected
+⭕ Network is initialized
+🌋 Device: Tesla T4
+🌋 DeviceApiVersion: 1.4.303
+🌋 MaxComputeSharedMemory: 48 kB
+🌋 NonCoherentAtomSize: 64 bytes
+🌋 Heap[0]: 15360 MB
+🌋 Heap[2]: 246 MB
+🧱 [executor-init] node=0 segment=0 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=1 kind=attn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=2 kind=ffn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=3 kind=attn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=4 kind=ffn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=5 kind=attn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=6 kind=ffn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=7 kind=attn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=8 kind=ffn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=9 kind=attn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=10 kind=ffn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=11 kind=attn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=12 kind=ffn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=13 kind=attn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=14 kind=ffn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=15 kind=attn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=16 kind=ffn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=17 kind=attn role=redundant enabled=0 activeLayer=8 redundantLayer=8 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=18 kind=ffn role=redundant enabled=0 activeLayer=8 redundantLayer=8 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=19 kind=other role=unguarded enabled=1 activeLayer=7 redundantLayer=-1 nOps=2 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=20 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=0 segment=21 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=1 createExec=0 createSync=1
+🚀 Local Loading Mode (Root): Loading weights locally...
+   [PP] Node 0: Responsible for Layers 0-8 [First]
+   [PP] Node 0: Runtime-role loading primary=8 redundant=1
+💿 Loading weights for Node 0 (Layers [0, 8))...
+✅ Root: Weights loaded locally.
+ℹ️  [kv-migrate] PP migration is disabled (enable with --enable-pp-migration)
+[kv-collector] enabled, waiting for migration arming from runtime/UDS
+🚁 Network is in non-blocking mode
+Hi
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-4.48, 7.11] | MaxIdx: 14924 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=0 | Sent    12 kB Recv   501 kB |  Answer
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.95, 4.67] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=1 | Sent    12 kB Recv   501 kB |  Quran
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.78, 4.73] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=2 | Sent    12 kB Recv   501 kB | elm
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.84, 5.01] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=3 | Sent    12 kB Recv   501 kB |  Ha
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.81, 4.99] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=4 | Sent    12 kB Recv   501 kB |  Invalidate
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.79, 4.95] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=5 | Sent    12 kB Recv   501 kB |  schedules
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.78, 4.91] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=6 | Sent    12 kB Recv   501 kB |  note
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.89, 4.92] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=7 | Sent    12 kB Recv   501 kB |  rejo
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.71, 5.00] | MaxIdx: 791 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=8 | Sent    12 kB Recv   501 kB |  Chang
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.86, 4.79] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=9 | Sent    12 kB Recv   501 kB |  Stuart
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.94, 4.84] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=10 | Sent    12 kB Recv   501 kB |  Suppliers
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.73, 5.01] | MaxIdx: 791 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=11 | Sent    12 kB Recv   501 kB | Who
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.77, 4.92] | MaxIdx: 791 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=12 | Sent    12 kB Recv   501 kB | APH
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.75, 4.95] | MaxIdx: 791 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=13 | Sent    12 kB Recv   501 kB |  comprises
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.92, 4.95] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=14 | Sent    12 kB Recv   501 kB | FF
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-3.81, 4.84] | MaxIdx: 2 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=15 | Sent    12 kB Recv   501 kB | uder
+
+Evaluation
+   nBatches: 32
+    nTokens: 0
+   tokens/s: -nan (-nan ms/tok)
+Prediction
+    nTokens: 16
+   tokens/s: inf (0.00 ms/tok)
+⭕ Network is closed

@@ -1,0 +1,348 @@
+nNodes=2
+nNodes=3
+🔍 [DEBUG] parseStageDefs received: "2:3:3"
+⚖️  [Auto-Split] Stage 0 (Weight 8.00): Assigned 28 layers
+⚡ KV Redundancy: "2,2,2"
+🧩 [runtime-plan] static layer plan ready: layers=28 stages=1 activeMarks=28 redundantMarks=0
+⚖️  Uneven partitioning strategy enabled: 2:3:3
+
+🔍 [DEBUG] Pipeline Partition Plan Verification:
+===================================================
+🌎 Global Stats: Total Nodes: 3, Total Stages: 1
+
+➡️  [Stage 0]
+    ├─ Range:      Layers 0 to 27 (Count: 28)
+    ├─ Root Node:  0
+    ├─ Member Nodes: [ 0 1 2 ]
+    └─ 🔍 TP Split Isolation Check:
+       • Node 0: Heads=6, KV=2, Dim=768
+       • Node 1: Heads=9, KV=3, Dim=1152
+       • Node 2: Heads=9, KV=3, Dim=1152
+       ✅ Stage Sums: Heads=24, KV=8, Dim=3072
+===================================================
+
+📄 AddBos: 0
+📄 BosId: 128000 (<|begin_of_text|>)
+📄 EosId: 128001 (<|end_of_text|>) 128009 (<|eot_id|>) 
+📄 RegularVocabSize: 128000
+📄 SpecialVocabSize: 256
+💡 Arch: Llama
+💡 HiddenAct: Silu
+💡 Dim: 3072
+💡 HeadDim: 128
+💡 QDim: 3072
+💡 KvDim: 1024
+💡 HiddenDim: 8192
+💡 VocabSize: 128256
+💡 nLayers: 28
+💡 nHeads: 24
+💡 nKvHeads: 8
+💡 OrigSeqLen: 131072
+💡 SeqLen: 512
+💡 NormEpsilon: 0.000010
+💡 RopeType: Llama3.1
+💡 RopeTheta: 500000
+💡 RopeScaling: f=32.0, l=1.0, h=4.0, o=8192
+📀 RequiredMemory: 1989 MB
+⭕ Socket[0]: connecting to 127.0.0.1:19701 worker
+⭕ Socket[0]: connected
+⭕ Socket[1]: connecting to 127.0.0.1:19702 worker
+⭕ Socket[1]: connected
+⭕ Network is initialized
+🌋 Device: Tesla T4
+🌋 DeviceApiVersion: 1.4.303
+🌋 MaxComputeSharedMemory: 48 kB
+🌋 NonCoherentAtomSize: 64 bytes
+🌋 Heap[0]: 15360 MB
+🌋 Heap[2]: 246 MB
+🧱 [executor-init] node=0 segment=0 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=1 kind=attn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=2 kind=ffn role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=3 kind=other role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=4 kind=other role=primary enabled=1 activeLayer=0 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=5 kind=attn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=6 kind=ffn role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=7 kind=other role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=8 kind=other role=primary enabled=1 activeLayer=1 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=9 kind=attn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=10 kind=ffn role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=11 kind=other role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=12 kind=other role=primary enabled=1 activeLayer=2 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=13 kind=attn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=14 kind=ffn role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=15 kind=other role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=16 kind=other role=primary enabled=1 activeLayer=3 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=17 kind=attn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=18 kind=ffn role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=19 kind=other role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=20 kind=other role=primary enabled=1 activeLayer=4 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=21 kind=attn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=22 kind=ffn role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=23 kind=other role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=24 kind=other role=primary enabled=1 activeLayer=5 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=25 kind=attn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=26 kind=ffn role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=27 kind=other role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=28 kind=other role=primary enabled=1 activeLayer=6 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=29 kind=attn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=30 kind=ffn role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=31 kind=other role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=32 kind=other role=primary enabled=1 activeLayer=7 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=33 kind=attn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=34 kind=ffn role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=35 kind=other role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=36 kind=other role=primary enabled=1 activeLayer=8 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=37 kind=attn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=38 kind=ffn role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=39 kind=other role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=40 kind=other role=primary enabled=1 activeLayer=9 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=41 kind=attn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=42 kind=ffn role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=43 kind=other role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=44 kind=other role=primary enabled=1 activeLayer=10 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=45 kind=attn role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=46 kind=ffn role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=47 kind=other role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=48 kind=other role=primary enabled=1 activeLayer=11 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=49 kind=attn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=50 kind=ffn role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=51 kind=other role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=52 kind=other role=primary enabled=1 activeLayer=12 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=53 kind=attn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=54 kind=ffn role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=55 kind=other role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=56 kind=other role=primary enabled=1 activeLayer=13 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=57 kind=attn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=58 kind=ffn role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=59 kind=other role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=60 kind=other role=primary enabled=1 activeLayer=14 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=61 kind=attn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=62 kind=ffn role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=63 kind=other role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=64 kind=other role=primary enabled=1 activeLayer=15 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=65 kind=attn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=66 kind=ffn role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=67 kind=other role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=68 kind=other role=primary enabled=1 activeLayer=16 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=69 kind=attn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=70 kind=ffn role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=71 kind=other role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=72 kind=other role=primary enabled=1 activeLayer=17 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=73 kind=attn role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=74 kind=ffn role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=75 kind=other role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=76 kind=other role=primary enabled=1 activeLayer=18 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=77 kind=attn role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=78 kind=ffn role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=79 kind=other role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=80 kind=other role=primary enabled=1 activeLayer=19 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=81 kind=attn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=82 kind=ffn role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=83 kind=other role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=84 kind=other role=primary enabled=1 activeLayer=20 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=85 kind=attn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=86 kind=ffn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=87 kind=other role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=88 kind=other role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=89 kind=attn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=90 kind=ffn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=91 kind=other role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=92 kind=other role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=93 kind=attn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=94 kind=ffn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=95 kind=other role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=96 kind=other role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=97 kind=attn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=98 kind=ffn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=99 kind=other role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=100 kind=other role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=101 kind=attn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=102 kind=ffn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=103 kind=other role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=104 kind=other role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=105 kind=attn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=106 kind=ffn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=107 kind=other role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=108 kind=other role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=109 kind=attn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=110 kind=ffn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=111 kind=other role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=1 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=0 segment=112 kind=other role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=1 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=0 segment=113 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=6 nSyncs=1 createExec=1 createSync=1
+🚀 Local Loading Mode (Root): Loading weights locally...
+   [PP] Node 0: Responsible for Layers 0-28 [First][Last]
+   [PP] Node 0: Runtime-role loading primary=28 redundant=0
+💿 Loading weights for Node 0 (Layers [0, 28))...
+✅ Root: Weights loaded locally.
+⚠️  [kv-migrate] default migration route(next) has no target stage from stage=0
+ℹ️  [kv-migrate] PP migration is disabled (enable with --enable-pp-migration)
+[kv-collector] enabled, waiting for migration arming from runtime/UDS
+[plan-uds] listening on /tmp/dllama_semantic_gpu_heads.sock
+🚁 Network is in non-blocking mode
+🛑 Stop: <|end_of_text|>
+🛑 Stop: <|eot_id|>
+⭐ Chat template: llama3
+<|start_header_id|>user<|end_header_id|>
+
+Write a comma-separated list of the numbers from 1 to 20.<|end_of_text|><|start_header_id|>assistant<|end_header_id|>
+
+
+🧭 [plan][emit][gpu] node=0 stage=0 layer=5 pos=0 epoch=1 kind=1 headMove=1 ffnMove=0 from=1 to=2
+🧭 [plan][apply][gpu] node=0 stage=0 epoch=1 layer=5 pos=0 cmd=1 kvHeads=2 qHeads=6 ffnDim=2048
+🔷️ Eval    0 ms Sync    0 ms | Sent  8803 kB Recv 16853 kB | (23 tokens)
+🧪 [Root Logits] (eval batchIndex=22) Valid: ✅ OK | Range: [-10.71, 12.22] | MaxIdx: 220 | Zero: 0/128256 | NetDelta: S=9014560 R=17257728
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-10.16, 10.60] | MaxIdx: 11 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=23 | Sent   385 kB Recv   732 kB | ,
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.02, 9.45] | MaxIdx: 33 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=24 | Sent   382 kB Recv   732 kB | B
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.05, 9.32] | MaxIdx: 220 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=25 | Sent   382 kB Recv   732 kB |  
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.67, 11.01] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=26 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.49, 13.96] | MaxIdx: 11 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=27 | Sent   382 kB Recv   732 kB | ,
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.42, 12.94] | MaxIdx: 430 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=28 | Sent   382 kB Recv   732 kB |  that
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.15, 13.54] | MaxIdx: 220 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=29 | Sent   382 kB Recv   732 kB |  
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.84, 14.68] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=30 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.41, 14.01] | MaxIdx: 320 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=31 | Sent   382 kB Recv   732 kB |  (
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.92, 12.77] | MaxIdx: 67 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=32 | Sent   382 kB Recv   732 kB | d
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.77, 9.67] | MaxIdx: 439 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=33 | Sent   382 kB Recv   732 kB |  as
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.73, 12.55] | MaxIdx: 420 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=34 | Sent   382 kB Recv   732 kB |  this
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.28, 13.88] | MaxIdx: 220 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=35 | Sent   382 kB Recv   732 kB |  
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.23, 18.07] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=36 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.60, 12.55] | MaxIdx: 320 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=37 | Sent   382 kB Recv   732 kB |  (
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.98, 11.44] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=38 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.77, 13.84] | MaxIdx: 320 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=39 | Sent   382 kB Recv   732 kB |  (
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.99, 12.05] | MaxIdx: 35 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=40 | Sent   382 kB Recv   732 kB | D
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.95, 11.28] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=41 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.04, 9.71] | MaxIdx: 278 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=42 | Sent   382 kB Recv   732 kB | al
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.56, 10.54] | MaxIdx: 11 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=43 | Sent   382 kB Recv   732 kB | ,
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.35, 9.81] | MaxIdx: 220 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=44 | Sent   382 kB Recv   732 kB |  
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.29, 15.10] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=45 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.86, 11.63] | MaxIdx: 25 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=46 | Sent   382 kB Recv   732 kB | :
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.97, 10.75] | MaxIdx: 220 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=47 | Sent   382 kB Recv   732 kB |  
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-6.91, 14.98] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=48 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.74, 13.07] | MaxIdx: 220 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=49 | Sent   382 kB Recv   732 kB |  
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.20, 13.18] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=50 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.46, 13.95] | MaxIdx: 473 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=51 | Sent   382 kB Recv   732 kB |  H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.53, 10.96] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=52 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.56, 11.23] | MaxIdx: 6354 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=53 | Sent   382 kB Recv   732 kB | -S
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-10.39, 12.14] | MaxIdx: 11 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=54 | Sent   382 kB Recv   732 kB | ,
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.83, 14.78] | MaxIdx: 473 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=55 | Sent   382 kB Recv   732 kB |  H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.76, 14.36] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=56 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.25, 10.22] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=57 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.53, 9.88] | MaxIdx: 39 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=58 | Sent   382 kB Recv   732 kB | H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.48, 13.00] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=59 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.77, 10.82] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=60 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.54, 12.22] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=61 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.02, 13.29] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=62 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.92, 11.39] | MaxIdx: 15 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=63 | Sent   382 kB Recv   732 kB | 0
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.13, 13.69] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=64 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.53, 13.27] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=65 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.11, 12.52] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=66 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.17, 12.26] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=67 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.27, 12.85] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=68 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.60, 12.15] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=69 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.53, 13.30] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=70 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.19, 14.08] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=71 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.59, 15.12] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=72 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.71, 15.08] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=73 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.08, 15.23] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=74 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.87, 14.83] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=75 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.19, 13.01] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=76 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.13, 14.27] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=77 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.86, 14.41] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=78 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.78, 13.73] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=79 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.80, 13.09] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=80 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.64, 13.77] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=81 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.38, 12.47] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=82 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.44, 11.85] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=83 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.90, 11.92] | MaxIdx: 11 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=84 | Sent   382 kB Recv   732 kB | ,
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.36, 11.43] | MaxIdx: 912 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=85 | Sent   382 kB Recv   732 kB |  no
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.45, 10.28] | MaxIdx: 11 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=86 | Sent   382 kB Recv   732 kB | ,
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.83, 11.78] | MaxIdx: 473 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=87 | Sent   382 kB Recv   732 kB |  H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.16, 15.04] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=88 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.58, 11.77] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=89 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.32, 10.91] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=90 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.19, 12.34] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=91 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-7.96, 12.81] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=92 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.32, 13.98] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=93 | Sent   382 kB Recv   732 kB | -H
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-8.11, 13.68] | MaxIdx: 5364 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=94 | Sent   382 kB Recv   732 kB | -M
+🧪 [Root Logits] (pred) Valid: ✅ OK | Range: [-9.12, 12.69] | MaxIdx: 11529 | Zero: 0/128256
+🔶 Pred    0 ms Sync    0 ms | pos=95 | Sent   382 kB Recv   732 kB | -H
+
+Evaluation
+   nBatches: 32
+    nTokens: 23
+   tokens/s: inf (0.00 ms/tok)
+Prediction
+    nTokens: 73
+   tokens/s: inf (0.00 ms/tok)
+⭕ Network is closed

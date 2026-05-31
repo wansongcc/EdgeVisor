@@ -1,0 +1,60 @@
+Listening on 0.0.0.0:19992...
+⭕ The root node has connected
+⭕ peerWorkers: 1
+⭕ NodeIndex: 1
+⭕ Socket[0]: accepted root node
+⭕ Waiting worker-pair accept: localWorker=1 expecting one of [0..0]
+⭕ Socket[1]: accepted worker(globalNode=1, workerIndex=0)
+⭕ Network is initialized
+📀 RequiredMemory: 724 MB
+🔍 [DEBUG] parseStageDefs received: "1:2*1"
+⚖️  [Auto-Split] Stage 0 (Weight 3.00): Assigned 21 layers
+⚖️  [Auto-Split] Stage 1 (Weight 1.00): Assigned 7 layers
+🌋 Device: Tesla T4
+🌋 DeviceApiVersion: 1.4.303
+🌋 MaxComputeSharedMemory: 48 kB
+🌋 NonCoherentAtomSize: 64 bytes
+🌋 Heap[0]: 15360 MB
+🌋 Heap[2]: 246 MB
+🧱 [executor-init] node=2 segment=0 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=0 createExec=0 createSync=0
+🧱 [executor-init] node=2 segment=1 kind=other role=unguarded enabled=1 activeLayer=-1 redundantLayer=-1 nOps=0 nSyncs=2 createExec=0 createSync=1
+🧱 [executor-init] node=2 segment=2 kind=attn role=redundant enabled=0 activeLayer=20 redundantLayer=20 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=3 kind=ffn role=redundant enabled=0 activeLayer=20 redundantLayer=20 nOps=6 nSyncs=0 createExec=1 createSync=0
+🧱 [executor-init] node=2 segment=4 kind=attn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=5 kind=ffn role=primary enabled=1 activeLayer=21 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=6 kind=attn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=7 kind=ffn role=primary enabled=1 activeLayer=22 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=8 kind=attn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=9 kind=ffn role=primary enabled=1 activeLayer=23 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=10 kind=attn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=11 kind=ffn role=primary enabled=1 activeLayer=24 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=12 kind=attn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=13 kind=ffn role=primary enabled=1 activeLayer=25 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=14 kind=attn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=15 kind=ffn role=primary enabled=1 activeLayer=26 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=16 kind=attn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=15 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=17 kind=ffn role=primary enabled=1 activeLayer=27 redundantLayer=-1 nOps=11 nSyncs=1 createExec=1 createSync=1
+🧱 [executor-init] node=2 segment=18 kind=other role=unguarded enabled=1 activeLayer=0 redundantLayer=-1 nOps=6 nSyncs=1 createExec=1 createSync=1
+🚀 Worker 2: Local Loading Mode from /home/cc/dllama/distributed-llama/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+[graph-build-split] node=2 stage=1 q=[0,3072) kOwned=[0,1024) kCompute=[0,1024) kvCache=[0,1024) ffn=[0,8192) vocab=[0,128256) fullAtt=1 fullFfn=1 fullLogits=1 kvRedundant=1
+[graph-build] node=2 stage=1 kind=pp_recv layer=21 nOps=0 nSyncs=2
+⚠️ [seg-build] Adding redundant weight holder for layer 20 before startLayer 21
+[graph-build] node=2 stage=1 kind=att layer=21 nOps=15 nSyncs=1
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=0 name=block_cast_x_pp code=CAST in={src=PIPE idx=2 type=BATCH tag=AUTO} out={src=BUFFER idx=0 type=BATCH tag=AUTO} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=1 name=block_norm_pre_0 code=INV_RMS in={src=BUFFER idx=0 type=BATCH tag=AUTO} out={src=BUFFER idx=8 type=BATCH tag=AUTO} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=2 name=block_norm_0 code=RMS_NORM in={src=BUFFER idx=0 type=BATCH tag=AUTO} out={src=BUFFER idx=1 type=BATCH tag=AUTO} w={t=0 z=1 y=1 x=3072 bytes=12288}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=3 name=block_cast_y code=CAST in={src=BUFFER idx=1 type=BATCH tag=AUTO} out={src=BUFFER idx=2 type=BATCH tag=AUTO} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=4 name=block_matmul_q code=MATMUL in={src=BUFFER idx=2 type=BATCH tag=AUTO} out={src=BUFFER idx=5 type=BATCHED_SLICE tag=HEAD} w={t=2 z=1 y=3072 x=3072 bytes=5308416} matmul={view=1 inStart=0 outStart=0 inTag=AUTO outTag=HEAD aView(off=0,sizeX=0) cView(off=0,sizeX=3072)}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=5 name=block_matmul_k code=MATMUL in={src=BUFFER idx=2 type=BATCH tag=AUTO} out={src=BUFFER idx=6 type=BATCH tag=AUTO} w={t=2 z=1 y=3072 x=1024 bytes=1769472} matmul={view=1 inStart=0 outStart=0 inTag=AUTO outTag=AUTO aView(off=0,sizeX=0) cView(off=0,sizeX=1024)}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=6 name=block_matmul_v code=MATMUL in={src=BUFFER idx=2 type=BATCH tag=AUTO} out={src=BUFFER idx=7 type=BATCH tag=AUTO} w={t=2 z=1 y=3072 x=1024 bytes=1769472} matmul={view=1 inStart=0 outStart=0 inTag=AUTO outTag=AUTO aView(off=0,sizeX=0) cView(off=0,sizeX=1024)}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=7 name=block_rope_q code=ROPE in={src=BUFFER idx=5 type=BATCHED_SLICE tag=HEAD} out={src=BUFFER idx=5 type=BATCHED_SLICE tag=HEAD} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=8 name=block_rope_k code=ROPE in={src=BUFFER idx=6 type=BATCH tag=AUTO} out={src=BUFFER idx=6 type=BATCH tag=AUTO} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=9 name=block_shift_k code=SHIFT in={src=BUFFER idx=6 type=BATCH tag=AUTO} out={src=BUFFER idx=26 type=RAW tag=AUTO} w={t=4294967295 z=0 y=0 x=0 bytes=0} shift={dstColStart=0 dstRowStride=1024 dstColStartUnit=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=10 name=block_shift_v code=SHIFT in={src=BUFFER idx=7 type=BATCH tag=AUTO} out={src=BUFFER idx=27 type=RAW tag=AUTO} w={t=4294967295 z=0 y=0 x=0 bytes=0} shift={dstColStart=0 dstRowStride=1024 dstColStartUnit=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=11 name=block_multihead_att code=MULTIHEAD_ATT in={src=BUFFER idx=3 type=BATCHED_SLICE tag=HEAD} out={src=BUFFER idx=3 type=BATCHED_SLICE tag=HEAD} w={t=4294967295 z=0 y=0 x=0 bytes=0} att={nHeads0=24 qStart=0 qStride=3072 kvStart=0 kvStride=1024}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=12 name=block_cast_y2 code=CAST in={src=BUFFER idx=3 type=BATCHED_SLICE tag=HEAD} out={src=BUFFER idx=4 type=BATCHED_SLICE tag=HEAD} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=13 name=block_matmul_wo code=MATMUL in={src=BUFFER idx=4 type=BATCHED_SLICE tag=HEAD} out={src=BUFFER idx=1 type=BATCH tag=AUTO} w={t=2 z=1 y=3072 x=3072 bytes=5308416} matmul={view=2 inStart=0 outStart=0 inTag=HEAD outTag=AUTO aView(off=0,sizeX=0) cView(off=0,sizeX=0)}
+[graph-build-op] node=2 stage=1 kind=att layer=21 i=14 name=block_cast_d code=CAST in={src=BUFFER idx=1 type=BATCH tag=AUTO} out={src=PIPE idx=4 type=BATCHED_SLICE tag=STACKED_BY_NODE} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build] node=2 stage=1 kind=ff layer=21 nOps=11 nSyncs=1
+[graph-build-op] node=2 stage=1 kind=ff layer=21 i=0 name=block_merge_add2 code=MERGE_ADD in={src=PIPE idx=4 type=BATCH tag=AUTO} out={src=BUFFER idx=0 type=BATCH tag=AUTO} w={t=4294967295 z=0 y=0 x=0 bytes=0}
+[graph-build-op] node=2 stage=1 kind=ff layer=21 i=1 name=block_norm_pre_1 code=INV_RMS in={src=BUFFER idx=0 type=BATCH tag=AUTO

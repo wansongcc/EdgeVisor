@@ -1,0 +1,4 @@
+scenario,with_vg_wall_ms,no_vg_wall_ms,with_minus_no_vg_wall_ms,with_vg_t_recover_ms,with_vg_post_wave_avg_ms,no_vg_post_wave_avg_ms,with_vg_post_tokens_s,no_vg_post_tokens_s,with_vg_vs_no_vg_post_tokens_s_delta_pct,verdict,with_apply_seen,with_root_exit,no_vg_root_exit
+compute_skew,11264.732,14347.787,-3083.054,1213.319,511.25,609.812,1.95599,1.63985,19.279,VG absorption better,True,0,0
+bandwidth_skew,49448.71,12750.537,36698.173,8368.103,2894.375,505.375,0.3455,1.97873,-82.539,No-VG better/mixed,True,0,0
+compute_and_bandwidth_skew,58026.037,17404.634,40621.403,5615.602,3432.5,802.375,0.29133,1.2463,-76.624,No-VG better/mixed,True,0,0

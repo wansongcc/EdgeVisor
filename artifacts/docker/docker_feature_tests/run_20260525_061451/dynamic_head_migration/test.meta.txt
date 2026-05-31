@@ -1,0 +1,5 @@
+== dynamic head migration ==
+network=b01_feat_head_net_1779689706_head
+root=b01_feat_head_root_1779689706_head
+worker=b01_feat_head_w1_1779689706_head
+socket=/home/cc/yhbian/B01/docker_feature_tests/run_20260525_061451/sockets/head_1779689706_head.sock

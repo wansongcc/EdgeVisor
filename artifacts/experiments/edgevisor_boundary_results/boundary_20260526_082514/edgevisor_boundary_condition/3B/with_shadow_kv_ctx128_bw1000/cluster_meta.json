@@ -1,0 +1,39 @@
+{
+  "net": "b01ab_boundary_20260526_082514_edgevisor_boundar_net",
+  "root": "b01ab_boundary_20260526_082514_edgevisor_boundar_n0",
+  "workers": [
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n1",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n2",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n3",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n4",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n5",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n6",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n7"
+  ],
+  "all_names": [
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n0",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n1",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n2",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n3",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n4",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n5",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n6",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n7"
+  ],
+  "sock_host": "/home/cc/yhbian/B01/edgevisor_boundary_results/boundary_20260526_082514/s/b01_5a6608d8981c.sock",
+  "test_dir": "/home/cc/yhbian/B01/edgevisor_boundary_results/boundary_20260526_082514/edgevisor_boundary_condition/3B/with_shadow_kv_ctx128_bw1000",
+  "model": "3B",
+  "variant": "with_shadow_kv_ctx128_bw1000",
+  "exp": "edgevisor_boundary_condition",
+  "root_cmd": "./dllama inference --prompt 'The capital of France is' --steps 24 --model /models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m --tokenizer /models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 2048 --benchmark --workers b01ab_boundary_20260526_082514_edgevisor_boundar_n1:9999 b01ab_boundary_20260526_082514_edgevisor_boundar_n2:9999 b01ab_boundary_20260526_082514_edgevisor_boundar_n3:9999 b01ab_boundary_20260526_082514_edgevisor_boundar_n4:9999 b01ab_boundary_20260526_082514_edgevisor_boundar_n5:9999 b01ab_boundary_20260526_082514_edgevisor_boundar_n6:9999 b01ab_boundary_20260526_082514_edgevisor_boundar_n7:9999 --ratios '1:1:1*1:1:1*1:1' --enable-plan-barrier --enable-stage-full-weights --enable-kv-redundancy-during-migration 1 --kv-redundancy 2",
+  "active_workers": [
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n1",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n2",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n3",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n4",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n5",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n6",
+    "b01ab_boundary_20260526_082514_edgevisor_boundar_n7"
+  ],
+  "standby_workers": []
+}

@@ -1,0 +1,6 @@
+exp=/home/cc/yhbian/B01/docker_distributed_runs/run_4containers_20260525_055404
+image=dllama-exp-env:latest
+network=b01_ev4_net_1779688444
+workers=b01_ev4_worker1_1779688444,b01_ev4_worker2_1779688444,b01_ev4_worker3_1779688444
+root=b01_ev4_root_1779688444
+ratios=1:1:1:1

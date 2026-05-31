@@ -1,0 +1,5 @@
+scenario,weak_network,cpu_limits,vg_wall_ms,pp_wall_ms,vg_minus_pp_wall_ms,vg_avg_pred_ms,pp_avg_pred_ms,vg_tokens_s,pp_tokens_s,vg_vs_pp_tokens_s_delta_pct,verdict,hypothesis
+no_skew_reference,False,"2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0",3156.22,4569.269,-1413.049,176.0,399.25,5.68182,2.5047,126.847,VG better,VG should win/compete when bandwidth is high and compute skew is small.
+compute_skew,False,"2.0,2.0,2.0,2.0,0.3,2.0,2.0,2.0",7986.606,5801.677,2184.93,828.5,508.5,1.207,1.96657,-38.624,PP better,PP fallback should improve when a very slow device becomes a VG-internal TP straggler.
+bandwidth_skew,True,"2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0",38576.477,6960.601,31615.876,4648.25,683.75,0.21513,1.46252,-85.29,PP better,PP fallback should improve if traffic to/from a VG-internal device is weak and PP can reduce that device's work.
+compute_and_bandwidth_skew,True,"2.0,2.0,2.0,2.0,0.3,2.0,2.0,2.0",41618.272,7623.724,33994.548,4847.75,723.0,0.20628,1.38313,-85.086,PP better,PP fallback should be best when compute and bandwidth skews hit the same VG-internal device.

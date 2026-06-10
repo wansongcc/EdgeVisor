@@ -20,7 +20,11 @@ def parse_gpu_list(value: str) -> list[int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a looping LangGraph agent with a swappable LLM backend.")
-    parser.add_argument("--backend", choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo"], required=True)
+    parser.add_argument(
+        "--backend",
+        choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo", "edgevisor_lingualinked"],
+        required=True,
+    )
     parser.add_argument(
         "--episode",
         type=Path,
@@ -36,6 +40,10 @@ def main() -> int:
     parser.add_argument("--edge-exo-gpus", default="0,1,2", help="Comma-separated GPU indices for EdgeVisor-EXO.")
     parser.add_argument("--edge-exo-total-layers", type=int, default=28)
     parser.add_argument("--edge-exo-memory-field", choices=["total", "free"], default="total")
+    parser.add_argument("--lingualinked-gpus", default="0,1,2", help="Comma-separated GPU indices for EdgeVisor-LinguaLinked.")
+    parser.add_argument("--lingualinked-total-layers", type=int, default=28)
+    parser.add_argument("--lingualinked-overlap-layers", type=int, default=2)
+    parser.add_argument("--lingualinked-memory-field", choices=["total", "free"], default="total")
     parser.add_argument("--ctx", type=int, default=2048)
     args = parser.parse_args()
 
@@ -70,6 +78,16 @@ def main() -> int:
             "gpu_indices": parse_gpu_list(args.edge_exo_gpus),
             "total_layers": args.edge_exo_total_layers,
             "memory_field": args.edge_exo_memory_field,
+        }
+    elif args.backend == "edgevisor_lingualinked":
+        backend_kwargs = {
+            "cuda_visible": args.cuda_visible,
+            "ctx": args.ctx,
+            "steps": args.edge_steps,
+            "gpu_indices": parse_gpu_list(args.lingualinked_gpus),
+            "total_layers": args.lingualinked_total_layers,
+            "overlap_layers": args.lingualinked_overlap_layers,
+            "memory_field": args.lingualinked_memory_field,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

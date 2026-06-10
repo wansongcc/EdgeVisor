@@ -28,6 +28,13 @@ EDGE_EXO_PLAN = EDGE_EXO_ENGINE / "src/edgevisor_exo_plan.py"
 EDGE_EXO_MODEL = EDGE_MODEL
 EDGE_EXO_TOKENIZER = EDGE_TOKENIZER
 
+EDGE_LL_PROJECT = ROOT / "EdgeVisor-LinguaLinked"
+EDGE_LL_ENGINE = EDGE_LL_PROJECT / "EdgeVisor"
+EDGE_LL_DLLAMA = EDGE_LL_ENGINE / "dllama"
+EDGE_LL_PLAN = EDGE_LL_ENGINE / "src/lingualinked_plan.py"
+EDGE_LL_MODEL = EDGE_MODEL
+EDGE_LL_TOKENIZER = EDGE_TOKENIZER
+
 DLLAMA_PROJECT = ROOT / "distributed-llama"
 DLLAMA_ENGINE = DLLAMA_PROJECT
 DLLAMA_CLI = DLLAMA_ENGINE / "dllama"
@@ -125,6 +132,30 @@ def parse_edge_metrics(log_text: str) -> Dict[str, Any]:
         log_text,
         re.S,
     )
+    stage_profile: List[Dict[str, Any]] = []
+    for match in re.finditer(
+        r"Stage\s+(\d+)\s+Node\s+(\d+):\s+per-fwd total=\s*([0-9.]+)\s*ms"
+        r"\s+\(exec=\s*([0-9.]+)\s+sync=\s*([0-9.]+)\)"
+        r"\s+\|\s+per-tok total=\s*([0-9.]+)\s*ms"
+        r"\s+\(exec=\s*([0-9.]+)\s+sync=\s*([0-9.]+)\)"
+        r"\s+\|\s+fwd=(\d+)\s+tok=(\d+)",
+        log_text,
+    ):
+        stage_profile.append(
+            {
+                "stage": int(match.group(1)),
+                "node": int(match.group(2)),
+                "per_fwd_total_ms": float(match.group(3)),
+                "per_fwd_exec_ms": float(match.group(4)),
+                "per_fwd_sync_ms": float(match.group(5)),
+                "per_tok_total_ms": float(match.group(6)),
+                "per_tok_exec_ms": float(match.group(7)),
+                "per_tok_sync_ms": float(match.group(8)),
+                "forward_count": int(match.group(9)),
+                "token_count": int(match.group(10)),
+            }
+        )
+    stage_profile.sort(key=lambda x: int(x["stage"]))
     n_pred = int(pred_match.group(1)) if pred_match else len(pred_parts)
     tpot = float(pred_match.group(3)) if pred_match else (pred_ms / n_pred if n_pred else None)
     tpot_after_first = None
@@ -141,6 +172,7 @@ def parse_edge_metrics(log_text: str) -> Dict[str, Any]:
         "tpot_ms_after_first": tpot_after_first,
         "plan_apply_seen": "[plan][apply]" in log_text,
         "plan_emit_seen": "[plan][emit]" in log_text,
+        "stage_profile": stage_profile,
     }
 
 
@@ -356,6 +388,8 @@ class EdgeVisorBackend(Backend):
         vulkan_project: Optional[Path] = None,
         root_gpu: int = 0,
         enable_benchmark: bool = True,
+        extra_root_args: Optional[List[str]] = None,
+        extra_env: Optional[Dict[str, str]] = None,
     ):
         ensure_paths([dllama_path, model_path, tokenizer_path])
         if backend_name:
@@ -374,6 +408,8 @@ class EdgeVisorBackend(Backend):
         self.vulkan_project = vulkan_project or project_dir
         self.root_gpu = root_gpu
         self.enable_benchmark = enable_benchmark
+        self.extra_root_args = list(extra_root_args or [])
+        self.extra_env = dict(extra_env or {})
         self.last_plan: Optional[Dict[str, Any]] = None
 
     def generate(
@@ -386,6 +422,7 @@ class EdgeVisorBackend(Backend):
     ) -> GenerationResult:
         prompt = render_messages(messages)
         env = base_env(self.cuda_visible, self.vulkan_project)
+        env.update(self.extra_env)
         procs: List[subprocess.Popen[Any]] = []
         dynamic_events: List[Dict[str, Any]] = []
         port_base = 32000 + random.randint(0, 2000)
@@ -455,6 +492,8 @@ class EdgeVisorBackend(Backend):
                     root_cmd.extend(["--ratios", self.ratios])
             if socket_path:
                 root_cmd.extend(["--enable-plan-barrier", "--kv-redundancy", "2"])
+            if self.extra_root_args:
+                root_cmd.extend(self.extra_root_args)
 
             start = time.perf_counter()
             root_proc = popen_log(root_cmd, logs["root"], self.engine_dir, env)
@@ -481,6 +520,24 @@ class EdgeVisorBackend(Backend):
         metrics = parse_edge_metrics(log_text)
         metrics["wall_ms"] = wall_ms
         metrics["valid"] = rc == 0 and "Critical" not in log_text and "error" not in log_text.lower()
+        node_metrics: List[Dict[str, Any]] = []
+        for label, path in logs.items():
+            text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+            gpu = self.root_gpu if label == "root" else None
+            if label.startswith("worker"):
+                try:
+                    gpu = self.worker_gpus[int(label.removeprefix("worker"))]
+                except Exception:
+                    gpu = None
+            node_metrics.append(
+                {
+                    "node": label,
+                    "gpu": gpu,
+                    "log_path": str(path),
+                    "metrics": parse_edge_metrics(text),
+                }
+            )
+        metrics["node_metrics"] = node_metrics
         if self.last_plan is not None:
             metrics["exo_plan"] = self.last_plan
         return GenerationResult(
@@ -670,6 +727,172 @@ class EdgeVisorExoBackend(EdgeVisorBackend):
         return ratios, plan
 
 
+class EdgeVisorLinguaLinkedBackend(EdgeVisorBackend):
+    name = "edgevisor_lingualinked"
+
+    def __init__(
+        self,
+        cuda_visible: str = "0,1,2",
+        ctx: int = 2048,
+        steps: int = 128,
+        timeout_s: int = 240,
+        gpu_indices: Optional[List[int]] = None,
+        total_layers: int = 28,
+        overlap_layers: int = 2,
+        memory_field: str = "total",
+    ):
+        ensure_paths([EDGE_LL_DLLAMA, EDGE_LL_MODEL, EDGE_LL_TOKENIZER, EDGE_LL_PLAN])
+        self.gpu_indices = gpu_indices if gpu_indices is not None else [0, 1, 2]
+        if not self.gpu_indices:
+            raise BackendError("edgevisor_lingualinked requires at least one GPU index")
+        self.total_layers = total_layers
+        self.overlap_layers = max(0, overlap_layers)
+        self.memory_field = memory_field
+        self.current_plan = self._make_plan()
+        self.current_layers = list(self.current_plan["layers"])
+        ratios = str(self.current_plan["ratios"])
+        super().__init__(
+            cuda_visible=cuda_visible,
+            ctx=ctx,
+            steps=steps,
+            timeout_s=timeout_s,
+            ratios=ratios,
+            worker_gpus=self.gpu_indices[1:],
+            backend_name=self.name,
+            project_dir=EDGE_LL_PROJECT,
+            engine_dir=EDGE_LL_ENGINE,
+            dllama_path=EDGE_LL_DLLAMA,
+            model_path=EDGE_LL_MODEL,
+            tokenizer_path=EDGE_LL_TOKENIZER,
+            vulkan_project=EDGE_LL_PROJECT,
+            root_gpu=self.gpu_indices[0],
+            extra_root_args=[
+                "--runtime-redundant-boundary-layers",
+                str(self.overlap_layers),
+                "--runtime-active-seg-enabled",
+                "1",
+                "--runtime-redundant-seg-enabled",
+                "0",
+                "--enable-kv-redundancy-during-migration",
+                "0",
+                "--kv-redundancy",
+                "0",
+            ],
+            extra_env={
+                "DLLAMA_LINGUALINKED_MODE": "1",
+                "DLLAMA_RUNTIME_PLAN_PRINT": "1",
+            },
+        )
+        self.last_plan = self.current_plan
+
+    def _make_plan(self, stage_ms: Optional[List[float]] = None) -> Dict[str, Any]:
+        cmd = [
+            sys.executable,
+            str(EDGE_LL_PLAN),
+            "--gpu-indices",
+            ",".join(str(x) for x in self.gpu_indices),
+            "--total-layers",
+            str(self.total_layers),
+            "--overlap-layers",
+            str(self.overlap_layers),
+            "--memory-field",
+            self.memory_field,
+            "--json",
+        ]
+        if stage_ms is not None:
+            cmd.extend(["--current-layers", ",".join(str(x) for x in self.current_layers)])
+            cmd.extend(["--stage-ms", ",".join(f"{x:.6f}" for x in stage_ms)])
+        proc = subprocess.run(
+            cmd,
+            cwd=str(EDGE_LL_ENGINE),
+            env=base_env(",".join(str(x) for x in self.gpu_indices), EDGE_LL_PROJECT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            raise BackendError(f"edgevisor_lingualinked plan failed:\n{proc.stderr.strip()}")
+        plan = json.loads(proc.stdout)
+        if not plan.get("ratios"):
+            raise BackendError(f"edgevisor_lingualinked plan did not produce ratios: {plan}")
+        return plan
+
+    def _extract_stage_ms(self, result: GenerationResult) -> Optional[List[float]]:
+        stage_profile = result.metrics.get("stage_profile")
+        if isinstance(stage_profile, list) and len(stage_profile) >= len(self.gpu_indices):
+            values: List[float] = []
+            for entry in stage_profile[: len(self.gpu_indices)]:
+                if not isinstance(entry, dict):
+                    return None
+                value = entry.get("per_tok_total_ms") or entry.get("per_fwd_total_ms")
+                if value is None or float(value) <= 0.0:
+                    return None
+                values.append(float(value))
+            return values
+
+        node_metrics = result.metrics.get("node_metrics")
+        if not isinstance(node_metrics, list) or len(node_metrics) < len(self.gpu_indices):
+            return None
+        values: List[float] = []
+        for node in node_metrics[: len(self.gpu_indices)]:
+            m = node.get("metrics", {}) if isinstance(node, dict) else {}
+            if not isinstance(m, dict):
+                return None
+            value = m.get("prediction_ms_total")
+            if value is None:
+                eval_ms = m.get("eval_ms")
+                pred_ms = m.get("prediction_ms_total")
+                if eval_ms is not None or pred_ms is not None:
+                    value = float(eval_ms or 0.0) + float(pred_ms or 0.0)
+            if value is None or float(value) <= 0.0:
+                return None
+            values.append(float(value))
+        return values
+
+    def generate(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        generation_name: str,
+        out_dir: Path,
+        dynamic_plan: Optional[Dict[str, Any]] = None,
+    ) -> GenerationResult:
+        used_plan = dict(self.current_plan)
+        self.ratios = str(used_plan["ratios"])
+        self.last_plan = used_plan
+        result = super().generate(messages, max_tokens, generation_name, out_dir, dynamic_plan=None)
+        result.metrics["lingualinked_plan"] = used_plan
+        stage_ms = self._extract_stage_ms(result)
+        if stage_ms is not None:
+            next_plan = self._make_plan(stage_ms=stage_ms)
+            self.current_plan = next_plan
+            self.current_layers = list(next_plan["layers"])
+            result.metrics["lingualinked_stage_ms"] = stage_ms
+            result.metrics["next_lingualinked_plan"] = next_plan
+            result.dynamic_events.append(
+                {
+                    "event": "lingualinked_request_rebalance",
+                    "stage_ms": stage_ms,
+                    "from_layers": used_plan.get("layers"),
+                    "to_layers": next_plan.get("layers"),
+                    "from_ratios": used_plan.get("ratios"),
+                    "to_ratios": next_plan.get("ratios"),
+                }
+            )
+        else:
+            result.metrics["lingualinked_stage_ms"] = None
+            result.dynamic_events.append(
+                {
+                    "event": "lingualinked_request_rebalance_skipped",
+                    "reason": "missing per-stage benchmark metrics",
+                    "layers": used_plan.get("layers"),
+                    "ratios": used_plan.get("ratios"),
+                }
+            )
+        return result
+
+
 def make_backend(name: str, **kwargs: Any) -> Backend:
     if name == "mock":
         return MockBackend()
@@ -681,4 +904,6 @@ def make_backend(name: str, **kwargs: Any) -> Backend:
         return DllamaBackend(**kwargs)
     if name == "edgevisor_exo":
         return EdgeVisorExoBackend(**kwargs)
+    if name == "edgevisor_lingualinked":
+        return EdgeVisorLinguaLinkedBackend(**kwargs)
     raise BackendError(f"unknown backend: {name}")

@@ -152,6 +152,36 @@ python3 EdgeVisor/examples/plan-uds-client.py SOCKET set_pp_migration \
   --trigger-pos 0
 ```
 
+## LinguaLinked 复现路线
+
+LinguaLinked 复现版本独立维护在：
+
+```text
+/home/byh/B01/EdgeVisor-LinguaLinked
+git@github.com:BianYanhui/EdgeVisor-LinguaLinked.git
+```
+
+该版本基于 EdgeVisor 的 PP 能力实现：
+
+- 纯 PP：每个 stage 只有一个设备，不使用 TP。
+- 相邻 stage 冗余加载 overlap layers 的权重。
+- 冗余 layers 在正常 request 中保持休眠，不进行冗余 KV-cache 计算。
+- 每个 request 结束后，依据上一轮各 stage 耗时，在 overlap 范围内调整下一轮 PP layer 边界。
+
+Agentic 路线沿用本项目 `agent_bench` 的 LangGraph backend 抽象，可直接把 LLM
+Generation backend 切换为 `edgevisor_lingualinked`：
+
+```bash
+cd /home/byh/B01/EdgeVisor
+/home/byh/B01/agent_langgraph_venv/bin/python -m agent_bench.run_loop_episode \
+  --backend edgevisor_lingualinked \
+  --cuda-visible 0,1,2 \
+  --lingualinked-gpus 0,1,2 \
+  --lingualinked-overlap-layers 2 \
+  --edge-steps 96 \
+  --ctx 2048
+```
+
 ## 已保留的功能范围
 
 - Llama3 chat template 使用 `<|eot_id|>` 作为消息结束符。

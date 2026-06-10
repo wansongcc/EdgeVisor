@@ -1,0 +1,28 @@
+{
+  "id": "text_stats_two_generation",
+  "description": "A two-generation agent episode with one text statistics tool call.",
+  "initial_messages": [
+    {
+      "role": "system",
+      "content": "You are an agent benchmark participant. Keep outputs brief and do not call tools directly; the runtime executes tools."
+    }
+  ],
+  "generations": [
+    {
+      "name": "plan_text_stats",
+      "prompt": "We need character count, word count, and uppercase form for the text 'EdgeVisor agent backend'. State in one short sentence that the text_stats tool should be used.",
+      "max_tokens": 24
+    },
+    {
+      "name": "final_answer",
+      "prompt": "The text_stats tool returned: {tool_result} Summarize these fields in one short sentence.",
+      "max_tokens": 48
+    }
+  ],
+  "tool_call": {
+    "name": "text_stats",
+    "arguments": {
+      "text": "EdgeVisor agent backend"
+    }
+  }
+}

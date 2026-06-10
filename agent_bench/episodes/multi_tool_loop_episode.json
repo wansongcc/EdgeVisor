@@ -1,0 +1,17 @@
+{
+  "id": "multi_tool_loop_agent",
+  "description": "A looping agent task where the LLM chooses tools until it has enough observations for a final answer.",
+  "max_llm_turns": 10,
+  "max_tokens": 128,
+  "min_tool_calls": 6,
+  "required_tools": [
+    "calculator",
+    "lookup_fact",
+    "text_stats",
+    "unit_convert",
+    "list_sort",
+    "hash_text"
+  ],
+  "reject_duplicate_required_tools": true,
+  "task": "Create a compact final report. Use one tool per turn. You need observations for all of these items before final_answer: (1) calculate 12345 * 6789, (2) lookup the gpu_policy fact, (3) get text_stats for 'EdgeVisor agent backend', (4) convert 42 celsius to fahrenheit, (5) sort the list [7, 2, 9, 1], and (6) compute sha256 for the text 'agent-loop'. After the six observations, return final_answer with all results in one concise paragraph."
+}

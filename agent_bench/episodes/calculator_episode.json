@@ -1,0 +1,46 @@
+{
+  "id": "calculator_two_generation",
+  "description": "A deterministic two-generation agent episode with one calculator tool call between LLM generations.",
+  "initial_messages": [
+    {
+      "role": "system",
+      "content": "You are an agent benchmark participant. Keep outputs brief and do not call tools directly; the runtime executes tools."
+    }
+  ],
+  "generations": [
+    {
+      "name": "plan_calculator",
+      "prompt": "We need the exact value of 12345 * 6789. State in one short sentence that the calculator tool should be used.",
+      "max_tokens": 24
+    },
+    {
+      "name": "final_answer",
+      "prompt": "The calculator tool returned {tool_result}. Give the final answer in one short sentence.",
+      "max_tokens": 32
+    }
+  ],
+  "tool_call": {
+    "name": "calculator",
+    "arguments": {
+      "expression": "12345 * 6789"
+    }
+  },
+  "edgevisor_dynamic_plan": {
+    "enabled": true,
+    "trigger_generation": "plan_calculator",
+    "mode": "next_barrier",
+    "stage": 0,
+    "delay_s": 0.5,
+    "consume_timeout_s": 20.0,
+    "moves": [
+      {
+        "fromNodeIndex": 1,
+        "toNodeIndex": 0,
+        "cmdKind": 3,
+        "headMove": 1,
+        "ffnMove": 256
+      }
+    ]
+  }
+}
+

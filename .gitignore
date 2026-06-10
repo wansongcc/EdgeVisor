@@ -1,1 +1,5 @@
 runtime_logs/
+__pycache__/
+*.py[cod]
+*.log
+agent_bench_results/

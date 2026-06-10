@@ -1,0 +1,28 @@
+{
+  "id": "local_lookup_two_generation",
+  "description": "A two-generation agent episode with one local fact lookup tool call.",
+  "initial_messages": [
+    {
+      "role": "system",
+      "content": "You are an agent benchmark participant. Keep outputs brief and do not call tools directly; the runtime executes tools."
+    }
+  ],
+  "generations": [
+    {
+      "name": "plan_lookup",
+      "prompt": "We need the benchmark GPU policy. State in one short sentence that the local lookup tool should be used.",
+      "max_tokens": 24
+    },
+    {
+      "name": "final_answer",
+      "prompt": "The local lookup tool returned: {tool_result} Give the policy in one short sentence.",
+      "max_tokens": 48
+    }
+  ],
+  "tool_call": {
+    "name": "lookup_fact",
+    "arguments": {
+      "key": "gpu_policy"
+    }
+  }
+}

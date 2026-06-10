@@ -7,6 +7,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,19 @@ EDGE_ENGINE = EDGE_PROJECT / "EdgeVisor"
 EDGE_DLLAMA = EDGE_ENGINE / "dllama"
 EDGE_MODEL = ROOT / "models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m"
 EDGE_TOKENIZER = ROOT / "models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
+
+EDGE_EXO_PROJECT = ROOT / "EdgeVisor-EXO"
+EDGE_EXO_ENGINE = EDGE_EXO_PROJECT / "EdgeVisor"
+EDGE_EXO_DLLAMA = EDGE_EXO_ENGINE / "dllama"
+EDGE_EXO_PLAN = EDGE_EXO_ENGINE / "src/edgevisor_exo_plan.py"
+EDGE_EXO_MODEL = EDGE_MODEL
+EDGE_EXO_TOKENIZER = EDGE_TOKENIZER
+
+DLLAMA_PROJECT = ROOT / "distributed-llama"
+DLLAMA_ENGINE = DLLAMA_PROJECT
+DLLAMA_CLI = DLLAMA_ENGINE / "dllama"
+DLLAMA_MODEL = EDGE_MODEL
+DLLAMA_TOKENIZER = EDGE_TOKENIZER
 
 PRIMA_DIR = ROOT / "prima_cpp_work/prima.cpp"
 PRIMA_CLI = PRIMA_DIR / "llama-cli"
@@ -56,15 +70,19 @@ def ensure_paths(paths: Iterable[Path]) -> None:
         raise BackendError("missing required files:\n" + "\n".join(missing))
 
 
-def base_env(cuda_visible: str = "0,1,2") -> Dict[str, str]:
+def base_env(cuda_visible: str = "0,1,2", vulkan_project: Path = EDGE_PROJECT) -> Dict[str, str]:
     env = os.environ.copy()
-    vulkan_bin = EDGE_PROJECT / "tools/vulkan_deps/root/usr/bin"
-    vulkan_lib = EDGE_PROJECT / "tools/vulkan_deps/root/usr/lib/x86_64-linux-gnu"
-    env["PATH"] = f"{vulkan_bin}:{env.get('PATH', '')}"
-    env["LD_LIBRARY_PATH"] = (
-        f"{vulkan_lib}:/usr/local/cuda/lib64:/usr/local/lib:"
-        f"{env.get('LD_LIBRARY_PATH', '')}"
-    )
+    vulkan_bin = vulkan_project / "tools/vulkan_deps/root/usr/bin"
+    vulkan_lib = vulkan_project / "tools/vulkan_deps/root/usr/lib/x86_64-linux-gnu"
+    if vulkan_bin.exists():
+        env["PATH"] = f"{vulkan_bin}:{env.get('PATH', '')}"
+    if vulkan_lib.exists():
+        env["LD_LIBRARY_PATH"] = (
+            f"{vulkan_lib}:/usr/local/cuda/lib64:/usr/local/lib:"
+            f"{env.get('LD_LIBRARY_PATH', '')}"
+        )
+    else:
+        env["LD_LIBRARY_PATH"] = f"/usr/local/cuda/lib64:/usr/local/lib:{env.get('LD_LIBRARY_PATH', '')}"
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible
     return env
 
@@ -252,7 +270,7 @@ class MockBackend(Backend):
 class PrimaBackend(Backend):
     name = "prima"
 
-    def __init__(self, cuda_visible: str = "0,1,2", ctx: int = 512, timeout_s: int = 180):
+    def __init__(self, cuda_visible: str = "0,1,2", ctx: int = 2048, timeout_s: int = 180):
         ensure_paths([PRIMA_CLI, PRIMA_MODEL])
         self.cuda_visible = cuda_visible
         self.ctx = ctx
@@ -324,19 +342,39 @@ class EdgeVisorBackend(Backend):
     def __init__(
         self,
         cuda_visible: str = "0,1,2",
-        ctx: int = 512,
+        ctx: int = 2048,
         steps: int = 128,
         timeout_s: int = 240,
         ratios: str = "1:1",
         worker_gpus: Optional[List[int]] = None,
+        backend_name: Optional[str] = None,
+        project_dir: Path = EDGE_PROJECT,
+        engine_dir: Path = EDGE_ENGINE,
+        dllama_path: Path = EDGE_DLLAMA,
+        model_path: Path = EDGE_MODEL,
+        tokenizer_path: Path = EDGE_TOKENIZER,
+        vulkan_project: Optional[Path] = None,
+        root_gpu: int = 0,
+        enable_benchmark: bool = True,
     ):
-        ensure_paths([EDGE_DLLAMA, EDGE_MODEL, EDGE_TOKENIZER])
+        ensure_paths([dllama_path, model_path, tokenizer_path])
+        if backend_name:
+            self.name = backend_name
         self.cuda_visible = cuda_visible
         self.ctx = ctx
         self.steps = steps
         self.timeout_s = timeout_s
         self.ratios = ratios
         self.worker_gpus = worker_gpus if worker_gpus is not None else [1]
+        self.project_dir = project_dir
+        self.engine_dir = engine_dir
+        self.dllama_path = dllama_path
+        self.model_path = model_path
+        self.tokenizer_path = tokenizer_path
+        self.vulkan_project = vulkan_project or project_dir
+        self.root_gpu = root_gpu
+        self.enable_benchmark = enable_benchmark
+        self.last_plan: Optional[Dict[str, Any]] = None
 
     def generate(
         self,
@@ -347,7 +385,7 @@ class EdgeVisorBackend(Backend):
         dynamic_plan: Optional[Dict[str, Any]] = None,
     ) -> GenerationResult:
         prompt = render_messages(messages)
-        env = base_env(self.cuda_visible)
+        env = base_env(self.cuda_visible, self.vulkan_project)
         procs: List[subprocess.Popen[Any]] = []
         dynamic_events: List[Dict[str, Any]] = []
         port_base = 32000 + random.randint(0, 2000)
@@ -372,7 +410,7 @@ class EdgeVisorBackend(Backend):
             steps = estimate_edge_steps(prompt, max_tokens, self.ctx, self.steps)
             for idx, gpu in enumerate(self.worker_gpus):
                 worker_cmd = [
-                    str(EDGE_DLLAMA),
+                    str(self.dllama_path),
                     "worker",
                     "--port",
                     str(worker_ports[idx]),
@@ -381,21 +419,21 @@ class EdgeVisorBackend(Backend):
                     "--gpu-index",
                     str(gpu),
                 ]
-                procs.append(popen_log(worker_cmd, logs[f"worker{idx}"], EDGE_ENGINE, env))
+                procs.append(popen_log(worker_cmd, logs[f"worker{idx}"], self.engine_dir, env))
             if self.worker_gpus:
                 time.sleep(3.0)
 
             root_cmd = [
-                str(EDGE_DLLAMA),
+                str(self.dllama_path),
                 "inference",
                 "--prompt",
                 prompt,
                 "--steps",
                 str(steps),
                 "--model",
-                str(EDGE_MODEL),
+                str(self.model_path),
                 "--tokenizer",
-                str(EDGE_TOKENIZER),
+                str(self.tokenizer_path),
                 "--buffer-float-type",
                 "q80",
                 "--nthreads",
@@ -407,16 +445,19 @@ class EdgeVisorBackend(Backend):
                 "--seed",
                 "1",
                 "--gpu-index",
-                "0",
-                "--benchmark",
+                str(self.root_gpu),
             ]
+            if self.enable_benchmark:
+                root_cmd.append("--benchmark")
             if self.worker_gpus:
-                root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in worker_ports], "--ratios", self.ratios])
+                root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in worker_ports]])
+                if self.ratios:
+                    root_cmd.extend(["--ratios", self.ratios])
             if socket_path:
                 root_cmd.extend(["--enable-plan-barrier", "--kv-redundancy", "2"])
 
             start = time.perf_counter()
-            root_proc = popen_log(root_cmd, logs["root"], EDGE_ENGINE, env)
+            root_proc = popen_log(root_cmd, logs["root"], self.engine_dir, env)
             procs.append(root_proc)
 
             if socket_path:
@@ -440,6 +481,8 @@ class EdgeVisorBackend(Backend):
         metrics = parse_edge_metrics(log_text)
         metrics["wall_ms"] = wall_ms
         metrics["valid"] = rc == 0 and "Critical" not in log_text and "error" not in log_text.lower()
+        if self.last_plan is not None:
+            metrics["exo_plan"] = self.last_plan
         return GenerationResult(
             backend=self.name,
             content=strip_edge_content(log_text),
@@ -513,6 +556,120 @@ class EdgeVisorBackend(Backend):
         return events
 
 
+class DllamaBackend(EdgeVisorBackend):
+    name = "dllama"
+
+    def __init__(
+        self,
+        cuda_visible: str = "0,1,2",
+        ctx: int = 2048,
+        steps: int = 128,
+        timeout_s: int = 240,
+        ratios: str = "1:1",
+        worker_gpus: Optional[List[int]] = None,
+        root_gpu: int = 0,
+    ):
+        # The upstream distributed-llama runtime uses tensor-style splitting.
+        # On the 3B Llama model used here, the 2-worker case has a kvDim
+        # divisibility assertion; the previously verified stable setup is one
+        # root plus one worker.
+        super().__init__(
+            cuda_visible=cuda_visible,
+            ctx=ctx,
+            steps=steps,
+            timeout_s=timeout_s,
+            ratios="",
+            worker_gpus=worker_gpus if worker_gpus is not None else [1],
+            backend_name=self.name,
+            project_dir=DLLAMA_PROJECT,
+            engine_dir=DLLAMA_ENGINE,
+            dllama_path=DLLAMA_CLI,
+            model_path=DLLAMA_MODEL,
+            tokenizer_path=DLLAMA_TOKENIZER,
+            vulkan_project=DLLAMA_PROJECT,
+            root_gpu=root_gpu,
+            enable_benchmark=False,
+        )
+
+    def generate(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        generation_name: str,
+        out_dir: Path,
+        dynamic_plan: Optional[Dict[str, Any]] = None,
+    ) -> GenerationResult:
+        return super().generate(messages, max_tokens, generation_name, out_dir, dynamic_plan=None)
+
+
+class EdgeVisorExoBackend(EdgeVisorBackend):
+    name = "edgevisor_exo"
+
+    def __init__(
+        self,
+        cuda_visible: str = "0,1,2",
+        ctx: int = 2048,
+        steps: int = 128,
+        timeout_s: int = 240,
+        gpu_indices: Optional[List[int]] = None,
+        total_layers: int = 28,
+        memory_field: str = "total",
+    ):
+        ensure_paths([EDGE_EXO_DLLAMA, EDGE_EXO_MODEL, EDGE_EXO_TOKENIZER, EDGE_EXO_PLAN])
+        self.gpu_indices = gpu_indices if gpu_indices is not None else [0, 1, 2]
+        if not self.gpu_indices:
+            raise BackendError("edgevisor_exo requires at least one GPU index")
+        self.total_layers = total_layers
+        self.memory_field = memory_field
+        ratios, plan = self._make_exo_plan()
+        super().__init__(
+            cuda_visible=cuda_visible,
+            ctx=ctx,
+            steps=steps,
+            timeout_s=timeout_s,
+            ratios=ratios,
+            worker_gpus=self.gpu_indices[1:],
+            backend_name=self.name,
+            project_dir=EDGE_EXO_PROJECT,
+            engine_dir=EDGE_EXO_ENGINE,
+            dllama_path=EDGE_EXO_DLLAMA,
+            model_path=EDGE_EXO_MODEL,
+            tokenizer_path=EDGE_EXO_TOKENIZER,
+            vulkan_project=EDGE_EXO_PROJECT,
+            root_gpu=self.gpu_indices[0],
+        )
+        self.last_plan = plan
+
+    def _make_exo_plan(self) -> tuple[str, Dict[str, Any]]:
+        cmd = [
+            sys.executable,
+            str(EDGE_EXO_PLAN),
+            "--gpu-indices",
+            ",".join(str(x) for x in self.gpu_indices),
+            "--total-layers",
+            str(self.total_layers),
+            "--memory-field",
+            self.memory_field,
+            "--json",
+        ]
+        proc = subprocess.run(
+            cmd,
+            cwd=str(EDGE_EXO_ENGINE),
+            env=base_env(",".join(str(x) for x in self.gpu_indices), EDGE_EXO_PROJECT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            raise BackendError(f"edgevisor_exo plan failed:\n{proc.stderr.strip()}")
+        plan = json.loads(proc.stdout)
+        ratios = str(plan.get("ratios", ""))
+        if not ratios:
+            raise BackendError(f"edgevisor_exo plan did not produce ratios: {plan}")
+        return ratios, plan
+
+
 def make_backend(name: str, **kwargs: Any) -> Backend:
     if name == "mock":
         return MockBackend()
@@ -520,4 +677,8 @@ def make_backend(name: str, **kwargs: Any) -> Backend:
         return PrimaBackend(**kwargs)
     if name == "edgevisor":
         return EdgeVisorBackend(**kwargs)
+    if name == "dllama":
+        return DllamaBackend(**kwargs)
+    if name == "edgevisor_exo":
+        return EdgeVisorExoBackend(**kwargs)
     raise BackendError(f"unknown backend: {name}")

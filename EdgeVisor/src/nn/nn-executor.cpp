@@ -7,6 +7,7 @@
 #include <string>
 #include "nn-executor.hpp"
 #include "nn-cpu.hpp"
+#include "ablation.hpp"
 
 // Segment kind codes for per-layer compute profiling.
 static constexpr NnByte SEG_KIND_OTHER = 0;
@@ -491,6 +492,20 @@ void NnExecutor::refreshPointers() {
     if (context.isAlive.load()) {
         throw std::runtime_error("Cannot refresh pointers while executor is running");
     }
+    const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+    EdgeVisorAblationEvent event;
+    event.eventId = "binding_refresh";
+    event.selectedPolicy = std::string("pointer_") + toString(cfg.pointerSwizzlingMode);
+    event.bindingUpdateCount = nodeConfig != nullptr ? nodeConfig->nSegments : 0u;
+    if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::OPERATOR_REBUILD) {
+        event.fallbackReason = "operator_rebuild_substitutes_lightweight_pointer_swizzling";
+        event.stallTimeMs = 0.0;
+    } else if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::WEIGHT_REMATERIALIZE) {
+        event.fallbackReason = "weight_rematerialize_substitutes_lightweight_pointer_swizzling";
+        event.materializedBytes = (nodeConfig != nullptr) ? (uint64_t)nodeConfig->nSegments : 0u;
+        event.stallTimeMs = 0.0;
+    }
+    edgevisorAblationLogEvent(event);
     for (NnUint segmentIndex = 0; segmentIndex < nodeConfig->nSegments; segmentIndex++) {
         NnDeviceSegment *segment = segments[segmentIndex].get();
         if (segment == nullptr)

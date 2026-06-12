@@ -1,6 +1,7 @@
 #include "nn-cpu.hpp"
 #include "nn-cpu-ops.hpp"
 #include "nn-core.hpp"
+#include "ablation.hpp"
 #include "plan-command.hpp"
 #include "llm.hpp"
 #include <cassert>
@@ -25,6 +26,43 @@
 #define DEBUG_CPU_OP_QUANTS false
 
 #define BUFFER_ALIGNMENT 64
+
+static void logCpuPlanApplyAblationEvent(
+    NnUint stageIndex,
+    NnUint fromNode,
+    NnUint toNode,
+    NnUint layerIndex,
+    NnUint pos,
+    NnUint cmd,
+    bool success,
+    const char *reason) {
+    EdgeVisorAblationEvent ev;
+    ev.eventId = "plan_command_apply";
+    ev.triggerPos = pos;
+    ev.triggerLayer = layerIndex;
+    ev.affectedStage = stageIndex;
+    ev.fromNode = fromNode;
+    ev.toNode = toNode;
+    ev.selectedPolicy = std::string("cpu_apply_cmd_") + std::to_string((unsigned)cmd);
+    ev.bindingUpdateCount = 1u;
+    ev.applySuccess = success;
+    auto appendFallbackReason = [&](const char *fallbackReason) {
+        if (fallbackReason == nullptr || fallbackReason[0] == '\0') return;
+        if (!ev.fallbackReason.empty()) ev.fallbackReason += ";";
+        ev.fallbackReason += fallbackReason;
+    };
+    appendFallbackReason(reason);
+    const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+    if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::OPERATOR_REBUILD) {
+        appendFallbackReason("operator_rebuild_substitutes_lightweight_pointer_swizzling");
+        ev.fallbackCount = 1u;
+    } else if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::WEIGHT_REMATERIALIZE) {
+        appendFallbackReason("weight_rematerialize_substitutes_lightweight_pointer_swizzling");
+        ev.materializedBytes = ev.bindingUpdateCount;
+        ev.fallbackCount = 1u;
+    }
+    edgevisorAblationLogEvent(ev);
+}
 
 #if DLLAMA_DEBUG_ATTN
 
@@ -2303,6 +2341,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)gqaGroupSize);
                                 std::fflush(stdout);
                                 logLocalWorkSplit("cmdlist");
+                                logCpuPlanApplyAblationEvent(
+                                    ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    pc2.nMoves > 0u ? pc2.moves[0].fromNodeIndex : 0u,
+                                    pc2.nMoves > 0u ? pc2.moves[0].toNodeIndex : 0u,
+                                    layerIndex,
+                                    pos,
+                                    cmd,
+                                    true,
+                                    "");
                                 device->setPlanEpoch(msgEpoch);
                             }
                             return;
@@ -2467,6 +2514,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)gqaGroupSize);
                                 std::fflush(stdout);
                                 logLocalWorkSplit("legacy");
+                                logCpuPlanApplyAblationEvent(
+                                    ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    fromNode,
+                                    toNode,
+                                    layerIndex,
+                                    pos,
+                                    cmd,
+                                    true,
+                                    "");
                                 device->setPlanEpoch(msgEpoch);
                             } else if (!legacyNoOp) {
                                 // This happens if cmd asks to move 0, or cmd kind is unknown.
@@ -2482,6 +2538,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)fromNode,
                                     (unsigned)toNode);
                                 std::fflush(stdout);
+                                logCpuPlanApplyAblationEvent(
+                                    ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    fromNode,
+                                    toNode,
+                                    layerIndex,
+                                    pos,
+                                    cmd,
+                                    false,
+                                    "no_op");
                             }
                         }
                     }

@@ -22,7 +22,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run a looping LangGraph agent with a swappable LLM backend.")
     parser.add_argument(
         "--backend",
-        choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo", "edgevisor_lingualinked"],
+        choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo", "edgevisor_lingualinked", "edgevisor_ablation"],
         required=True,
     )
     parser.add_argument(
@@ -44,6 +44,17 @@ def main() -> int:
     parser.add_argument("--lingualinked-total-layers", type=int, default=28)
     parser.add_argument("--lingualinked-overlap-layers", type=int, default=2)
     parser.add_argument("--lingualinked-memory-field", choices=["total", "free"], default="total")
+    parser.add_argument("--shadow-kv-mode", choices=["enabled", "disabled_transfer", "disabled_recompute"], default="enabled")
+    parser.add_argument(
+        "--pointer-swizzling-mode",
+        choices=["enabled", "operator_rebuild", "weight_rematerialize"],
+        default="enabled",
+    )
+    parser.add_argument("--jit-mode", choices=["enabled", "static", "greedy", "oracle"], default="enabled")
+    parser.add_argument("--vg-mode", choices=["enabled", "flat", "random", "pure_pp", "no_elastic_vg"], default="enabled")
+    parser.add_argument("--fallback-policy", default="disabled_unless_necessary")
+    parser.add_argument("--experiment-id", default="")
+    parser.add_argument("--edgevisor-ablation-config", type=Path, default=None)
     parser.add_argument("--ctx", type=int, default=2048)
     args = parser.parse_args()
 
@@ -88,6 +99,23 @@ def main() -> int:
             "total_layers": args.lingualinked_total_layers,
             "overlap_layers": args.lingualinked_overlap_layers,
             "memory_field": args.lingualinked_memory_field,
+        }
+    elif args.backend == "edgevisor_ablation":
+        backend_kwargs = {
+            "cuda_visible": args.cuda_visible,
+            "ctx": args.ctx,
+            "steps": args.edge_steps,
+            "ratios": args.edge_ratios,
+            "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
+            "ablation_config": {
+                "shadow_kv_mode": args.shadow_kv_mode,
+                "pointer_swizzling_mode": args.pointer_swizzling_mode,
+                "jit_mode": args.jit_mode,
+                "vg_mode": args.vg_mode,
+                "fallback_policy": args.fallback_policy,
+                "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
+                "config_path": str(args.edgevisor_ablation_config) if args.edgevisor_ablation_config else "",
+            },
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

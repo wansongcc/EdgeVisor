@@ -1,12 +1,14 @@
 #include "plan-controller.hpp"
 
 #include "app.hpp"
+#include "ablation.hpp"
 #include "json.hpp"
 #include "plan-command.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -253,6 +255,18 @@ static bool parseBool(const json &j, const char *key, bool fallback) {
     return fallback;
 }
 
+static double parseDouble(const json &j, const char *key, double fallback) {
+    if (!j.contains(key)) return fallback;
+    try {
+        if (j.at(key).is_number()) {
+            return j.at(key).get<double>();
+        }
+    } catch (...) {
+        return fallback;
+    }
+    return fallback;
+}
+
 static std::string modeToStr(uint32_t mode) {
     if (mode == PLAN_CMD_MODE_EXACT) return "exact";
     if (mode == PLAN_CMD_MODE_NEXT_BARRIER) return "next_barrier";
@@ -297,6 +311,62 @@ static bool parseMode(const std::string &s, uint32_t &out) {
     if (s == "next" || s == "next_barrier") { out = PLAN_CMD_MODE_NEXT_BARRIER; return true; }
     if (s == "none") { out = PLAN_CMD_MODE_NONE; return true; }
     return false;
+}
+
+static std::string nodePairString(const PlanCommand &cmd) {
+    std::ostringstream oss;
+    oss << "stage=" << cmd.stageIndex << ",from=" << cmd.fromNodeIndex << ",to=" << cmd.toNodeIndex;
+    return oss.str();
+}
+
+static void populateAblationPlanEvent(
+    EdgeVisorAblationEvent &ev,
+    const PlanCommand &cmd,
+    const json &jcmd,
+    const char *eventId,
+    uint64_t bindingCount) {
+    const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+    ev.eventId = eventId;
+    ev.triggerPos = cmd.triggerPos;
+    ev.triggerLayer = cmd.triggerLayer;
+    ev.affectedStage = cmd.stageIndex;
+    ev.fromNode = cmd.fromNodeIndex;
+    ev.toNode = cmd.toNodeIndex;
+    ev.selectedPolicy = std::string("jit_") + toString(cfg.jitMode);
+    ev.bindingUpdateCount = bindingCount;
+    ev.tDecisionMs = parseDouble(jcmd, "tDecisionMs", 0.0);
+    ev.tStatePrepareMs = parseDouble(jcmd, "tStatePrepareMs", 0.0);
+    ev.tCommandMs = parseDouble(jcmd, "tCommandMs", 0.0);
+    ev.tApplyMs = parseDouble(jcmd, "tApplyMs", 0.0);
+    ev.tRecoverMs = parseDouble(jcmd, "tRecoverMs", 0.0);
+    ev.stallTimeMs = parseDouble(jcmd, "stallTimeMs", 0.0);
+    ev.stateTransferBytes = parseU32(jcmd, "stateTransferBytes", 0u);
+    ev.recomputeTokensOrLayers = parseU32(jcmd, "recomputeTokensOrLayers", 0u);
+    ev.candidateCount = parseU32(jcmd, "candidateCount", 1u);
+    ev.rejectedMoves = parseU32(jcmd, "rejectedMoves", 0u);
+    ev.fallbackCount = parseU32(jcmd, "fallbackCount", 0u);
+    ev.vgMappingBefore = jcmd.value("vgMappingBefore", std::string("vg_") + toString(cfg.vgMode));
+    ev.vgMappingAfter = jcmd.value("vgMappingAfter", std::string("vg_") + toString(cfg.vgMode));
+    ev.physicalDeviceGroup = jcmd.value("physicalDeviceGroup", nodePairString(cmd));
+    ev.logicalGroup = jcmd.value("logicalGroup", std::string("stage_") + std::to_string(cmd.stageIndex));
+    ev.applySuccess = true;
+
+    if (cfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
+        ev.fallbackReason = "shadow_kv_disabled_transfer_fallback";
+    } else if (cfg.shadowKvMode == ShadowKvMode::DISABLED_RECOMPUTE) {
+        ev.fallbackReason = "shadow_kv_disabled_recompute_fallback";
+    }
+    if (cfg.jitMode == JitMode::STATIC) {
+        ev.fallbackReason = ev.fallbackReason.empty() ? "static_policy_replaces_runtime_jit" : ev.fallbackReason + ";static_policy_replaces_runtime_jit";
+    } else if (cfg.jitMode == JitMode::GREEDY) {
+        ev.fallbackReason = ev.fallbackReason.empty() ? "greedy_policy_ignores_enactment_cost" : ev.fallbackReason + ";greedy_policy_ignores_enactment_cost";
+    } else if (cfg.jitMode == JitMode::ORACLE) {
+        ev.fallbackReason = ev.fallbackReason.empty() ? "oracle_policy_for_experiment_upper_bound" : ev.fallbackReason + ";oracle_policy_for_experiment_upper_bound";
+    }
+    if (cfg.vgMode != VgMode::ENABLED) {
+        const std::string reason = std::string("vg_mode_") + toString(cfg.vgMode);
+        ev.fallbackReason = ev.fallbackReason.empty() ? reason : ev.fallbackReason + ";" + reason;
+    }
 }
 
 std::unique_ptr<PlanUdsController> PlanUdsController::start(const std::string &socketPath, RootLlmInference *inference) {
@@ -471,6 +541,14 @@ void PlanUdsController::run() {
                 }
 
                 const uint64_t cacheSeq = planCommandCache().store(cmd);
+                EdgeVisorAblationEvent ev;
+                populateAblationPlanEvent(
+                    ev,
+                    cmd,
+                    jcmd,
+                    "plan_command_emit",
+                    (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u);
+                edgevisorAblationLogEvent(ev);
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}};
             } else if (op == "set_pp_migration") {
                 if (!req.contains("cmd")) throw std::runtime_error("missing cmd");
@@ -512,6 +590,9 @@ void PlanUdsController::run() {
                 }
 
                 const uint64_t cacheSeq = planCommandCache().store(cmd);
+                EdgeVisorAblationEvent ev;
+                populateAblationPlanEvent(ev, cmd, jcmd, "pp_migration_emit", 1u);
+                edgevisorAblationLogEvent(ev);
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}, {"ppMigration", true}, {"layerCount", cmd.reserved0}};
             } else if (op == "set_runtime_gate") {
                 if (inference_ == nullptr) throw std::runtime_error("inference not available");

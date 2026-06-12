@@ -13,6 +13,7 @@
 #include "tokenizer.hpp"
 #include "llm.hpp"
 #include "plan-command.hpp"
+#include "ablation.hpp"
 
 class AppCliArgs {
 public:
@@ -54,6 +55,14 @@ public:
     bool runtimeActiveSegEnabled; // Default gate for primary segments
     bool runtimeRedundantSegEnabled; // Default gate for redundant segments
     char *runtimePrimarySkipLayersStr; // Comma-separated primary layers to disable, e.g. "14,15"
+    char *edgevisorAblationConfigPath;
+    char *shadowKvModeStr;
+    char *pointerSwizzlingModeStr;
+    char *jitModeStr;
+    char *vgModeStr;
+    char *fallbackPolicyStr;
+    char *ablationLogPath;
+    char *experimentId;
 
     // worker
     NnUint port;

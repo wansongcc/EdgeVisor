@@ -176,6 +176,22 @@ def parse_edge_metrics(log_text: str) -> Dict[str, Any]:
     }
 
 
+def _jsonl_records(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
 def strip_prima_content(log_text: str) -> str:
     match = re.search(r"generate:.*?\n\n(?P<content>.*?)(?:\nllama_perf_|llama_perf_|$)", log_text, re.S)
     if match:
@@ -390,6 +406,7 @@ class EdgeVisorBackend(Backend):
         enable_benchmark: bool = True,
         extra_root_args: Optional[List[str]] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        ablation_config: Optional[Dict[str, Any]] = None,
     ):
         ensure_paths([dllama_path, model_path, tokenizer_path])
         if backend_name:
@@ -410,7 +427,144 @@ class EdgeVisorBackend(Backend):
         self.enable_benchmark = enable_benchmark
         self.extra_root_args = list(extra_root_args or [])
         self.extra_env = dict(extra_env or {})
+        self.ablation_config = dict(ablation_config or {})
         self.last_plan: Optional[Dict[str, Any]] = None
+        self.ablation_effective_topology = self._apply_ablation_topology()
+
+    def _apply_ablation_topology(self) -> Dict[str, Any]:
+        if not self.ablation_config:
+            return {}
+        cfg = self.ablation_config
+        vg_mode = str(cfg.get("vg_mode", "enabled"))
+        original_workers = list(self.worker_gpus)
+        original_ratios = self.ratios
+        effective_workers = list(self.worker_gpus)
+        effective_ratios = self.ratios
+
+        if vg_mode in {"flat", "pure_pp", "no_elastic_vg"}:
+            effective_ratios = ":".join("1" for _ in range(1 + len(effective_workers)))
+        elif vg_mode == "random":
+            seed = str(cfg.get("experiment_id") or "edgevisor_ablation")
+            rng = random.Random(seed)
+            rng.shuffle(effective_workers)
+            effective_ratios = ":".join("1" for _ in range(1 + len(effective_workers)))
+
+        self.worker_gpus = effective_workers
+        self.ratios = effective_ratios
+        return {
+            "vg_mode": vg_mode,
+            "root_gpu": self.root_gpu,
+            "original_worker_gpus": original_workers,
+            "effective_worker_gpus": effective_workers,
+            "original_ratios": original_ratios,
+            "effective_ratios": effective_ratios,
+        }
+
+    def _plan_barrier_args(self) -> List[str]:
+        if not self.ablation_config:
+            return ["--enable-plan-barrier", "--kv-redundancy", "2"]
+        shadow_mode = str(self.ablation_config.get("shadow_kv_mode", "enabled"))
+        if shadow_mode == "enabled":
+            return ["--enable-plan-barrier", "--kv-redundancy", "2"]
+        return [
+            "--enable-plan-barrier",
+            "--kv-redundancy",
+            "0",
+            "--enable-kv-redundancy-during-migration",
+            "0",
+        ]
+
+    def _ablation_dynamic_plan(self, dynamic_plan: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not self.ablation_config or dynamic_plan is None:
+            return dynamic_plan
+        cfg = self.ablation_config
+        plan = dict(dynamic_plan)
+        jit_mode = str(cfg.get("jit_mode", "enabled"))
+        vg_mode = str(cfg.get("vg_mode", "enabled"))
+        shadow_mode = str(cfg.get("shadow_kv_mode", "enabled"))
+
+        if jit_mode == "static":
+            plan["stage"] = int(plan.get("stage", 0))
+            plan["moves"] = [
+                {
+                    "fromNodeIndex": int(plan.get("static_from_node", 1)),
+                    "toNodeIndex": int(plan.get("static_to_node", 0)),
+                    "cmdKind": int(plan.get("static_kind", 3)),
+                    "headMove": int(plan.get("static_heads", 1)),
+                    "ffnMove": int(plan.get("static_ffn", 256)),
+                }
+            ]
+            plan["jit_decision_reason"] = "static_fixed_rule"
+        elif jit_mode == "greedy":
+            from_node = int(plan.get("greedy_from_node", len(self.worker_gpus)))
+            to_node = int(plan.get("greedy_to_node", 0))
+            plan["moves"] = [
+                {
+                    "fromNodeIndex": from_node,
+                    "toNodeIndex": to_node,
+                    "cmdKind": 3,
+                    "headMove": int(plan.get("heads", 1)),
+                    "ffnMove": int(plan.get("ffn", 256)),
+                }
+            ]
+            plan["jit_decision_reason"] = "greedy_resource_only_rule"
+        elif jit_mode == "oracle":
+            plan["jit_decision_reason"] = "oracle_offline_upper_bound_placeholder"
+        else:
+            plan["jit_decision_reason"] = "runtime_enabled"
+
+        plan["candidateCount"] = int(plan.get("candidate_count", 1))
+        plan["vgMappingBefore"] = plan.get("vg_mapping_before", f"vg_{vg_mode}:{self.ratios}")
+        plan["vgMappingAfter"] = plan.get("vg_mapping_after", f"vg_{vg_mode}:{self.ratios}")
+        plan["physicalDeviceGroup"] = plan.get(
+            "physical_device_group",
+            ",".join(str(x) for x in [self.root_gpu, *self.worker_gpus]),
+        )
+        plan["logicalGroup"] = plan.get("logical_group", f"{vg_mode}_stage_{int(plan.get('stage', 0))}")
+
+        state_prepare_ms = float(plan.get("state_prepare_ms", plan.get("simulated_stall_ms", 0.0)) or 0.0)
+        if shadow_mode == "disabled_transfer":
+            plan["fallbackCount"] = int(plan.get("fallback_count", 1))
+            plan["stateTransferBytes"] = int(plan.get("state_transfer_bytes", 0))
+            plan["tStatePrepareMs"] = state_prepare_ms
+            plan["stallTimeMs"] = max(float(plan.get("stallTimeMs", 0.0) or 0.0), state_prepare_ms)
+        elif shadow_mode == "disabled_recompute":
+            plan["fallbackCount"] = int(plan.get("fallback_count", 1))
+            plan["recomputeTokensOrLayers"] = int(plan.get("recompute_tokens_or_layers", 0))
+            plan["tStatePrepareMs"] = state_prepare_ms
+            plan["stallTimeMs"] = max(float(plan.get("stallTimeMs", 0.0) or 0.0), state_prepare_ms)
+        if shadow_mode in {"disabled_transfer", "disabled_recompute"} and isinstance(plan.get("moves"), list):
+            safe_moves = []
+            rejected = int(plan.get("rejectedMoves", 0))
+            for move in plan["moves"]:
+                if not isinstance(move, dict):
+                    safe_moves.append(move)
+                    continue
+                m = dict(move)
+                if int(m.get("headMove", 0) or 0) > 0:
+                    rejected += 1
+                    m["headMove"] = 0
+                    if int(m.get("ffnMove", 0) or 0) > 0:
+                        m["cmdKind"] = 2
+                    m["fallbackReason"] = "kv_head_move_removed_without_shadow_readiness"
+                safe_moves.append(m)
+            plan["moves"] = safe_moves
+            if rejected:
+                plan["rejectedMoves"] = rejected
+                plan["fallbackCount"] = max(int(plan.get("fallbackCount", 0)), 1)
+                plan["fallbackReason"] = "kv_head_move_removed_without_shadow_readiness"
+                if shadow_mode == "disabled_transfer" and int(plan.get("stateTransferBytes", 0) or 0) == 0:
+                    bytes_per_head = int(plan.get("estimated_state_transfer_bytes_per_head", 1024 * 1024))
+                    plan["stateTransferBytes"] = max(0, rejected * bytes_per_head)
+                elif shadow_mode == "disabled_recompute" and int(plan.get("recomputeTokensOrLayers", 0) or 0) == 0:
+                    plan["recomputeTokensOrLayers"] = rejected
+                if float(plan.get("tStatePrepareMs", 0.0) or 0.0) == 0.0:
+                    plan["tStatePrepareMs"] = float(plan.get("simulated_stall_ms", 0.0) or 0.0)
+                plan["stallTimeMs"] = max(
+                    float(plan.get("stallTimeMs", 0.0) or 0.0),
+                    float(plan.get("tStatePrepareMs", 0.0) or 0.0),
+                )
+        return plan
 
     def generate(
         self,
@@ -421,6 +575,7 @@ class EdgeVisorBackend(Backend):
         dynamic_plan: Optional[Dict[str, Any]] = None,
     ) -> GenerationResult:
         prompt = render_messages(messages)
+        dynamic_plan = self._ablation_dynamic_plan(dynamic_plan)
         env = base_env(self.cuda_visible, self.vulkan_project)
         env.update(self.extra_env)
         procs: List[subprocess.Popen[Any]] = []
@@ -440,6 +595,7 @@ class EdgeVisorBackend(Backend):
         logs = {
             "root": out_dir / f"{generation_name}_edgevisor_root.log",
         }
+        ablation_log_path = out_dir / f"{generation_name}_ablation.jsonl"
         for idx, gpu in enumerate(self.worker_gpus):
             logs[f"worker{idx}"] = out_dir / f"{generation_name}_edgevisor_worker_gpu{gpu}.log"
 
@@ -491,7 +647,18 @@ class EdgeVisorBackend(Backend):
                 if self.ratios:
                     root_cmd.extend(["--ratios", self.ratios])
             if socket_path:
-                root_cmd.extend(["--enable-plan-barrier", "--kv-redundancy", "2"])
+                root_cmd.extend(self._plan_barrier_args())
+            if self.ablation_config:
+                cfg = self.ablation_config
+                root_cmd.extend(["--ablation-log-path", str(ablation_log_path)])
+                root_cmd.extend(["--experiment-id", str(cfg.get("experiment_id", generation_name))])
+                root_cmd.extend(["--shadow-kv-mode", str(cfg.get("shadow_kv_mode", "enabled"))])
+                root_cmd.extend(["--pointer-swizzling-mode", str(cfg.get("pointer_swizzling_mode", "enabled"))])
+                root_cmd.extend(["--jit-mode", str(cfg.get("jit_mode", "enabled"))])
+                root_cmd.extend(["--vg-mode", str(cfg.get("vg_mode", "enabled"))])
+                root_cmd.extend(["--fallback-policy", str(cfg.get("fallback_policy", "disabled_unless_necessary"))])
+                if cfg.get("config_path"):
+                    root_cmd.extend(["--edgevisor-ablation-config", str(cfg["config_path"])])
             if self.extra_root_args:
                 root_cmd.extend(self.extra_root_args)
 
@@ -538,6 +705,13 @@ class EdgeVisorBackend(Backend):
                 }
             )
         metrics["node_metrics"] = node_metrics
+        if self.ablation_config:
+            metrics["ablation_config"] = dict(self.ablation_config)
+            metrics["ablation_effective_topology"] = dict(self.ablation_effective_topology)
+        ablation_records = _jsonl_records(ablation_log_path)
+        if ablation_records:
+            metrics["ablation_log_path"] = str(ablation_log_path)
+            metrics["ablation_events"] = ablation_records
         if self.last_plan is not None:
             metrics["exo_plan"] = self.last_plan
         return GenerationResult(
@@ -579,6 +753,25 @@ class EdgeVisorBackend(Backend):
             "mode": dynamic_plan.get("mode", "next_barrier"),
             "stageIndex": int(dynamic_plan.get("stage", 0)),
         }
+        for key in (
+            "candidateCount",
+            "rejectedMoves",
+            "fallbackCount",
+            "stateTransferBytes",
+            "recomputeTokensOrLayers",
+            "tDecisionMs",
+            "tStatePrepareMs",
+            "tCommandMs",
+            "tApplyMs",
+            "tRecoverMs",
+            "stallTimeMs",
+            "vgMappingBefore",
+            "vgMappingAfter",
+            "physicalDeviceGroup",
+            "logicalGroup",
+        ):
+            if key in dynamic_plan:
+                cmd[key] = dynamic_plan[key]
         if "moves" in dynamic_plan:
             cmd["moves"] = dynamic_plan["moves"]
         else:
@@ -593,7 +786,19 @@ class EdgeVisorBackend(Backend):
             )
         try:
             set_resp = uds_request(socket_path, {"op": "set_plan", "cmd": cmd}, timeout_s=2.0)
-            events.append({"event": "set_plan", "request": cmd, "response": set_resp})
+            events.append(
+                {
+                    "event": "set_plan",
+                    "request": cmd,
+                    "response": set_resp,
+                    "ablation_config": dict(self.ablation_config),
+                    "ablation_effective_topology": dict(self.ablation_effective_topology),
+                    "jit_decision_reason": dynamic_plan.get("jit_decision_reason"),
+                    "stall_time_ms": float(dynamic_plan.get("simulated_stall_ms", 0.0)),
+                    "recovery_latency_ms": float(dynamic_plan.get("simulated_recovery_latency_ms", dynamic_plan.get("simulated_stall_ms", 0.0))),
+                    "fluctuation_type": dynamic_plan.get("fluctuation_type", "unspecified"),
+                }
+            )
         except Exception as exc:
             events.append({"event": "set_plan_error", "error": str(exc), "request": cmd})
             return events
@@ -893,6 +1098,32 @@ class EdgeVisorLinguaLinkedBackend(EdgeVisorBackend):
         return result
 
 
+class EdgeVisorAblationBackend(EdgeVisorBackend):
+    name = "edgevisor_ablation"
+
+    def __init__(
+        self,
+        cuda_visible: str = "0,1,2",
+        ctx: int = 2048,
+        steps: int = 128,
+        timeout_s: int = 240,
+        ratios: str = "1:1",
+        worker_gpus: Optional[List[int]] = None,
+        ablation_config: Optional[Dict[str, Any]] = None,
+    ):
+        config = dict(ablation_config or {})
+        super().__init__(
+            cuda_visible=cuda_visible,
+            ctx=ctx,
+            steps=steps,
+            timeout_s=timeout_s,
+            ratios=ratios,
+            worker_gpus=worker_gpus if worker_gpus is not None else [1],
+            backend_name=self.name,
+            ablation_config=config,
+        )
+
+
 def make_backend(name: str, **kwargs: Any) -> Backend:
     if name == "mock":
         return MockBackend()
@@ -906,4 +1137,6 @@ def make_backend(name: str, **kwargs: Any) -> Backend:
         return EdgeVisorExoBackend(**kwargs)
     if name == "edgevisor_lingualinked":
         return EdgeVisorLinguaLinkedBackend(**kwargs)
+    if name == "edgevisor_ablation":
+        return EdgeVisorAblationBackend(**kwargs)
     raise BackendError(f"unknown backend: {name}")

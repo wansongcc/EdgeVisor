@@ -1,4 +1,5 @@
 #include "nn-vulkan.hpp"
+#include "ablation.hpp"
 #include "plan-command.hpp"
 #include "llm.hpp"
 #include <algorithm>
@@ -24,6 +25,43 @@ static bool hasPortabilityExtension() {
     }
 #endif
     return false;
+}
+
+static void logVulkanPlanApplyAblationEvent(
+    NnUint stageIndex,
+    NnUint fromNode,
+    NnUint toNode,
+    NnUint layerIndex,
+    NnUint pos,
+    NnUint cmd,
+    bool success,
+    const char *reason) {
+    EdgeVisorAblationEvent ev;
+    ev.eventId = "plan_command_apply";
+    ev.triggerPos = pos;
+    ev.triggerLayer = layerIndex;
+    ev.affectedStage = stageIndex;
+    ev.fromNode = fromNode;
+    ev.toNode = toNode;
+    ev.selectedPolicy = std::string("gpu_apply_cmd_") + std::to_string((unsigned)cmd);
+    ev.bindingUpdateCount = 1u;
+    ev.applySuccess = success;
+    auto appendFallbackReason = [&](const char *fallbackReason) {
+        if (fallbackReason == nullptr || fallbackReason[0] == '\0') return;
+        if (!ev.fallbackReason.empty()) ev.fallbackReason += ";";
+        ev.fallbackReason += fallbackReason;
+    };
+    appendFallbackReason(reason);
+    const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+    if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::OPERATOR_REBUILD) {
+        appendFallbackReason("operator_rebuild_substitutes_lightweight_pointer_swizzling");
+        ev.fallbackCount = 1u;
+    } else if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::WEIGHT_REMATERIALIZE) {
+        appendFallbackReason("weight_rematerialize_substitutes_lightweight_pointer_swizzling");
+        ev.materializedBytes = ev.bindingUpdateCount;
+        ev.fallbackCount = 1u;
+    }
+    edgevisorAblationLogEvent(ev);
 }
 
 static bool hasValidationLayer() {
@@ -728,6 +766,7 @@ static bool handleVulkanPlanApply(
             printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u cmdlist missing/mismatch\n",
                 (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)layerIndex, (unsigned)pos);
             std::fflush(stdout);
+            logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "cmdlist_missing_or_mismatch");
             return true;
         }
         const uint32_t maxMovesAllowed = std::min<uint32_t>(DLLAMA_PLAN_CMD_MAX_MOVES, (uint32_t)(2u * st->nNodes));
@@ -735,6 +774,7 @@ static bool handleVulkanPlanApply(
             printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u reject: nMoves=%u > maxAllowed=%u\n",
                 (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)pc2.nMoves, (unsigned)maxMovesAllowed);
             std::fflush(stdout);
+            logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "too_many_moves");
             return true;
         }
         for (uint32_t i = 0; i < pc2.nMoves; ++i) {
@@ -749,6 +789,7 @@ static bool handleVulkanPlanApply(
         printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u reject: bad move\n",
             (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)layerIndex, (unsigned)pos);
         std::fflush(stdout);
+        logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "bad_move");
         return true;
     }
 
@@ -820,6 +861,7 @@ static bool handleVulkanPlanApply(
         printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u reject: split underflow\n",
             (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)layerIndex, (unsigned)pos);
         std::fflush(stdout);
+        logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "split_underflow");
         return true;
     }
 
@@ -835,6 +877,7 @@ static bool handleVulkanPlanApply(
             (unsigned)(plan->headSplit.lengths ? plan->headSplit.lengths[myNode] : 0u),
             (unsigned)(plan->ffnSplit.lengths ? plan->ffnSplit.lengths[myNode] : 0u));
         std::fflush(stdout);
+        logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, true, "");
         device->setPlanEpoch(msgEpoch);
     }
     return true;

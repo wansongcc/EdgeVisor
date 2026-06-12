@@ -250,6 +250,14 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.runtimeActiveSegEnabled = true;
     args.runtimeRedundantSegEnabled = false;
     args.runtimePrimarySkipLayersStr = nullptr;
+    args.edgevisorAblationConfigPath = nullptr;
+    args.shadowKvModeStr = nullptr;
+    args.pointerSwizzlingModeStr = nullptr;
+    args.jitModeStr = nullptr;
+    args.vgModeStr = nullptr;
+    args.fallbackPolicyStr = nullptr;
+    args.ablationLogPath = nullptr;
+    args.experimentId = nullptr;
 
     {
         int envBoundaryLayers = -1;
@@ -462,6 +470,22 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.runtimeRedundantBoundaryLayers = (NnUint)x;
         } else if (std::strcmp(name, "--runtime-primary-skip-layers") == 0) {
             args.runtimePrimarySkipLayersStr = value;
+        } else if (std::strcmp(name, "--edgevisor-ablation-config") == 0) {
+            args.edgevisorAblationConfigPath = value;
+        } else if (std::strcmp(name, "--shadow-kv-mode") == 0) {
+            args.shadowKvModeStr = value;
+        } else if (std::strcmp(name, "--pointer-swizzling-mode") == 0) {
+            args.pointerSwizzlingModeStr = value;
+        } else if (std::strcmp(name, "--jit-mode") == 0) {
+            args.jitModeStr = value;
+        } else if (std::strcmp(name, "--vg-mode") == 0) {
+            args.vgModeStr = value;
+        } else if (std::strcmp(name, "--fallback-policy") == 0) {
+            args.fallbackPolicyStr = value;
+        } else if (std::strcmp(name, "--ablation-log-path") == 0) {
+            args.ablationLogPath = value;
+        } else if (std::strcmp(name, "--experiment-id") == 0) {
+            args.experimentId = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -1357,6 +1381,19 @@ void RootLlmInference::forward() {
                 migrationAckSeen = true;
                 migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
                 migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
+                {
+                    const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
+                    EdgeVisorAblationEvent ev;
+                    ev.eventId = "pp_migration_recover";
+                    ev.triggerPos = (migrationAckPos >= 0) ? (NnUint)migrationAckPos : 0xFFFFFFFFu;
+                    ev.triggerLayer = (migrationAckLayer >= 0) ? (NnUint)migrationAckLayer : 0xFFFFFFFFu;
+                    ev.fromNode = migrationFromNodeIndex;
+                    ev.toNode = nextStageRootNode;
+                    ev.selectedPolicy = std::string("shadow_") + toString(ablationCfg.shadowKvMode);
+                    ev.recomputeTokensOrLayers = (uint64_t)pendingLayerSwitchLayers.size();
+                    ev.applySuccess = true;
+                    edgevisorAblationLogEvent(ev);
+                }
                 std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
                     (unsigned)pendingLayerSwitchLayers.size());
                 std::fflush(stdout);
@@ -1513,6 +1550,32 @@ void RootLlmInference::forward() {
                     (unsigned)nextStageRootNode,
                     migrationLayers.size());
                 std::fflush(stdout);
+            }
+            {
+                const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
+                EdgeVisorAblationEvent ev;
+                ev.eventId = "pp_migration_apply";
+                ev.triggerPos = (triggerPos >= 0) ? (NnUint)triggerPos : 0xFFFFFFFFu;
+                ev.triggerLayer = (boundaryLayerForMigration >= 0) ? (NnUint)boundaryLayerForMigration : 0xFFFFFFFFu;
+                ev.affectedStage = (effectiveFromStage != nullptr) ? effectiveFromStage->stageIndex : 0xFFFFFFFFu;
+                ev.fromNode = effectiveFromNode;
+                ev.toNode = effectiveToNode;
+                ev.selectedPolicy = std::string("vg_") + toString(ablationCfg.vgMode);
+                ev.bindingUpdateCount = (uint64_t)migrationLayers.size();
+                ev.recomputeTokensOrLayers = (uint64_t)migrationLayers.size();
+                ev.vgMappingBefore = std::string("vg_") + toString(ablationCfg.vgMode);
+                ev.vgMappingAfter = std::string("vg_") + toString(ablationCfg.vgMode);
+                ev.physicalDeviceGroup = "pp_route";
+                ev.logicalGroup = "pp_stage_boundary";
+                ev.applySuccess = canApplyRoute && !migrationLayers.empty();
+                if (!validRoute) {
+                    ev.rejectedMoves = 1u;
+                    ev.fallbackCount = 1u;
+                    ev.fallbackReason = "invalid_pp_route_fallback_to_current_route";
+                } else if (ablationCfg.vgMode != VgMode::ENABLED) {
+                    ev.fallbackReason = std::string("vg_mode_") + toString(ablationCfg.vgMode);
+                }
+                edgevisorAblationLogEvent(ev);
             }
                 lastPpPlanCacheSeqApplied = snap.cacheSeq;
             }
@@ -1758,6 +1821,19 @@ void WorkerLlmInference::flushPendingKvAck() {
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
     NnUint nNodes = args->nWorkers + 1;
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
+    EdgeVisorAblationConfig ablationConfig = edgevisorAblationConfigFromSources(
+        args->edgevisorAblationConfigPath,
+        args->shadowKvModeStr,
+        args->pointerSwizzlingModeStr,
+        args->jitModeStr,
+        args->vgModeStr,
+        args->fallbackPolicyStr,
+        args->ablationLogPath,
+        args->experimentId);
+    setEdgeVisorAblationConfig(ablationConfig);
+    if (edgevisorAblationLogEnabled()) {
+        edgevisorAblationLogSimpleEvent("runtime_config", "full_or_ablation");
+    }
 
     if (nNodes > header.nKvHeads)
         // TODO: https://github.com/b4rtaz/distributed-llama/issues/70

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from json import JSONDecoder
 from pathlib import Path
+from statistics import quantiles
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -24,6 +26,8 @@ class LoopState(TypedDict, total=False):
     turn: int
     tool_count: int
     used_tools: List[str]
+    started_at: float
+    generation_count: int
 
 
 def _append_generation_event(
@@ -32,9 +36,20 @@ def _append_generation_event(
     result: GenerationResult,
     action: Optional[Dict[str, Any]],
 ) -> None:
+    generation_id = len([ev for ev in events if ev.get("type") == "llm_generation"]) + 1
+    stage_id = None
+    for dyn in result.dynamic_events:
+        if not isinstance(dyn, dict):
+            continue
+        req = dyn.get("request")
+        if isinstance(req, dict) and "stageIndex" in req:
+            stage_id = req.get("stageIndex")
+            break
     events.append(
         {
             "type": "llm_generation",
+            "generation_id": generation_id,
+            "stage_id": stage_id,
             "name": name,
             "backend": result.backend,
             "content": result.content,
@@ -282,6 +297,7 @@ def build_loop_graph():
             events.append(
                 {
                     "type": "tool_call",
+                    "tool_call_id": int(state.get("tool_count", 0)) + 1,
                     "turn": turn,
                     "name": result.name,
                     "arguments": result.arguments,
@@ -298,6 +314,7 @@ def build_loop_graph():
             events.append(
                 {
                     "type": "tool_error",
+                    "tool_call_id": int(state.get("tool_count", 0)) + 1,
                     "turn": turn,
                     "name": tool_name,
                     "arguments": arguments,
@@ -338,6 +355,7 @@ def build_loop_graph():
 def run_loop_episode(episode: Dict[str, Any], backend: Backend, out_dir: Path) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     app = build_loop_graph()
+    started_at = time.perf_counter()
     initial: LoopState = {
         "episode": episode,
         "backend": backend,
@@ -347,16 +365,70 @@ def run_loop_episode(episode: Dict[str, Any], backend: Backend, out_dir: Path) -
         "turn": 1,
         "tool_count": 0,
         "used_tools": [],
+        "started_at": started_at,
+        "generation_count": 0,
     }
     final_state = app.invoke(initial)
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    events = final_state.get("events", [])
+    llm_events = [ev for ev in events if ev.get("type") == "llm_generation"]
+    tool_events = [ev for ev in events if ev.get("type") == "tool_call"]
+    stage_ids = [ev.get("stage_id") for ev in llm_events if ev.get("stage_id") is not None]
+    tpot_values = []
+    affected_generation_latency = 0.0
+    cumulative_stall = 0.0
+    recovery_latency = 0.0
+    max_token_stall = 0.0
+    for ev in llm_events:
+        metrics = ev.get("metrics", {}) if isinstance(ev, dict) else {}
+        if isinstance(metrics, dict):
+            tpot = metrics.get("tpot_ms_after_first") or metrics.get("tpot_ms_all_pred")
+            if tpot is not None:
+                tpot_values.append(float(tpot))
+            wall = metrics.get("wall_ms")
+            if wall is not None:
+                affected_generation_latency += float(wall)
+        for dyn in ev.get("dynamic_events", []) if isinstance(ev, dict) else []:
+            if not isinstance(dyn, dict):
+                continue
+            stall = dyn.get("stall_time_ms") or dyn.get("simulated_stall_ms") or 0.0
+            cumulative_stall += float(stall)
+            recovery_latency += float(dyn.get("recovery_latency_ms") or stall or 0.0)
+            max_token_stall = max(max_token_stall, float(stall))
+    if tpot_values:
+        if len(tpot_values) >= 2:
+            p99 = quantiles(tpot_values, n=100, method="inclusive")[98]
+        else:
+            p99 = tpot_values[0]
+    else:
+        p99 = 0.0
+    baseline_ms = float(episode.get("baseline_completion_time_ms", 0.0) or 0.0)
+    agent_metrics = {
+        "episode_id": episode["id"],
+        "episode_length": len(events),
+        "generation_id": len(llm_events),
+        "tool_call_id": len(tool_events),
+        "stage_id": stage_ids[-1] if stage_ids else None,
+        "generation_count": len(llm_events),
+        "tool_call_count": len(tool_events),
+        "episode_completion_time": elapsed_ms,
+        "episode_delay_over_baseline": max(0.0, elapsed_ms - baseline_ms) if baseline_ms > 0 else 0.0,
+        "cumulative_stall_time": cumulative_stall,
+        "affected_generation_latency": affected_generation_latency,
+        "recovery_latency": recovery_latency,
+        "max_token_stall": max_token_stall,
+        "p99_tpot": p99,
+        "task_success": bool(final_state.get("final_answer")) and int(final_state.get("tool_count", 0)) >= int(episode.get("min_tool_calls", 0)),
+    }
     trace = {
         "episode_id": episode["id"],
         "backend": backend.name,
-        "events": final_state.get("events", []),
+        "events": events,
         "messages": final_state.get("messages", []),
         "final_answer": final_state.get("final_answer", ""),
         "tool_count": final_state.get("tool_count", 0),
         "used_tools": final_state.get("used_tools", []),
+        "agent_metrics": agent_metrics,
     }
     (out_dir / "trace.json").write_text(json.dumps(trace, indent=2, ensure_ascii=False), encoding="utf-8")
     return trace

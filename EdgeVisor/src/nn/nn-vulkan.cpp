@@ -684,7 +684,25 @@ static bool handleVulkanPlanBarrier(
 
     if (trigger) {
         emitEpoch = curEpoch + 1u;
-        if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u) {
+        if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u) {
+            const PlanMove &m = pc.moves[0];
+            cmd = m.cmdKind;
+            headMove = m.headMove;
+            ffnMove = m.ffnMove;
+            fromNode = m.fromNodeIndex;
+            toNode = m.toNodeIndex;
+            printf("🧭 [plan][emit][gpu] node=%u stage=%u layer=%u pos=%u epoch=%u kind=single-move headMove=%u ffnMove=%u from=%u to=%u seq=%u\n",
+                (unsigned)myNode,
+                (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                (unsigned)layerIndex,
+                (unsigned)pos,
+                (unsigned)emitEpoch,
+                (unsigned)headMove,
+                (unsigned)ffnMove,
+                (unsigned)fromNode,
+                (unsigned)toNode,
+                (unsigned)pc.seq);
+        } else if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u) {
             cmd = 4u;
             fromNode = pc.seq;
             printf("🧭 [plan][emit][gpu] node=%u stage=%u layer=%u pos=%u epoch=%u kind=cmdlist seq=%u moves=%u\n",

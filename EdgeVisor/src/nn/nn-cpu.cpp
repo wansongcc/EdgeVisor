@@ -2043,8 +2043,29 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
             if (trigger) {
                 emitEpoch = curEpoch + 1u;
-                const bool useMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u);
-                if (useMoveList) {
+                const bool useSingleMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u);
+                const bool useMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 1u);
+                if (useSingleMoveList) {
+                    // Encode the single v2 move directly in the broadcast pipe. Workers do not
+                    // share the root process planCommandCache, so cmdlist-by-seq is unsafe here.
+                    const PlanMove &m = pc.moves[0];
+                    cmd = m.cmdKind;
+                    headMove = m.headMove;
+                    ffnMove = m.ffnMove;
+                    fromNode = m.fromNodeIndex;
+                    toNode = m.toNodeIndex;
+                    printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=single-move headMove=%u ffnMove=%u from=%u to=%u seq=%u\n",
+                        (unsigned)myNode,
+                        (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                        (unsigned)layerIndex,
+                        (unsigned)pos,
+                        (unsigned)emitEpoch,
+                        (unsigned)headMove,
+                        (unsigned)ffnMove,
+                        (unsigned)fromNode,
+                        (unsigned)toNode,
+                        (unsigned)pc.seq);
+                } else if (useMoveList) {
                     // cmd=4 means: apply from PlanCommand move list, referenced by seq.
                     cmd = 4u;
                     headMove = 0u;

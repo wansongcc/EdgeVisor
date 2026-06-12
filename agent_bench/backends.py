@@ -514,6 +514,7 @@ class EdgeVisorBackend(Backend):
         jit_mode = str(cfg.get("jit_mode", "enabled"))
         vg_mode = str(cfg.get("vg_mode", "enabled"))
         shadow_mode = str(cfg.get("shadow_kv_mode", "enabled"))
+        allow_head_kv_migration = bool(cfg.get("allow_head_kv_migration", False))
 
         if jit_mode == "static":
             plan["stage"] = int(plan.get("stage", 0))
@@ -565,26 +566,36 @@ class EdgeVisorBackend(Backend):
             plan["recomputeTokensOrLayers"] = int(plan.get("recompute_tokens_or_layers", 0))
             plan["tStatePrepareMs"] = state_prepare_ms
             plan["stallTimeMs"] = max(float(plan.get("stallTimeMs", 0.0) or 0.0), state_prepare_ms)
-        if shadow_mode in {"disabled_transfer", "disabled_recompute"} and isinstance(plan.get("moves"), list):
+        if isinstance(plan.get("moves"), list):
             safe_moves = []
             rejected = int(plan.get("rejectedMoves", 0))
+            removed_head_move = False
+            original_moves = []
             for move in plan["moves"]:
                 if not isinstance(move, dict):
                     safe_moves.append(move)
                     continue
                 m = dict(move)
-                if int(m.get("headMove", 0) or 0) > 0:
+                original_moves.append(dict(m))
+                if int(m.get("headMove", 0) or 0) > 0 and (
+                    not allow_head_kv_migration or shadow_mode in {"disabled_transfer", "disabled_recompute"}
+                ):
                     rejected += 1
+                    removed_head_move = True
                     m["headMove"] = 0
                     if int(m.get("ffnMove", 0) or 0) > 0:
                         m["cmdKind"] = 2
-                    m["fallbackReason"] = "kv_head_move_removed_without_shadow_readiness"
+                    else:
+                        m["cmdKind"] = 0
+                    m["fallbackReason"] = "kv_head_move_removed_until_state_transfer_validated"
                 safe_moves.append(m)
-            plan["moves"] = safe_moves
-            if rejected:
+            plan["moves"] = [m for m in safe_moves if not (isinstance(m, dict) and int(m.get("headMove", 0) or 0) == 0 and int(m.get("ffnMove", 0) or 0) == 0)]
+            if removed_head_move:
+                plan["originalMoves"] = original_moves
                 plan["rejectedMoves"] = rejected
                 plan["fallbackCount"] = max(int(plan.get("fallbackCount", 0)), 1)
-                plan["fallbackReason"] = "kv_head_move_removed_without_shadow_readiness"
+                plan["fallbackReason"] = "kv_head_move_removed_until_state_transfer_validated"
+                plan["allowHeadKvMigration"] = allow_head_kv_migration
                 if shadow_mode == "disabled_transfer" and int(plan.get("stateTransferBytes", 0) or 0) == 0:
                     bytes_per_head = int(plan.get("estimated_state_transfer_bytes_per_head", 1024 * 1024))
                     plan["stateTransferBytes"] = max(0, rejected * bytes_per_head)
@@ -797,6 +808,8 @@ class EdgeVisorBackend(Backend):
             "tApplyMs",
             "tRecoverMs",
             "stallTimeMs",
+            "fallbackReason",
+            "fallback_reason",
             "vgMappingBefore",
             "vgMappingAfter",
             "physicalDeviceGroup",

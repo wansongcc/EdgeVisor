@@ -57,6 +57,11 @@ def main() -> int:
     parser.add_argument("--edgevisor-ablation-config", type=Path, default=None)
     parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
     parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
+    parser.add_argument(
+        "--allow-head-kv-migration",
+        action="store_true",
+        help="Opt in to experimental online KV/head migration; disabled by default for agentic success runs.",
+    )
     parser.add_argument("--ctx", type=int, default=2048)
     args = parser.parse_args()
 
@@ -115,6 +120,7 @@ def main() -> int:
                 "jit_mode": args.jit_mode,
                 "vg_mode": args.vg_mode,
                 "fallback_policy": args.fallback_policy,
+                "allow_head_kv_migration": args.allow_head_kv_migration,
                 "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
                 "config_path": str(args.edgevisor_ablation_config) if args.edgevisor_ablation_config else "",
             },

@@ -349,6 +349,7 @@ static void populateAblationPlanEvent(
     ev.vgMappingAfter = jcmd.value("vgMappingAfter", std::string("vg_") + toString(cfg.vgMode));
     ev.physicalDeviceGroup = jcmd.value("physicalDeviceGroup", nodePairString(cmd));
     ev.logicalGroup = jcmd.value("logicalGroup", std::string("stage_") + std::to_string(cmd.stageIndex));
+    ev.fallbackReason = jcmd.value("fallbackReason", jcmd.value("fallback_reason", std::string()));
     ev.applySuccess = true;
 
     if (cfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
@@ -497,16 +498,28 @@ void PlanUdsController::run() {
 
                 cmd.stageIndex = parseU32(jcmd, "stageIndex", 0u);
 
-                // Legacy single-edge fields (used when moves[] is not provided).
-                cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
-                cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 1u);
-                cmd.cmdKind = parseU32(jcmd, "cmdKind", PLAN_CMD_KIND_BOTH);
-                cmd.nHeadsToMove = parseU32(jcmd, "nHeadsToMove", 1u);
-                cmd.nFfnToMove = parseU32(jcmd, "nFfnToMove", 256u);
+                const bool hasMovesField = jcmd.contains("moves");
+
+                // Legacy single-edge fields are used only when moves[] is absent.
+                // An explicit empty moves[] means a no-op command; do not fall back
+                // to the historical default 0->1 head+ffn migration.
+                if (!hasMovesField) {
+                    cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
+                    cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 1u);
+                    cmd.cmdKind = parseU32(jcmd, "cmdKind", PLAN_CMD_KIND_BOTH);
+                    cmd.nHeadsToMove = parseU32(jcmd, "nHeadsToMove", 1u);
+                    cmd.nFfnToMove = parseU32(jcmd, "nFfnToMove", 256u);
+                } else {
+                    cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
+                    cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 0u);
+                    cmd.cmdKind = 0u;
+                    cmd.nHeadsToMove = 0u;
+                    cmd.nFfnToMove = 0u;
+                }
 
                 // Optional v2 move list: moves=[{fromNodeIndex,toNodeIndex,cmdKind,headMove,ffnMove}, ...]
                 cmd.nMoves = 0u;
-                if (jcmd.contains("moves")) {
+                if (hasMovesField) {
                     const json &jmoves = jcmd.at("moves");
                     if (!jmoves.is_array()) {
                         throw std::runtime_error("moves must be an array");

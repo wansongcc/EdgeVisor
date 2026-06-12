@@ -1394,6 +1394,69 @@ static NnUint getSplitTotalForStage(const NnDimSplit* split, const NnStageConfig
     return sum;
 }
 
+static bool hasHeadDeltaForStage(const std::vector<int> &deltaHeadOrKv, const NnStageConfig *stage) {
+    if (stage == nullptr) return false;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n < deltaHeadOrKv.size() && deltaHeadOrKv[n] != 0) return true;
+    }
+    return false;
+}
+
+static bool validateKvShadowCoverage(
+    const NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage,
+    const std::vector<int> &deltaHeadOrKv,
+    char *reason,
+    size_t reasonSize
+) {
+    auto setReason = [&](const char *value) {
+        if (reason != nullptr && reasonSize != 0u) {
+            std::snprintf(reason, reasonSize, "%s", value != nullptr ? value : "kv_shadow_invalid");
+        }
+    };
+    if (!getEnableStageFullWeights()) {
+        setReason("kv_shadow_requires_stage_full_weights");
+        return false;
+    }
+    if (!getEnableKvRedundancyDuringMigration()) {
+        setReason("kv_shadow_redundancy_disabled");
+        return false;
+    }
+    if (plan == nullptr || stage == nullptr ||
+        plan->kvHeadSplit.starts == nullptr || plan->kvHeadSplit.lengths == nullptr ||
+        plan->kvHeadComputeSplit.starts == nullptr || plan->kvHeadComputeSplit.lengths == nullptr) {
+        setReason("kv_shadow_split_missing");
+        return false;
+    }
+
+    NnUint newStart = 0u;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n >= deltaHeadOrKv.size()) {
+            setReason("kv_shadow_delta_missing");
+            return false;
+        }
+        const int newLenSigned = (int)plan->kvHeadSplit.lengths[n] + deltaHeadOrKv[n];
+        if (newLenSigned < 0) {
+            setReason("kv_shadow_underflow");
+            return false;
+        }
+
+        const NnUint newLen = (NnUint)newLenSigned;
+        const NnUint newEnd = newStart + newLen;
+        const NnUint shadowStart = plan->kvHeadComputeSplit.starts[n];
+        const NnUint shadowEnd = shadowStart + plan->kvHeadComputeSplit.lengths[n];
+        if (newStart < shadowStart || newEnd > shadowEnd) {
+            setReason("kv_shadow_coverage_miss");
+            return false;
+        }
+        newStart = newEnd;
+    }
+    setReason("");
+    return true;
+}
+
 
 NnCpuDevice::NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan) {
     this->netConfig = netConfig;
@@ -2232,6 +2295,30 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 return;
                             }
 
+                            if (gqaLockstep && hasHeadDeltaForStage(deltaHeadOrKv, st)) {
+                                char reason[96] = {0};
+                                if (!validateKvShadowCoverage(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos,
+                                        reason);
+                                    std::fflush(stdout);
+                                    logCpuPlanApplyAblationEvent(
+                                        ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        pc2.nMoves > 0u ? pc2.moves[0].fromNodeIndex : 0u,
+                                        pc2.nMoves > 0u ? pc2.moves[0].toNodeIndex : 0u,
+                                        layerIndex,
+                                        pos,
+                                        cmd,
+                                        false,
+                                        reason);
+                                    return;
+                                }
+                            }
+
                             // Apply head/KV deltas.
                             if (gqaLockstep) {
                                 for (NnUint i = 0; i < st->nNodes; ++i) {
@@ -2427,6 +2514,31 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                             (unsigned)plan->kvHeadSplit.lengths[fromNode],
                                             (unsigned)kvMove);
                                         std::fflush(stdout);
+                                        legacyNoOp = true;
+                                        return;
+                                    }
+                                    std::vector<int> deltaHeadOrKv(plan->nNodes, 0);
+                                    deltaHeadOrKv[fromNode] -= (int)kvMove;
+                                    deltaHeadOrKv[toNode] += (int)kvMove;
+                                    char reason[96] = {0};
+                                    if (!validateKvShadowCoverage(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
+                                        printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
+                                            (unsigned)myNode,
+                                            (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                            (unsigned)msgEpoch,
+                                            (unsigned)layerIndex,
+                                            (unsigned)pos,
+                                            reason);
+                                        std::fflush(stdout);
+                                        logCpuPlanApplyAblationEvent(
+                                            ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                            fromNode,
+                                            toNode,
+                                            layerIndex,
+                                            pos,
+                                            cmd,
+                                            false,
+                                            reason);
                                         legacyNoOp = true;
                                         return;
                                     }

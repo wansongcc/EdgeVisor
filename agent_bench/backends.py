@@ -496,8 +496,19 @@ class EdgeVisorBackend(Backend):
         if not self.ablation_config:
             return ["--enable-plan-barrier", "--kv-redundancy", "2"]
         shadow_mode = str(self.ablation_config.get("shadow_kv_mode", "enabled"))
+        allow_head_kv_migration = bool(self.ablation_config.get("allow_head_kv_migration", False))
         if shadow_mode == "enabled":
-            return ["--enable-plan-barrier", "--kv-redundancy", "2"]
+            args = ["--enable-plan-barrier", "--kv-redundancy", "2"]
+            if allow_head_kv_migration:
+                args = [
+                    "--enable-plan-barrier",
+                    "--enable-stage-full-weights",
+                    "--enable-kv-redundancy-during-migration",
+                    "1",
+                    "--kv-redundancy",
+                    "2",
+                ]
+            return args
         return [
             "--enable-plan-barrier",
             "--kv-redundancy",

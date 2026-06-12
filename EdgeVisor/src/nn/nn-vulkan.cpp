@@ -460,6 +460,69 @@ static NnUint getSplitTotalForStageVulkan(const NnDimSplit *split, const NnStage
     return total;
 }
 
+static bool hasHeadDeltaForStageVulkan(const std::vector<int> &deltaHeadOrKv, const NnStageConfig *stage) {
+    if (stage == nullptr) return false;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n < deltaHeadOrKv.size() && deltaHeadOrKv[n] != 0) return true;
+    }
+    return false;
+}
+
+static bool validateKvShadowCoverageVulkan(
+    const NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage,
+    const std::vector<int> &deltaHeadOrKv,
+    char *reason,
+    size_t reasonSize
+) {
+    auto setReason = [&](const char *value) {
+        if (reason != nullptr && reasonSize != 0u) {
+            std::snprintf(reason, reasonSize, "%s", value != nullptr ? value : "kv_shadow_invalid");
+        }
+    };
+    if (!getEnableStageFullWeights()) {
+        setReason("kv_shadow_requires_stage_full_weights");
+        return false;
+    }
+    if (!getEnableKvRedundancyDuringMigration()) {
+        setReason("kv_shadow_redundancy_disabled");
+        return false;
+    }
+    if (plan == nullptr || stage == nullptr ||
+        plan->kvHeadSplit.starts == nullptr || plan->kvHeadSplit.lengths == nullptr ||
+        plan->kvHeadComputeSplit.starts == nullptr || plan->kvHeadComputeSplit.lengths == nullptr) {
+        setReason("kv_shadow_split_missing");
+        return false;
+    }
+
+    NnUint newStart = 0u;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n >= deltaHeadOrKv.size()) {
+            setReason("kv_shadow_delta_missing");
+            return false;
+        }
+        const int newLenSigned = (int)plan->kvHeadSplit.lengths[n] + deltaHeadOrKv[n];
+        if (newLenSigned < 0) {
+            setReason("kv_shadow_underflow");
+            return false;
+        }
+
+        const NnUint newLen = (NnUint)newLenSigned;
+        const NnUint newEnd = newStart + newLen;
+        const NnUint shadowStart = plan->kvHeadComputeSplit.starts[n];
+        const NnUint shadowEnd = shadowStart + plan->kvHeadComputeSplit.lengths[n];
+        if (newStart < shadowStart || newEnd > shadowEnd) {
+            setReason("kv_shadow_coverage_miss");
+            return false;
+        }
+        newStart = newEnd;
+    }
+    setReason("");
+    return true;
+}
+
 static bool resolveUnevenSliceVulkan(
     NnNetConfig *netConfig,
     NnNodeConfig *nodeConfig,
@@ -791,6 +854,22 @@ static bool handleVulkanPlanApply(
         std::fflush(stdout);
         logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "bad_move");
         return true;
+    }
+
+    if (gqaGroupSize > 1u && hasHeadDeltaForStageVulkan(deltaHeadOrKv, st)) {
+        char reason[96] = {0};
+        if (!validateKvShadowCoverageVulkan(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
+            printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
+                (unsigned)myNode,
+                (unsigned)onlyStage,
+                (unsigned)msgEpoch,
+                (unsigned)layerIndex,
+                (unsigned)pos,
+                reason);
+            std::fflush(stdout);
+            logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, reason);
+            return true;
+        }
     }
 
     bool changed = false;

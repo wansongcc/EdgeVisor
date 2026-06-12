@@ -23,6 +23,11 @@ PYTHON_BIN="${PYTHON_BIN:-/home/byh/B01/agent_langgraph_venv/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="python3"
 fi
+EDGE_COLD_START="${EDGE_COLD_START:-0}"
+edge_session_args=()
+if [[ "${EDGE_COLD_START}" == "1" ]]; then
+  edge_session_args+=(--edge-cold-start)
+fi
 
 mkdir -p "${OUT_ROOT}"
 
@@ -95,6 +100,7 @@ PY
         --jit-mode "${jit}" \
         --vg-mode "${vg}" \
         --experiment-id "${name}_${fluct}_rep${repeat}" \
+        "${edge_session_args[@]}" \
         | tee "${run_root}/run_stdout.json"
     done
   done

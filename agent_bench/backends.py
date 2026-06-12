@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import random
 import re
@@ -8,6 +9,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,7 @@ ROOT = Path(os.environ.get("B01_ROOT", "/home/byh/B01"))
 EDGE_PROJECT = ROOT / "EdgeVisor"
 EDGE_ENGINE = EDGE_PROJECT / "EdgeVisor"
 EDGE_DLLAMA = EDGE_ENGINE / "dllama"
+EDGE_DLLAMA_API = EDGE_ENGINE / "dllama-api"
 EDGE_MODEL = ROOT / "models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m"
 EDGE_TOKENIZER = ROOT / "models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
 
@@ -192,6 +195,30 @@ def _jsonl_records(path: Path) -> List[Dict[str, Any]]:
     return records
 
 
+def read_text_since(path: Path, offset: int) -> tuple[str, int]:
+    if not path.exists():
+        return "", offset
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        f.seek(offset)
+        text = f.read()
+        return text, f.tell()
+
+
+def jsonl_records_since(path: Path, offset: int) -> tuple[List[Dict[str, Any]], int]:
+    text, new_offset = read_text_since(path, offset)
+    records: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records, new_offset
+
+
 def strip_prima_content(log_text: str) -> str:
     match = re.search(r"generate:.*?\n\n(?P<content>.*?)(?:\nllama_perf_|llama_perf_|$)", log_text, re.S)
     if match:
@@ -293,6 +320,9 @@ class Backend:
         dynamic_plan: Optional[Dict[str, Any]] = None,
     ) -> GenerationResult:
         raise NotImplementedError
+
+    def close(self) -> None:
+        return None
 
 
 class MockBackend(Backend):
@@ -399,6 +429,7 @@ class EdgeVisorBackend(Backend):
         project_dir: Path = EDGE_PROJECT,
         engine_dir: Path = EDGE_ENGINE,
         dllama_path: Path = EDGE_DLLAMA,
+        api_path: Path = EDGE_DLLAMA_API,
         model_path: Path = EDGE_MODEL,
         tokenizer_path: Path = EDGE_TOKENIZER,
         vulkan_project: Optional[Path] = None,
@@ -420,6 +451,7 @@ class EdgeVisorBackend(Backend):
         self.project_dir = project_dir
         self.engine_dir = engine_dir
         self.dllama_path = dllama_path
+        self.api_path = api_path
         self.model_path = model_path
         self.tokenizer_path = tokenizer_path
         self.vulkan_project = vulkan_project or project_dir
@@ -1110,6 +1142,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         ratios: str = "1:1",
         worker_gpus: Optional[List[int]] = None,
         ablation_config: Optional[Dict[str, Any]] = None,
+        persistent: bool = True,
+        api_port: int = 0,
     ):
         config = dict(ablation_config or {})
         super().__init__(
@@ -1122,6 +1156,307 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             backend_name=self.name,
             ablation_config=config,
         )
+        self.persistent = persistent
+        self.api_port = api_port
+        self._persistent_started = False
+        self._persistent_procs: List[subprocess.Popen[Any]] = []
+        self._persistent_logs: Dict[str, Path] = {}
+        self._persistent_log_offsets: Dict[str, int] = {}
+        self._persistent_ablation_log_path: Optional[Path] = None
+        self._persistent_ablation_offset = 0
+        self._persistent_socket_path: Optional[str] = None
+        self._persistent_root_cmd: List[str] = []
+        self._persistent_worker_cmds: List[List[str]] = []
+        self._persistent_out_dir: Optional[Path] = None
+        self._session_started_at_ms = 0.0
+        self._session_generation_count = 0
+
+    def close(self) -> None:
+        if not self._persistent_procs:
+            return
+        terminate_all(self._persistent_procs)
+        close_logs(self._persistent_procs)
+        self._persistent_procs = []
+        self._persistent_started = False
+        if self._persistent_socket_path:
+            try:
+                os.unlink(self._persistent_socket_path)
+            except FileNotFoundError:
+                pass
+            self._persistent_socket_path = None
+
+    def _persistent_env(self) -> Dict[str, str]:
+        env = base_env(self.cuda_visible, self.vulkan_project)
+        env.update(self.extra_env)
+        return env
+
+    def _choose_api_port(self) -> int:
+        if self.api_port > 0:
+            return self.api_port
+        for _ in range(50):
+            port = 35000 + random.randint(0, 2000)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("127.0.0.1", port))
+                    return port
+                except OSError:
+                    continue
+        raise BackendError("could not allocate EdgeVisor API port")
+
+    def _http_json(self, method: str, path: str, body: Optional[Dict[str, Any]] = None, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        if self.api_port <= 0:
+            raise BackendError("persistent API port is not initialized")
+        data = None
+        headers: Dict[str, str] = {}
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers = {"Content-Type": "application/json", "Content-Length": str(len(data))}
+        conn = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=timeout_s or self.timeout_s)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8", errors="replace")
+        finally:
+            conn.close()
+        if resp.status < 200 or resp.status >= 300:
+            raise BackendError(f"EdgeVisor API HTTP {resp.status}: {raw[:500]}")
+        return json.loads(raw) if raw.strip() else {}
+
+    def _wait_api_ready(self, root_proc: subprocess.Popen[Any]) -> None:
+        deadline = time.time() + 120.0
+        last_error = ""
+        while time.time() < deadline:
+            if root_proc.poll() is not None:
+                text = self._persistent_logs.get("root", Path("/nonexistent")).read_text(encoding="utf-8", errors="replace") if self._persistent_logs.get("root") else ""
+                raise BackendError(f"EdgeVisor API exited while starting, rc={root_proc.returncode}\n{text[-2000:]}")
+            try:
+                self._http_json("GET", "/v1/models", timeout_s=2.0)
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(0.5)
+        raise BackendError(f"EdgeVisor API did not become ready: {last_error}")
+
+    def _start_persistent_session(self, out_dir: Path) -> None:
+        if self._persistent_started:
+            return
+        ensure_paths([self.api_path, self.dllama_path, self.model_path, self.tokenizer_path])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.api_port = self._choose_api_port()
+        port_base = 32000 + random.randint(0, 2000)
+        worker_ports = [port_base + i + 1 for i in range(len(self.worker_gpus))]
+        socket_path = f"/tmp/edgevisor_agent_persistent_{os.getpid()}_{port_base}.sock"
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+        self._persistent_socket_path = socket_path
+        self._persistent_out_dir = out_dir
+        self._persistent_ablation_log_path = out_dir / "persistent_ablation.jsonl"
+        self._persistent_ablation_offset = 0
+        self._persistent_logs = {"root": out_dir / "persistent_edgevisor_api_root.log"}
+        for idx, gpu in enumerate(self.worker_gpus):
+            self._persistent_logs[f"worker{idx}"] = out_dir / f"persistent_edgevisor_worker_gpu{gpu}.log"
+        self._persistent_log_offsets = {name: 0 for name in self._persistent_logs}
+
+        env = self._persistent_env()
+        env["DLLAMA_PLAN_CTRL_SOCKET"] = socket_path
+        env["DLLAMA_ENABLE_PLAN_BARRIER"] = "1"
+
+        procs: List[subprocess.Popen[Any]] = []
+        worker_cmds: List[List[str]] = []
+        try:
+            for idx, gpu in enumerate(self.worker_gpus):
+                worker_cmd = [
+                    str(self.dllama_path),
+                    "worker",
+                    "--port",
+                    str(worker_ports[idx]),
+                    "--nthreads",
+                    "1",
+                    "--gpu-index",
+                    str(gpu),
+                ]
+                worker_cmds.append(worker_cmd)
+                procs.append(popen_log(worker_cmd, self._persistent_logs[f"worker{idx}"], self.engine_dir, env))
+            if self.worker_gpus:
+                time.sleep(3.0)
+
+            root_cmd = [
+                str(self.api_path),
+                "--port",
+                str(self.api_port),
+                "--model",
+                str(self.model_path),
+                "--tokenizer",
+                str(self.tokenizer_path),
+                "--buffer-float-type",
+                "q80",
+                "--nthreads",
+                "1",
+                "--max-seq-len",
+                str(self.ctx),
+                "--temperature",
+                "0",
+                "--seed",
+                "1",
+                "--gpu-index",
+                str(self.root_gpu),
+            ]
+            if self.enable_benchmark:
+                root_cmd.append("--benchmark")
+            if self.worker_gpus:
+                root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in worker_ports]])
+                if self.ratios:
+                    root_cmd.extend(["--ratios", self.ratios])
+            root_cmd.extend(self._plan_barrier_args())
+            cfg = self.ablation_config
+            root_cmd.extend(["--ablation-log-path", str(self._persistent_ablation_log_path)])
+            root_cmd.extend(["--experiment-id", str(cfg.get("experiment_id", "persistent_episode"))])
+            root_cmd.extend(["--shadow-kv-mode", str(cfg.get("shadow_kv_mode", "enabled"))])
+            root_cmd.extend(["--pointer-swizzling-mode", str(cfg.get("pointer_swizzling_mode", "enabled"))])
+            root_cmd.extend(["--jit-mode", str(cfg.get("jit_mode", "enabled"))])
+            root_cmd.extend(["--vg-mode", str(cfg.get("vg_mode", "enabled"))])
+            root_cmd.extend(["--fallback-policy", str(cfg.get("fallback_policy", "disabled_unless_necessary"))])
+            if cfg.get("config_path"):
+                root_cmd.extend(["--edgevisor-ablation-config", str(cfg["config_path"])])
+            if self.extra_root_args:
+                root_cmd.extend(self.extra_root_args)
+
+            started = time.perf_counter()
+            root_proc = popen_log(root_cmd, self._persistent_logs["root"], self.engine_dir, env)
+            procs.append(root_proc)
+            self.api_port = int(self.api_port)
+            self._wait_api_ready(root_proc)
+            self._session_started_at_ms = (time.perf_counter() - started) * 1000.0
+            self._persistent_procs = procs
+            self._persistent_worker_cmds = worker_cmds
+            self._persistent_root_cmd = root_cmd
+            self._persistent_started = True
+        except Exception:
+            terminate_all(procs)
+            close_logs(procs)
+            if self._persistent_socket_path:
+                try:
+                    os.unlink(self._persistent_socket_path)
+                except FileNotFoundError:
+                    pass
+                self._persistent_socket_path = None
+            raise
+
+    def _collect_persistent_metrics(self, wall_ms: float, rc: int) -> Dict[str, Any]:
+        root_delta = ""
+        node_metrics: List[Dict[str, Any]] = []
+        cache_hit = False
+        for label, path in self._persistent_logs.items():
+            text, new_offset = read_text_since(path, self._persistent_log_offsets.get(label, 0))
+            self._persistent_log_offsets[label] = new_offset
+            if label == "root":
+                root_delta = text
+                cache_hit = "Found naive cache" in text
+            gpu = self.root_gpu if label == "root" else None
+            if label.startswith("worker"):
+                try:
+                    gpu = self.worker_gpus[int(label.removeprefix("worker"))]
+                except Exception:
+                    gpu = None
+            node_metrics.append({"node": label, "gpu": gpu, "log_path": str(path), "metrics": parse_edge_metrics(text)})
+        metrics = parse_edge_metrics(root_delta)
+        metrics.update(
+            {
+                "wall_ms": wall_ms,
+                "valid": rc == 0,
+                "persistent_session": True,
+                "persistent_cache_hit": cache_hit,
+                "persistent_session_start_ms": self._session_started_at_ms,
+                "persistent_generation_index": self._session_generation_count,
+                "api_port": self.api_port,
+                "node_metrics": node_metrics,
+                "ablation_config": dict(self.ablation_config),
+                "ablation_effective_topology": dict(self.ablation_effective_topology),
+            }
+        )
+        if self._persistent_ablation_log_path is not None:
+            records, new_offset = jsonl_records_since(self._persistent_ablation_log_path, self._persistent_ablation_offset)
+            self._persistent_ablation_offset = new_offset
+            metrics["ablation_log_path"] = str(self._persistent_ablation_log_path)
+            metrics["ablation_events"] = records
+        return metrics
+
+    def _generate_persistent(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        generation_name: str,
+        out_dir: Path,
+        dynamic_plan: Optional[Dict[str, Any]] = None,
+    ) -> GenerationResult:
+        self._start_persistent_session(out_dir)
+        self._session_generation_count += 1
+        dynamic_plan = self._ablation_dynamic_plan(dynamic_plan)
+        dynamic_events: List[Dict[str, Any]] = []
+        plan_thread: Optional[threading.Thread] = None
+        plan_box: Dict[str, Any] = {"events": []}
+        if dynamic_plan and dynamic_plan.get("enabled", True) and self._persistent_socket_path and self._persistent_procs:
+            root_proc = self._persistent_procs[-1]
+
+            def drive_plan() -> None:
+                plan_box["events"] = self._drive_dynamic_plan(self._persistent_socket_path or "", root_proc, dynamic_plan or {})
+
+            plan_thread = threading.Thread(target=drive_plan, daemon=True)
+            plan_thread.start()
+
+        payload = {
+            "model": "edgevisor-ablation-persistent",
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": 0,
+            "seed": 1,
+            "stream": False,
+        }
+        start = time.perf_counter()
+        rc = 0
+        content = ""
+        try:
+            resp = self._http_json("POST", "/v1/chat/completions", payload, timeout_s=self.timeout_s)
+            choices = resp.get("choices", []) if isinstance(resp, dict) else []
+            if choices and isinstance(choices[0], dict):
+                message = choices[0].get("message", {})
+                if isinstance(message, dict):
+                    content = str(message.get("content", ""))
+        except Exception as exc:
+            rc = 1
+            content = f"[edgevisor persistent api error] {exc}"
+        wall_ms = (time.perf_counter() - start) * 1000.0
+        if plan_thread is not None:
+            plan_thread.join(timeout=float((dynamic_plan or {}).get("consume_timeout_s", 20.0)) + 5.0)
+            dynamic_events = list(plan_box.get("events", []))
+        metrics = self._collect_persistent_metrics(wall_ms=wall_ms, rc=rc)
+        if self.last_plan is not None:
+            metrics["exo_plan"] = self.last_plan
+        return GenerationResult(
+            backend=self.name,
+            content=content.strip(),
+            metrics=metrics,
+            command=list(self._persistent_root_cmd),
+            log_path=str(self._persistent_logs.get("root", "")),
+            dynamic_events=dynamic_events,
+            rc=rc,
+        )
+
+    def generate(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        generation_name: str,
+        out_dir: Path,
+        dynamic_plan: Optional[Dict[str, Any]] = None,
+    ) -> GenerationResult:
+        if not self.persistent:
+            result = super().generate(messages, max_tokens, generation_name, out_dir, dynamic_plan=dynamic_plan)
+            result.metrics["persistent_session"] = False
+            return result
+        return self._generate_persistent(messages, max_tokens, generation_name, out_dir, dynamic_plan=dynamic_plan)
 
 
 def make_backend(name: str, **kwargs: Any) -> Backend:

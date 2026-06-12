@@ -134,6 +134,13 @@ def _extract_partial_final(text: str) -> Optional[Dict[str, Any]]:
 def _normalize_action(value: Dict[str, Any]) -> Dict[str, Any]:
     value = {_clean_key(k): v for k, v in value.items()}
     tool = value.get("tool") or value.get("name") or value.get("action")
+    if tool is None and "final_answer" in value:
+        answer_value = value.get("final_answer")
+        if isinstance(answer_value, (dict, list)):
+            answer = json.dumps(answer_value, ensure_ascii=False, sort_keys=True)
+        else:
+            answer = str(answer_value or "")
+        return {"tool": "final_answer", "arguments": {"answer": answer}, "reason": str(value.get("reason", ""))}
     tool = _clean_atom(tool)
     if tool in {"final", "answer"}:
         tool = "final_answer"
@@ -144,7 +151,11 @@ def _normalize_action(value: Dict[str, Any]) -> Dict[str, Any]:
         args = {}
     args = _clean_arguments(args)
     if tool == "final_answer" and "answer" not in args:
-        args["answer"] = str(value.get("answer") or value.get("content") or "")
+        answer_value = value.get("answer") or value.get("content") or ""
+        if isinstance(answer_value, (dict, list)):
+            args["answer"] = json.dumps(answer_value, ensure_ascii=False, sort_keys=True)
+        else:
+            args["answer"] = str(answer_value)
     return {"tool": str(tool or ""), "arguments": args, "reason": str(value.get("reason", ""))}
 
 
@@ -213,11 +224,12 @@ def build_loop_graph():
             dynamic_plan=dynamic_plan,
         )
         action = _extract_action(result.content)
+        assistant_content = result.content.strip() or "INVALID_ACTION_JSON"
         _append_generation_event(events, generation_name, result, action)
 
         if not action or not action.get("tool"):
             events.append({"type": "parse_error", "turn": turn, "content": result.content})
-            messages.append({"role": "assistant", "content": "INVALID_ACTION_JSON"})
+            messages.append({"role": "assistant", "content": assistant_content})
             messages.append(
                 {
                     "role": "user",
@@ -227,7 +239,7 @@ def build_loop_graph():
             return {**state, "messages": messages, "events": events, "turn": turn + 1, "pending_action": {}}
 
         tool_name = action["tool"]
-        messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
+        messages.append({"role": "assistant", "content": assistant_content})
         if tool_name == "final_answer":
             min_tools = int(episode.get("min_tool_calls", 0))
             tool_count = int(state.get("tool_count", 0))
@@ -368,7 +380,12 @@ def run_loop_episode(episode: Dict[str, Any], backend: Backend, out_dir: Path) -
         "started_at": started_at,
         "generation_count": 0,
     }
-    final_state = app.invoke(initial)
+    try:
+        final_state = app.invoke(initial)
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     events = final_state.get("events", [])
     llm_events = [ev for ev in events if ev.get("type") == "llm_generation"]

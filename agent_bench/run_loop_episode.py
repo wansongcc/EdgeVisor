@@ -55,6 +55,8 @@ def main() -> int:
     parser.add_argument("--fallback-policy", default="disabled_unless_necessary")
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--edgevisor-ablation-config", type=Path, default=None)
+    parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
+    parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
     parser.add_argument("--ctx", type=int, default=2048)
     args = parser.parse_args()
 
@@ -116,6 +118,8 @@ def main() -> int:
                 "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
                 "config_path": str(args.edgevisor_ablation_config) if args.edgevisor_ablation_config else "",
             },
+            "persistent": not args.edge_cold_start,
+            "api_port": args.edge_api_port,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

@@ -18,6 +18,24 @@ def parse_gpu_list(value: str) -> list[int]:
     return [int(x) for x in value.split(",") if x.strip()]
 
 
+def make_virtual_topology(args: argparse.Namespace) -> Dict[str, Any]:
+    if not args.edge_virtual_pp_tp_3stage:
+        return {}
+    logical_node_gpus = parse_gpu_list(args.edge_virtual_node_gpus)
+    if not logical_node_gpus:
+        logical_node_gpus = [0, 1, 2, 0, 1, 2, 0, 1]
+    return {
+        "enabled": True,
+        "name": "virtual_pp_tp_3stage_3_3_2",
+        "ratios": args.edge_virtual_ratios,
+        "logical_node_gpus": logical_node_gpus,
+        "root_gpu": logical_node_gpus[0],
+        "worker_gpus": logical_node_gpus[1:],
+        "stage_layout": [3, 3, 2],
+        "launch_stagger_s": args.edge_virtual_launch_stagger_s,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a looping LangGraph agent with a swappable LLM backend.")
     parser.add_argument(
@@ -34,6 +52,27 @@ def main() -> int:
     parser.add_argument("--cuda-visible", default="0,1,2")
     parser.add_argument("--edge-worker-gpus", default="1", help="Comma-separated worker GPU indices for EdgeVisor.")
     parser.add_argument("--edge-ratios", default="1:1")
+    parser.add_argument(
+        "--edge-virtual-pp-tp-3stage",
+        action="store_true",
+        help="Use an 8-logical-node 3-stage PP+TP topology on 3 physical GPUs for short ablation experiments.",
+    )
+    parser.add_argument(
+        "--edge-virtual-ratios",
+        default="1:1:1*1:1:1*1:1",
+        help="Ratios string for --edge-virtual-pp-tp-3stage.",
+    )
+    parser.add_argument(
+        "--edge-virtual-node-gpus",
+        default="0,1,2,0,1,2,0,1",
+        help="Logical-node to physical-GPU mapping for virtual PP+TP mode; node0 is root, remaining nodes are workers.",
+    )
+    parser.add_argument(
+        "--edge-virtual-launch-stagger-s",
+        type=float,
+        default=2.0,
+        help="Delay between launching workers in virtual PP+TP mode to reduce same-GPU initialization contention.",
+    )
     parser.add_argument("--edge-steps", type=int, default=256)
     parser.add_argument("--dllama-worker-gpus", default="1", help="Comma-separated worker GPU indices for Dllama.")
     parser.add_argument("--dllama-ratios", default="1:1")
@@ -58,6 +97,11 @@ def main() -> int:
     parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
     parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
     parser.add_argument(
+        "--disable-episode-dynamic-plan",
+        action="store_true",
+        help="Ignore edgevisor_dynamic_plan from the episode file for static topology smoke tests.",
+    )
+    parser.add_argument(
         "--allow-head-kv-migration",
         action="store_true",
         help="Opt in to experimental online KV/head migration; disabled by default for agentic success runs.",
@@ -66,8 +110,12 @@ def main() -> int:
     args = parser.parse_args()
 
     episode = load_episode(args.episode)
+    if args.disable_episode_dynamic_plan:
+        episode = dict(episode)
+        episode.pop("edgevisor_dynamic_plan", None)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = args.out_root / f"{episode['id']}_{args.backend}_{stamp}"
+    virtual_topology = make_virtual_topology(args)
 
     backend_kwargs: Dict[str, Any] = {}
     if args.backend == "prima":
@@ -79,6 +127,7 @@ def main() -> int:
             "steps": args.edge_steps,
             "ratios": args.edge_ratios,
             "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
+            "virtual_topology": virtual_topology,
         }
     elif args.backend == "dllama":
         backend_kwargs = {
@@ -126,6 +175,7 @@ def main() -> int:
             },
             "persistent": not args.edge_cold_start,
             "api_port": args.edge_api_port,
+            "virtual_topology": virtual_topology,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

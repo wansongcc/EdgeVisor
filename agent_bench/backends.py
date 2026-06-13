@@ -438,6 +438,7 @@ class EdgeVisorBackend(Backend):
         extra_root_args: Optional[List[str]] = None,
         extra_env: Optional[Dict[str, str]] = None,
         ablation_config: Optional[Dict[str, Any]] = None,
+        virtual_topology: Optional[Dict[str, Any]] = None,
     ):
         ensure_paths([dllama_path, model_path, tokenizer_path])
         if backend_name:
@@ -460,8 +461,68 @@ class EdgeVisorBackend(Backend):
         self.extra_root_args = list(extra_root_args or [])
         self.extra_env = dict(extra_env or {})
         self.ablation_config = dict(ablation_config or {})
+        self.virtual_topology = self._normalize_virtual_topology(virtual_topology)
+        if self.virtual_topology:
+            self.root_gpu = int(self.virtual_topology["root_gpu"])
+            self.worker_gpus = list(self.virtual_topology["worker_gpus"])
+            self.ratios = str(self.virtual_topology["ratios"])
         self.last_plan: Optional[Dict[str, Any]] = None
         self.ablation_effective_topology = self._apply_ablation_topology()
+
+    def _normalize_virtual_topology(self, cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not cfg or not cfg.get("enabled", False):
+            return {}
+        ratios = str(cfg.get("ratios") or "1:1:1*1:1:1*1:1")
+        logical_node_gpus = cfg.get("logical_node_gpus") or [0, 1, 2, 0, 1, 2, 0, 1]
+        logical_node_gpus = [int(x) for x in logical_node_gpus]
+        if len(logical_node_gpus) < 2:
+            raise BackendError("virtual topology requires at least root plus one worker node")
+        root_gpu = int(cfg.get("root_gpu", logical_node_gpus[0]))
+        worker_gpus = cfg.get("worker_gpus")
+        if worker_gpus is None:
+            worker_gpus = logical_node_gpus[1:]
+        worker_gpus = [int(x) for x in worker_gpus]
+        if len(worker_gpus) + 1 != len(logical_node_gpus):
+            raise BackendError("virtual topology worker_gpus must match logical_node_gpus[1:] length")
+        launch_stagger_s = float(cfg.get("launch_stagger_s", 2.0))
+        node_gpu_map = {idx: gpu for idx, gpu in enumerate(logical_node_gpus)}
+        return {
+            "enabled": True,
+            "name": str(cfg.get("name") or "virtual_pp_tp_3stage_3_3_2"),
+            "ratios": ratios,
+            "root_gpu": root_gpu,
+            "worker_gpus": worker_gpus,
+            "logical_node_gpus": logical_node_gpus,
+            "node_gpu_map": node_gpu_map,
+            "launch_stagger_s": launch_stagger_s,
+            "stage_layout": cfg.get("stage_layout") or [3, 3, 2],
+        }
+
+    def _worker_log_path(self, out_dir: Path, prefix: str, worker_idx: int, gpu: int) -> Path:
+        node_id = worker_idx + 1
+        return out_dir / f"{prefix}_worker_node{node_id}_gpu{gpu}.log"
+
+    def _node_metric_entry(self, label: str, path: Path, text: str) -> Dict[str, Any]:
+        gpu = self.root_gpu if label == "root" else None
+        logical_node = 0 if label == "root" else None
+        if label.startswith("worker"):
+            try:
+                worker_idx = int(label.removeprefix("worker"))
+                gpu = self.worker_gpus[worker_idx]
+                logical_node = worker_idx + 1
+            except Exception:
+                gpu = None
+                logical_node = None
+        return {
+            "node": label,
+            "logical_node": logical_node,
+            "gpu": gpu,
+            "log_path": str(path),
+            "metrics": parse_edge_metrics(text),
+        }
+
+    def _launch_worker(self, worker_cmd: List[str], log_path: Path, env: Dict[str, str]) -> subprocess.Popen[Any]:
+        return popen_log(worker_cmd, log_path, self.engine_dir, env)
 
     def _apply_ablation_topology(self) -> Dict[str, Any]:
         if not self.ablation_config:
@@ -490,6 +551,7 @@ class EdgeVisorBackend(Backend):
             "effective_worker_gpus": effective_workers,
             "original_ratios": original_ratios,
             "effective_ratios": effective_ratios,
+            "virtual_topology": dict(self.virtual_topology),
         }
 
     def _plan_barrier_args(self) -> List[str]:
@@ -565,6 +627,8 @@ class EdgeVisorBackend(Backend):
             ",".join(str(x) for x in [self.root_gpu, *self.worker_gpus]),
         )
         plan["logicalGroup"] = plan.get("logical_group", f"{vg_mode}_stage_{int(plan.get('stage', 0))}")
+        if self.virtual_topology:
+            plan["nodeGpuMap"] = plan.get("node_gpu_map", json.dumps(self.virtual_topology["node_gpu_map"], sort_keys=True))
 
         state_prepare_ms = float(plan.get("state_prepare_ms", plan.get("simulated_stall_ms", 0.0)) or 0.0)
         if shadow_mode == "disabled_transfer":
@@ -651,10 +715,11 @@ class EdgeVisorBackend(Backend):
         }
         ablation_log_path = out_dir / f"{generation_name}_ablation.jsonl"
         for idx, gpu in enumerate(self.worker_gpus):
-            logs[f"worker{idx}"] = out_dir / f"{generation_name}_edgevisor_worker_gpu{gpu}.log"
+            logs[f"worker{idx}"] = self._worker_log_path(out_dir, f"{generation_name}_edgevisor", idx, gpu)
 
         try:
             steps = estimate_edge_steps(prompt, max_tokens, self.ctx, self.steps)
+            launch_stagger_s = float(self.virtual_topology.get("launch_stagger_s", 0.0)) if self.virtual_topology else 0.0
             for idx, gpu in enumerate(self.worker_gpus):
                 worker_cmd = [
                     str(self.dllama_path),
@@ -666,7 +731,9 @@ class EdgeVisorBackend(Backend):
                     "--gpu-index",
                     str(gpu),
                 ]
-                procs.append(popen_log(worker_cmd, logs[f"worker{idx}"], self.engine_dir, env))
+                procs.append(self._launch_worker(worker_cmd, logs[f"worker{idx}"], env))
+                if launch_stagger_s > 0.0 and idx + 1 < len(self.worker_gpus):
+                    time.sleep(launch_stagger_s)
             if self.worker_gpus:
                 time.sleep(3.0)
 
@@ -744,20 +811,7 @@ class EdgeVisorBackend(Backend):
         node_metrics: List[Dict[str, Any]] = []
         for label, path in logs.items():
             text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
-            gpu = self.root_gpu if label == "root" else None
-            if label.startswith("worker"):
-                try:
-                    gpu = self.worker_gpus[int(label.removeprefix("worker"))]
-                except Exception:
-                    gpu = None
-            node_metrics.append(
-                {
-                    "node": label,
-                    "gpu": gpu,
-                    "log_path": str(path),
-                    "metrics": parse_edge_metrics(text),
-                }
-            )
+            node_metrics.append(self._node_metric_entry(label, path, text))
         metrics["node_metrics"] = node_metrics
         if self.ablation_config:
             metrics["ablation_config"] = dict(self.ablation_config)
@@ -1168,6 +1222,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         ablation_config: Optional[Dict[str, Any]] = None,
         persistent: bool = True,
         api_port: int = 0,
+        virtual_topology: Optional[Dict[str, Any]] = None,
     ):
         config = dict(ablation_config or {})
         super().__init__(
@@ -1179,6 +1234,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             worker_gpus=worker_gpus if worker_gpus is not None else [1],
             backend_name=self.name,
             ablation_config=config,
+            virtual_topology=virtual_topology,
         )
         self.persistent = persistent
         self.api_port = api_port
@@ -1280,7 +1336,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         self._persistent_ablation_offset = 0
         self._persistent_logs = {"root": out_dir / "persistent_edgevisor_api_root.log"}
         for idx, gpu in enumerate(self.worker_gpus):
-            self._persistent_logs[f"worker{idx}"] = out_dir / f"persistent_edgevisor_worker_gpu{gpu}.log"
+            self._persistent_logs[f"worker{idx}"] = self._worker_log_path(out_dir, "persistent_edgevisor", idx, gpu)
         self._persistent_log_offsets = {name: 0 for name in self._persistent_logs}
 
         env = self._persistent_env()
@@ -1290,6 +1346,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         procs: List[subprocess.Popen[Any]] = []
         worker_cmds: List[List[str]] = []
         try:
+            launch_stagger_s = float(self.virtual_topology.get("launch_stagger_s", 0.0)) if self.virtual_topology else 0.0
             for idx, gpu in enumerate(self.worker_gpus):
                 worker_cmd = [
                     str(self.dllama_path),
@@ -1302,7 +1359,9 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
                     str(gpu),
                 ]
                 worker_cmds.append(worker_cmd)
-                procs.append(popen_log(worker_cmd, self._persistent_logs[f"worker{idx}"], self.engine_dir, env))
+                procs.append(self._launch_worker(worker_cmd, self._persistent_logs[f"worker{idx}"], env))
+                if launch_stagger_s > 0.0 and idx + 1 < len(self.worker_gpus):
+                    time.sleep(launch_stagger_s)
             if self.worker_gpus:
                 time.sleep(3.0)
 
@@ -1378,13 +1437,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             if label == "root":
                 root_delta = text
                 cache_hit = "Found naive cache" in text
-            gpu = self.root_gpu if label == "root" else None
-            if label.startswith("worker"):
-                try:
-                    gpu = self.worker_gpus[int(label.removeprefix("worker"))]
-                except Exception:
-                    gpu = None
-            node_metrics.append({"node": label, "gpu": gpu, "log_path": str(path), "metrics": parse_edge_metrics(text)})
+            node_metrics.append(self._node_metric_entry(label, path, text))
         metrics = parse_edge_metrics(root_delta)
         metrics.update(
             {

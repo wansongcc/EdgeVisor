@@ -139,6 +139,23 @@ def load_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
     return by_run_root
 
 
+def load_manifest_results(root: Path) -> List[Dict[str, Any]]:
+    path = root / "manifest_results.jsonl"
+    rows: List[Dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
 def _fallback_labels(path: Path, root: Path) -> Dict[str, Any]:
     rel = path.relative_to(root)
     parts = rel.parts
@@ -175,6 +192,23 @@ def load_row(path: Path, root: Path, manifest: Dict[str, Dict[str, Any]]) -> Dic
     row["trace_path"] = str(path)
     row["task_success"] = bool(metrics.get("task_success"))
     row["episode_id"] = metrics.get("episode_id", trace.get("episode_id", ""))
+    return row
+
+
+def failed_row(result: Dict[str, Any], manifest: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    run_root = str(Path(str(result.get("run_root", ""))).resolve())
+    item = manifest.get(run_root, {})
+    row: Dict[str, Any] = {col: "" for col in RUN_COLUMNS}
+    row.update(
+        {
+            "variant": item.get("variant", result.get("variant", "unknown")),
+            "fluctuation": item.get("fluctuation", result.get("fluctuation", "unknown")),
+            "repeat": item.get("repeat", result.get("repeat", "")),
+            "task_success": False,
+            "episode_completion_time": _safe_float(result.get("elapsed_s")) * 1000.0,
+            "trace_path": "",
+        }
+    )
     return row
 
 
@@ -358,7 +392,22 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     traces = sorted(iter_trace_files(root))
     manifest = load_manifest(root)
+    manifest_results = load_manifest_results(root)
     rows = [load_row(path, root, manifest) for path in traces]
+    traced_run_roots = set()
+    for row in rows:
+        trace_path = str(row.get("trace_path", ""))
+        if trace_path:
+            for parent in [Path(trace_path).parent, *Path(trace_path).parents]:
+                if str(parent.resolve()) in manifest:
+                    traced_run_roots.add(str(parent.resolve()))
+                    break
+                if parent.resolve() == root:
+                    break
+    for result in manifest_results:
+        run_root = str(Path(str(result.get("run_root", ""))).resolve())
+        if run_root and run_root not in traced_run_roots and int(result.get("rc", 1) or 0) != 0:
+            rows.append(failed_row(result, manifest))
     if not rows:
         raise SystemExit(f"no trace.json files found under {root}")
 

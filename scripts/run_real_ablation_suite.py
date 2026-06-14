@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -69,6 +70,30 @@ def network_proxy_rate(fluctuation: str, args: argparse.Namespace) -> Optional[f
         "mixed_bw": float(args.network_mixed_mib_s),
     }
     return rates.get(fluctuation)
+
+
+def port_is_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", int(port)))
+            return True
+        except OSError:
+            return False
+
+
+def port_block_is_free(port_base: int, worker_count: int = 7) -> bool:
+    ports = [port_base + i + 1 for i in range(worker_count)]
+    ports.extend(port_base + 100 + i + 1 for i in range(worker_count))
+    return all(port_is_free(port) for port in ports)
+
+
+def choose_port_base(preferred_base: int, *, worker_count: int = 7, attempts: int = 100) -> int:
+    for attempt in range(attempts):
+        candidate = preferred_base + attempt * 200
+        if port_block_is_free(candidate, worker_count=worker_count):
+            return candidate
+    raise PerturbationError(f"could not find a free EdgeVisor port block starting at {preferred_base}")
 
 
 def start_compute_stress(
@@ -405,7 +430,8 @@ def main() -> int:
                     run_root.mkdir(parents=True, exist_ok=True)
                     episode_copy = run_root / "episode.json"
                     plan = write_episode_copy(args.episode, episode_copy, fluctuation, variant_name, repeat)
-                    port_base = args.fixed_port_base + variant_idx * 1000 + fluct_idx * 100 + repeat * 10
+                    preferred_port_base = args.fixed_port_base + variant_idx * 2000 + fluct_idx * 600 + repeat * 200
+                    port_base = choose_port_base(preferred_port_base, worker_count=7)
                     cmd = build_episode_command(args, variant_name, modes, fluctuation, repeat, run_root, episode_copy, port_base)
                     perturbation_record: Dict[str, Any] = {"fluctuation": fluctuation, "compute": None, "network": None}
                     stress_proc: Optional[subprocess.Popen[str]] = None
@@ -470,7 +496,7 @@ def main() -> int:
                         flush=True,
                     )
                     if rc != 0:
-                        raise SystemExit(f"episode failed rc={rc}; see {run_root / 'run_stdout.json'}")
+                        print(f"[ablation] warning: episode failed rc={rc}; see {run_root / 'run_stdout.json'}", flush=True)
     finally:
         pass
 

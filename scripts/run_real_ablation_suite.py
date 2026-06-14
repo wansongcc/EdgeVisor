@@ -169,9 +169,17 @@ def terminate_proc(proc: Optional[subprocess.Popen[Any]]) -> None:
         log_f.close()
 
 
-def write_episode_copy(src: Path, dst: Path, fluctuation: str, variant_name: str, repeat: int) -> Dict[str, Any]:
+def write_episode_copy(
+    src: Path,
+    dst: Path,
+    fluctuation: str,
+    variant_name: str,
+    repeat: int,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
     episode = json.loads(src.read_text(encoding="utf-8"))
     plan = dict(episode.get("edgevisor_dynamic_plan", {}))
+    migration_layer_count = max(1, int(args.migration_layer_count))
     plan.update(
         {
             "enabled": True,
@@ -181,13 +189,13 @@ def write_episode_copy(src: Path, dst: Path, fluctuation: str, variant_name: str
             "stage": 1,
             "from_node": 5,
             "to_node": 6,
-            "layerCount": 1,
+            "layerCount": migration_layer_count,
             "delay_s": 0.5,
             "consume_timeout_s": 30.0,
             "fluctuation_type": fluctuation,
             "candidate_count": 2,
             "state_transfer_bytes": 0,
-            "recompute_tokens_or_layers": 0,
+            "recompute_tokens_or_layers": migration_layer_count,
             "fallback_count": 0,
             "experiment_variant": variant_name,
             "repeat": repeat,
@@ -362,7 +370,13 @@ def main() -> int:
     parser.add_argument("--ctx", type=int, default=2048)
     parser.add_argument("--edge-steps", type=int, default=256)
     parser.add_argument("--edge-virtual-launch-stagger-s", type=float, default=2.0)
-    parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=1)
+    parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=0)
+    parser.add_argument(
+        "--migration-layer-count",
+        type=int,
+        default=1,
+        help="Number of PP boundary layers to migrate in set_pp_migration commands.",
+    )
     parser.add_argument("--fixed-port-base", type=int, default=32000)
     parser.add_argument("--compute-target-gpu", type=int, default=2)
     parser.add_argument("--compute-stress-steps", type=int, default=1024)
@@ -391,6 +405,8 @@ def main() -> int:
         raise SystemExit(f"missing python interpreter: {args.python_bin}")
 
     repeats = 1 if args.smoke else max(1, args.repeats)
+    if args.runtime_redundant_boundary_layers <= 0:
+        args.runtime_redundant_boundary_layers = max(1, int(args.migration_layer_count))
     variants = selected_variants(args)
     fluctuations = selected_fluctuations(args)
     args.out_root.mkdir(parents=True, exist_ok=True)
@@ -410,6 +426,8 @@ def main() -> int:
             "ratios": "1:1:1*1:1:1*1:1",
             "node_gpu_map": "0,1,2,0,1,2,0,1",
             "gpu3_allowed": False,
+            "migration_layer_count": args.migration_layer_count,
+            "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
         },
         "perturbation": {
             "compute": "background dllama inference on target GPU",
@@ -429,7 +447,7 @@ def main() -> int:
                     run_root = args.out_root / variant_name / fluctuation / f"rep_{repeat}"
                     run_root.mkdir(parents=True, exist_ok=True)
                     episode_copy = run_root / "episode.json"
-                    plan = write_episode_copy(args.episode, episode_copy, fluctuation, variant_name, repeat)
+                    plan = write_episode_copy(args.episode, episode_copy, fluctuation, variant_name, repeat, args)
                     preferred_port_base = args.fixed_port_base + variant_idx * 2000 + fluct_idx * 600 + repeat * 200
                     port_base = choose_port_base(preferred_port_base, worker_count=7)
                     cmd = build_episode_command(args, variant_name, modes, fluctuation, repeat, run_root, episode_copy, port_base)

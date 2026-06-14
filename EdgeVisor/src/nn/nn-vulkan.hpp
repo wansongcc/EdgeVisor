@@ -176,6 +176,8 @@ private:
     vk::Fence fence;
     std::vector<vk::PipelineLayout> pipelineLayouts;
     std::vector<vk::Pipeline> pipelines;
+    std::vector<vk::ShaderModule> smallKMatmulShaderModules;
+    std::vector<vk::Pipeline> smallKMatmulPipelines;
     vk::PipelineCache pipelineCache;
     vk::CommandBuffer commandBuffer;
     std::vector<std::vector<NnVulkanBuffer *>> buffersToSync;

@@ -36,6 +36,12 @@ def make_virtual_topology(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def load_ablation_config(path: Path | None) -> Dict[str, Any]:
+    if path is None:
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a looping LangGraph agent with a swappable LLM backend.")
     parser.add_argument(
@@ -94,6 +100,9 @@ def main() -> int:
     parser.add_argument("--fallback-policy", default="disabled_unless_necessary")
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--edgevisor-ablation-config", type=Path, default=None)
+    parser.add_argument("--edge-fixed-port-base", type=int, default=0, help="Use a fixed worker port base for tc-based loopback shaping.")
+    parser.add_argument("--enable-pp-migration", action="store_true", help="Enable EdgeVisor PP layer migration control path.")
+    parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=1)
     parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
     parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
     parser.add_argument(
@@ -157,25 +166,35 @@ def main() -> int:
             "memory_field": args.lingualinked_memory_field,
         }
     elif args.backend == "edgevisor_ablation":
-        backend_kwargs = {
-            "cuda_visible": args.cuda_visible,
-            "ctx": args.ctx,
-            "steps": args.edge_steps,
-            "ratios": args.edge_ratios,
-            "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
-            "ablation_config": {
+        extra_env: Dict[str, str] = {}
+        if args.edge_fixed_port_base > 0:
+            extra_env["EDGEVISOR_FIXED_PORT_BASE"] = str(args.edge_fixed_port_base)
+        ablation_config = load_ablation_config(args.edgevisor_ablation_config)
+        ablation_config.update(
+            {
                 "shadow_kv_mode": args.shadow_kv_mode,
                 "pointer_swizzling_mode": args.pointer_swizzling_mode,
                 "jit_mode": args.jit_mode,
                 "vg_mode": args.vg_mode,
                 "fallback_policy": args.fallback_policy,
                 "allow_head_kv_migration": args.allow_head_kv_migration,
+                "enable_pp_migration": args.enable_pp_migration,
+                "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
                 "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
                 "config_path": str(args.edgevisor_ablation_config) if args.edgevisor_ablation_config else "",
-            },
+            }
+        )
+        backend_kwargs = {
+            "cuda_visible": args.cuda_visible,
+            "ctx": args.ctx,
+            "steps": args.edge_steps,
+            "ratios": args.edge_ratios,
+            "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
+            "ablation_config": ablation_config,
             "persistent": not args.edge_cold_start,
             "api_port": args.edge_api_port,
             "virtual_topology": virtual_topology,
+            "extra_env": extra_env,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

@@ -64,6 +64,114 @@ class BackendError(RuntimeError):
     pass
 
 
+class TcpRateProxy:
+    def __init__(self, listen_port: int, target_port: int, rate_bytes_per_s: float, log_path: Path):
+        self.listen_port = int(listen_port)
+        self.target_port = int(target_port)
+        self.rate_bytes_per_s = float(rate_bytes_per_s)
+        self.log_path = log_path
+        self._stop = threading.Event()
+        self._server: Optional[socket.socket] = None
+        self._threads: List[threading.Thread] = []
+
+    def start(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", self.listen_port))
+        server.listen(16)
+        server.settimeout(0.5)
+        self._server = server
+        thread = threading.Thread(target=self._accept_loop, name=f"edgevisor-proxy-{self.listen_port}", daemon=True)
+        thread.start()
+        self._threads.append(thread)
+        self._log(f"listen=127.0.0.1:{self.listen_port} target=127.0.0.1:{self.target_port} rate_bytes_per_s={self.rate_bytes_per_s:.3f}")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._server is not None:
+            try:
+                self._server.close()
+            except OSError:
+                pass
+            self._server = None
+        for thread in list(self._threads):
+            thread.join(timeout=1.0)
+        self._threads.clear()
+
+    def _log(self, text: str) -> None:
+        try:
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(f"{time.time():.6f} {text}\n")
+        except OSError:
+            pass
+
+    def _connect_target(self) -> socket.socket:
+        last_error: Optional[Exception] = None
+        for _ in range(200):
+            if self._stop.is_set():
+                raise RuntimeError("proxy stopped")
+            try:
+                return socket.create_connection(("127.0.0.1", self.target_port), timeout=1.0)
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.05)
+        raise RuntimeError(f"target 127.0.0.1:{self.target_port} not ready: {last_error}")
+
+    def _accept_loop(self) -> None:
+        assert self._server is not None
+        while not self._stop.is_set():
+            try:
+                client, addr = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                target = self._connect_target()
+            except Exception as exc:
+                self._log(f"connect_target_error={exc}")
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+            self._log(f"accepted addr={addr}")
+            for src, dst, label in ((client, target, "client_to_target"), (target, client, "target_to_client")):
+                thread = threading.Thread(target=self._pipe, args=(src, dst, label), daemon=True)
+                thread.start()
+                self._threads.append(thread)
+
+    def _pipe(self, src: socket.socket, dst: socket.socket, label: str) -> None:
+        total = 0
+        try:
+            src.settimeout(0.5)
+            while not self._stop.is_set():
+                try:
+                    chunk = src.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                dst.sendall(chunk)
+                total += len(chunk)
+                if self.rate_bytes_per_s > 0.0:
+                    time.sleep(len(chunk) / self.rate_bytes_per_s)
+        except OSError as exc:
+            self._log(f"pipe_error label={label} error={exc}")
+        finally:
+            self._log(f"pipe_done label={label} bytes={total}")
+            for sock in (src, dst):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+
 def render_messages(messages: List[Dict[str, str]]) -> str:
     lines: List[str] = []
     for msg in messages:
@@ -469,6 +577,20 @@ class EdgeVisorBackend(Backend):
         self.last_plan: Optional[Dict[str, Any]] = None
         self.ablation_effective_topology = self._apply_ablation_topology()
 
+    def _choose_port_base(self) -> int:
+        fixed = (
+            self.extra_env.get("EDGEVISOR_FIXED_PORT_BASE")
+            or self.extra_env.get("EDGEVISOR_PORT_BASE")
+            or os.environ.get("EDGEVISOR_FIXED_PORT_BASE")
+            or os.environ.get("EDGEVISOR_PORT_BASE")
+        )
+        if fixed:
+            port_base = int(fixed)
+            if port_base <= 0:
+                raise BackendError(f"invalid EDGEVISOR_FIXED_PORT_BASE: {fixed}")
+            return port_base
+        return 32000 + random.randint(0, 2000)
+
     def _normalize_virtual_topology(self, cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not cfg or not cfg.get("enabled", False):
             return {}
@@ -524,6 +646,33 @@ class EdgeVisorBackend(Backend):
     def _launch_worker(self, worker_cmd: List[str], log_path: Path, env: Dict[str, str]) -> subprocess.Popen[Any]:
         return popen_log(worker_cmd, log_path, self.engine_dir, env)
 
+    def _network_proxy_rate_bytes_per_s(self) -> float:
+        cfg = self.ablation_config or {}
+        rate = float(cfg.get("network_proxy_rate_bytes_per_s", 0.0) or 0.0)
+        if rate <= 0.0:
+            rate_mbps = float(cfg.get("network_proxy_rate_mbps", 0.0) or 0.0)
+            if rate_mbps > 0.0:
+                rate = rate_mbps * 1024.0 * 1024.0
+        return rate
+
+    def _make_worker_ports(self, port_base: int, out_dir: Path, prefix: str) -> tuple[List[int], List[int], List[TcpRateProxy]]:
+        worker_ports = [port_base + i + 1 for i in range(len(self.worker_gpus))]
+        proxy_rate = self._network_proxy_rate_bytes_per_s()
+        if proxy_rate <= 0.0:
+            return worker_ports, worker_ports, []
+        worker_actual_ports = [port_base + 100 + i + 1 for i in range(len(self.worker_gpus))]
+        proxies: List[TcpRateProxy] = []
+        for idx, (listen_port, target_port) in enumerate(zip(worker_ports, worker_actual_ports)):
+            proxy = TcpRateProxy(
+                listen_port=listen_port,
+                target_port=target_port,
+                rate_bytes_per_s=proxy_rate,
+                log_path=out_dir / f"{prefix}_proxy_node{idx + 1}.log",
+            )
+            proxy.start()
+            proxies.append(proxy)
+        return worker_actual_ports, worker_ports, proxies
+
     def _apply_ablation_topology(self) -> Dict[str, Any]:
         if not self.ablation_config:
             return {}
@@ -570,14 +719,25 @@ class EdgeVisorBackend(Backend):
                     "--kv-redundancy",
                     "2",
                 ]
-            return args
-        return [
+            return self._append_pp_migration_args(args)
+        return self._append_pp_migration_args([
             "--enable-plan-barrier",
             "--kv-redundancy",
             "0",
             "--enable-kv-redundancy-during-migration",
             "0",
-        ]
+        ])
+
+    def _append_pp_migration_args(self, args: List[str]) -> List[str]:
+        if not self.ablation_config or not self.ablation_config.get("enable_pp_migration", False):
+            return args
+        out = list(args)
+        out.append("--enable-pp-migration")
+        boundary_layers = int(self.ablation_config.get("runtime_redundant_boundary_layers", 1))
+        out.extend(["--runtime-redundant-boundary-layers", str(max(0, boundary_layers))])
+        out.extend(["--runtime-active-seg-enabled", "1"])
+        out.extend(["--runtime-redundant-seg-enabled", "0"])
+        return out
 
     def _ablation_dynamic_plan(self, dynamic_plan: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not self.ablation_config or dynamic_plan is None:
@@ -588,8 +748,9 @@ class EdgeVisorBackend(Backend):
         vg_mode = str(cfg.get("vg_mode", "enabled"))
         shadow_mode = str(cfg.get("shadow_kv_mode", "enabled"))
         allow_head_kv_migration = bool(cfg.get("allow_head_kv_migration", False))
+        is_pp_plan = str(plan.get("plan_op", "set_plan")) == "set_pp_migration"
 
-        if jit_mode == "static":
+        if jit_mode == "static" and not is_pp_plan:
             plan["stage"] = int(plan.get("stage", 0))
             plan["moves"] = [
                 {
@@ -601,7 +762,7 @@ class EdgeVisorBackend(Backend):
                 }
             ]
             plan["jit_decision_reason"] = "static_fixed_rule"
-        elif jit_mode == "greedy":
+        elif jit_mode == "greedy" and not is_pp_plan:
             from_node = int(plan.get("greedy_from_node", len(self.worker_gpus)))
             to_node = int(plan.get("greedy_to_node", 0))
             plan["moves"] = [
@@ -630,7 +791,7 @@ class EdgeVisorBackend(Backend):
         if self.virtual_topology:
             plan["nodeGpuMap"] = plan.get("node_gpu_map", json.dumps(self.virtual_topology["node_gpu_map"], sort_keys=True))
 
-        state_prepare_ms = float(plan.get("state_prepare_ms", plan.get("simulated_stall_ms", 0.0)) or 0.0)
+        state_prepare_ms = float(plan.get("state_prepare_ms", plan.get("tStatePrepareMs", 0.0)) or 0.0)
         if shadow_mode == "disabled_transfer":
             plan["fallbackCount"] = int(plan.get("fallback_count", 1))
             plan["stateTransferBytes"] = int(plan.get("state_transfer_bytes", 0))
@@ -677,7 +838,7 @@ class EdgeVisorBackend(Backend):
                 elif shadow_mode == "disabled_recompute" and int(plan.get("recomputeTokensOrLayers", 0) or 0) == 0:
                     plan["recomputeTokensOrLayers"] = rejected
                 if float(plan.get("tStatePrepareMs", 0.0) or 0.0) == 0.0:
-                    plan["tStatePrepareMs"] = float(plan.get("simulated_stall_ms", 0.0) or 0.0)
+                    plan["tStatePrepareMs"] = state_prepare_ms
                 plan["stallTimeMs"] = max(
                     float(plan.get("stallTimeMs", 0.0) or 0.0),
                     float(plan.get("tStatePrepareMs", 0.0) or 0.0),
@@ -697,9 +858,10 @@ class EdgeVisorBackend(Backend):
         env = base_env(self.cuda_visible, self.vulkan_project)
         env.update(self.extra_env)
         procs: List[subprocess.Popen[Any]] = []
+        proxies: List[TcpRateProxy] = []
         dynamic_events: List[Dict[str, Any]] = []
-        port_base = 32000 + random.randint(0, 2000)
-        worker_ports = [port_base + i + 1 for i in range(len(self.worker_gpus))]
+        port_base = self._choose_port_base()
+        worker_actual_ports, root_worker_ports, proxies = self._make_worker_ports(port_base, out_dir, generation_name)
         socket_path = None
         if dynamic_plan and dynamic_plan.get("enabled", True):
             socket_path = str(dynamic_plan.get("socket_path") or f"/tmp/edgevisor_agent_{os.getpid()}_{port_base}.sock")
@@ -725,7 +887,7 @@ class EdgeVisorBackend(Backend):
                     str(self.dllama_path),
                     "worker",
                     "--port",
-                    str(worker_ports[idx]),
+                    str(worker_actual_ports[idx]),
                     "--nthreads",
                     "1",
                     "--gpu-index",
@@ -764,7 +926,7 @@ class EdgeVisorBackend(Backend):
             if self.enable_benchmark:
                 root_cmd.append("--benchmark")
             if self.worker_gpus:
-                root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in worker_ports]])
+                root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in root_worker_ports]])
                 if self.ratios:
                     root_cmd.extend(["--ratios", self.ratios])
             if socket_path:
@@ -798,6 +960,8 @@ class EdgeVisorBackend(Backend):
         finally:
             terminate_all(procs)
             close_logs(procs)
+            for proxy in proxies:
+                proxy.stop()
             if socket_path:
                 try:
                     os.unlink(socket_path)
@@ -867,6 +1031,7 @@ class EdgeVisorBackend(Backend):
             "fallbackCount",
             "stateTransferBytes",
             "recomputeTokensOrLayers",
+            "layerCount",
             "tDecisionMs",
             "tStatePrepareMs",
             "tCommandMs",
@@ -882,7 +1047,16 @@ class EdgeVisorBackend(Backend):
         ):
             if key in dynamic_plan:
                 cmd[key] = dynamic_plan[key]
-        if "moves" in dynamic_plan:
+        plan_op = str(dynamic_plan.get("plan_op", "set_plan"))
+        if plan_op == "set_pp_migration":
+            cmd.update(
+                {
+                    "fromNodeIndex": int(dynamic_plan.get("fromNodeIndex", dynamic_plan.get("from_node", 0))),
+                    "toNodeIndex": int(dynamic_plan.get("toNodeIndex", dynamic_plan.get("to_node", 1))),
+                    "layerCount": int(dynamic_plan.get("layerCount", dynamic_plan.get("layer_count", 1))),
+                }
+            )
+        elif "moves" in dynamic_plan:
             cmd["moves"] = dynamic_plan["moves"]
         else:
             cmd.update(
@@ -895,17 +1069,17 @@ class EdgeVisorBackend(Backend):
                 }
             )
         try:
-            set_resp = uds_request(socket_path, {"op": "set_plan", "cmd": cmd}, timeout_s=2.0)
+            set_resp = uds_request(socket_path, {"op": plan_op, "cmd": cmd}, timeout_s=2.0)
             events.append(
                 {
-                    "event": "set_plan",
+                    "event": plan_op,
                     "request": cmd,
                     "response": set_resp,
                     "ablation_config": dict(self.ablation_config),
                     "ablation_effective_topology": dict(self.ablation_effective_topology),
                     "jit_decision_reason": dynamic_plan.get("jit_decision_reason"),
-                    "stall_time_ms": float(dynamic_plan.get("simulated_stall_ms", 0.0)),
-                    "recovery_latency_ms": float(dynamic_plan.get("simulated_recovery_latency_ms", dynamic_plan.get("simulated_stall_ms", 0.0))),
+                    "stall_time_ms": float(dynamic_plan.get("stallTimeMs", dynamic_plan.get("tStatePrepareMs", 0.0)) or 0.0),
+                    "recovery_latency_ms": float(dynamic_plan.get("tRecoverMs", dynamic_plan.get("stallTimeMs", 0.0)) or 0.0),
                     "fluctuation_type": dynamic_plan.get("fluctuation_type", "unspecified"),
                 }
             )
@@ -1223,6 +1397,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         persistent: bool = True,
         api_port: int = 0,
         virtual_topology: Optional[Dict[str, Any]] = None,
+        extra_env: Optional[Dict[str, str]] = None,
     ):
         config = dict(ablation_config or {})
         super().__init__(
@@ -1235,6 +1410,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             backend_name=self.name,
             ablation_config=config,
             virtual_topology=virtual_topology,
+            extra_env=extra_env,
         )
         self.persistent = persistent
         self.api_port = api_port
@@ -1247,11 +1423,15 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         self._persistent_socket_path: Optional[str] = None
         self._persistent_root_cmd: List[str] = []
         self._persistent_worker_cmds: List[List[str]] = []
+        self._persistent_proxies: List[TcpRateProxy] = []
         self._persistent_out_dir: Optional[Path] = None
         self._session_started_at_ms = 0.0
         self._session_generation_count = 0
 
     def close(self) -> None:
+        for proxy in list(self._persistent_proxies):
+            proxy.stop()
+        self._persistent_proxies = []
         if not self._persistent_procs:
             return
         terminate_all(self._persistent_procs)
@@ -1323,8 +1503,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         ensure_paths([self.api_path, self.dllama_path, self.model_path, self.tokenizer_path])
         out_dir.mkdir(parents=True, exist_ok=True)
         self.api_port = self._choose_api_port()
-        port_base = 32000 + random.randint(0, 2000)
-        worker_ports = [port_base + i + 1 for i in range(len(self.worker_gpus))]
+        port_base = self._choose_port_base()
+        worker_ports, root_worker_ports, proxies = self._make_worker_ports(port_base, out_dir, "persistent_edgevisor")
         socket_path = f"/tmp/edgevisor_agent_persistent_{os.getpid()}_{port_base}.sock"
         try:
             os.unlink(socket_path)
@@ -1389,7 +1569,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             if self.enable_benchmark:
                 root_cmd.append("--benchmark")
             if self.worker_gpus:
-                root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in worker_ports]])
+                root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in root_worker_ports]])
                 if self.ratios:
                     root_cmd.extend(["--ratios", self.ratios])
             root_cmd.extend(self._plan_barrier_args())
@@ -1414,9 +1594,12 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             self._session_started_at_ms = (time.perf_counter() - started) * 1000.0
             self._persistent_procs = procs
             self._persistent_worker_cmds = worker_cmds
+            self._persistent_proxies = proxies
             self._persistent_root_cmd = root_cmd
             self._persistent_started = True
         except Exception:
+            for proxy in proxies:
+                proxy.stop()
             terminate_all(procs)
             close_logs(procs)
             if self._persistent_socket_path:

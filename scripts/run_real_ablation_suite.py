@@ -239,7 +239,11 @@ def build_episode_command(
                 {
                     "network_proxy_rate_mbps": rate,
                     "network_proxy_mode": "user_space_tcp_rate_proxy",
-                    "network_proxy_scope": "all_worker_connections",
+                    "network_proxy_scope": args.network_proxy_scope,
+                    "network_proxy_nodes": parse_csv(args.network_proxy_nodes),
+                    "network_proxy_from_node": 5,
+                    "network_proxy_to_node": 6,
+                    "network_proxy_start_throttled": False,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -340,6 +344,17 @@ def main() -> int:
     parser.add_argument("--network-intra-mib-s", type=float, default=10.0)
     parser.add_argument("--network-inter-mib-s", type=float, default=10.0)
     parser.add_argument("--network-mixed-mib-s", type=float, default=10.0)
+    parser.add_argument(
+        "--network-proxy-scope",
+        choices=["all_worker_connections", "selected_worker_nodes", "migration_nodes"],
+        default="migration_nodes",
+        help="Scope for user-space TCP rate proxy injection.",
+    )
+    parser.add_argument(
+        "--network-proxy-nodes",
+        default="5,6",
+        help="Logical worker nodes to throttle when the scope is selected_worker_nodes or migration_nodes.",
+    )
     parser.add_argument("--timeout-s", type=int, default=900)
     args = parser.parse_args()
 
@@ -373,7 +388,9 @@ def main() -> int:
         },
         "perturbation": {
             "compute": "background dllama inference on target GPU",
-            "network": "user-space TCP rate proxy between root and workers; actual bytes are throttled, no simulated stalls",
+            "network": "user-space TCP rate proxy on selected root-worker TCP links; actual bytes are throttled, no simulated stalls",
+            "network_proxy_scope": args.network_proxy_scope,
+            "network_proxy_nodes": parse_csv(args.network_proxy_nodes),
             "simulated_fields_allowed": False,
         },
     }
@@ -414,7 +431,8 @@ def main() -> int:
                             perturbation_record["network"] = {
                                 "enabled": True,
                                 "method": "user_space_tcp_rate_proxy",
-                                "scope": "all_worker_connections",
+                                "scope": args.network_proxy_scope,
+                                "nodes": parse_csv(args.network_proxy_nodes),
                                 "rate_mib_per_s": rate,
                             }
                         manifest_item = {

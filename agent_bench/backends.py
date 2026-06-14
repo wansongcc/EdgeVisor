@@ -65,12 +65,22 @@ class BackendError(RuntimeError):
 
 
 class TcpRateProxy:
-    def __init__(self, listen_port: int, target_port: int, rate_bytes_per_s: float, log_path: Path):
+    def __init__(
+        self,
+        listen_port: int,
+        target_port: int,
+        rate_bytes_per_s: float,
+        log_path: Path,
+        start_throttled: bool = True,
+    ):
         self.listen_port = int(listen_port)
         self.target_port = int(target_port)
         self.rate_bytes_per_s = float(rate_bytes_per_s)
         self.log_path = log_path
         self._stop = threading.Event()
+        self._throttle = threading.Event()
+        if start_throttled:
+            self._throttle.set()
         self._server: Optional[socket.socket] = None
         self._threads: List[threading.Thread] = []
 
@@ -85,7 +95,14 @@ class TcpRateProxy:
         thread = threading.Thread(target=self._accept_loop, name=f"edgevisor-proxy-{self.listen_port}", daemon=True)
         thread.start()
         self._threads.append(thread)
-        self._log(f"listen=127.0.0.1:{self.listen_port} target=127.0.0.1:{self.target_port} rate_bytes_per_s={self.rate_bytes_per_s:.3f}")
+        self._log(
+            f"listen=127.0.0.1:{self.listen_port} target=127.0.0.1:{self.target_port} "
+            f"rate_bytes_per_s={self.rate_bytes_per_s:.3f} throttled={self._throttle.is_set()}"
+        )
+
+    def activate(self) -> None:
+        self._throttle.set()
+        self._log("throttle_activated")
 
     def stop(self) -> None:
         self._stop.set()
@@ -155,7 +172,7 @@ class TcpRateProxy:
                     break
                 dst.sendall(chunk)
                 total += len(chunk)
-                if self.rate_bytes_per_s > 0.0:
+                if self.rate_bytes_per_s > 0.0 and self._throttle.is_set():
                     time.sleep(len(chunk) / self.rate_bytes_per_s)
         except OSError as exc:
             self._log(f"pipe_error label={label} error={exc}")
@@ -655,6 +672,37 @@ class EdgeVisorBackend(Backend):
                 rate = rate_mbps * 1024.0 * 1024.0
         return rate
 
+    def _network_proxy_nodes(self) -> Optional[set[int]]:
+        cfg = self.ablation_config or {}
+        raw = cfg.get("network_proxy_nodes")
+        scope = str(cfg.get("network_proxy_scope", "all_worker_connections"))
+        if raw is None and scope == "all_worker_connections":
+            return None
+        if raw is None and scope in {"selected_worker_nodes", "migration_nodes"}:
+            raw = [
+                cfg.get("network_proxy_from_node"),
+                cfg.get("network_proxy_to_node"),
+            ]
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            if raw.strip().lower() in {"", "all", "*", "all_worker_connections"}:
+                return None
+            items = [item.strip() for item in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            items = list(raw)
+        else:
+            items = [raw]
+        nodes: set[int] = set()
+        for item in items:
+            if item is None or str(item).strip() == "":
+                continue
+            node = int(item)
+            if node <= 0:
+                raise BackendError(f"network_proxy_nodes must name worker logical nodes >= 1, got {node}")
+            nodes.add(node)
+        return nodes or None
+
     def _make_worker_ports(self, port_base: int, out_dir: Path, prefix: str) -> tuple[List[int], List[int], List[TcpRateProxy]]:
         worker_ports = [port_base + i + 1 for i in range(len(self.worker_gpus))]
         proxy_rate = self._network_proxy_rate_bytes_per_s()
@@ -662,12 +710,18 @@ class EdgeVisorBackend(Backend):
             return worker_ports, worker_ports, []
         worker_actual_ports = [port_base + 100 + i + 1 for i in range(len(self.worker_gpus))]
         proxies: List[TcpRateProxy] = []
+        proxied_nodes = self._network_proxy_nodes()
         for idx, (listen_port, target_port) in enumerate(zip(worker_ports, worker_actual_ports)):
+            node_id = idx + 1
+            if proxied_nodes is not None and node_id not in proxied_nodes:
+                worker_actual_ports[idx] = listen_port
+                continue
             proxy = TcpRateProxy(
                 listen_port=listen_port,
                 target_port=target_port,
                 rate_bytes_per_s=proxy_rate,
                 log_path=out_dir / f"{prefix}_proxy_node{idx + 1}.log",
+                start_throttled=bool((self.ablation_config or {}).get("network_proxy_start_throttled", True)),
             )
             proxy.start()
             proxies.append(proxy)
@@ -948,6 +1002,9 @@ class EdgeVisorBackend(Backend):
             start = time.perf_counter()
             root_proc = popen_log(root_cmd, logs["root"], self.engine_dir, env)
             procs.append(root_proc)
+            if not bool((self.ablation_config or {}).get("network_proxy_start_throttled", True)):
+                for proxy in proxies:
+                    proxy.activate()
 
             if socket_path:
                 dynamic_events.extend(self._drive_dynamic_plan(socket_path, root_proc, dynamic_plan or {}))
@@ -1591,6 +1648,9 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             procs.append(root_proc)
             self.api_port = int(self.api_port)
             self._wait_api_ready(root_proc)
+            if not bool((self.ablation_config or {}).get("network_proxy_start_throttled", True)):
+                for proxy in proxies:
+                    proxy.activate()
             self._session_started_at_ms = (time.perf_counter() - started) * 1000.0
             self._persistent_procs = procs
             self._persistent_worker_cmds = worker_cmds

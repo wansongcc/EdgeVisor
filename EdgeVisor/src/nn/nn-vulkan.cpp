@@ -3,6 +3,7 @@
 #include "llm.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -14,6 +15,27 @@
 #else
     #define VULKAN_TRACE(...)
 #endif
+
+static constexpr NnUint VULKAN_Q40_MATMUL_THREADS = 256u;
+static constexpr NnUint VULKAN_SMALLK_Q40_MATMUL_THREADS = 128u;
+static constexpr NnUint VULKAN_SMALLK_Q40_MATMUL_MAX_BLOCKS = 256u;
+
+static bool envFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+
+static bool vulkanMatmulSelectDebugEnabled() {
+    static const bool enabled = envFlagEnabled("DLLAMA_DEBUG_VULKAN_MATMUL_SELECT");
+    return enabled;
+}
+
+static bool vulkanSmallKMatmulDisabled() {
+    static const bool disabled = envFlagEnabled("DLLAMA_VULKAN_DISABLE_SMALLK_MATMUL");
+    return disabled;
+}
+
 
 static bool hasPortabilityExtension() {
 #ifdef __APPLE__
@@ -1011,6 +1033,10 @@ NnDeviceSegment *NnVulkanDevice::createSegment(NnUint segmentIndex) {
     return new NnVulkanDeviceSegment(this, &context, &copier, &bufferFactory, &data, netConfig, segmentIndex, segmentConfig, netExecution);
 };
 
+static const char *getSmallKQ80Q40MatmulShaderFileName() {
+    return "matmul-forward-q80-q40-f32-smallk.spv";
+}
+
 static const char *getShaderFileName(const NnOpCode opCode, const NnOpQuantType quantType) {
     if (opCode == OP_MERGE_ADD) {
         if (quantType == F32_F32_F32) return "merge-add-forward-f32-f32.spv";
@@ -1186,7 +1212,13 @@ static NnSize3D resolveShaderLogicalSize(NnVulkanDeviceData *data, NnPointerConf
     return size;
 }
 
-static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, const NnUint nBatches, const NnSize3D inputSize, const NnSize3D outputSize) {
+static std::vector<NnUint> resolveShaderConstants(
+    const NnOpConfig *opConfig,
+    const NnUint nBatches,
+    const NnSize3D inputSize,
+    const NnSize3D outputSize,
+    const NnUint q40MatmulThreads = VULKAN_Q40_MATMUL_THREADS
+) {
     std::vector<NnUint> consts;
     consts.push_back(nBatches);
 
@@ -1209,9 +1241,8 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
             // Online head/FFN repartition can change a matmul input width after
             // pipeline creation, so do not specialize this to the initial slice.
             // The shader guards against threads beyond BatchInfo.inputSizeX.
-            constexpr NnUint maxThreads = 256u;
             assert(inputSize.x % Q40_BLOCK_SIZE == 0);
-            consts.push_back(maxThreads);
+            consts.push_back(q40MatmulThreads);
             consts.push_back(opConfig->weightSize.y / Q40_BLOCK_SIZE); // physical weight row stride, in Q40 blocks
             consts.push_back(opConfig->weightSize.x); // physical output rows per expert
         } else if (opConfig->weightSize.floatType == F_32) {
@@ -1225,6 +1256,33 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
         consts.push_back(config->k);
     }
     return consts;
+}
+
+static bool isQ80Q40MatmulPipeline(const NnOpConfig *opConfig, const NnSize3D inputSize, const NnSize3D outputSize) {
+    return opConfig->code == OP_MATMUL &&
+        inputSize.floatType == F_Q80 &&
+        opConfig->weightSize.floatType == F_Q40 &&
+        outputSize.floatType == F_32;
+}
+
+static NnUint resolveQ80BlockCount(const NnSize3D inputSize) {
+    if (inputSize.floatType == F_Q80 && (inputSize.x % Q80_BLOCK_SIZE) == 0u) {
+        return inputSize.x / Q80_BLOCK_SIZE;
+    }
+    return inputSize.x;
+}
+
+static bool shouldUseSmallKQ80Q40MatmulPipeline(
+    const NnOpConfig *opConfig,
+    const NnSize3D inputSize,
+    const NnSize3D outputSize,
+    const vk::Pipeline smallKPipeline
+) {
+    return smallKPipeline &&
+        !vulkanSmallKMatmulDisabled() &&
+        isQ80Q40MatmulPipeline(opConfig, inputSize, outputSize) &&
+        (inputSize.x % Q80_BLOCK_SIZE) == 0u &&
+        (inputSize.x / Q80_BLOCK_SIZE) <= VULKAN_SMALLK_Q40_MATMUL_MAX_BLOCKS;
 }
 
 static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const NnSize3D inputSize, const NnSize3D outputSize) {
@@ -1291,7 +1349,7 @@ static std::vector<uint32_t> readShader(const char *fileName) {
     FILE *file = fopen(path.c_str(), "rb");
     if (!file)
         throw std::runtime_error("Failed to open shader file: " + path);
-    constexpr size_t maxSize = 16384;
+    constexpr size_t maxSize = 65536;
     uint32_t chunk[maxSize];
     size_t bytesRead = fread(chunk, 1, maxSize, file);
     assert(bytesRead < maxSize); // Check if the file is too large
@@ -1303,6 +1361,49 @@ static std::vector<uint32_t> readShader(const char *fileName) {
     }
     fclose(file);
     return code;
+}
+
+static vk::ShaderModule createShaderModule(NnVulkanContext *context, const char *shaderFileName) {
+    std::vector<uint32_t> code = readShader(shaderFileName);
+    VULKAN_TRACE("Loading shader: %s", shaderFileName);
+    vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
+        vk::ShaderModuleCreateFlags(),
+        code.size(),
+        code.data()
+    );
+    return context->device.createShaderModule(shaderModuleCreateInfo);
+}
+
+static void fillSpecializationInfo(
+    std::vector<vk::SpecializationMapEntry> &entries,
+    vk::SpecializationInfo &info,
+    const std::vector<NnUint> &constants
+) {
+    entries.resize(constants.size());
+    for (NnUint i = 0; i < constants.size(); i++) {
+        entries[i] = vk::SpecializationMapEntry(
+            i,
+            i * sizeof(NnUint),
+            sizeof(NnUint)
+        );
+        VULKAN_TRACE("Spec constant %d: %u", i, constants[i]);
+    }
+    info = vk::SpecializationInfo(
+        constants.size(),
+        entries.data(),
+        constants.size() * sizeof(NnUint),
+        constants.data()
+    );
+}
+
+static vk::Pipeline createComputePipeline(
+    NnVulkanContext *context,
+    vk::PipelineCache pipelineCache,
+    vk::PipelineLayout pipelineLayout,
+    const vk::PipelineShaderStageCreateInfo &shaderCreateInfo
+) {
+    vk::ComputePipelineCreateInfo pipelineInfo(vk::PipelineCreateFlags(), shaderCreateInfo, pipelineLayout, vk::Pipeline(), 0);
+    return context->device.createComputePipelines(pipelineCache, pipelineInfo).value.front();
 }
 
 static vk::DescriptorType toDescriptorType(NnVulkanBuffer *buffer) {
@@ -1382,6 +1483,8 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanDevice *ownerDevice, NnVulk
     descriptorSetLayouts(segmentConfig->nOps),
     pipelineLayouts(segmentConfig->nOps),
     pipelines(segmentConfig->nOps),
+    smallKMatmulShaderModules(segmentConfig->nOps),
+    smallKMatmulPipelines(segmentConfig->nOps),
     buffersToSync(segmentConfig->nOps)
 {
     this->segmentData.reset(new NnVulkanDeviceSegmentData(bufferFactory, data, segmentConfig, netExecution->nBatches));
@@ -1400,11 +1503,15 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanDevice *ownerDevice, NnVulk
     }
 
     std::vector<vk::PipelineShaderStageCreateInfo> shaderCreateInfos(segmentConfig->nOps);
+    std::vector<vk::PipelineShaderStageCreateInfo> smallKMatmulShaderCreateInfos(segmentConfig->nOps);
     std::vector<std::vector<NnOpBufferAccess>> opBufferAccesses(segmentConfig->nOps);
 
     std::vector<vk::SpecializationInfo> specInfos(segmentConfig->nOps);
     std::vector<std::vector<vk::SpecializationMapEntry>> specEntries(segmentConfig->nOps);
     std::vector<std::vector<NnUint>> constants(segmentConfig->nOps);
+    std::vector<vk::SpecializationInfo> smallKMatmulSpecInfos(segmentConfig->nOps);
+    std::vector<std::vector<vk::SpecializationMapEntry>> smallKMatmulSpecEntries(segmentConfig->nOps);
+    std::vector<std::vector<NnUint>> smallKMatmulConstants(segmentConfig->nOps);
 
     for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
         NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
@@ -1419,37 +1526,13 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanDevice *ownerDevice, NnVulk
             outputSize.floatType
         );
         const char *shaderFileName = getShaderFileName(opConfig->code, opQuant);
-        std::vector<uint32_t> code = readShader(shaderFileName);
 
         buildShaderLayout(opBufferAccesses[opIndex], data, segmentData.get(), opIndex, opConfig);
 
-        VULKAN_TRACE("Loading shader: %s", shaderFileName);
-        vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
-            vk::ShaderModuleCreateFlags(),
-            code.size(),
-            code.data()
-        );
-
         constants[opIndex] = resolveShaderConstants(opConfig, netConfig->nBatches, inputSize, outputSize);
-        const std::vector<NnUint> *opConstants = &constants[opIndex];
+        fillSpecializationInfo(specEntries[opIndex], specInfos[opIndex], constants[opIndex]);
 
-        specEntries[opIndex].resize(opConstants->size());
-        for (NnUint i = 0; i < opConstants->size(); i++) {
-            specEntries[opIndex][i] = vk::SpecializationMapEntry(
-                i,
-                i * sizeof(NnUint),
-                sizeof(NnUint)
-            );
-            VULKAN_TRACE("Spec constant %d: %u", i, opConstants->at(i));
-        }
-        specInfos[opIndex] = vk::SpecializationInfo(
-            opConstants->size(),
-            specEntries[opIndex].data(),
-            opConstants->size() * sizeof(NnUint),
-            opConstants->data()
-        );
-
-        vk::ShaderModule shaderModule = context->device.createShaderModule(shaderModuleCreateInfo);
+        vk::ShaderModule shaderModule = createShaderModule(context, shaderFileName);
         vk::PipelineShaderStageCreateInfo shaderCreateInfo(
             vk::PipelineShaderStageCreateFlags(),
             vk::ShaderStageFlagBits::eCompute,
@@ -1460,6 +1543,33 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanDevice *ownerDevice, NnVulk
 
         shaderModules[opIndex] = shaderModule;
         shaderCreateInfos[opIndex] = shaderCreateInfo;
+
+        if (opQuant == Q80_Q40_F32 && !vulkanSmallKMatmulDisabled()) {
+            smallKMatmulConstants[opIndex] = resolveShaderConstants(
+                opConfig,
+                netConfig->nBatches,
+                inputSize,
+                outputSize,
+                VULKAN_SMALLK_Q40_MATMUL_THREADS
+            );
+            fillSpecializationInfo(
+                smallKMatmulSpecEntries[opIndex],
+                smallKMatmulSpecInfos[opIndex],
+                smallKMatmulConstants[opIndex]
+            );
+
+            vk::ShaderModule smallKShaderModule = createShaderModule(context, getSmallKQ80Q40MatmulShaderFileName());
+            vk::PipelineShaderStageCreateInfo smallKShaderCreateInfo(
+                vk::PipelineShaderStageCreateFlags(),
+                vk::ShaderStageFlagBits::eCompute,
+                smallKShaderModule,
+                "main",
+                &smallKMatmulSpecInfos[opIndex]
+            );
+            smallKMatmulShaderModules[opIndex] = smallKShaderModule;
+            smallKMatmulShaderCreateInfos[opIndex] = smallKShaderCreateInfo;
+        }
+
         VULKAN_TRACE("Segment %d, opIndex: %d, buffers: %zu", segmentIndex, opIndex, opBufferAccesses.size());
     }
 
@@ -1561,8 +1671,15 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanDevice *ownerDevice, NnVulk
         vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(vk::PipelineLayoutCreateFlags(), 1, &descriptorSetLayouts[opIndex]);
         pipelineLayouts[opIndex] = context->device.createPipelineLayout(pipelineLayoutCreateInfo);
 
-        vk::ComputePipelineCreateInfo pipelineInfo(vk::PipelineCreateFlags(), shaderCreateInfos[opIndex], pipelineLayouts[opIndex], vk::Pipeline(), 0);
-        pipelines[opIndex] = context->device.createComputePipelines(pipelineCache, pipelineInfo).value.front();
+        pipelines[opIndex] = createComputePipeline(context, pipelineCache, pipelineLayouts[opIndex], shaderCreateInfos[opIndex]);
+        if (smallKMatmulShaderModules[opIndex]) {
+            smallKMatmulPipelines[opIndex] = createComputePipeline(
+                context,
+                pipelineCache,
+                pipelineLayouts[opIndex],
+                smallKMatmulShaderCreateInfos[opIndex]
+            );
+        }
     }
 
     fence = context->device.createFence(vk::FenceCreateInfo());
@@ -1580,6 +1697,7 @@ NnVulkanDeviceSegment::~NnVulkanDeviceSegment() {
     if (descriptorPool) context->device.destroyDescriptorPool(descriptorPool);
 
     for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
+        if (smallKMatmulPipelines[opIndex]) context->device.destroyPipeline(smallKMatmulPipelines[opIndex]);
         if (pipelines[opIndex]) context->device.destroyPipeline(pipelines[opIndex]);
         if (pipelineLayouts[opIndex]) context->device.destroyPipelineLayout(pipelineLayouts[opIndex]);
     }
@@ -1587,6 +1705,7 @@ NnVulkanDeviceSegment::~NnVulkanDeviceSegment() {
     if (pipelineCache) context->device.destroyPipelineCache(pipelineCache);
     for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
         if (descriptorSetLayouts[opIndex]) context->device.destroyDescriptorSetLayout(descriptorSetLayouts[opIndex]);
+        if (smallKMatmulShaderModules[opIndex]) context->device.destroyShaderModule(smallKMatmulShaderModules[opIndex]);
         if (shaderModules[opIndex]) context->device.destroyShaderModule(shaderModules[opIndex]);
     }
     VULKAN_TRACE("Destroyed segment");
@@ -1951,9 +2070,19 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
                 VULKAN_TRACE("Created memory barrier for %zu buffers", memoryBarriers.size());
             }
 
+            NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
+            const NnSize3D inputSize = resolveShaderLogicalSize(data, &opConfig->input);
+            const NnSize3D outputSize = resolveShaderLogicalSize(data, &opConfig->output);
+            const bool useSmallKMatmul = shouldUseSmallKQ80Q40MatmulPipeline(
+                opConfig,
+                inputSize,
+                outputSize,
+                smallKMatmulPipelines[opIndex]
+            );
+            const char *pipelineName = useSmallKMatmul ? "smallk" : "large";
             commandBuffer.bindPipeline(
                 vk::PipelineBindPoint::eCompute,
-                pipelines[opIndex]
+                useSmallKMatmul ? smallKMatmulPipelines[opIndex] : pipelines[opIndex]
             );
             commandBuffer.bindDescriptorSets(
                 vk::PipelineBindPoint::eCompute,
@@ -1963,13 +2092,27 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
                 {}
             );
 
-            NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
-            const NnSize3D inputSize = resolveShaderLogicalSize(data, &opConfig->input);
-            const NnSize3D outputSize = resolveShaderLogicalSize(data, &opConfig->output);
-
             const NnUint groupCountX = resolveShaderNumberOfWorkGroupsX(opConfig, inputSize, outputSize);
             const NnUint groupCountY = batchSize;
             const NnUint groupCountZ = resolveShaderNumberOfWorkGroupsZ(opConfig, inputSize, outputSize);
+
+            if (opConfig->code == OP_MATMUL && vulkanMatmulSelectDebugEnabled()) {
+                const NnMatmulOpConfig *matmulConfig = opConfig->config != nullptr
+                    ? (const NnMatmulOpConfig *)opConfig->config
+                    : nullptr;
+                const NnUint kBlocks = resolveQ80BlockCount(inputSize);
+                std::printf(
+                    "[vulkan][matmul-select] op=%s batchSize=%u kBlocks=%u n=%u view=%u pipeline=%s\n",
+                    opConfig->name != nullptr ? opConfig->name : "<unnamed>",
+                    (unsigned)batchSize,
+                    (unsigned)kBlocks,
+                    (unsigned)outputSize.x,
+                    (unsigned)(matmulConfig != nullptr ? matmulConfig->view : 0u),
+                    pipelineName
+                );
+                std::fflush(stdout);
+            }
+
             commandBuffer.dispatch(groupCountX, groupCountY, groupCountZ);
             VULKAN_TRACE("Dispatched %s (%d, %d, %d)", opCodeToString(opConfig->code), groupCountX, groupCountY, groupCountZ);
         }

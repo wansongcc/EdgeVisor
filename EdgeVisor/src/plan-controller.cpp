@@ -370,6 +370,30 @@ static void populateAblationPlanEvent(
     }
 }
 
+static bool planCommandHasHeadMove(const PlanCommand &cmd) {
+    if (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves > 0u) {
+        for (uint32_t i = 0; i < cmd.nMoves && i < DLLAMA_PLAN_CMD_MAX_MOVES; ++i) {
+            if (cmd.moves[i].headMove > 0u) return true;
+        }
+        return false;
+    }
+    return (cmd.cmdKind == PLAN_CMD_KIND_HEAD || cmd.cmdKind == PLAN_CMD_KIND_BOTH) && cmd.nHeadsToMove > 0u;
+}
+
+static void logRejectedJitPlan(
+    const PlanCommand &cmd,
+    const json &jcmd,
+    const char *reason,
+    uint64_t bindingCount) {
+    EdgeVisorAblationEvent ev;
+    populateAblationPlanEvent(ev, cmd, jcmd, "jit_plan_rejected", bindingCount);
+    ev.applySuccess = false;
+    ev.fallbackReason = reason;
+    ev.rejectedMoves = bindingCount;
+    ev.fallbackCount = 1u;
+    edgevisorAblationLogEvent(ev);
+}
+
 std::unique_ptr<PlanUdsController> PlanUdsController::start(const std::string &socketPath, RootLlmInference *inference) {
 #ifdef _WIN32
     (void)socketPath;
@@ -553,6 +577,18 @@ void PlanUdsController::run() {
                     cmd.triggerLayer = 0xFFFFFFFFu;
                 }
 
+                const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+                const bool hasHeadMove = planCommandHasHeadMove(cmd);
+                if (cfg.disableShardingController && hasHeadMove) {
+                    const uint64_t rejectedCount =
+                        (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u;
+                    logRejectedJitPlan(cmd, jcmd, "sharding_controller_disabled", rejectedCount);
+                    resp = json{{"ok", false}, {"rejected", true}, {"reason", "sharding_controller_disabled"}, {"cmd", cmdToJson(cmd)}};
+                    writeLine(cfd, resp.dump());
+                    ::close(cfd);
+                    continue;
+                }
+
                 const uint64_t cacheSeq = planCommandCache().store(cmd);
                 EdgeVisorAblationEvent ev;
                 populateAblationPlanEvent(
@@ -600,6 +636,15 @@ void PlanUdsController::run() {
                 } else {
                     cmd.triggerPos = 0xFFFFFFFFu;
                     cmd.triggerLayer = 0xFFFFFFFFu;
+                }
+
+                const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+                if (cfg.disablePipelineBalancer) {
+                    logRejectedJitPlan(cmd, jcmd, "pipeline_balancer_disabled", 1u);
+                    resp = json{{"ok", false}, {"rejected", true}, {"reason", "pipeline_balancer_disabled"}, {"cmd", cmdToJson(cmd)}, {"ppMigration", true}};
+                    writeLine(cfd, resp.dump());
+                    ::close(cfd);
+                    continue;
                 }
 
                 const uint64_t cacheSeq = planCommandCache().store(cmd);

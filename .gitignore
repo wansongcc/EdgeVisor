@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 *.log
 agent_bench_results/
+.DS_Store
+artifacts/shadowkv_ablation_20260615/
+artifacts/pointer_swizzling_microbench_20260615/
+artifacts/jit_hierarchy_ablation_20260615/

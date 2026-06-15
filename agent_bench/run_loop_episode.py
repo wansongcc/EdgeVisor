@@ -97,6 +97,8 @@ def main() -> int:
     )
     parser.add_argument("--jit-mode", choices=["enabled", "static", "greedy", "oracle"], default="enabled")
     parser.add_argument("--vg-mode", choices=["enabled", "flat", "random", "pure_pp", "no_elastic_vg"], default="enabled")
+    parser.add_argument("--disable-sharding-controller", action="store_true", help="Disable head-level JIT sharding-controller plans.")
+    parser.add_argument("--disable-pipeline-balancer", action="store_true", help="Disable PP layer-level JIT pipeline-balancer plans.")
     parser.add_argument("--fallback-policy", default="disabled_unless_necessary")
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--edgevisor-ablation-config", type=Path, default=None)
@@ -176,6 +178,8 @@ def main() -> int:
                 "pointer_swizzling_mode": args.pointer_swizzling_mode,
                 "jit_mode": args.jit_mode,
                 "vg_mode": args.vg_mode,
+                "disable_sharding_controller": args.disable_sharding_controller,
+                "disable_pipeline_balancer": args.disable_pipeline_balancer,
                 "fallback_policy": args.fallback_policy,
                 "allow_head_kv_migration": args.allow_head_kv_migration,
                 "enable_pp_migration": args.enable_pp_migration,

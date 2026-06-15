@@ -127,6 +127,8 @@ worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-exe
 Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o ablation.o ${DEPS}
 # [TAB]
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
+pointer-swizzling-microbench: src/test/pointer_swizzling_microbench.cpp nn-quants.o nn-core.o nn-executor.o nn-cpu.o nn-cpu-ops.o llamafile-sgemm.o plan-command.o ablation.o ${DEPS}
+	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 dllama-api: src/dllama-api.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}

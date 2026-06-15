@@ -12,6 +12,34 @@
     "list_sort",
     "hash_text"
   ],
+  "required_tool_arguments": {
+    "calculator": {
+      "expression": "12345*6789"
+    },
+    "lookup_fact": {
+      "key": "gpu_policy"
+    },
+    "text_stats": {
+      "text": "EdgeVisor agent backend"
+    },
+    "unit_convert": {
+      "value": 42,
+      "from_unit": "celsius",
+      "to_unit": "fahrenheit"
+    },
+    "list_sort": {
+      "items": [
+        7,
+        2,
+        9,
+        1
+      ]
+    },
+    "hash_text": {
+      "algorithm": "sha256",
+      "text": "agent-loop"
+    }
+  },
   "reject_duplicate_required_tools": true,
   "task": "Run a compact agent workflow. Use one tool per turn and gather observations before final_answer: calculate 12345 * 6789, lookup gpu_policy, compute text_stats for 'EdgeVisor agent backend', convert 42 celsius to fahrenheit, sort [7, 2, 9, 1], and compute sha256 for 'agent-loop'. After all observations, return one concise final report.",
   "edgevisor_dynamic_plan": {

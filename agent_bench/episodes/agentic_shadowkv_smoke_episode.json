@@ -1,0 +1,39 @@
+{
+  "id": "agentic_shadowkv_smoke_loop",
+  "description": "Short loop-schema agent episode for Shadow KV smoke tests with two required tool calls.",
+  "max_llm_turns": 6,
+  "max_tokens": 64,
+  "min_tool_calls": 2,
+  "required_tools": [
+    "calculator",
+    "lookup_fact"
+  ],
+  "required_tool_arguments": {
+    "calculator": {
+      "expression": "12345*6789"
+    },
+    "lookup_fact": {
+      "key": "gpu_policy"
+    }
+  },
+  "reject_duplicate_required_tools": true,
+  "task": "Run a short agent workflow. Use one tool per turn and gather observations before final_answer: calculate 12345 * 6789 and lookup gpu_policy. After both observations, return one concise final report.",
+  "edgevisor_dynamic_plan": {
+    "enabled": true,
+    "trigger_generation": "agent_step_02",
+    "mode": "next_barrier",
+    "stage": 0,
+    "delay_s": 0.0,
+    "consume_timeout_s": 20.0,
+    "fluctuation_type": "mixed",
+    "moves": [
+      {
+        "fromNodeIndex": 1,
+        "toNodeIndex": 0,
+        "cmdKind": 3,
+        "headMove": 1,
+        "ffnMove": 256
+      }
+    ]
+  }
+}

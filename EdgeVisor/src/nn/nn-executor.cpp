@@ -1,10 +1,13 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 #include <sstream>
 #include <string>
+#include <vector>
 #include "nn-executor.hpp"
 #include "nn-cpu.hpp"
 #include "ablation.hpp"
@@ -149,6 +152,146 @@ static NnUint inferMaxLayerIndex(const NnNodeConfig *nodeConfig) {
         }
     }
     return maxIdx;
+}
+
+struct PointerBindingWorkStats {
+    uint64_t bindingUpdates = 0u;
+    uint64_t materializedBytes = 0u;
+    uint64_t fallbackCount = 0u;
+};
+
+struct PointerRebuildDescriptor {
+    uint32_t opCode;
+    uint32_t opIndex;
+    uint32_t inputKey;
+    uint32_t outputKey;
+    uint32_t weightHash;
+    uint32_t dependencyMask;
+    uint64_t descriptorHash;
+};
+
+static volatile uint64_t gPointerBindingSink = 0u;
+
+static uint64_t parseEnvUint64Or(const char *name, uint64_t fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(v, &end, 10);
+    if (end == v) return fallback;
+    return (uint64_t)parsed;
+}
+
+static uint64_t estimateOpWeightBytes(const NnOpConfig &op) {
+    if (op.weightSize.nBytes > 0u) return (uint64_t)op.weightSize.nBytes;
+    if (op.weightSize.length > 0u) return (uint64_t)op.weightSize.length * sizeof(float);
+    return 0u;
+}
+
+static uint64_t estimateNodeWeightBytes(const NnNodeConfig *nodeConfig) {
+    uint64_t total = 0u;
+    if (nodeConfig == nullptr || nodeConfig->segments == nullptr) return total;
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        const NnSegmentConfig &seg = nodeConfig->segments[s];
+        for (NnUint i = 0; i < seg.nOps; ++i) {
+            total += estimateOpWeightBytes(seg.ops[i]);
+            total += (uint64_t)seg.ops[i].configSize;
+        }
+    }
+    return total;
+}
+
+static PointerBindingWorkStats simulateOperatorRebuildBindingWork(const NnNodeConfig *nodeConfig) {
+    PointerBindingWorkStats stats;
+    if (nodeConfig == nullptr || nodeConfig->segments == nullptr) return stats;
+
+    uint64_t totalOps = 0u;
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        totalOps += (uint64_t)nodeConfig->segments[s].nOps;
+    }
+    if (totalOps == 0u) return stats;
+
+    const uint64_t rounds = parseEnvUint64Or("EDGEVISOR_OPERATOR_REBUILD_ROUNDS", 96u);
+    std::vector<PointerRebuildDescriptor> graph;
+    graph.reserve((size_t)totalOps);
+    uint64_t checksum = 1469598103934665603ull;
+
+    for (uint64_t r = 0u; r < rounds; ++r) {
+        graph.clear();
+        for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+            const NnSegmentConfig &seg = nodeConfig->segments[s];
+            for (NnUint i = 0; i < seg.nOps; ++i) {
+                const NnOpConfig &op = seg.ops[i];
+                PointerRebuildDescriptor d;
+                d.opCode = (uint32_t)op.code;
+                d.opIndex = (uint32_t)op.index;
+                d.inputKey = ((uint32_t)op.input.source << 24) ^ ((uint32_t)op.input.type << 16) ^
+                             ((uint32_t)op.input.sliceTag << 8) ^ (uint32_t)op.input.pointerIndex;
+                d.outputKey = ((uint32_t)op.output.source << 24) ^ ((uint32_t)op.output.type << 16) ^
+                              ((uint32_t)op.output.sliceTag << 8) ^ (uint32_t)op.output.pointerIndex;
+                d.weightHash = (uint32_t)((estimateOpWeightBytes(op) >> 6) ^ op.configSize ^ (uint64_t)(s * 131u + i));
+                d.dependencyMask = (uint32_t)((d.inputKey * 16777619u) ^ (d.outputKey + d.weightHash + (uint32_t)r));
+                d.descriptorHash = ((uint64_t)d.inputKey << 32) ^ d.outputKey ^ ((uint64_t)d.weightHash << 7) ^ r;
+                graph.push_back(d);
+            }
+        }
+
+        for (size_t i = 0; i < graph.size(); ++i) {
+            PointerRebuildDescriptor &d = graph[i];
+            const size_t prev = (i == 0u) ? (graph.size() - 1u) : (i - 1u);
+            const size_t next = (i + 1u == graph.size()) ? 0u : (i + 1u);
+            d.dependencyMask ^= graph[prev].outputKey + graph[next].inputKey + (uint32_t)i;
+            d.descriptorHash ^= ((uint64_t)d.dependencyMask << 17) | ((uint64_t)d.opCode << 3);
+            checksum ^= d.descriptorHash + 0x9e3779b97f4a7c15ull + (checksum << 6) + (checksum >> 2);
+        }
+    }
+
+    gPointerBindingSink ^= checksum;
+    stats.bindingUpdates = totalOps;
+    stats.fallbackCount = 1u;
+    return stats;
+}
+
+static PointerBindingWorkStats simulateWeightRematerializeBindingWork(const NnNodeConfig *nodeConfig) {
+    PointerBindingWorkStats stats;
+    uint64_t targetBytes = parseEnvUint64Or("EDGEVISOR_WEIGHT_REMATERIALIZE_BYTES", 0u);
+    if (targetBytes == 0u) {
+        const uint64_t estimated = estimateNodeWeightBytes(nodeConfig);
+        targetBytes = estimated > 0u ? estimated : (64ull * 1024ull * 1024ull);
+    }
+    const uint64_t capBytes = parseEnvUint64Or("EDGEVISOR_WEIGHT_REMATERIALIZE_MAX_BYTES", 256ull * 1024ull * 1024ull);
+    if (capBytes > 0u && targetBytes > capBytes) targetBytes = capBytes;
+    const uint64_t passes = std::max<uint64_t>(1u, parseEnvUint64Or("EDGEVISOR_WEIGHT_REMATERIALIZE_PASSES", 1u));
+    const uint64_t chunkBytesRaw = parseEnvUint64Or("EDGEVISOR_WEIGHT_REMATERIALIZE_CHUNK_BYTES", 8ull * 1024ull * 1024ull);
+    const size_t chunkBytes = (size_t)std::max<uint64_t>(1024u, std::min<uint64_t>(chunkBytesRaw, targetBytes));
+
+    std::vector<NnByte> host(chunkBytes);
+    std::vector<NnByte> device(chunkBytes);
+    for (size_t i = 0u; i < host.size(); ++i) {
+        host[i] = (NnByte)((i * 131u + 17u) & 0xffu);
+    }
+
+    uint64_t copied = 0u;
+    uint64_t checksum = 1099511628211ull;
+    for (uint64_t p = 0u; p < passes; ++p) {
+        uint64_t passCopied = 0u;
+        while (passCopied < targetBytes) {
+            const size_t n = (size_t)std::min<uint64_t>((uint64_t)chunkBytes, targetBytes - passCopied);
+            std::memcpy(device.data(), host.data(), n);
+            if (n > 0u) {
+                device[0] ^= (NnByte)((copied + p) & 0xffu);
+                checksum ^= (uint64_t)device[0] + ((uint64_t)device[n - 1u] << 8) + copied;
+                checksum *= 1099511628211ull;
+            }
+            copied += (uint64_t)n;
+            passCopied += (uint64_t)n;
+        }
+    }
+
+    gPointerBindingSink ^= checksum;
+    stats.bindingUpdates = (nodeConfig != nullptr) ? (uint64_t)nodeConfig->nSegments : 0u;
+    stats.materializedBytes = targetBytes * passes;
+    stats.fallbackCount = 1u;
+    return stats;
 }
 
 void NnFakeNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
@@ -321,6 +464,10 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.segmentLayerIndex = segmentLayerIndex.empty() ? nullptr : segmentLayerIndex.data();
     context.segmentHasExecOps = segmentHasExecOps.empty() ? nullptr : segmentHasExecOps.data();
     context.nSegments = (this->nodeConfig != nullptr) ? this->nodeConfig->nSegments : 0u;
+    context.currentStepIndex.store(0u);
+    context.doneThreadCount.store(0u);
+    context.isAlive.store(false);
+    context.batchSize = 0u;
     if (benchmark)
         context.timer = new Timer();
     else
@@ -497,21 +644,32 @@ void NnExecutor::refreshPointers() {
     event.eventId = "binding_refresh";
     event.selectedPolicy = std::string("pointer_") + toString(cfg.pointerSwizzlingMode);
     event.bindingUpdateCount = nodeConfig != nullptr ? nodeConfig->nSegments : 0u;
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    PointerBindingWorkStats stats;
     if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::OPERATOR_REBUILD) {
+        stats = simulateOperatorRebuildBindingWork(nodeConfig);
         event.fallbackReason = "operator_rebuild_substitutes_lightweight_pointer_swizzling";
         event.stallTimeMs = 0.0;
     } else if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::WEIGHT_REMATERIALIZE) {
+        stats = simulateWeightRematerializeBindingWork(nodeConfig);
         event.fallbackReason = "weight_rematerialize_substitutes_lightweight_pointer_swizzling";
-        event.materializedBytes = (nodeConfig != nullptr) ? (uint64_t)nodeConfig->nSegments : 0u;
         event.stallTimeMs = 0.0;
     }
-    edgevisorAblationLogEvent(event);
+
     for (NnUint segmentIndex = 0; segmentIndex < nodeConfig->nSegments; segmentIndex++) {
         NnDeviceSegment *segment = segments[segmentIndex].get();
         if (segment == nullptr)
             continue;
         segment->refreshPointers();
     }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+
+    event.tBindMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (stats.bindingUpdates > 0u) event.bindingUpdateCount = stats.bindingUpdates;
+    event.materializedBytes = stats.materializedBytes;
+    event.fallbackCount = stats.fallbackCount;
+    edgevisorAblationLogEvent(event);
 }
 
 void NnExecutor::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
@@ -594,10 +752,20 @@ void NnExecutor::setRedundantLayerEnabled(NnUint layerIndex, bool enabled) {
     std::fflush(stdout);
 }
 
-bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow) {
-    kRow.assign(kvDim, 0.0f);
-    vRow.assign(kvDim, 0.0f);
-    if (nodeConfig == nullptr || segments.empty() || kvDim == 0u) return false;
+bool NnExecutor::exportLayerKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    NnUint kvDim,
+    std::vector<float> &kRow,
+    std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
+    const bool partial = rangeLen != 0u;
+    const NnUint outDim = partial ? rangeLen : kvDim;
+    kRow.assign(outDim, 0.0f);
+    vRow.assign(outDim, 0.0f);
+    if (nodeConfig == nullptr || segments.empty() || kvDim == 0u || outDim == 0u) return false;
+    if (partial && rangeStart + rangeLen > kvDim) return false;
 
     bool readAny = false;
     std::unordered_set<NnUint> readK;
@@ -609,7 +777,7 @@ bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvD
         if (baseSeg == nullptr) continue;
         auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(baseSeg);
         if (cpuSeg == nullptr || cpuSeg->device == nullptr) {
-            if (baseSeg->exportLayerKvRow(layerIndex, position, kvDim, kRow, vRow)) {
+            if (baseSeg->exportLayerKvRow(layerIndex, position, kvDim, kRow, vRow, rangeStart, rangeLen)) {
                 readAny = true;
             }
             continue;
@@ -630,29 +798,33 @@ bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvD
                 if (bSize.floatType != F_32 || bSize.x == 0u || bSize.y == 0u) return;
                 if (position >= bSize.y) return;
 
-                const NnUint srcStart = cfg->kvStart;
-                const NnUint needLen = cfg->kvDim0;
-                if (srcStart >= bSize.x || srcStart >= dstRow.size() || needLen == 0u) return;
+                const NnUint srcStart = partial ? rangeStart : cfg->kvStart;
+                const NnUint dstStart = partial ? 0u : cfg->kvStart;
+                const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+                if (srcStart >= bSize.x || dstStart >= dstRow.size() || needLen == 0u) return;
 
                 const NnUint srcAvail = bSize.x - srcStart;
-                const NnUint dstAvail = (NnUint)dstRow.size() - srcStart;
+                const NnUint dstAvail = (NnUint)dstRow.size() - dstStart;
                 const NnUint readLen = std::min(needLen, std::min(srcAvail, dstAvail));
                 if (readLen == 0u) return;
 
                 const float *buf = (const float *)cpuSeg->device->buffers[bufIdx];
                 const float *src = buf + (NnSize)position * (NnSize)bSize.x + (NnSize)srcStart;
-                std::memcpy(dstRow.data() + srcStart, src, (size_t)readLen * sizeof(float));
+                std::memcpy(dstRow.data() + dstStart, src, (size_t)readLen * sizeof(float));
                 seen.insert(bufIdx);
                 readAny = true;
 
-                std::printf("🧩 [kv-export] node=%u seg=%u layer=%u pos=%u buf=%u range=[%u,%u)\n",
+                std::printf("🧩 [kv-export] node=%u seg=%u layer=%u pos=%u buf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                     (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
                     (unsigned)s,
                     (unsigned)layerIndex,
                     (unsigned)position,
                     (unsigned)bufIdx,
                     (unsigned)srcStart,
-                    (unsigned)(srcStart + readLen));
+                    (unsigned)(srcStart + readLen),
+                    (unsigned)dstStart,
+                    (unsigned)(dstStart + readLen),
+                    partial ? 1u : 0u);
             };
 
             readOne(cfg->keyCacheBufferIndex, kRow, readK);
@@ -671,9 +843,16 @@ bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvD
     return readAny;
 }
 
-bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
+bool NnExecutor::applyTransferredKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    const std::vector<float> &kRow,
+    const std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
     if (nodeConfig == nullptr || segments.empty()) return false;
     if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return false;
+    if (rangeLen != 0u && rangeLen != kRow.size()) return false;
 
     bool wroteAny = false;
     std::unordered_set<NnUint> writtenK;
@@ -685,7 +864,7 @@ bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const
         if (baseSeg == nullptr) continue;
         auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(baseSeg);
         if (cpuSeg == nullptr || cpuSeg->device == nullptr) {
-            if (baseSeg->applyTransferredKvRow(layerIndex, position, kRow, vRow)) {
+            if (baseSeg->applyTransferredKvRow(layerIndex, position, kRow, vRow, rangeStart, rangeLen)) {
                 wroteAny = true;
             }
             continue;
@@ -707,22 +886,24 @@ bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const
                 if (bSize.floatType != F_32 || bSize.x == 0u || bSize.y == 0u) return;
                 if (position >= bSize.y) return;
 
-                const NnUint srcStart = cfg->kvStart;
-                const NnUint needLen = cfg->kvDim0;
-                if (srcStart >= srcRow.size() || srcStart >= bSize.x || needLen == 0u) return;
+                const bool partial = rangeLen != 0u;
+                const NnUint dstStart = partial ? rangeStart : cfg->kvStart;
+                const NnUint srcStart = partial ? 0u : cfg->kvStart;
+                const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+                if (srcStart >= srcRow.size() || dstStart >= bSize.x || needLen == 0u) return;
 
                 const NnUint srcAvail = (NnUint)srcRow.size() - srcStart;
-                const NnUint dstAvail = bSize.x - srcStart;
+                const NnUint dstAvail = bSize.x - dstStart;
                 const NnUint writeLen = std::min(needLen, std::min(srcAvail, dstAvail));
                 if (writeLen == 0u) return;
 
                 float *buf = (float *)cpuSeg->device->buffers[bufIdx];
-                float *dst = buf + (NnSize)position * (NnSize)bSize.x + (NnSize)srcStart;
+                float *dst = buf + (NnSize)position * (NnSize)bSize.x + (NnSize)dstStart;
                 std::memcpy(dst, srcRow.data() + srcStart, (size_t)writeLen * sizeof(float));
                 written.insert(bufIdx);
                 wroteAny = true;
 
-                std::printf("🧩 [kv-write] node=%u seg=%u layer=%u pos=%u %sBuf=%u bufX=%u srcRange=[%u,%u) dstRange=[%u,%u)\n",
+                std::printf("🧩 [kv-write] node=%u seg=%u layer=%u pos=%u %sBuf=%u bufX=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                     (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
                     (unsigned)s,
                     (unsigned)layerIndex,
@@ -732,8 +913,9 @@ bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const
                     (unsigned)bSize.x,
                     (unsigned)srcStart,
                     (unsigned)(srcStart + writeLen),
-                    (unsigned)srcStart,
-                    (unsigned)(srcStart + writeLen));
+                    (unsigned)dstStart,
+                    (unsigned)(dstStart + writeLen),
+                    partial ? 1u : 0u);
                 std::fflush(stdout);
             };
 

@@ -23,9 +23,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
-BASE = Path("/home/cc/yhbian/B01")
+BASE = Path(os.environ.get("B01_ROOT", "/home/cc/yhbian/B01"))
 PROJ = BASE / "EdgeVisor"
-HOST_MODEL_DIR = Path("/home/cc/dllama/distributed-llama/models")
+ENGINE_DIR = PROJ / "EdgeVisor"
+CONTAINER_ENGINE_DIR = "/workspace/EdgeVisor/EdgeVisor"
+UDS_CLIENT = ENGINE_DIR / "examples/plan-uds-client.py"
+HOST_MODEL_DIR = Path(os.environ.get("B01_MODEL_DIR", "/home/cc/dllama/distributed-llama/models"))
 IMAGE = "dllama-exp-env:latest"
 TOKENIZER = "/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
 MODELS = {
@@ -191,7 +194,7 @@ def wait_for_uds(sock_path, timeout_s=180):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if sock_path.exists():
-            p = run(["python3", str(PROJ / "examples/plan-uds-client.py"), str(sock_path), "ping"], check=False)
+            p = run(["python3", str(UDS_CLIENT), str(sock_path), "ping"], check=False)
             if p.returncode == 0:
                 return True
         time.sleep(0.5)
@@ -317,7 +320,7 @@ def start_cluster(model_name, variant, exp_name, steps=96, max_seq_len=2048, ext
                 "-v",
                 f"{HOST_MODEL_DIR}:/models:ro",
                 "-w",
-                "/workspace/EdgeVisor",
+                CONTAINER_ENGINE_DIR,
                 IMAGE,
                 "bash",
                 "-lc",
@@ -357,8 +360,10 @@ def start_cluster(model_name, variant, exp_name, steps=96, max_seq_len=2048, ext
             f"{HOST_MODEL_DIR}:/models:ro",
             "-v",
             f"{SOCK_DIR}:/uds",
+            "-v",
+            f"{test_dir}:/out",
             "-w",
-            "/workspace/EdgeVisor",
+            CONTAINER_ENGINE_DIR,
             "-e",
             f"DLLAMA_PLAN_CTRL_SOCKET={sock_cont}",
             IMAGE,
@@ -403,7 +408,7 @@ def uds_set_plan(sock, seq, from_node, to_node, stage=0, head=1, ffn=0, mode="ne
     t0 = time.time()
     args = [
         "python3",
-        str(PROJ / "examples/plan-uds-client.py"),
+        str(UDS_CLIENT),
         str(sock),
         "set_plan",
         "--seq",
@@ -681,11 +686,11 @@ def main():
             "-v",
             f"{PROJ}:/workspace/EdgeVisor",
             "-w",
-            "/workspace/EdgeVisor",
+            CONTAINER_ENGINE_DIR,
             IMAGE,
             "bash",
             "-lc",
-            "make -j$(nproc) dllama",
+            "make clean >/dev/null 2>&1 || true; make -j$(nproc) dllama",
         ],
         check=False,
         timeout=900,

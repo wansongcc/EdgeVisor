@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <algorithm>
+#include <map>
+#include <utility>
+#include <ctime>
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
@@ -136,6 +139,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
     p.enableStageFullWeights = args->enableStageFullWeights ? 1u : 0u;
     p.enableKvRedundancyDuringMigration = args->enableKvRedundancyDuringMigration ? 1u : 0u;
+    p.allowNoShadowHeadMigration = args->allowNoShadowHeadMigration ? 1u : 0u;
     p.enableKvAggregate = args->enableKvAggregate ? 1u : 0u;
     p.runtimeRedundantBoundaryLayers = args->runtimeRedundantBoundaryLayers;
     p.runtimeActiveSegEnabled = args->runtimeActiveSegEnabled ? 1u : 0u;
@@ -145,6 +149,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.modelPathLen = 0u;
     p.ratiosLen = 0u;
     p.primarySkipLayersLen = 0u;
+    p.kvRedundancyLen = 0u;
 
     if (args->modelPath != nullptr) {
         p.flags |= LLM_BOOTSTRAP_HAS_MODEL_PATH;
@@ -158,6 +163,10 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
         p.flags |= LLM_BOOTSTRAP_HAS_PRIMARY_SKIP_LAYERS;
         p.primarySkipLayersLen = (NnUint)std::strlen(args->runtimePrimarySkipLayersStr) + 1u;
     }
+    if (args->kvRedundancyStr != nullptr && args->kvRedundancyStr[0] != '\0') {
+        p.flags |= LLM_BOOTSTRAP_HAS_KV_REDUNDANCY;
+        p.kvRedundancyLen = (NnUint)std::strlen(args->kvRedundancyStr) + 1u;
+    }
     if (args->enableKvAggregate) {
         p.flags |= LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE;
     }
@@ -166,9 +175,15 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     if (p.modelPathLen > 0u) network->write(socketIndex, args->modelPath, p.modelPathLen);
     if (p.ratiosLen > 0u) network->write(socketIndex, args->ratiosStr, p.ratiosLen);
     if (p.primarySkipLayersLen > 0u) network->write(socketIndex, args->runtimePrimarySkipLayersStr, p.primarySkipLayersLen);
+    if (p.kvRedundancyLen > 0u) network->write(socketIndex, args->kvRedundancyStr, p.kvRedundancyLen);
 }
 
-static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &modelPath, std::string &ratiosStr, std::string &primarySkipLayersStr) {
+static LlmBootstrapPacket readBootstrapPacket(
+    NnNetwork *network,
+    std::string &modelPath,
+    std::string &ratiosStr,
+    std::string &primarySkipLayersStr,
+    std::string &kvRedundancyStr) {
     LlmBootstrapPacket p;
     network->read(ROOT_SOCKET_INDEX, &p, sizeof(p));
     if (p.magic != LLM_BOOTSTRAP_MAGIC)
@@ -179,6 +194,7 @@ static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &m
     modelPath.clear();
     ratiosStr.clear();
     primarySkipLayersStr.clear();
+    kvRedundancyStr.clear();
     if ((p.flags & LLM_BOOTSTRAP_HAS_MODEL_PATH) != 0u) {
         std::vector<char> buf(p.modelPathLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.modelPathLen);
@@ -193,6 +209,11 @@ static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &m
         std::vector<char> buf(p.primarySkipLayersLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.primarySkipLayersLen);
         primarySkipLayersStr.assign(buf.data());
+    }
+    if ((p.flags & LLM_BOOTSTRAP_HAS_KV_REDUNDANCY) != 0u) {
+        std::vector<char> buf(p.kvRedundancyLen);
+        network->read(ROOT_SOCKET_INDEX, buf.data(), p.kvRedundancyLen);
+        kvRedundancyStr.assign(buf.data());
     }
     return p;
 }
@@ -244,12 +265,23 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.enablePlanBarrier = false;
     args.enableStageFullWeights = false;
     args.enableKvRedundancyDuringMigration = true;
+    args.allowNoShadowHeadMigration = false;
     args.enableKvAggregate = false;
     args.enablePpMigration = false;
     args.runtimeRedundantBoundaryLayers = 1u;
     args.runtimeActiveSegEnabled = true;
     args.runtimeRedundantSegEnabled = false;
     args.runtimePrimarySkipLayersStr = nullptr;
+    args.edgevisorAblationConfigPath = nullptr;
+    args.shadowKvModeStr = nullptr;
+    args.pointerSwizzlingModeStr = nullptr;
+    args.jitModeStr = nullptr;
+    args.vgModeStr = nullptr;
+    args.disableShardingControllerStr = nullptr;
+    args.disablePipelineBalancerStr = nullptr;
+    args.fallbackPolicyStr = nullptr;
+    args.ablationLogPath = nullptr;
+    args.experimentId = nullptr;
 
     {
         int envBoundaryLayers = -1;
@@ -328,6 +360,17 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             continue;
         }
 
+        if (std::strcmp(name, "--allow-no-shadow-head-migration") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.allowNoShadowHeadMigration = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.allowNoShadowHeadMigration = true;
+                i += 1;
+            }
+            continue;
+        }
+
         if (std::strcmp(name, "--enable-kv-aggregate") == 0) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 args.enableKvAggregate = std::atoi(argv[i + 1]) != 0;
@@ -367,6 +410,28 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.runtimeRedundantSegEnabled = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--disable-sharding-controller") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.disableShardingControllerStr = argv[i + 1];
+                i += 2;
+            } else {
+                args.disableShardingControllerStr = (char *)"1";
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--disable-pipeline-balancer") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.disablePipelineBalancerStr = argv[i + 1];
+                i += 2;
+            } else {
+                args.disablePipelineBalancerStr = (char *)"1";
                 i += 1;
             }
             continue;
@@ -462,6 +527,22 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.runtimeRedundantBoundaryLayers = (NnUint)x;
         } else if (std::strcmp(name, "--runtime-primary-skip-layers") == 0) {
             args.runtimePrimarySkipLayersStr = value;
+        } else if (std::strcmp(name, "--edgevisor-ablation-config") == 0) {
+            args.edgevisorAblationConfigPath = value;
+        } else if (std::strcmp(name, "--shadow-kv-mode") == 0) {
+            args.shadowKvModeStr = value;
+        } else if (std::strcmp(name, "--pointer-swizzling-mode") == 0) {
+            args.pointerSwizzlingModeStr = value;
+        } else if (std::strcmp(name, "--jit-mode") == 0) {
+            args.jitModeStr = value;
+        } else if (std::strcmp(name, "--vg-mode") == 0) {
+            args.vgModeStr = value;
+        } else if (std::strcmp(name, "--fallback-policy") == 0) {
+            args.fallbackPolicyStr = value;
+        } else if (std::strcmp(name, "--ablation-log-path") == 0) {
+            args.ablationLogPath = value;
+        } else if (std::strcmp(name, "--experiment-id") == 0) {
+            args.experimentId = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -938,6 +1019,96 @@ static bool areNodesInSameStageLocal(const NnUnevenPartitionPlan *plan, NnUint n
     return stageContainsNodeLocal(stageA, nodeB);
 }
 
+static std::vector<NnUint> stageNodeListLocal(const NnStageConfig *stage) {
+    std::vector<NnUint> out;
+    if (stage == nullptr) return out;
+    out.reserve(stage->nNodes);
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        out.push_back(stage->nodeIndices[i]);
+    }
+    return out;
+}
+
+static bool stageRankLocal(const NnStageConfig *stage, NnUint node, NnUint *rank) {
+    if (rank != nullptr) *rank = 0u;
+    if (stage == nullptr || stage->nodeIndices == nullptr) return false;
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        if (stage->nodeIndices[i] == node) {
+            if (rank != nullptr) *rank = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool getHeadMigrationTargetRangeLocal(
+    const NnUnevenPartitionPlan *plan,
+    const PlanCommand &cmd,
+    bool planAfterApply,
+    NnUint *stageIndex,
+    NnUint *fromNode,
+    NnUint *toNode,
+    NnUint *rangeStart,
+    NnUint *rangeLen) {
+    if (stageIndex != nullptr) *stageIndex = 0xFFFFFFFFu;
+    if (fromNode != nullptr) *fromNode = 0u;
+    if (toNode != nullptr) *toNode = 0u;
+    if (rangeStart != nullptr) *rangeStart = 0u;
+    if (rangeLen != nullptr) *rangeLen = 0u;
+    if (plan == nullptr || plan->nStages == 0u ||
+        plan->kvHeadSplit.starts == nullptr || plan->kvHeadSplit.lengths == nullptr) {
+        return false;
+    }
+
+    NnUint f = 0u;
+    NnUint t = 0u;
+    NnUint move = 0u;
+    if (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves > 0u) {
+        const PlanMove &m = cmd.moves[0];
+        if (m.cmdKind != PLAN_CMD_KIND_HEAD && m.cmdKind != PLAN_CMD_KIND_BOTH) return false;
+        f = m.fromNodeIndex;
+        t = m.toNodeIndex;
+        move = m.headMove;
+    } else {
+        if (cmd.cmdKind != PLAN_CMD_KIND_HEAD && cmd.cmdKind != PLAN_CMD_KIND_BOTH) return false;
+        f = cmd.fromNodeIndex;
+        t = cmd.toNodeIndex;
+        move = cmd.nHeadsToMove;
+    }
+    if (move == 0u || f >= plan->nNodes || t >= plan->nNodes || f == t) return false;
+
+    const NnStageConfig *stage = findStageForNodeLocal(plan, f);
+    if (stage == nullptr || !stageContainsNodeLocal(stage, t)) return false;
+    NnUint rf = 0u;
+    NnUint rt = 0u;
+    if (!stageRankLocal(stage, f, &rf) || !stageRankLocal(stage, t, &rt)) return false;
+    const NnUint dist = (rf >= rt) ? (rf - rt) : (rt - rf);
+    if (dist != 1u) return false;
+
+    const NnUint curStart = plan->kvHeadSplit.starts[f];
+    const NnUint curLen = plan->kvHeadSplit.lengths[f];
+    const NnUint preLen = planAfterApply ? (curLen + move) : curLen;
+    if (preLen < move) return false;
+
+    NnUint start = 0u;
+    if (rt > rf) {
+        start = curStart + preLen - move;
+    } else {
+        if (planAfterApply) {
+            if (curStart < move) return false;
+            start = curStart - move;
+        } else {
+            start = curStart;
+        }
+    }
+    if (stageIndex != nullptr) *stageIndex = stage->stageIndex;
+    if (fromNode != nullptr) *fromNode = f;
+    if (toNode != nullptr) *toNode = t;
+    if (rangeStart != nullptr) *rangeStart = start;
+    if (rangeLen != nullptr) *rangeLen = move;
+    return true;
+}
+
 RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
@@ -960,6 +1131,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     waitingKvAckNodes.clear();
     waitingKvAckNodeExpected.clear();
     waitingKvAckNodeReceived.clear();
+    tokenHistory.clear();
 
     boundaryLayerForMigration = -1;
     migrationLayers.clear();
@@ -973,9 +1145,21 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     migrationAckPos = -1;
     migrationAckLayer = -1;
     lastPpPlanCacheSeqApplied = 0ull;
+    lastHeadRecoveryPlanCacheSeqApplied = 0ull;
+    headRecoveryRangeCacheSeq = 0ull;
+    headRecoveryRangeCached = false;
+    headRecoveryPlanAfterApply = false;
+    headRecoveryStageIndex = 0xFFFFFFFFu;
+    headRecoveryFromNode = 0u;
+    headRecoveryToNode = 0u;
+    headRecoveryRangeHeadStart = 0u;
+    headRecoveryRangeHeadLen = 0u;
     migrationFromNodeIndex = 0u;
     nextStageRootNode = (NnUint)-1;
     kvAckSocketIndex = -1;
+    nextKvExportRequestId = 1u;
+    lastMigrationStateTransferBytes = 0u;
+    lastMigrationExportedRows = 0u;
 
     if (plan != nullptr) {
         const NnStageConfig *myStage = findStageForNodeLocal(plan, 0u);
@@ -1059,6 +1243,13 @@ void RootLlmInference::setPosition(NnUint position) {
 void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
     assert(batchIndex >= 0 && batchIndex < execution->batchSize);
     tokenPipe[batchIndex] = (float)token;
+    const NnUint pos = controlPacket.position + batchIndex;
+    if (header != nullptr && pos < header->seqLen) {
+        if (tokenHistory.size() <= pos) {
+            tokenHistory.resize((size_t)pos + 1u, -1);
+        }
+        tokenHistory[pos] = (int)token;
+    }
 }
 
 void RootLlmInference::setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments) {
@@ -1089,7 +1280,9 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
     NnUint layerIndex,
     NnUint position,
     const std::vector<float> &kRow,
-    const std::vector<float> &vRow) {
+    const std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
     if (network == nullptr) return KV_TRANSFER_SUBMIT_NO_NETWORK;
     if (nextStageRootNode == (NnUint)-1) return KV_TRANSFER_SUBMIT_NO_TARGET_STAGE;
     if (!migrationLayers.empty()) {
@@ -1097,6 +1290,7 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
         if (!inList) return KV_TRANSFER_SUBMIT_LAYER_NOT_IN_LIST;
     }
     if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return KV_TRANSFER_SUBMIT_INVALID_ROW;
+    if (rangeLen != 0u && rangeLen != kRow.size()) return KV_TRANSFER_SUBMIT_INVALID_ROW;
 
     std::lock_guard<std::mutex> lk(kvTransferMutex);
     if (waitingKvAck) return KV_TRANSFER_SUBMIT_WAITING_ACK;
@@ -1123,17 +1317,20 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
     if (targetNodes.empty()) {
         targetNodes.push_back(nextStageRootNode);
     }
+    if (plan != nullptr &&
+        nextStageRootNode < plan->nNodes &&
+        stageContainsNodeLocal(findStageForNodeLocal(plan, nextStageRootNode), migrationFromNodeIndex)) {
+        targetNodes.clear();
+        targetNodes.push_back(nextStageRootNode);
+    }
 
     bool queuedAny = false;
+    bool localAppliedAny = false;
     for (NnUint targetNode : targetNodes) {
         if (targetNode == 0u) {
             if (executor != nullptr) {
-                const bool localOk = executor->applyTransferredKvRow(layerIndex, position, kRow, vRow);
-                std::printf("🧩 [kv-write-local] layer=%u pos=%u targetNode=0 status=%s\n",
-                    (unsigned)layerIndex,
-                    (unsigned)position,
-                    localOk ? "ok" : "fail");
-                std::fflush(stdout);
+                const bool localOk = executor->applyTransferredKvRow(layerIndex, position, kRow, vRow, rangeStart, rangeLen);
+                if (localOk) localAppliedAny = true;
             }
             continue;
         }
@@ -1149,19 +1346,852 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
         item.header.kvDim = (NnUint)kRow.size();
         item.header.fromNodeIndex = migrationFromNodeIndex;
         item.header.targetNodeIndex = targetNode;
-        item.header.reserved = 0u;
+        item.header.rangeStart = rangeStart;
+        item.header.rangeLen = rangeLen;
         item.kRow = kRow;
         item.vRow = vRow;
         pendingKvTransfers.push_back(std::move(item));
         queuedAny = true;
     }
 
+    if (localAppliedAny) return KV_TRANSFER_SUBMIT_OK;
     if (!queuedAny) return KV_TRANSFER_SUBMIT_DUP_LAYER_PENDING;
     return KV_TRANSFER_SUBMIT_OK;
 }
 
 bool RootLlmInference::submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
     return submitBoundaryKvTransferDetailed(layerIndex, position, kRow, vRow) == KV_TRANSFER_SUBMIT_OK;
+}
+
+bool RootLlmInference::collectSourceStageKvTransfers(
+    NnUint endPos,
+    NnUint *exportedRows,
+    NnUint *queuedRows,
+    uint64_t *sourceTransferBytes) {
+    if (exportedRows != nullptr) *exportedRows = 0u;
+    if (queuedRows != nullptr) *queuedRows = 0u;
+    if (sourceTransferBytes != nullptr) *sourceTransferBytes = 0u;
+    if (header == nullptr || migrationLayers.empty()) return false;
+
+    const NnUint kvDim = header->kvDim;
+    if (kvDim == 0u) return false;
+
+    const NnStageConfig *sourceStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
+    if (sourceStage == nullptr) return false;
+    const std::vector<NnUint> sourceNodes = stageNodeListLocal(sourceStage);
+    if (sourceNodes.empty()) return false;
+
+    struct RowPair {
+        std::vector<float> k;
+        std::vector<float> v;
+        NnUint sources = 0u;
+    };
+    std::map<std::pair<NnUint, NnUint>, RowPair> rows;
+    uint64_t rxBytes = 0u;
+    NnUint exported = 0u;
+
+    auto mergeRow = [&](NnUint sourceNode, NnUint layer, NnUint pos, const std::vector<float> &kRow, const std::vector<float> &vRow) {
+        if (kRow.size() != kvDim || vRow.size() != kvDim) return;
+        RowPair &slot = rows[std::make_pair(layer, pos)];
+        if (slot.k.empty()) {
+            slot.k.assign(kvDim, 0.0f);
+            slot.v.assign(kvDim, 0.0f);
+        }
+        for (NnUint i = 0u; i < kvDim; ++i) {
+            if (kRow[i] != 0.0f) slot.k[i] = kRow[i];
+            if (vRow[i] != 0.0f) slot.v[i] = vRow[i];
+        }
+        slot.sources += 1u;
+        exported += 1u;
+        rxBytes += (uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)kRow.size() * sizeof(float) + (uint64_t)vRow.size() * sizeof(float);
+        std::printf("🧩 [kv-export-merge] sourceNode=%u layer=%u pos=%u kvDim=%u\n",
+            (unsigned)sourceNode,
+            (unsigned)layer,
+            (unsigned)pos,
+            (unsigned)kvDim);
+        std::fflush(stdout);
+    };
+
+    bool requestedRemote = false;
+    const NnUint requestId = nextKvExportRequestId++;
+    LlmKvExportRequestHeader req{};
+    req.magic = LLM_KV_EXPORT_REQUEST_MAGIC;
+    req.version = LLM_KV_EXPORT_REQUEST_VERSION;
+    req.requestId = requestId;
+    req.fromNodeIndex = 0xFFFFFFFFu;
+    req.targetStageRootNodeIndex = nextStageRootNode;
+    req.endPosition = endPos;
+    req.layerCount = (NnUint)migrationLayers.size();
+    req.kvDim = kvDim;
+    req.rangeStart = 0u;
+    req.rangeLen = 0u;
+
+    for (NnUint node : sourceNodes) {
+        if (node == 0u) continue;
+        const int socketIndex = (network != nullptr) ? network->getSocketIndexForNode(node, 0u) : -1;
+        if (socketIndex < 0) {
+            std::printf("⚠️  [kv-export-request] missing socket for source node=%u\n", (unsigned)node);
+            std::fflush(stdout);
+            continue;
+        }
+        LlmControlPacket ctrl = controlPacket;
+        ctrl.flags = LLM_CTRL_HAS_KV_EXPORT_REQUEST | LLM_CTRL_CONTROL_ONLY;
+        ctrl.batchSize = 1u;
+        ctrl.planCmdSeq = 0u;
+        logRootControlSend(ctrl);
+        network->write((NnUint)socketIndex, &ctrl, sizeof(ctrl));
+        network->write((NnUint)socketIndex, &req, sizeof(req));
+        for (NnUint layer : migrationLayers) {
+            network->write((NnUint)socketIndex, &layer, sizeof(layer));
+        }
+        requestedRemote = true;
+        std::printf("🧩 [kv-export-request] requestId=%u sourceNode=%u layers=%u posRange=[0,%u]\n",
+            (unsigned)requestId,
+            (unsigned)node,
+            (unsigned)migrationLayers.size(),
+            (unsigned)endPos);
+        std::fflush(stdout);
+    }
+
+    if (stageContainsNodeLocal(sourceStage, 0u) && executor != nullptr) {
+        for (NnUint layer : migrationLayers) {
+            for (NnUint pos = 0u; pos <= endPos; ++pos) {
+                std::vector<float> kRow;
+                std::vector<float> vRow;
+                if (executor->exportLayerKvRow(layer, pos, kvDim, kRow, vRow)) {
+                    mergeRow(0u, layer, pos, kRow, vRow);
+                }
+            }
+        }
+    }
+
+    if (requestedRemote && network != nullptr) {
+        for (NnUint node : sourceNodes) {
+            if (node == 0u) continue;
+            const int socketIndex = network->getSocketIndexForNode(node, 0u);
+            if (socketIndex < 0) continue;
+
+            LlmKvExportResponseHeader resp{};
+            network->read((NnUint)socketIndex, &resp, sizeof(resp));
+            if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
+                resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
+                resp.requestId != requestId ||
+                resp.fromNodeIndex != node) {
+                std::printf("⚠️  [kv-export-response] bad header from node=%u magic=0x%08x version=%u request=%u rows=%u\n",
+                    (unsigned)node,
+                    (unsigned)resp.magic,
+                    (unsigned)resp.version,
+                    (unsigned)resp.requestId,
+                    (unsigned)resp.rowCount);
+                std::fflush(stdout);
+                continue;
+            }
+            rxBytes += sizeof(resp);
+            for (NnUint i = 0u; i < resp.rowCount; ++i) {
+                LlmKvTransferHeader hdr{};
+                network->read((NnUint)socketIndex, &hdr, sizeof(hdr));
+                if (hdr.magic != LLM_KV_TRANSFER_MAGIC ||
+                    hdr.version != LLM_KV_TRANSFER_VERSION ||
+                    hdr.kvDim != kvDim ||
+                    hdr.rangeLen != 0u ||
+                    hdr.fromNodeIndex != node) {
+                    if (hdr.kvDim > 0u) {
+                        std::vector<float> discard((size_t)hdr.kvDim * 2u);
+                        network->read((NnUint)socketIndex, discard.data(), discard.size() * sizeof(float));
+                    }
+                    continue;
+                }
+                std::vector<float> kRow(kvDim);
+                std::vector<float> vRow(kvDim);
+                network->read((NnUint)socketIndex, kRow.data(), kRow.size() * sizeof(float));
+                network->read((NnUint)socketIndex, vRow.data(), vRow.size() * sizeof(float));
+                mergeRow(node, hdr.layerIndex, hdr.position, kRow, vRow);
+            }
+            std::printf("🧩 [kv-export-response] requestId=%u sourceNode=%u rowCount=%u exportedRows=%u\n",
+                (unsigned)requestId,
+                (unsigned)node,
+                (unsigned)resp.rowCount,
+                (unsigned)resp.exportedRows);
+            std::fflush(stdout);
+        }
+    }
+
+    NnUint queued = 0u;
+    for (auto &entry : rows) {
+        const NnUint layer = entry.first.first;
+        const NnUint pos = entry.first.second;
+        if (submitBoundaryKvTransfer(layer, pos, entry.second.k, entry.second.v)) {
+            queued += 1u;
+        }
+    }
+
+    if (exportedRows != nullptr) *exportedRows = exported;
+    if (queuedRows != nullptr) *queuedRows = queued;
+    if (sourceTransferBytes != nullptr) *sourceTransferBytes = rxBytes;
+    return queued > 0u;
+}
+
+bool RootLlmInference::collectHeadKvTransfers(
+    const PlanCommand &cmd,
+    NnUint endPos,
+    NnUint *exportedRows,
+    NnUint *queuedRows,
+    uint64_t *sourceTransferBytes) {
+    if (exportedRows != nullptr) *exportedRows = 0u;
+    if (queuedRows != nullptr) *queuedRows = 0u;
+    if (sourceTransferBytes != nullptr) *sourceTransferBytes = 0u;
+    if (header == nullptr || plan == nullptr || executor == nullptr) return false;
+    if (header->headDim == 0u || header->kvDim == 0u) return false;
+
+    NnUint stageIndex = 0u;
+    NnUint fromNode = 0u;
+    NnUint toNode = 0u;
+    NnUint rangeHeadStart = 0u;
+    NnUint rangeHeadLen = 0u;
+    if (headRecoveryRangeCached) {
+        stageIndex = headRecoveryStageIndex;
+        fromNode = headRecoveryFromNode;
+        toNode = headRecoveryToNode;
+        rangeHeadStart = headRecoveryRangeHeadStart;
+        rangeHeadLen = headRecoveryRangeHeadLen;
+    } else if (!getHeadMigrationTargetRangeLocal(plan, cmd, false, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen) &&
+               !getHeadMigrationTargetRangeLocal(plan, cmd, true, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen)) {
+        std::printf("⚠️  [head-migrate] cannot derive transfer range for command seq=%u\n", (unsigned)cmd.seq);
+        std::fflush(stdout);
+        return false;
+    }
+    const NnStageConfig *stage = (stageIndex < plan->nStages) ? &plan->stages[stageIndex] : nullptr;
+    if (stage == nullptr || stage->endLayer <= stage->startLayer) return false;
+
+    const NnUint rangeStart = rangeHeadStart * header->headDim;
+    const NnUint rangeLen = rangeHeadLen * header->headDim;
+    if (rangeLen == 0u || rangeStart >= header->kvDim || rangeStart + rangeLen > header->kvDim) return false;
+
+    migrationFromNodeIndex = fromNode;
+    nextStageRootNode = toNode;
+
+    std::vector<NnUint> layers;
+    layers.reserve(stage->endLayer - stage->startLayer);
+    for (NnUint layer = stage->startLayer; layer < stage->endLayer; ++layer) {
+        layers.push_back(layer);
+    }
+
+    struct PartialRow {
+        NnUint layer = 0u;
+        NnUint pos = 0u;
+        std::vector<float> k;
+        std::vector<float> v;
+    };
+    std::vector<PartialRow> rows;
+    rows.reserve((size_t)layers.size() * ((size_t)endPos + 1u));
+
+    auto appendPartial = [&](NnUint layer, NnUint pos, const std::vector<float> &fullK, const std::vector<float> &fullV) {
+        if (fullK.size() < rangeStart + rangeLen || fullV.size() < rangeStart + rangeLen) return;
+        PartialRow row;
+        row.layer = layer;
+        row.pos = pos;
+        row.k.assign(fullK.begin() + rangeStart, fullK.begin() + rangeStart + rangeLen);
+        row.v.assign(fullV.begin() + rangeStart, fullV.begin() + rangeStart + rangeLen);
+        rows.push_back(std::move(row));
+    };
+
+    uint64_t rxBytes = 0u;
+    NnUint exported = 0u;
+
+    if (fromNode == 0u) {
+        for (NnUint layer : layers) {
+            for (NnUint pos = 0u; pos <= endPos; ++pos) {
+                std::vector<float> kRow;
+                std::vector<float> vRow;
+                if (executor->exportLayerKvRow(layer, pos, header->kvDim, kRow, vRow, rangeStart, rangeLen)) {
+                    if (kRow.size() == rangeLen && vRow.size() == rangeLen) {
+                        PartialRow row;
+                        row.layer = layer;
+                        row.pos = pos;
+                        row.k = std::move(kRow);
+                        row.v = std::move(vRow);
+                        rows.push_back(std::move(row));
+                    } else {
+                        appendPartial(layer, pos, kRow, vRow);
+                    }
+                    exported += 1u;
+                    rxBytes += (uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)rangeLen * sizeof(float) * 2ull;
+                }
+            }
+        }
+    } else if (network != nullptr) {
+        const int socketIndex = network->getSocketIndexForNode(fromNode, 0u);
+        if (socketIndex < 0) return false;
+        const NnUint requestId = nextKvExportRequestId++;
+        LlmKvExportRequestHeader req{};
+        req.magic = LLM_KV_EXPORT_REQUEST_MAGIC;
+        req.version = LLM_KV_EXPORT_REQUEST_VERSION;
+        req.requestId = requestId;
+        req.fromNodeIndex = fromNode;
+        req.targetStageRootNodeIndex = toNode;
+        req.endPosition = endPos;
+        req.layerCount = (NnUint)layers.size();
+        req.kvDim = header->kvDim;
+        req.rangeStart = rangeStart;
+        req.rangeLen = rangeLen;
+
+        LlmControlPacket ctrl = controlPacket;
+        ctrl.flags = LLM_CTRL_HAS_KV_EXPORT_REQUEST | LLM_CTRL_CONTROL_ONLY;
+        ctrl.batchSize = 1u;
+        ctrl.planCmdSeq = 0u;
+        logRootControlSend(ctrl);
+        network->write((NnUint)socketIndex, &ctrl, sizeof(ctrl));
+        network->write((NnUint)socketIndex, &req, sizeof(req));
+        for (NnUint layer : layers) {
+            network->write((NnUint)socketIndex, &layer, sizeof(layer));
+        }
+        std::printf("🧩 [head-kv-export-request] requestId=%u sourceNode=%u targetNode=%u layers=%u posRange=[0,%u] range=[%u,%u)\n",
+            (unsigned)requestId,
+            (unsigned)fromNode,
+            (unsigned)toNode,
+            (unsigned)layers.size(),
+            (unsigned)endPos,
+            (unsigned)rangeStart,
+            (unsigned)(rangeStart + rangeLen));
+        std::fflush(stdout);
+
+        LlmKvExportResponseHeader resp{};
+        network->read((NnUint)socketIndex, &resp, sizeof(resp));
+        if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
+            resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
+            resp.requestId != requestId ||
+            resp.fromNodeIndex != fromNode) {
+            std::printf("⚠️  [head-kv-export-response] bad header from node=%u magic=0x%08x version=%u request=%u rows=%u\n",
+                (unsigned)fromNode,
+                (unsigned)resp.magic,
+                (unsigned)resp.version,
+                (unsigned)resp.requestId,
+                (unsigned)resp.rowCount);
+            std::fflush(stdout);
+            return false;
+        }
+        rxBytes += sizeof(resp);
+        for (NnUint i = 0u; i < resp.rowCount; ++i) {
+            LlmKvTransferHeader hdr{};
+            network->read((NnUint)socketIndex, &hdr, sizeof(hdr));
+            const bool okHeader =
+                hdr.magic == LLM_KV_TRANSFER_MAGIC &&
+                hdr.version == LLM_KV_TRANSFER_VERSION &&
+                hdr.kvDim == rangeLen &&
+                hdr.rangeStart == rangeStart &&
+                hdr.rangeLen == rangeLen &&
+                hdr.fromNodeIndex == fromNode;
+            if (!okHeader) {
+                if (hdr.kvDim > 0u) {
+                    std::vector<float> discard((size_t)hdr.kvDim * 2u);
+                    network->read((NnUint)socketIndex, discard.data(), discard.size() * sizeof(float));
+                }
+                continue;
+            }
+            PartialRow row;
+            row.layer = hdr.layerIndex;
+            row.pos = hdr.position;
+            row.k.resize(rangeLen);
+            row.v.resize(rangeLen);
+            network->read((NnUint)socketIndex, row.k.data(), row.k.size() * sizeof(float));
+            network->read((NnUint)socketIndex, row.v.data(), row.v.size() * sizeof(float));
+            rows.push_back(std::move(row));
+            exported += 1u;
+            rxBytes += (uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)rangeLen * sizeof(float) * 2ull;
+        }
+    }
+
+    NnUint queued = 0u;
+    for (const PartialRow &row : rows) {
+        if (submitBoundaryKvTransferDetailed(row.layer, row.pos, row.k, row.v, rangeStart, rangeLen) == KV_TRANSFER_SUBMIT_OK) {
+            queued += 1u;
+        }
+    }
+
+    if (exportedRows != nullptr) *exportedRows = exported;
+    if (queuedRows != nullptr) *queuedRows = queued;
+    if (sourceTransferBytes != nullptr) *sourceTransferBytes = rxBytes;
+    std::printf("🧩 [head-kv-transfer-collect] stage=%u route=%u->%u heads=[%u,%u) dimRange=[%u,%u) exported=%u queued=%u posRange=[0,%u]\n",
+        (unsigned)stageIndex,
+        (unsigned)fromNode,
+        (unsigned)toNode,
+        (unsigned)rangeHeadStart,
+        (unsigned)(rangeHeadStart + rangeHeadLen),
+        (unsigned)rangeStart,
+        (unsigned)(rangeStart + rangeLen),
+        (unsigned)exported,
+        (unsigned)queued,
+        (unsigned)endPos);
+    std::fflush(stdout);
+    return queued > 0u;
+}
+
+bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes) {
+    if (targetTransferBytes != nullptr) *targetTransferBytes = 0u;
+    if (network == nullptr) return false;
+
+    bool sentAny = false;
+    uint64_t bytes = 0u;
+    for (int guard = 0; guard < 10000; ++guard) {
+        bool sendKvTransfer = false;
+        std::vector<PendingKvTransferItem> kvTransfers;
+        {
+            std::lock_guard<std::mutex> lk(kvTransferMutex);
+            if (!pendingKvTransfers.empty() && !waitingKvAck) {
+                sendKvTransfer = true;
+                kvTransfers = pendingKvTransfers;
+                pendingKvTransfers.clear();
+                waitingKvAck = true;
+                waitingKvAckExpectedCount = (NnUint)kvTransfers.size();
+                waitingKvAckLayers.clear();
+                waitingKvAckReceivedCount = 0u;
+                waitingKvAckReceivedLayers.clear();
+                waitingKvAckNodes.clear();
+                waitingKvAckNodeExpected.clear();
+                waitingKvAckNodeReceived.clear();
+                for (const auto &it : kvTransfers) {
+                    appendUniqueLayer(waitingKvAckLayers, it.header.layerIndex);
+                    const NnUint targetNode = it.header.targetNodeIndex;
+                    if (targetNode == 0u) continue;
+                    auto itNode = std::find(waitingKvAckNodes.begin(), waitingKvAckNodes.end(), targetNode);
+                    if (itNode == waitingKvAckNodes.end()) {
+                        waitingKvAckNodes.push_back(targetNode);
+                        waitingKvAckNodeExpected.push_back(1u);
+                        waitingKvAckNodeReceived.push_back(0u);
+                    } else {
+                        const size_t idx = (size_t)(itNode - waitingKvAckNodes.begin());
+                        waitingKvAckNodeExpected[idx] += 1u;
+                    }
+                }
+                std::sort(waitingKvAckLayers.begin(), waitingKvAckLayers.end());
+            }
+        }
+
+        if (sendKvTransfer) {
+            LlmControlPacket out = controlPacket;
+            out.flags = LLM_CTRL_HAS_KV_TRANSFER | LLM_CTRL_CONTROL_ONLY;
+            out.batchSize = 1u;
+            out.planCmdSeq = 0u;
+            logRootControlSend(out);
+            network->writeAll(&out, sizeof(LlmControlPacket));
+
+            LlmKvTransferBatchHeader bh{};
+            bh.magic = LLM_KV_TRANSFER_BATCH_MAGIC;
+            bh.version = LLM_KV_TRANSFER_BATCH_VERSION;
+            bh.count = (NnUint)kvTransfers.size();
+            bh.reserved = 0u;
+            network->writeAll(&bh, sizeof(bh));
+            bytes += (uint64_t)network->nSockets * ((uint64_t)sizeof(LlmControlPacket) + (uint64_t)sizeof(bh));
+            for (const auto &it : kvTransfers) {
+                network->writeAll(&it.header, sizeof(LlmKvTransferHeader));
+                network->writeAll(it.kRow.data(), it.kRow.size() * sizeof(float));
+                network->writeAll(it.vRow.data(), it.vRow.size() * sizeof(float));
+                bytes += (uint64_t)network->nSockets *
+                    ((uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)it.kRow.size() * sizeof(float) + (uint64_t)it.vRow.size() * sizeof(float));
+            }
+            sentAny = true;
+        }
+
+        if (!waitingKvAck) break;
+
+        const NnStageConfig *targetStage = findStageForNodeLocal(plan, nextStageRootNode);
+        NnUint validAckCountInc = 0u;
+        std::vector<NnUint> ackedLayersInc;
+        std::vector<NnUint> nodeAckInc(waitingKvAckNodes.size(), 0u);
+        NnUint ackPos = 0u;
+        bool ackPosSet = false;
+
+        for (size_t ni = 0u; ni < waitingKvAckNodes.size(); ++ni) {
+            if (ni >= waitingKvAckNodeExpected.size() || ni >= waitingKvAckNodeReceived.size()) continue;
+            if (waitingKvAckNodeReceived[ni] >= waitingKvAckNodeExpected[ni]) continue;
+            const NnUint ackNode = waitingKvAckNodes[ni];
+            const int socketIndex = network->getSocketIndexForNode(ackNode, 0u);
+            if (socketIndex < 0) continue;
+
+            LlmKvAckBatchHeader abh{};
+            network->read((NnUint)socketIndex, &abh, sizeof(abh));
+            if (abh.magic != LLM_KV_ACK_BATCH_MAGIC || abh.version != LLM_KV_ACK_BATCH_VERSION) {
+                std::printf("⚠️  [kv-migrate] unexpected packet on ack socket node=%u (magic=0x%08x ver=%u), skip\n",
+                    (unsigned)ackNode,
+                    (unsigned)abh.magic,
+                    (unsigned)abh.version);
+                std::fflush(stdout);
+                continue;
+            }
+
+            for (NnUint i = 0u; i < abh.count; ++i) {
+                LlmKvAckPacket ack{};
+                network->read((NnUint)socketIndex, &ack, sizeof(ack));
+                if (ack.magic != LLM_KV_ACK_MAGIC || ack.version != LLM_KV_ACK_VERSION) continue;
+                if (ack.toNodeIndex != 0u) continue;
+                if (ack.fromNodeIndex != ackNode) continue;
+                if (targetStage != nullptr) {
+                    if (!stageContainsNodeLocal(targetStage, ack.fromNodeIndex)) continue;
+                } else {
+                    if (ack.fromNodeIndex != nextStageRootNode) continue;
+                }
+                validAckCountInc += 1u;
+                nodeAckInc[ni] += 1u;
+                appendUniqueLayer(ackedLayersInc, ack.layerIndex);
+                if (!ackPosSet) {
+                    ackPos = ack.position;
+                    ackPosSet = true;
+                }
+                std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
+                    (unsigned)ack.layerIndex,
+                    (unsigned)ack.position,
+                    (unsigned)ack.fromNodeIndex);
+            }
+        }
+
+        if (validAckCountInc > 0u) {
+            std::sort(ackedLayersInc.begin(), ackedLayersInc.end());
+            std::lock_guard<std::mutex> lk(kvTransferMutex);
+            waitingKvAckReceivedCount += validAckCountInc;
+            for (size_t ni = 0u; ni < nodeAckInc.size() && ni < waitingKvAckNodeReceived.size(); ++ni) {
+                waitingKvAckNodeReceived[ni] += nodeAckInc[ni];
+            }
+            for (NnUint layer : ackedLayersInc) {
+                appendUniqueLayer(waitingKvAckReceivedLayers, layer);
+            }
+            std::sort(waitingKvAckReceivedLayers.begin(), waitingKvAckReceivedLayers.end());
+
+            const bool layersMatched = !waitingKvAckLayers.empty() && waitingKvAckReceivedLayers == waitingKvAckLayers;
+            const bool rowsMatched = (waitingKvAckExpectedCount == 0u) || (waitingKvAckReceivedCount >= waitingKvAckExpectedCount);
+            if (layersMatched && rowsMatched) {
+                waitingKvAck = false;
+                waitingKvAckExpectedCount = 0u;
+                waitingKvAckReceivedCount = 0u;
+                waitingKvAckNodes.clear();
+                waitingKvAckNodeExpected.clear();
+                waitingKvAckNodeReceived.clear();
+                pendingLayerSwitchLayers = waitingKvAckReceivedLayers;
+                waitingKvAckReceivedLayers.clear();
+                migrationAckSeen = true;
+                migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
+                migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
+                std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
+                    (unsigned)pendingLayerSwitchLayers.size());
+                std::fflush(stdout);
+            }
+        }
+        if (!waitingKvAck) break;
+    }
+
+    if (targetTransferBytes != nullptr) *targetTransferBytes = bytes;
+    return sentAny && !waitingKvAck;
+}
+
+bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
+    if (network == nullptr) return false;
+    std::vector<NnUint> switchLayers;
+    {
+        std::lock_guard<std::mutex> lk(kvTransferMutex);
+        if (pendingLayerSwitchLayers.empty()) return false;
+        switchLayers = pendingLayerSwitchLayers;
+        pendingLayerSwitchLayers.clear();
+        if (executor != nullptr) {
+            const NnUint selfNodeIndex = 0u;
+            const bool selfIsSource = areNodesInSameStageLocal(plan, selfNodeIndex, migrationFromNodeIndex);
+            const bool selfIsTarget = areNodesInSameStageLocal(plan, selfNodeIndex, nextStageRootNode);
+            for (NnUint layer : switchLayers) {
+                if (selfIsSource) executor->setPrimaryLayerEnabled(layer, false);
+                if (selfIsTarget) executor->setRedundantLayerEnabled(layer, true);
+            }
+        }
+    }
+
+    LlmControlPacket out = controlPacket;
+    out.flags = LLM_CTRL_HAS_LAYER_SWITCH | LLM_CTRL_CONTROL_ONLY;
+    out.batchSize = 1u;
+    out.planCmdSeq = 0u;
+    logRootControlSend(out);
+    network->writeAll(&out, sizeof(LlmControlPacket));
+
+    LlmLayerSwitchBatchHeader sbh{};
+    sbh.magic = LLM_LAYER_SWITCH_BATCH_MAGIC;
+    sbh.version = LLM_LAYER_SWITCH_BATCH_VERSION;
+    sbh.count = (NnUint)switchLayers.size();
+    sbh.reserved = 0u;
+    network->writeAll(&sbh, sizeof(sbh));
+    for (NnUint layer : switchLayers) {
+        LlmLayerSwitchPacket switchPkt{};
+        switchPkt.magic = LLM_LAYER_SWITCH_MAGIC;
+        switchPkt.version = LLM_LAYER_SWITCH_VERSION;
+        switchPkt.boundaryLayer = layer;
+        switchPkt.fromNodeIndex = migrationFromNodeIndex;
+        switchPkt.toNodeIndex = nextStageRootNode;
+        switchPkt.reserved0 = 0u;
+        switchPkt.reserved1 = 0u;
+        switchPkt.reserved2 = 0u;
+        network->writeAll(&switchPkt, sizeof(switchPkt));
+    }
+    return true;
+}
+
+void RootLlmInference::collectProfilePackets() {
+    if (!profileEnabled) return;
+
+    lastPerf.clear();
+    lastPerf.reserve((network != nullptr ? network->nSockets : 0u) + 1u);
+
+    LlmPerfPacket rootPacket;
+    rootPacket.position = controlPacket.position;
+    rootPacket.batchSize = controlPacket.batchSize;
+    rootPacket.nodeIndex = 0;
+    rootPacket.stageIndex = getStageIndexForNode(plan, 0);
+    rootPacket.execUs = executor != nullptr ? executor->getTotalTime(STEP_EXECUTE_OP) : 0u;
+    rootPacket.syncUs = executor != nullptr ? executor->getTotalTime(STEP_SYNC_NODES) : 0u;
+    lastPerf.push_back(rootPacket);
+
+    if (network != nullptr && network->nSockets > 0) {
+        const NnUint nWorkers = network->nSockets;
+        const size_t base = lastPerf.size();
+        lastPerf.resize(base + nWorkers);
+
+        std::vector<NnSocketIo> ios(nWorkers);
+        for (NnUint i = 0; i < nWorkers; ++i) {
+            ios[i].socketIndex = i;
+            ios[i].data = &lastPerf[base + i];
+            ios[i].size = sizeof(LlmPerfPacket);
+        }
+        network->readMany(nWorkers, &ios[0]);
+    }
+}
+
+bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens) {
+    if (recomputeMs != nullptr) *recomputeMs = 0.0;
+    if (recomputeTokens != nullptr) *recomputeTokens = 0u;
+    if (executor == nullptr || execution == nullptr || header == nullptr) return false;
+    if (endPos >= header->seqLen) return false;
+    if (tokenHistory.size() <= endPos) return false;
+    for (NnUint pos = 0u; pos <= endPos; ++pos) {
+        if (tokenHistory[pos] < 0) return false;
+    }
+
+    const NnUint savedBatchSize = controlPacket.batchSize;
+    const NnUint savedPosition = controlPacket.position;
+    std::vector<float> savedTokens(savedBatchSize);
+    for (NnUint i = 0u; i < savedBatchSize; ++i) {
+        savedTokens[i] = tokenPipe[i];
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    const NnUint replayBatch = 1u;
+    for (NnUint pos = 0u; pos <= endPos; ++pos) {
+        execution->setBatchSize(replayBatch);
+        controlPacket.batchSize = replayBatch;
+        controlPacket.position = pos;
+        positionPipe[0] = (float)pos;
+        tokenPipe[0] = (float)tokenHistory[pos];
+
+        if (network != nullptr) {
+            LlmControlPacket out = controlPacket;
+            out.flags = controlPacket.flags & LLM_CTRL_PROFILE;
+            out.planCmdSeq = 0u;
+            logRootControlSend(out);
+            network->writeAll(&out, sizeof(LlmControlPacket));
+        }
+        executor->forward();
+        collectProfilePackets();
+    }
+    auto t1 = std::chrono::steady_clock::now();
+
+    execution->setBatchSize(savedBatchSize);
+    controlPacket.batchSize = savedBatchSize;
+    controlPacket.position = savedPosition;
+    for (NnUint i = 0u; i < savedBatchSize; ++i) {
+        positionPipe[i] = (float)(savedPosition + i);
+        tokenPipe[i] = savedTokens[i];
+    }
+
+    if (recomputeMs != nullptr) {
+        *recomputeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    if (recomputeTokens != nullptr) {
+        *recomputeTokens = (uint64_t)(endPos + 1u) * (uint64_t)migrationLayers.size();
+    }
+    return true;
+}
+
+bool RootLlmInference::replayHistoryForHeadMigrationRecompute(
+    const PlanCommand &cmd,
+    NnUint endPos,
+    double *recomputeMs,
+    uint64_t *recomputeTokens) {
+    if (recomputeMs != nullptr) *recomputeMs = 0.0;
+    if (recomputeTokens != nullptr) *recomputeTokens = 0u;
+    NnUint stageIndex = 0u;
+    NnUint fromNode = 0u;
+    NnUint toNode = 0u;
+    NnUint rangeHeadStart = 0u;
+    NnUint rangeHeadLen = 0u;
+    if (headRecoveryRangeCached) {
+        stageIndex = headRecoveryStageIndex;
+        fromNode = headRecoveryFromNode;
+        toNode = headRecoveryToNode;
+        rangeHeadStart = headRecoveryRangeHeadStart;
+        rangeHeadLen = headRecoveryRangeHeadLen;
+    } else if (!getHeadMigrationTargetRangeLocal(plan, cmd, false, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen) &&
+               !getHeadMigrationTargetRangeLocal(plan, cmd, true, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen)) {
+        return false;
+    }
+    if (stageIndex >= plan->nStages) return false;
+    const NnStageConfig *stage = &plan->stages[stageIndex];
+    if (stage->endLayer <= stage->startLayer) return false;
+
+    const bool ok = replayHistoryForMigrationRecompute(endPos, recomputeMs, recomputeTokens);
+    if (ok && recomputeTokens != nullptr) {
+        *recomputeTokens = (uint64_t)(endPos + 1u) *
+            (uint64_t)(stage->endLayer - stage->startLayer) *
+            (uint64_t)rangeHeadLen;
+    }
+    return ok;
+}
+
+void RootLlmInference::emitPpMigrationRecoverEvent(
+    bool applySuccess,
+    uint64_t stateTransferBytes,
+    uint64_t recomputeTokensOrLayers,
+    double statePrepareMs,
+    double recoverMs,
+    double stallMs,
+    const std::string &fallbackReason) {
+    const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
+    EdgeVisorAblationEvent ev;
+    ev.eventId = "pp_migration_recover";
+    ev.triggerPos = (asyncKvCollectPos >= 0) ? (NnUint)asyncKvCollectPos : 0xFFFFFFFFu;
+    ev.triggerLayer = (asyncKvCollectLayer >= 0) ? (NnUint)asyncKvCollectLayer : 0xFFFFFFFFu;
+    const NnStageConfig *fromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
+    ev.affectedStage = (fromStage != nullptr) ? fromStage->stageIndex : 0xFFFFFFFFu;
+    ev.fromNode = migrationFromNodeIndex;
+    ev.toNode = nextStageRootNode;
+    ev.selectedPolicy = std::string("shadow_") + toString(ablationCfg.shadowKvMode);
+    ev.tStatePrepareMs = statePrepareMs;
+    ev.tRecoverMs = recoverMs;
+    ev.stallTimeMs = stallMs;
+    ev.stateTransferBytes = stateTransferBytes;
+    ev.recomputeTokensOrLayers = recomputeTokensOrLayers;
+    ev.bindingUpdateCount = (uint64_t)migrationLayers.size();
+    ev.physicalDeviceGroup = "pp_route";
+    ev.logicalGroup = "pp_stage_boundary";
+    ev.fallbackReason = fallbackReason;
+    ev.applySuccess = applySuccess;
+    edgevisorAblationLogEvent(ev);
+}
+
+bool RootLlmInference::recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUint triggerPos) {
+    if (header == nullptr || plan == nullptr) return false;
+    const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
+    if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) return false;
+    if (ablationCfg.shadowKvMode != ShadowKvMode::DISABLED_TRANSFER &&
+        ablationCfg.shadowKvMode != ShadowKvMode::DISABLED_RECOMPUTE) return false;
+
+    NnUint stageIndex = 0u;
+    NnUint fromNode = 0u;
+    NnUint toNode = 0u;
+    NnUint rangeHeadStart = 0u;
+    NnUint rangeHeadLen = 0u;
+    if (headRecoveryRangeCached) {
+        stageIndex = headRecoveryStageIndex;
+        fromNode = headRecoveryFromNode;
+        toNode = headRecoveryToNode;
+        rangeHeadStart = headRecoveryRangeHeadStart;
+        rangeHeadLen = headRecoveryRangeHeadLen;
+    } else if (!getHeadMigrationTargetRangeLocal(plan, cmd, false, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen) &&
+               !getHeadMigrationTargetRangeLocal(plan, cmd, true, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen)) {
+        return false;
+    }
+    if (stageIndex >= plan->nStages) return false;
+    const NnStageConfig *stage = &plan->stages[stageIndex];
+    const NnUint endPos = std::min(triggerPos, (header->seqLen > 0u) ? (header->seqLen - 1u) : 0u);
+
+    auto tStall0 = std::chrono::steady_clock::now();
+    bool applyOk = false;
+    uint64_t stateBytes = 0u;
+    uint64_t recomputeUnits = 0u;
+    double statePrepareMs = 0.0;
+    double recoverMs = 0.0;
+    std::string fallbackReason;
+
+    if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
+        auto t0 = std::chrono::steady_clock::now();
+        NnUint exported = 0u;
+        NnUint queued = 0u;
+        uint64_t sourceBytes = 0u;
+        const bool collected = collectHeadKvTransfers(cmd, endPos, &exported, &queued, &sourceBytes);
+        auto t1 = std::chrono::steady_clock::now();
+        uint64_t targetBytes = 0u;
+        const bool localTarget = (toNode == 0u);
+        const bool transferred = collected && (localTarget || flushPendingKvTransfersControlOnly(&targetBytes));
+        auto t2 = std::chrono::steady_clock::now();
+        statePrepareMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        recoverMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        stateBytes = sourceBytes + targetBytes;
+        applyOk = transferred;
+        fallbackReason = "shadow_kv_disabled_head_real_transfer";
+        std::printf("🧩 [head-migrate] real transfer stage=%u route=%u->%u heads=[%u,%u) exported=%u queued=%u sourceBytes=%llu targetBytes=%llu status=%s\n",
+            (unsigned)stageIndex,
+            (unsigned)fromNode,
+            (unsigned)toNode,
+            (unsigned)rangeHeadStart,
+            (unsigned)(rangeHeadStart + rangeHeadLen),
+            (unsigned)exported,
+            (unsigned)queued,
+            (unsigned long long)sourceBytes,
+            (unsigned long long)targetBytes,
+            applyOk ? "ok" : "fail");
+        std::fflush(stdout);
+    } else if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_RECOMPUTE) {
+        auto t0 = std::chrono::steady_clock::now();
+        double replayMs = 0.0;
+        uint64_t replayUnits = 0u;
+        const bool recomputed = replayHistoryForHeadMigrationRecompute(cmd, endPos, &replayMs, &replayUnits);
+        auto t1 = std::chrono::steady_clock::now();
+        statePrepareMs = replayMs;
+        recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        recomputeUnits = replayUnits;
+        applyOk = recomputed;
+        fallbackReason = recomputed ? "shadow_kv_disabled_head_real_recompute_replay" : "head_recompute_replay_failed_missing_token_history";
+    }
+
+    auto tStall1 = std::chrono::steady_clock::now();
+    const double stallMs = std::chrono::duration<double, std::milli>(tStall1 - tStall0).count();
+
+    EdgeVisorAblationEvent ev;
+    ev.eventId = "head_migration_recover";
+    ev.triggerPos = endPos;
+    ev.triggerLayer = (stage != nullptr && stage->endLayer > stage->startLayer) ? (stage->endLayer - 1u) : 0xFFFFFFFFu;
+    ev.affectedStage = stageIndex;
+    ev.fromNode = fromNode;
+    ev.toNode = toNode;
+    ev.selectedPolicy = std::string("shadow_") + toString(ablationCfg.shadowKvMode);
+    ev.tStatePrepareMs = statePrepareMs;
+    ev.tRecoverMs = recoverMs;
+    ev.stallTimeMs = stallMs;
+    ev.stateTransferBytes = stateBytes;
+    ev.recomputeTokensOrLayers = recomputeUnits;
+    ev.bindingUpdateCount = rangeHeadLen;
+    ev.physicalDeviceGroup = "intra_stage_head_route";
+    ev.logicalGroup = "intra_stage_head_migration";
+    ev.fallbackReason = fallbackReason;
+    ev.applySuccess = applyOk;
+    edgevisorAblationLogEvent(ev);
+
+    std::printf("🧩 [head-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu stage=%u route=%u->%u heads=[%u,%u) posRange=[0,%u]\n",
+        toString(ablationCfg.shadowKvMode),
+        applyOk ? "ok" : "fail",
+        stallMs,
+        (unsigned long long)stateBytes,
+        (unsigned long long)recomputeUnits,
+        (unsigned)stageIndex,
+        (unsigned)fromNode,
+        (unsigned)toNode,
+        (unsigned)rangeHeadStart,
+        (unsigned)(rangeHeadStart + rangeHeadLen),
+        (unsigned)endPos);
+    std::fflush(stdout);
+    return applyOk;
 }
 
 void RootLlmInference::forward() {
@@ -1278,6 +2308,46 @@ void RootLlmInference::forward() {
             }
         }
     }
+
+    {
+        const PlanCommandSnapshot preSnap = planCommandCache().load();
+        const PlanCommand &pc = preSnap.cmd;
+        const bool hasHeadPayload =
+            (pc.cmdKind == PLAN_CMD_KIND_HEAD || pc.cmdKind == PLAN_CMD_KIND_BOTH) ||
+            (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u);
+        const bool shouldCache =
+            getAllowNoShadowHeadMigration() &&
+            isValidPlanCommandHeader(pc) &&
+            pc.mode != PLAN_CMD_MODE_NONE &&
+            hasHeadPayload &&
+            preSnap.cacheSeq != lastHeadRecoveryPlanCacheSeqApplied &&
+            preSnap.cacheSeq != headRecoveryRangeCacheSeq;
+        if (shouldCache) {
+            NnUint stageIndex = 0u;
+            NnUint fromNode = 0u;
+            NnUint toNode = 0u;
+            NnUint rangeHeadStart = 0u;
+            NnUint rangeHeadLen = 0u;
+            if (getHeadMigrationTargetRangeLocal(plan, pc, false, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen)) {
+                headRecoveryRangeCacheSeq = preSnap.cacheSeq;
+                headRecoveryRangeCached = true;
+                headRecoveryPlanAfterApply = false;
+                headRecoveryStageIndex = stageIndex;
+                headRecoveryFromNode = fromNode;
+                headRecoveryToNode = toNode;
+                headRecoveryRangeHeadStart = rangeHeadStart;
+                headRecoveryRangeHeadLen = rangeHeadLen;
+                std::printf("🧩 [head-migrate] cached pre-apply range cacheSeq=%llu stage=%u route=%u->%u heads=[%u,%u)\n",
+                    (unsigned long long)preSnap.cacheSeq,
+                    (unsigned)stageIndex,
+                    (unsigned)fromNode,
+                    (unsigned)toNode,
+                    (unsigned)rangeHeadStart,
+                    (unsigned)(rangeHeadStart + rangeHeadLen));
+                std::fflush(stdout);
+            }
+        }
+    }
     executor->forward();
 
     if (network != nullptr && waitingKvAck) {
@@ -1387,6 +2457,9 @@ void RootLlmInference::forward() {
             migrationLayerCount = (cmdLayerCount < 1) ? 1 : cmdLayerCount;
             migrationLayerListPinnedByEnv = false;
             migrationBatchSubmitted = false;
+            migrationExportRequested = false;
+            lastMigrationStateTransferBytes = 0u;
+            lastMigrationExportedRows = 0u;
             asyncKvCollectPos = -1;
             asyncKvCollectLayer = -1;
 
@@ -1514,7 +2587,103 @@ void RootLlmInference::forward() {
                     migrationLayers.size());
                 std::fflush(stdout);
             }
+            {
+                const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
+                EdgeVisorAblationEvent ev;
+                ev.eventId = "pp_migration_apply";
+                ev.triggerPos = (triggerPos >= 0) ? (NnUint)triggerPos : 0xFFFFFFFFu;
+                ev.triggerLayer = (boundaryLayerForMigration >= 0) ? (NnUint)boundaryLayerForMigration : 0xFFFFFFFFu;
+                ev.affectedStage = (effectiveFromStage != nullptr) ? effectiveFromStage->stageIndex : 0xFFFFFFFFu;
+                ev.fromNode = effectiveFromNode;
+                ev.toNode = effectiveToNode;
+                ev.selectedPolicy = std::string("vg_") + toString(ablationCfg.vgMode);
+                ev.bindingUpdateCount = (uint64_t)migrationLayers.size();
+                ev.vgMappingBefore = std::string("vg_") + toString(ablationCfg.vgMode);
+                ev.vgMappingAfter = std::string("vg_") + toString(ablationCfg.vgMode);
+                ev.physicalDeviceGroup = "pp_route";
+                ev.logicalGroup = "pp_stage_boundary";
+                ev.applySuccess = canApplyRoute && !migrationLayers.empty();
+                if (!validRoute) {
+                    ev.rejectedMoves = 1u;
+                    ev.fallbackCount = 1u;
+                    ev.fallbackReason = "invalid_pp_route_fallback_to_current_route";
+                } else if (ablationCfg.vgMode != VgMode::ENABLED) {
+                    ev.fallbackReason = std::string("vg_mode_") + toString(ablationCfg.vgMode);
+                }
+                edgevisorAblationLogEvent(ev);
+            }
                 lastPpPlanCacheSeqApplied = snap.cacheSeq;
+            }
+        }
+    }
+
+    {
+        const PlanCommandSnapshot snap = planCommandCache().load();
+        const PlanCommand &pc = snap.cmd;
+        const bool isNewHeadCommand = (snap.cacheSeq != lastHeadRecoveryPlanCacheSeqApplied);
+        const bool hasHeadPayload =
+            (pc.cmdKind == PLAN_CMD_KIND_HEAD || pc.cmdKind == PLAN_CMD_KIND_BOTH) ||
+            (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u);
+        if (isNewHeadCommand &&
+            isValidPlanCommandHeader(pc) &&
+            pc.mode != PLAN_CMD_MODE_NONE &&
+            hasHeadPayload &&
+            getAllowNoShadowHeadMigration()) {
+            NnUint stageIndex = 0u;
+            NnUint fromNode = 0u;
+            NnUint toNode = 0u;
+            NnUint rangeHeadStart = 0u;
+            NnUint rangeHeadLen = 0u;
+            bool haveRange = false;
+            if (headRecoveryRangeCached && headRecoveryRangeCacheSeq == snap.cacheSeq) {
+                stageIndex = headRecoveryStageIndex;
+                fromNode = headRecoveryFromNode;
+                toNode = headRecoveryToNode;
+                rangeHeadStart = headRecoveryRangeHeadStart;
+                rangeHeadLen = headRecoveryRangeHeadLen;
+                haveRange = true;
+            } else {
+                haveRange =
+                    getHeadMigrationTargetRangeLocal(plan, pc, false, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen) ||
+                    getHeadMigrationTargetRangeLocal(plan, pc, true, &stageIndex, &fromNode, &toNode, &rangeHeadStart, &rangeHeadLen);
+                if (haveRange) {
+                    headRecoveryRangeCacheSeq = snap.cacheSeq;
+                    headRecoveryRangeCached = true;
+                    headRecoveryPlanAfterApply = false;
+                    headRecoveryStageIndex = stageIndex;
+                    headRecoveryFromNode = fromNode;
+                    headRecoveryToNode = toNode;
+                    headRecoveryRangeHeadStart = rangeHeadStart;
+                    headRecoveryRangeHeadLen = rangeHeadLen;
+                }
+            }
+            if (haveRange && !headRecoveryPlanAfterApply) {
+                const bool exactReady =
+                    pc.mode != PLAN_CMD_MODE_EXACT ||
+                    (pc.triggerPos != 0xFFFFFFFFu && controlPacket.position >= pc.triggerPos);
+                if (exactReady) {
+                    NnUint recoverPos = controlPacket.position;
+                    if (pc.mode == PLAN_CMD_MODE_EXACT && pc.triggerPos != 0xFFFFFFFFu) {
+                        recoverPos = std::max(controlPacket.position, pc.triggerPos);
+                    }
+                    if (header != nullptr && header->seqLen > 0u && recoverPos >= header->seqLen) {
+                        recoverPos = header->seqLen - 1u;
+                    }
+                    const bool recovered = recoverHeadMigrationNoShadow(pc, recoverPos);
+                    if (recovered) {
+                        lastHeadRecoveryPlanCacheSeqApplied = snap.cacheSeq;
+                        planCommandCache().consumeIfCacheSeq(snap.cacheSeq);
+                        headRecoveryRangeCached = false;
+                    } else {
+                        std::printf("⚠️  [head-migrate] recovery failed for cacheSeq=%llu; keep command pending for retry\n",
+                            (unsigned long long)snap.cacheSeq);
+                        std::fflush(stdout);
+                    }
+                }
+            } else if (haveRange && headRecoveryPlanAfterApply) {
+                planCommandCache().consumeIfCacheSeq(snap.cacheSeq);
+                headRecoveryRangeCached = false;
+                headRecoveryPlanAfterApply = false;
             }
         }
     }
@@ -1522,32 +2691,91 @@ void RootLlmInference::forward() {
     if (!migrationBatchSubmitted && asyncKvCollectPos >= 0 &&
         controlPacket.position == (NnUint)asyncKvCollectPos &&
         !migrationLayers.empty() && executor != nullptr && header != nullptr) {
-        NnUint exported = 0u;
-        NnUint queued = 0u;
         const NnUint endPos = std::min((NnUint)asyncKvCollectPos, (header->seqLen > 0u) ? (header->seqLen - 1u) : 0u);
-        for (NnUint layer : migrationLayers) {
-            for (NnUint pos = 0u; pos <= endPos; ++pos) {
-                std::vector<float> kRow;
-                std::vector<float> vRow;
-                if (executor->exportLayerKvRow(layer, pos, header->kvDim, kRow, vRow)) {
-                    exported += 1u;
-                    if (submitBoundaryKvTransfer(layer, pos, kRow, vRow)) {
-                        queued += 1u;
-                    }
-                } else {
-                    std::printf("⚠️  [kv-migrate] export row failed layer=%u pos=%u\n",
-                        (unsigned)layer,
-                        (unsigned)pos);
-                }
+        const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
+        auto tStall0 = std::chrono::steady_clock::now();
+        bool applyOk = false;
+        uint64_t stateBytes = 0u;
+        uint64_t recomputeUnits = 0u;
+        double statePrepareMs = 0.0;
+        double recoverMs = 0.0;
+        std::string fallbackReason;
+
+        if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) {
+            auto t0 = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lk(kvTransferMutex);
+                pendingLayerSwitchLayers = migrationLayers;
             }
+            applyOk = sendPendingLayerSwitchControlOnly();
+            auto t1 = std::chrono::steady_clock::now();
+            recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            fallbackReason = "shadow_kv_precomputed_redundant_state";
+            migrationBatchSubmitted = applyOk;
+        } else if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
+            auto t0 = std::chrono::steady_clock::now();
+            NnUint exported = 0u;
+            NnUint queued = 0u;
+            uint64_t sourceBytes = 0u;
+            const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
+            auto t1 = std::chrono::steady_clock::now();
+            uint64_t targetBytes = 0u;
+            const bool transferred = collected && flushPendingKvTransfersControlOnly(&targetBytes);
+            const bool switched = transferred && sendPendingLayerSwitchControlOnly();
+            auto t2 = std::chrono::steady_clock::now();
+            statePrepareMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            recoverMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            stateBytes = sourceBytes + targetBytes;
+            lastMigrationStateTransferBytes = stateBytes;
+            lastMigrationExportedRows = exported;
+            applyOk = switched;
+            fallbackReason = "shadow_kv_disabled_real_transfer";
+            migrationBatchSubmitted = applyOk;
+            std::printf("🧩 [kv-migrate] real transfer prepared exported=%u queued=%u layers=%u posRange=[0,%u] sourceBytes=%llu targetBytes=%llu targetRoot=%u status=%s\n",
+                (unsigned)exported,
+                (unsigned)queued,
+                (unsigned)migrationLayers.size(),
+                (unsigned)endPos,
+                (unsigned long long)sourceBytes,
+                (unsigned long long)targetBytes,
+                (unsigned)nextStageRootNode,
+                applyOk ? "ok" : "fail");
+        } else if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_RECOMPUTE) {
+            auto t0 = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lk(kvTransferMutex);
+                pendingLayerSwitchLayers = migrationLayers;
+            }
+            const bool switched = sendPendingLayerSwitchControlOnly();
+            auto tSwitch = std::chrono::steady_clock::now();
+            double replayMs = 0.0;
+            uint64_t replayUnits = 0u;
+            const bool recomputed = switched && replayHistoryForMigrationRecompute(endPos, &replayMs, &replayUnits);
+            auto t1 = std::chrono::steady_clock::now();
+            recomputeUnits = replayUnits;
+            statePrepareMs = replayMs;
+            recoverMs = std::chrono::duration<double, std::milli>(tSwitch - t0).count();
+            fallbackReason = recomputed ? "shadow_kv_disabled_real_recompute_replay" : "real_recompute_replay_failed_missing_token_history";
+            applyOk = switched && recomputed;
+            migrationBatchSubmitted = applyOk;
         }
-        migrationBatchSubmitted = (queued > 0u);
-        std::printf("🧩 [kv-migrate] prepared history batch exported=%u queued=%u layers=%u posRange=[0,%u] targetRoot=%u\n",
-            (unsigned)exported,
-            (unsigned)queued,
+
+        auto tStall1 = std::chrono::steady_clock::now();
+        const double stallMs = std::chrono::duration<double, std::milli>(tStall1 - tStall0).count();
+        emitPpMigrationRecoverEvent(applyOk, stateBytes, recomputeUnits, statePrepareMs, recoverMs, stallMs, fallbackReason);
+        if (applyOk) {
+            migrationAckSeen = true;
+            migrationAckPos = (int)endPos;
+            migrationAckLayer = !migrationLayers.empty() ? (int)migrationLayers.back() : migrationAckLayer;
+        }
+        std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu layers=%u posRange=[0,%u]\n",
+            toString(ablationCfg.shadowKvMode),
+            applyOk ? "ok" : "fail",
+            stallMs,
+            (unsigned long long)stateBytes,
+            (unsigned long long)recomputeUnits,
             (unsigned)migrationLayers.size(),
-            (unsigned)endPos,
-            (unsigned)nextStageRootNode);
+            (unsigned)endPos);
         std::fflush(stdout);
     }
 
@@ -1580,38 +2808,7 @@ void RootLlmInference::forward() {
         }
     }
 
-    if (!profileEnabled) return;
-
-    // Collect per-node timings for this forward() call.
-    lastPerf.clear();
-    lastPerf.reserve((network != nullptr ? network->nSockets : 0u) + 1u);
-
-    // Root node (node 0)
-    {
-        LlmPerfPacket p;
-        p.position = controlPacket.position;
-        p.batchSize = controlPacket.batchSize;
-        p.nodeIndex = 0;
-        p.stageIndex = getStageIndexForNode(plan, 0);
-        p.execUs = executor->getTotalTime(STEP_EXECUTE_OP);
-        p.syncUs = executor->getTotalTime(STEP_SYNC_NODES);
-        lastPerf.push_back(p);
-    }
-
-    // Worker nodes
-    if (network != nullptr && network->nSockets > 0) {
-        const NnUint nWorkers = network->nSockets;
-        const size_t base = lastPerf.size();
-        lastPerf.resize(base + nWorkers);
-
-        std::vector<NnSocketIo> ios(nWorkers);
-        for (NnUint i = 0; i < nWorkers; ++i) {
-            ios[i].socketIndex = i;
-            ios[i].data = &lastPerf[base + i];
-            ios[i].size = sizeof(LlmPerfPacket);
-        }
-        network->readMany(nWorkers, &ios[0]);
-    }
+    collectProfilePackets();
 }
 
 void RootLlmInference::finish() {
@@ -1717,6 +2914,33 @@ bool WorkerLlmInference::tryReadControlPacket() {
         }
     }
 
+    if ((controlPacket.flags & LLM_CTRL_HAS_KV_EXPORT_REQUEST) != 0u) {
+        LlmKvExportRequestHeader req{};
+        network->read(ROOT_SOCKET_INDEX, &req, sizeof(req));
+        std::vector<NnUint> layers;
+        if (req.magic == LLM_KV_EXPORT_REQUEST_MAGIC &&
+            req.version == LLM_KV_EXPORT_REQUEST_VERSION &&
+            req.layerCount > 0u) {
+            layers.resize(req.layerCount);
+            for (NnUint i = 0u; i < req.layerCount; ++i) {
+                network->read(ROOT_SOCKET_INDEX, &layers[i], sizeof(NnUint));
+            }
+            if (req.fromNodeIndex == localNodeIndex || req.fromNodeIndex == 0xFFFFFFFFu) {
+                pendingKvExportRequests.push_back(std::make_pair(req, std::move(layers)));
+            }
+        } else {
+            for (NnUint i = 0u; i < req.layerCount; ++i) {
+                NnUint discard = 0u;
+                network->read(ROOT_SOCKET_INDEX, &discard, sizeof(discard));
+            }
+            std::printf("⚠️  [Worker] Bad KV export request (magic=0x%08x version=%u layers=%u)\n",
+                (unsigned)req.magic,
+                (unsigned)req.version,
+                (unsigned)req.layerCount);
+            std::fflush(stdout);
+        }
+    }
+
     printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);
     for (NnUint i = 0; i < controlPacket.batchSize; i++)
         positionPipe[i] = (float)(controlPacket.position + i);
@@ -1741,6 +2965,86 @@ bool WorkerLlmInference::consumePendingKvTransfer(LlmKvTransferHeader &hdr, std:
     return true;
 }
 
+bool WorkerLlmInference::consumeKvExportRequest(LlmKvExportRequestHeader &hdr, std::vector<NnUint> &layers) {
+    if (pendingKvExportRequests.empty()) return false;
+    auto item = std::move(pendingKvExportRequests.front());
+    pendingKvExportRequests.pop_front();
+    hdr = item.first;
+    layers = std::move(item.second);
+    return true;
+}
+
+void WorkerLlmInference::flushKvExportResponse(
+    const LlmKvExportRequestHeader &req,
+    const std::vector<NnUint> &layers,
+    NnUint kvDim,
+    NnExecutor *executor) {
+    if (network == nullptr || executor == nullptr || kvDim == 0u) return;
+    const NnUint payloadStart = req.rangeLen != 0u ? req.rangeStart : 0u;
+    const NnUint payloadLen = req.rangeLen != 0u ? req.rangeLen : kvDim;
+    if (payloadStart >= kvDim || payloadStart + payloadLen > kvDim || payloadLen == 0u) return;
+
+    struct ExportedRow {
+        LlmKvTransferHeader header;
+        std::vector<float> kRow;
+        std::vector<float> vRow;
+    };
+    std::vector<ExportedRow> rows;
+    const NnUint endPos = req.endPosition;
+    for (NnUint layer : layers) {
+        for (NnUint pos = 0u; pos <= endPos; ++pos) {
+            std::vector<float> kRow;
+            std::vector<float> vRow;
+            if (!executor->exportLayerKvRow(layer, pos, kvDim, kRow, vRow, payloadStart, req.rangeLen != 0u ? payloadLen : 0u)) {
+                continue;
+            }
+            ExportedRow row;
+            row.header.magic = LLM_KV_TRANSFER_MAGIC;
+            row.header.version = LLM_KV_TRANSFER_VERSION;
+            row.header.layerIndex = layer;
+            row.header.position = pos;
+            row.header.kvDim = payloadLen;
+            row.header.fromNodeIndex = localNodeIndex;
+            row.header.targetNodeIndex = req.targetStageRootNodeIndex;
+            row.header.rangeStart = req.rangeLen != 0u ? payloadStart : 0u;
+            row.header.rangeLen = req.rangeLen != 0u ? payloadLen : 0u;
+            if (req.rangeLen != 0u) {
+                row.kRow = std::move(kRow);
+                row.vRow = std::move(vRow);
+            } else {
+                row.kRow.assign(kRow.begin() + payloadStart, kRow.begin() + payloadStart + payloadLen);
+                row.vRow.assign(vRow.begin() + payloadStart, vRow.begin() + payloadStart + payloadLen);
+            }
+            rows.push_back(std::move(row));
+        }
+    }
+
+    LlmKvExportResponseHeader resp{};
+    resp.magic = LLM_KV_EXPORT_RESPONSE_MAGIC;
+    resp.version = LLM_KV_EXPORT_RESPONSE_VERSION;
+    resp.requestId = req.requestId;
+    resp.fromNodeIndex = localNodeIndex;
+    resp.rowCount = (NnUint)rows.size();
+    resp.kvDim = payloadLen;
+    resp.exportedRows = (NnUint)rows.size();
+    resp.reserved = 0u;
+    network->write(ROOT_SOCKET_INDEX, &resp, sizeof(resp));
+    for (const ExportedRow &row : rows) {
+        network->write(ROOT_SOCKET_INDEX, &row.header, sizeof(row.header));
+        network->write(ROOT_SOCKET_INDEX, row.kRow.data(), row.kRow.size() * sizeof(float));
+        network->write(ROOT_SOCKET_INDEX, row.vRow.data(), row.vRow.size() * sizeof(float));
+    }
+    std::printf("🧩 [kv-export-response] node=%u requestId=%u rows=%u layers=%zu posRange=[0,%u] range=[%u,%u)\n",
+        (unsigned)localNodeIndex,
+        (unsigned)req.requestId,
+        (unsigned)rows.size(),
+        layers.size(),
+        (unsigned)endPos,
+        (unsigned)payloadStart,
+        (unsigned)(payloadStart + payloadLen));
+    std::fflush(stdout);
+}
+
 void WorkerLlmInference::flushPendingKvAck() {
     if (pendingKvAcks.empty() || network == nullptr) return;
     LlmKvAckBatchHeader abh{};
@@ -1758,6 +3062,21 @@ void WorkerLlmInference::flushPendingKvAck() {
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
     NnUint nNodes = args->nWorkers + 1;
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
+    EdgeVisorAblationConfig ablationConfig = edgevisorAblationConfigFromSources(
+        args->edgevisorAblationConfigPath,
+        args->shadowKvModeStr,
+        args->pointerSwizzlingModeStr,
+        args->jitModeStr,
+        args->vgModeStr,
+        args->disableShardingControllerStr,
+        args->disablePipelineBalancerStr,
+        args->fallbackPolicyStr,
+        args->ablationLogPath,
+        args->experimentId);
+    setEdgeVisorAblationConfig(ablationConfig);
+    if (edgevisorAblationLogEnabled()) {
+        edgevisorAblationLogSimpleEvent("runtime_config", "full_or_ablation");
+    }
 
     if (nNodes > header.nKvHeads)
         // TODO: https://github.com/b4rtaz/distributed-llama/issues/70
@@ -1781,6 +3100,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     // IMPORTANT: migration-time KV redundancy safety checks and compute range selection
     // depend on this flag during graph construction.
     setEnableKvRedundancyDuringMigration(args->enableKvRedundancyDuringMigration);
+    setAllowNoShadowHeadMigration(args->allowNoShadowHeadMigration);
     // IMPORTANT: KV aggregate pipe build is decided during graph construction.
     setEnableKvAggregate(args->enableKvAggregate);
     // Runtime redundant plan/gate defaults (consumed by buildLlmNetUneven + NnExecutor).
@@ -1932,7 +3252,8 @@ void runWorkerApp(AppCliArgs *args) {
         std::string bootModelPath;
         std::string bootRatios;
         std::string bootPrimarySkipLayers;
-        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers);
+        std::string bootKvRedundancy;
+        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers, bootKvRedundancy);
 
         const bool hasBootModel = !bootModelPath.empty();
         const bool hasBootRatios = !bootRatios.empty();
@@ -1943,6 +3264,7 @@ void runWorkerApp(AppCliArgs *args) {
         const bool bootEnablePlanBarrier = boot.enablePlanBarrier != 0u;
         const bool bootEnableStageFullWeights = boot.enableStageFullWeights != 0u;
         const bool bootEnableKvRedundancyDuringMigration = boot.enableKvRedundancyDuringMigration != 0u;
+        const bool bootAllowNoShadowHeadMigration = boot.allowNoShadowHeadMigration != 0u;
         const bool bootEnableKvAggregate = boot.enableKvAggregate != 0u;
         const NnUint bootRuntimeRedundantBoundaryLayers = boot.runtimeRedundantBoundaryLayers;
         const bool bootRuntimeActiveSegEnabled = boot.runtimeActiveSegEnabled != 0u;
@@ -1954,6 +3276,7 @@ void runWorkerApp(AppCliArgs *args) {
         setEnableStageFullWeights(bootEnableStageFullWeights);
         // Set migration-time KV redundancy behavior from bootstrap packet
         setEnableKvRedundancyDuringMigration(bootEnableKvRedundancyDuringMigration);
+        setAllowNoShadowHeadMigration(bootAllowNoShadowHeadMigration);
         // Set KV aggregate graph-build flag from bootstrap packet.
         setEnableKvAggregate(bootEnableKvAggregate);
         // Apply runtime redundant plan/gate defaults from bootstrap packet.
@@ -1989,9 +3312,11 @@ void runWorkerApp(AppCliArgs *args) {
                std::vector<NnStageDef> stageDefs = parseStageDefs(bootRatios.c_str(), netConfig.nNodes, header.nLayers);
              NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
 
-             // Worker side: use default KV redundancy (empty vector = default to NN_KV_REDUNDANCY_PAD_HEADS)
+             std::vector<NnUint> kvRedundancyPerNode = parseKvRedundancy(
+                 bootKvRedundancy.empty() ? nullptr : bootKvRedundancy.c_str(),
+                 netConfig.nNodes);
              planPtr.reset(new NnUnevenPartitionPlan(
-                 createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, {})
+                 createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, kvRedundancyPerNode)
              ));
         }
 
@@ -2065,12 +3390,20 @@ void runWorkerApp(AppCliArgs *args) {
                 std::vector<float> kvK;
                 std::vector<float> kvV;
                 while (inference.consumePendingKvTransfer(kvHdr, kvK, kvV)) {
-                    const bool wOk = executor.applyTransferredKvRow(kvHdr.layerIndex, kvHdr.position, kvK, kvV);
-                    std::printf("🧩 [kv-write-check] node=%u layer=%u pos=%u kvDim=%u status=%s\n",
+                    const bool wOk = executor.applyTransferredKvRow(
+                        kvHdr.layerIndex,
+                        kvHdr.position,
+                        kvK,
+                        kvV,
+                        kvHdr.rangeStart,
+                        kvHdr.rangeLen);
+                    std::printf("🧩 [kv-write-check] node=%u layer=%u pos=%u kvDim=%u range=[%u,%u) status=%s\n",
                         (unsigned)nodeConfig.nodeIndex,
                         (unsigned)kvHdr.layerIndex,
                         (unsigned)kvHdr.position,
                         (unsigned)kvHdr.kvDim,
+                        (unsigned)kvHdr.rangeStart,
+                        (unsigned)(kvHdr.rangeStart + kvHdr.rangeLen),
                         wOk ? "ok" : "fail");
                     std::fflush(stdout);
                 }
@@ -2119,6 +3452,28 @@ void runWorkerApp(AppCliArgs *args) {
                             (unsigned)switchPkt.boundaryLayer);
                         std::fflush(stdout);
                     }
+                }
+
+                LlmKvExportRequestHeader exportReq{};
+                std::vector<NnUint> exportLayers;
+                while (inference.consumeKvExportRequest(exportReq, exportLayers)) {
+                    inference.flushKvExportResponse(exportReq, exportLayers, exportReq.kvDim, &executor);
+                }
+
+                if ((inference.flags() & LLM_CTRL_CONTROL_ONLY) != 0u) {
+                    inference.flushPendingKvAck();
+                    if ((inference.flags() & LLM_CTRL_PROFILE) != 0u) {
+                        LlmPerfPacket p;
+                        p.position = inference.position();
+                        p.batchSize = inference.batchSize();
+                        p.nodeIndex = nodeConfig.nodeIndex;
+                        p.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
+                        p.execUs = 0u;
+                        p.syncUs = 0u;
+                        network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
+                    }
+                    isFirstAttempt = true;
+                    continue;
                 }
 
                 executor.forward();

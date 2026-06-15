@@ -1,6 +1,7 @@
 #include "nn-cpu.hpp"
 #include "nn-cpu-ops.hpp"
 #include "nn-core.hpp"
+#include "ablation.hpp"
 #include "plan-command.hpp"
 #include "llm.hpp"
 #include <cassert>
@@ -25,6 +26,43 @@
 #define DEBUG_CPU_OP_QUANTS false
 
 #define BUFFER_ALIGNMENT 64
+
+static void logCpuPlanApplyAblationEvent(
+    NnUint stageIndex,
+    NnUint fromNode,
+    NnUint toNode,
+    NnUint layerIndex,
+    NnUint pos,
+    NnUint cmd,
+    bool success,
+    const char *reason) {
+    EdgeVisorAblationEvent ev;
+    ev.eventId = "plan_command_apply";
+    ev.triggerPos = pos;
+    ev.triggerLayer = layerIndex;
+    ev.affectedStage = stageIndex;
+    ev.fromNode = fromNode;
+    ev.toNode = toNode;
+    ev.selectedPolicy = std::string("cpu_apply_cmd_") + std::to_string((unsigned)cmd);
+    ev.bindingUpdateCount = 1u;
+    ev.applySuccess = success;
+    auto appendFallbackReason = [&](const char *fallbackReason) {
+        if (fallbackReason == nullptr || fallbackReason[0] == '\0') return;
+        if (!ev.fallbackReason.empty()) ev.fallbackReason += ";";
+        ev.fallbackReason += fallbackReason;
+    };
+    appendFallbackReason(reason);
+    const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+    if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::OPERATOR_REBUILD) {
+        appendFallbackReason("operator_rebuild_substitutes_lightweight_pointer_swizzling");
+        ev.fallbackCount = 1u;
+    } else if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::WEIGHT_REMATERIALIZE) {
+        appendFallbackReason("weight_rematerialize_substitutes_lightweight_pointer_swizzling");
+        ev.materializedBytes = ev.bindingUpdateCount;
+        ev.fallbackCount = 1u;
+    }
+    edgevisorAblationLogEvent(ev);
+}
 
 #if DLLAMA_DEBUG_ATTN
 
@@ -1356,6 +1394,69 @@ static NnUint getSplitTotalForStage(const NnDimSplit* split, const NnStageConfig
     return sum;
 }
 
+static bool hasHeadDeltaForStage(const std::vector<int> &deltaHeadOrKv, const NnStageConfig *stage) {
+    if (stage == nullptr) return false;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n < deltaHeadOrKv.size() && deltaHeadOrKv[n] != 0) return true;
+    }
+    return false;
+}
+
+static bool validateKvShadowCoverage(
+    const NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage,
+    const std::vector<int> &deltaHeadOrKv,
+    char *reason,
+    size_t reasonSize
+) {
+    auto setReason = [&](const char *value) {
+        if (reason != nullptr && reasonSize != 0u) {
+            std::snprintf(reason, reasonSize, "%s", value != nullptr ? value : "kv_shadow_invalid");
+        }
+    };
+    if (!getEnableStageFullWeights()) {
+        setReason("kv_shadow_requires_stage_full_weights");
+        return false;
+    }
+    if (!getEnableKvRedundancyDuringMigration()) {
+        setReason("kv_shadow_redundancy_disabled");
+        return false;
+    }
+    if (plan == nullptr || stage == nullptr ||
+        plan->kvHeadSplit.starts == nullptr || plan->kvHeadSplit.lengths == nullptr ||
+        plan->kvHeadComputeSplit.starts == nullptr || plan->kvHeadComputeSplit.lengths == nullptr) {
+        setReason("kv_shadow_split_missing");
+        return false;
+    }
+
+    NnUint newStart = 0u;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n >= deltaHeadOrKv.size()) {
+            setReason("kv_shadow_delta_missing");
+            return false;
+        }
+        const int newLenSigned = (int)plan->kvHeadSplit.lengths[n] + deltaHeadOrKv[n];
+        if (newLenSigned < 0) {
+            setReason("kv_shadow_underflow");
+            return false;
+        }
+
+        const NnUint newLen = (NnUint)newLenSigned;
+        const NnUint newEnd = newStart + newLen;
+        const NnUint shadowStart = plan->kvHeadComputeSplit.starts[n];
+        const NnUint shadowEnd = shadowStart + plan->kvHeadComputeSplit.lengths[n];
+        if (newStart < shadowStart || newEnd > shadowEnd) {
+            setReason("kv_shadow_coverage_miss");
+            return false;
+        }
+        newStart = newEnd;
+    }
+    setReason("");
+    return true;
+}
+
 
 NnCpuDevice::NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan) {
     this->netConfig = netConfig;
@@ -1933,7 +2034,22 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                     trigger = false;
                 } else {
                 if (pc.mode == PLAN_CMD_MODE_EXACT) {
-                    trigger = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                    const bool exactMatch = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                    const bool missedExact =
+                        (pc.triggerPos != 0xFFFFFFFFu) &&
+                        (pc.triggerLayer != 0xFFFFFFFFu) &&
+                        ((pos > pc.triggerPos) || (pos == pc.triggerPos && layerIndex > pc.triggerLayer));
+                    trigger = exactMatch || missedExact;
+                    if (missedExact && !exactMatch) {
+                        printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u late-trigger for exact target layer=%u pos=%u\n",
+                            (unsigned)myNode,
+                            (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                            (unsigned)layerIndex,
+                            (unsigned)pos,
+                            (unsigned)pc.triggerLayer,
+                            (unsigned)pc.triggerPos);
+                        std::fflush(stdout);
+                    }
                 } else if (pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) {
                     trigger = true;
                 }
@@ -1942,8 +2058,29 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
             if (trigger) {
                 emitEpoch = curEpoch + 1u;
-                const bool useMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u);
-                if (useMoveList) {
+                const bool useSingleMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u);
+                const bool useMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 1u);
+                if (useSingleMoveList) {
+                    // Encode the single v2 move directly in the broadcast pipe. Workers do not
+                    // share the root process planCommandCache, so cmdlist-by-seq is unsafe here.
+                    const PlanMove &m = pc.moves[0];
+                    cmd = m.cmdKind;
+                    headMove = m.headMove;
+                    ffnMove = m.ffnMove;
+                    fromNode = m.fromNodeIndex;
+                    toNode = m.toNodeIndex;
+                    printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u epoch=%u kind=single-move headMove=%u ffnMove=%u from=%u to=%u seq=%u\n",
+                        (unsigned)myNode,
+                        (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                        (unsigned)layerIndex,
+                        (unsigned)pos,
+                        (unsigned)emitEpoch,
+                        (unsigned)headMove,
+                        (unsigned)ffnMove,
+                        (unsigned)fromNode,
+                        (unsigned)toNode,
+                        (unsigned)pc.seq);
+                } else if (useMoveList) {
                     // cmd=4 means: apply from PlanCommand move list, referenced by seq.
                     cmd = 4u;
                     headMove = 0u;
@@ -2162,6 +2299,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                             bool reject = false;
                             const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
                             const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
+                            const bool allowNoShadowHeadMigration = getAllowNoShadowHeadMigration();
                             for (uint32_t i = 0; i < pc2.nMoves; ++i) {
                                 const PlanMove &m = pc2.moves[i];
                                 const NnUint f = (NnUint)m.fromNodeIndex;
@@ -2172,8 +2310,8 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     // KV-head migration safety (GQA lockstep): without KV cache transfer, we
                                     // require KV redundancy to be enabled AND moved heads within the precomputed pad.
                                     if (gqaLockstep) {
-                                        if (!kvRedundancyEnabled) { reject = true; break; }
-                                        if (m.headMove > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; break; }
+                                        if (!kvRedundancyEnabled && !allowNoShadowHeadMigration) { reject = true; break; }
+                                        if (kvRedundancyEnabled && !allowNoShadowHeadMigration && m.headMove > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; break; }
                                     }
                                     deltaHeadOrKv[f] -= (int)m.headMove;
                                     deltaHeadOrKv[t] += (int)m.headMove;
@@ -2192,6 +2330,30 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)pos);
                                 std::fflush(stdout);
                                 return;
+                            }
+
+                            if (gqaLockstep && kvRedundancyEnabled && !allowNoShadowHeadMigration && hasHeadDeltaForStage(deltaHeadOrKv, st)) {
+                                char reason[96] = {0};
+                                if (!validateKvShadowCoverage(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
+                                    printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
+                                        (unsigned)myNode,
+                                        (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        (unsigned)msgEpoch,
+                                        (unsigned)layerIndex,
+                                        (unsigned)pos,
+                                        reason);
+                                    std::fflush(stdout);
+                                    logCpuPlanApplyAblationEvent(
+                                        ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                        pc2.nMoves > 0u ? pc2.moves[0].fromNodeIndex : 0u,
+                                        pc2.nMoves > 0u ? pc2.moves[0].toNodeIndex : 0u,
+                                        layerIndex,
+                                        pos,
+                                        cmd,
+                                        false,
+                                        reason);
+                                    return;
+                                }
                             }
 
                             // Apply head/KV deltas.
@@ -2303,6 +2465,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)gqaGroupSize);
                                 std::fflush(stdout);
                                 logLocalWorkSplit("cmdlist");
+                                logCpuPlanApplyAblationEvent(
+                                    ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    pc2.nMoves > 0u ? pc2.moves[0].fromNodeIndex : 0u,
+                                    pc2.nMoves > 0u ? pc2.moves[0].toNodeIndex : 0u,
+                                    layerIndex,
+                                    pos,
+                                    cmd,
+                                    true,
+                                    "");
                                 device->setPlanEpoch(msgEpoch);
                             }
                             return;
@@ -2344,7 +2515,8 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
                                 if (gqaLockstep) {
                                     const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
-                                    if (!kvRedundancyEnabled) {
+                                    const bool allowNoShadowHeadMigration = getAllowNoShadowHeadMigration();
+                                    if (!kvRedundancyEnabled && !allowNoShadowHeadMigration) {
                                         printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV redundancy disabled (--enable-kv-redundancy-during-migration=0)\n",
                                             (unsigned)myNode,
                                             (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
@@ -2356,7 +2528,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         return;
                                     }
                                     const NnUint kvMove = headMove;
-                                    if (kvMove > NN_KV_REDUNDANCY_PAD_HEADS) {
+                                    if (kvRedundancyEnabled && !allowNoShadowHeadMigration && kvMove > NN_KV_REDUNDANCY_PAD_HEADS) {
                                         printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV move=%u exceeds pad=%u\n",
                                             (unsigned)myNode,
                                             (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
@@ -2380,6 +2552,32 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                             (unsigned)plan->kvHeadSplit.lengths[fromNode],
                                             (unsigned)kvMove);
                                         std::fflush(stdout);
+                                        legacyNoOp = true;
+                                        return;
+                                    }
+                                    std::vector<int> deltaHeadOrKv(plan->nNodes, 0);
+                                    deltaHeadOrKv[fromNode] -= (int)kvMove;
+                                    deltaHeadOrKv[toNode] += (int)kvMove;
+                                    char reason[96] = {0};
+                                    if (kvRedundancyEnabled && !allowNoShadowHeadMigration &&
+                                        !validateKvShadowCoverage(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
+                                        printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
+                                            (unsigned)myNode,
+                                            (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                            (unsigned)msgEpoch,
+                                            (unsigned)layerIndex,
+                                            (unsigned)pos,
+                                            reason);
+                                        std::fflush(stdout);
+                                        logCpuPlanApplyAblationEvent(
+                                            ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                            fromNode,
+                                            toNode,
+                                            layerIndex,
+                                            pos,
+                                            cmd,
+                                            false,
+                                            reason);
                                         legacyNoOp = true;
                                         return;
                                     }
@@ -2467,6 +2665,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)gqaGroupSize);
                                 std::fflush(stdout);
                                 logLocalWorkSplit("legacy");
+                                logCpuPlanApplyAblationEvent(
+                                    ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    fromNode,
+                                    toNode,
+                                    layerIndex,
+                                    pos,
+                                    cmd,
+                                    true,
+                                    "");
                                 device->setPlanEpoch(msgEpoch);
                             } else if (!legacyNoOp) {
                                 // This happens if cmd asks to move 0, or cmd kind is unknown.
@@ -2482,6 +2689,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     (unsigned)fromNode,
                                     (unsigned)toNode);
                                 std::fflush(stdout);
+                                logCpuPlanApplyAblationEvent(
+                                    ((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
+                                    fromNode,
+                                    toNode,
+                                    layerIndex,
+                                    pos,
+                                    cmd,
+                                    false,
+                                    "no_op");
                             }
                         }
                     }

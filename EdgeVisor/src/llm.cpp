@@ -18,6 +18,8 @@ static bool g_enablePlanBarrier = false;
 static bool g_enableStageFullWeights = false;
 // Global flag to keep KV redundancy enabled during migration (set from app via bootstrap packet)
 static bool g_enableKvRedundancyDuringMigration = true;
+// Global flag to allow no-shadow head migration when recovery is handled by runtime Transfer/Recompute.
+static bool g_allowNoShadowHeadMigration = false;
 // Global flag to enable KV aggregate pipes (set from app via bootstrap packet)
 static bool g_enableKvAggregate = false;
 
@@ -173,6 +175,14 @@ void setEnableKvRedundancyDuringMigration(bool enable) {
 
 bool getEnableKvRedundancyDuringMigration() {
     return g_enableKvRedundancyDuringMigration;
+}
+
+void setAllowNoShadowHeadMigration(bool enable) {
+    g_allowNoShadowHeadMigration = enable;
+}
+
+bool getAllowNoShadowHeadMigration() {
+    return g_allowNoShadowHeadMigration;
 }
 
 void setEnableKvAggregate(bool enable) {

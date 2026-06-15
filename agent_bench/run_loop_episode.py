@@ -18,11 +18,35 @@ def parse_gpu_list(value: str) -> list[int]:
     return [int(x) for x in value.split(",") if x.strip()]
 
 
+def make_virtual_topology(args: argparse.Namespace) -> Dict[str, Any]:
+    if not args.edge_virtual_pp_tp_3stage:
+        return {}
+    logical_node_gpus = parse_gpu_list(args.edge_virtual_node_gpus)
+    if not logical_node_gpus:
+        logical_node_gpus = [0, 1, 2, 0, 1, 2, 0, 1]
+    return {
+        "enabled": True,
+        "name": "virtual_pp_tp_3stage_3_3_2",
+        "ratios": args.edge_virtual_ratios,
+        "logical_node_gpus": logical_node_gpus,
+        "root_gpu": logical_node_gpus[0],
+        "worker_gpus": logical_node_gpus[1:],
+        "stage_layout": [3, 3, 2],
+        "launch_stagger_s": args.edge_virtual_launch_stagger_s,
+    }
+
+
+def load_ablation_config(path: Path | None) -> Dict[str, Any]:
+    if path is None:
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a looping LangGraph agent with a swappable LLM backend.")
     parser.add_argument(
         "--backend",
-        choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo", "edgevisor_lingualinked"],
+        choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo", "edgevisor_lingualinked", "edgevisor_ablation"],
         required=True,
     )
     parser.add_argument(
@@ -34,6 +58,27 @@ def main() -> int:
     parser.add_argument("--cuda-visible", default="0,1,2")
     parser.add_argument("--edge-worker-gpus", default="1", help="Comma-separated worker GPU indices for EdgeVisor.")
     parser.add_argument("--edge-ratios", default="1:1")
+    parser.add_argument(
+        "--edge-virtual-pp-tp-3stage",
+        action="store_true",
+        help="Use an 8-logical-node 3-stage PP+TP topology on 3 physical GPUs for short ablation experiments.",
+    )
+    parser.add_argument(
+        "--edge-virtual-ratios",
+        default="1:1:1*1:1:1*1:1",
+        help="Ratios string for --edge-virtual-pp-tp-3stage.",
+    )
+    parser.add_argument(
+        "--edge-virtual-node-gpus",
+        default="0,1,2,0,1,2,0,1",
+        help="Logical-node to physical-GPU mapping for virtual PP+TP mode; node0 is root, remaining nodes are workers.",
+    )
+    parser.add_argument(
+        "--edge-virtual-launch-stagger-s",
+        type=float,
+        default=2.0,
+        help="Delay between launching workers in virtual PP+TP mode to reduce same-GPU initialization contention.",
+    )
     parser.add_argument("--edge-steps", type=int, default=256)
     parser.add_argument("--dllama-worker-gpus", default="1", help="Comma-separated worker GPU indices for Dllama.")
     parser.add_argument("--dllama-ratios", default="1:1")
@@ -44,12 +89,44 @@ def main() -> int:
     parser.add_argument("--lingualinked-total-layers", type=int, default=28)
     parser.add_argument("--lingualinked-overlap-layers", type=int, default=2)
     parser.add_argument("--lingualinked-memory-field", choices=["total", "free"], default="total")
+    parser.add_argument("--shadow-kv-mode", choices=["enabled", "disabled_transfer", "disabled_recompute"], default="enabled")
+    parser.add_argument(
+        "--pointer-swizzling-mode",
+        choices=["enabled", "operator_rebuild", "weight_rematerialize"],
+        default="enabled",
+    )
+    parser.add_argument("--jit-mode", choices=["enabled", "static", "greedy", "oracle"], default="enabled")
+    parser.add_argument("--vg-mode", choices=["enabled", "flat", "random", "pure_pp", "no_elastic_vg"], default="enabled")
+    parser.add_argument("--disable-sharding-controller", action="store_true", help="Disable head-level JIT sharding-controller plans.")
+    parser.add_argument("--disable-pipeline-balancer", action="store_true", help="Disable PP layer-level JIT pipeline-balancer plans.")
+    parser.add_argument("--fallback-policy", default="disabled_unless_necessary")
+    parser.add_argument("--experiment-id", default="")
+    parser.add_argument("--edgevisor-ablation-config", type=Path, default=None)
+    parser.add_argument("--edge-fixed-port-base", type=int, default=0, help="Use a fixed worker port base for tc-based loopback shaping.")
+    parser.add_argument("--enable-pp-migration", action="store_true", help="Enable EdgeVisor PP layer migration control path.")
+    parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=1)
+    parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
+    parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
+    parser.add_argument(
+        "--disable-episode-dynamic-plan",
+        action="store_true",
+        help="Ignore edgevisor_dynamic_plan from the episode file for static topology smoke tests.",
+    )
+    parser.add_argument(
+        "--allow-head-kv-migration",
+        action="store_true",
+        help="Opt in to experimental online KV/head migration; disabled by default for agentic success runs.",
+    )
     parser.add_argument("--ctx", type=int, default=2048)
     args = parser.parse_args()
 
     episode = load_episode(args.episode)
+    if args.disable_episode_dynamic_plan:
+        episode = dict(episode)
+        episode.pop("edgevisor_dynamic_plan", None)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = args.out_root / f"{episode['id']}_{args.backend}_{stamp}"
+    virtual_topology = make_virtual_topology(args)
 
     backend_kwargs: Dict[str, Any] = {}
     if args.backend == "prima":
@@ -61,6 +138,7 @@ def main() -> int:
             "steps": args.edge_steps,
             "ratios": args.edge_ratios,
             "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
+            "virtual_topology": virtual_topology,
         }
     elif args.backend == "dllama":
         backend_kwargs = {
@@ -88,6 +166,39 @@ def main() -> int:
             "total_layers": args.lingualinked_total_layers,
             "overlap_layers": args.lingualinked_overlap_layers,
             "memory_field": args.lingualinked_memory_field,
+        }
+    elif args.backend == "edgevisor_ablation":
+        extra_env: Dict[str, str] = {}
+        if args.edge_fixed_port_base > 0:
+            extra_env["EDGEVISOR_FIXED_PORT_BASE"] = str(args.edge_fixed_port_base)
+        ablation_config = load_ablation_config(args.edgevisor_ablation_config)
+        ablation_config.update(
+            {
+                "shadow_kv_mode": args.shadow_kv_mode,
+                "pointer_swizzling_mode": args.pointer_swizzling_mode,
+                "jit_mode": args.jit_mode,
+                "vg_mode": args.vg_mode,
+                "disable_sharding_controller": args.disable_sharding_controller,
+                "disable_pipeline_balancer": args.disable_pipeline_balancer,
+                "fallback_policy": args.fallback_policy,
+                "allow_head_kv_migration": args.allow_head_kv_migration,
+                "enable_pp_migration": args.enable_pp_migration,
+                "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
+                "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
+                "config_path": str(args.edgevisor_ablation_config) if args.edgevisor_ablation_config else "",
+            }
+        )
+        backend_kwargs = {
+            "cuda_visible": args.cuda_visible,
+            "ctx": args.ctx,
+            "steps": args.edge_steps,
+            "ratios": args.edge_ratios,
+            "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
+            "ablation_config": ablation_config,
+            "persistent": not args.edge_cold_start,
+            "api_port": args.edge_api_port,
+            "virtual_topology": virtual_topology,
+            "extra_env": extra_env,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

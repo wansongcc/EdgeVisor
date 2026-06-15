@@ -152,6 +152,91 @@ python3 EdgeVisor/examples/plan-uds-client.py SOCKET set_pp_migration \
   --trigger-pos 0
 ```
 
+## Agentic Ablation 实验框架
+
+`EdgeVisor_Agentlized_Ablation` 分支新增统一 ablation 配置层和 Agentic
+实验入口。默认配置等价于完整 EdgeVisor：
+
+- `shadow_kv_mode=enabled`
+- `pointer_swizzling_mode=enabled`
+- `jit_mode=enabled`
+- `vg_mode=enabled`
+- `fallback_policy=disabled_unless_necessary`
+
+配置优先级为 `CLI > env > JSON > default`。支持的 JSON/CLI/env 字段如下：
+
+| 字段 | CLI | Env | 模式 |
+|---|---|---|---|
+| `shadow_kv_mode` | `--shadow-kv-mode` | `EDGEVISOR_SHADOW_KV_MODE` | `enabled`, `disabled_transfer`, `disabled_recompute` |
+| `pointer_swizzling_mode` | `--pointer-swizzling-mode` | `EDGEVISOR_POINTER_SWIZZLING_MODE` | `enabled`, `operator_rebuild`, `weight_rematerialize` |
+| `jit_mode` | `--jit-mode` | `EDGEVISOR_JIT_MODE` | `enabled`, `static`, `greedy`, `oracle` |
+| `vg_mode` | `--vg-mode` | `EDGEVISOR_VG_MODE` | `enabled`, `flat`, `random`, `pure_pp`, `no_elastic_vg` |
+| `fallback_policy` | `--fallback-policy` | `EDGEVISOR_FALLBACK_POLICY` | 自定义字符串 |
+| `ablation_log_path` | `--ablation-log-path` | `EDGEVISOR_ABLATION_LOG_PATH` | JSONL 路径 |
+| `experiment_id` | `--experiment-id` | `EDGEVISOR_EXPERIMENT_ID` | 实验 ID |
+
+直接运行示例：
+
+```bash
+./EdgeVisor/dllama inference \
+  --enable-plan-barrier \
+  --edgevisor-ablation-config ablation_config.json \
+  --ablation-log-path logs/ablation.jsonl
+
+./EdgeVisor/dllama inference \
+  --enable-plan-barrier \
+  --shadow-kv-mode disabled_transfer \
+  --pointer-swizzling-mode enabled \
+  --jit-mode enabled \
+  --vg-mode enabled \
+  --ablation-log-path logs/shadow_transfer.jsonl
+```
+
+统一 JSONL 日志会记录 `experiment_id`、`ablation_variant`、`event_id`、
+`trigger_pos`、`trigger_layer`、`affected_stage`、`from_node`、`to_node`、
+`selected_policy`、`t_decision_ms`、`t_state_prepare_ms`、`t_bind_ms`、
+`t_command_ms`、`t_apply_ms`、`t_recover_ms`、`stall_time_ms`、
+`state_transfer_bytes`、`recompute_tokens_or_layers`、`binding_update_count`、
+`vg_mapping_before`、`vg_mapping_after`、`fallback_reason` 和 `apply_success`。
+
+服务器端完整 Agentic 消融套件入口：
+
+```bash
+cd /home/byh/B01/EdgeVisor
+bash scripts/run_agentic_ablation_suite.sh
+```
+
+脚本会显式约束 `CUDA_VISIBLE_DEVICES=0,1,2`，拒绝使用 GPU3。完整模式默认运行
+Full EdgeVisor、Shadow KV transfer/recompute、Pointer operator rebuild/weight
+rematerialize、JIT static/greedy、VG flat/random，并覆盖 compute、network、
+mixed 三类波动和 3 次重复。最小 smoke test 可执行：
+
+```bash
+SMOKE=1 bash scripts/run_agentic_ablation_suite.sh
+```
+
+结果汇总：
+
+```bash
+python3 scripts/summarize_ablation_results.py /home/byh/B01/agentic_ablation_results/RUN_DIR
+```
+
+汇总工具会输出 `ablation_summary.csv`、`ablation_runs.csv`、总表 Markdown，以及
+Shadow KV、Pointer Swizzling、JIT、VG 四组分表。所有数值均从真实 `trace.json`
+解析，不硬编码实验结果。
+
+`edgevisor_ablation` backend 会在 Agent episode 内部按模式改写实际运行策略：
+
+- Shadow KV disabled 模式会把 root 启动参数切到
+  `--kv-redundancy 0 --enable-kv-redundancy-during-migration 0`，并在 JSONL
+  中记录 transfer/recompute fallback 或 apply reject reason。
+- JIT `static` / `greedy` 会在发送 UDS `set_plan` 前改写 move list，而不是关闭
+  PlanCommand。
+- VG `flat` / `random` / `pure_pp` / `no_elastic_vg` 会生成合法 worker/ratio
+  映射，并把 physical/logical group 与 VG mapping 写入同一条 ablation 日志。
+- Pointer `operator_rebuild` / `weight_rematerialize` 保持安全 pointer refresh，
+  但将替代式 rebinding / rematerialization 成本字段写入统一 JSONL。
+
 ## LinguaLinked 复现路线
 
 LinguaLinked 复现版本独立维护在：

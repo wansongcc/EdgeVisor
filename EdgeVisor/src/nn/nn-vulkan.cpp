@@ -1,4 +1,5 @@
 #include "nn-vulkan.hpp"
+#include "ablation.hpp"
 #include "plan-command.hpp"
 #include "llm.hpp"
 #include <algorithm>
@@ -24,6 +25,43 @@ static bool hasPortabilityExtension() {
     }
 #endif
     return false;
+}
+
+static void logVulkanPlanApplyAblationEvent(
+    NnUint stageIndex,
+    NnUint fromNode,
+    NnUint toNode,
+    NnUint layerIndex,
+    NnUint pos,
+    NnUint cmd,
+    bool success,
+    const char *reason) {
+    EdgeVisorAblationEvent ev;
+    ev.eventId = "plan_command_apply";
+    ev.triggerPos = pos;
+    ev.triggerLayer = layerIndex;
+    ev.affectedStage = stageIndex;
+    ev.fromNode = fromNode;
+    ev.toNode = toNode;
+    ev.selectedPolicy = std::string("gpu_apply_cmd_") + std::to_string((unsigned)cmd);
+    ev.bindingUpdateCount = 1u;
+    ev.applySuccess = success;
+    auto appendFallbackReason = [&](const char *fallbackReason) {
+        if (fallbackReason == nullptr || fallbackReason[0] == '\0') return;
+        if (!ev.fallbackReason.empty()) ev.fallbackReason += ";";
+        ev.fallbackReason += fallbackReason;
+    };
+    appendFallbackReason(reason);
+    const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+    if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::OPERATOR_REBUILD) {
+        appendFallbackReason("operator_rebuild_substitutes_lightweight_pointer_swizzling");
+        ev.fallbackCount = 1u;
+    } else if (cfg.pointerSwizzlingMode == PointerSwizzlingMode::WEIGHT_REMATERIALIZE) {
+        appendFallbackReason("weight_rematerialize_substitutes_lightweight_pointer_swizzling");
+        ev.materializedBytes = ev.bindingUpdateCount;
+        ev.fallbackCount = 1u;
+    }
+    edgevisorAblationLogEvent(ev);
 }
 
 static bool hasValidationLayer() {
@@ -422,6 +460,69 @@ static NnUint getSplitTotalForStageVulkan(const NnDimSplit *split, const NnStage
     return total;
 }
 
+static bool hasHeadDeltaForStageVulkan(const std::vector<int> &deltaHeadOrKv, const NnStageConfig *stage) {
+    if (stage == nullptr) return false;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n < deltaHeadOrKv.size() && deltaHeadOrKv[n] != 0) return true;
+    }
+    return false;
+}
+
+static bool validateKvShadowCoverageVulkan(
+    const NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage,
+    const std::vector<int> &deltaHeadOrKv,
+    char *reason,
+    size_t reasonSize
+) {
+    auto setReason = [&](const char *value) {
+        if (reason != nullptr && reasonSize != 0u) {
+            std::snprintf(reason, reasonSize, "%s", value != nullptr ? value : "kv_shadow_invalid");
+        }
+    };
+    if (!getEnableStageFullWeights()) {
+        setReason("kv_shadow_requires_stage_full_weights");
+        return false;
+    }
+    if (!getEnableKvRedundancyDuringMigration()) {
+        setReason("kv_shadow_redundancy_disabled");
+        return false;
+    }
+    if (plan == nullptr || stage == nullptr ||
+        plan->kvHeadSplit.starts == nullptr || plan->kvHeadSplit.lengths == nullptr ||
+        plan->kvHeadComputeSplit.starts == nullptr || plan->kvHeadComputeSplit.lengths == nullptr) {
+        setReason("kv_shadow_split_missing");
+        return false;
+    }
+
+    NnUint newStart = 0u;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n >= deltaHeadOrKv.size()) {
+            setReason("kv_shadow_delta_missing");
+            return false;
+        }
+        const int newLenSigned = (int)plan->kvHeadSplit.lengths[n] + deltaHeadOrKv[n];
+        if (newLenSigned < 0) {
+            setReason("kv_shadow_underflow");
+            return false;
+        }
+
+        const NnUint newLen = (NnUint)newLenSigned;
+        const NnUint newEnd = newStart + newLen;
+        const NnUint shadowStart = plan->kvHeadComputeSplit.starts[n];
+        const NnUint shadowEnd = shadowStart + plan->kvHeadComputeSplit.lengths[n];
+        if (newStart < shadowStart || newEnd > shadowEnd) {
+            setReason("kv_shadow_coverage_miss");
+            return false;
+        }
+        newStart = newEnd;
+    }
+    setReason("");
+    return true;
+}
+
 static bool resolveUnevenSliceVulkan(
     NnNetConfig *netConfig,
     NnNodeConfig *nodeConfig,
@@ -574,7 +675,22 @@ static bool handleVulkanPlanBarrier(
         const unsigned int lastEmitted = device->getLastPlanCmdSeqEmitted();
         if (!(pc.seq != 0u && pc.seq <= lastEmitted)) {
             if (pc.mode == PLAN_CMD_MODE_EXACT) {
-                trigger = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                const bool exactMatch = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                const bool missedExact =
+                    (pc.triggerPos != 0xFFFFFFFFu) &&
+                    (pc.triggerLayer != 0xFFFFFFFFu) &&
+                    ((pos > pc.triggerPos) || (pos == pc.triggerPos && layerIndex > pc.triggerLayer));
+                trigger = exactMatch || missedExact;
+                if (missedExact && !exactMatch) {
+                    printf("🧭 [plan][emit][gpu] node=%u stage=%u layer=%u pos=%u late-trigger for exact target layer=%u pos=%u\n",
+                        (unsigned)myNode,
+                        (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                        (unsigned)layerIndex,
+                        (unsigned)pos,
+                        (unsigned)pc.triggerLayer,
+                        (unsigned)pc.triggerPos);
+                    std::fflush(stdout);
+                }
             } else {
                 trigger = true;
             }
@@ -583,7 +699,25 @@ static bool handleVulkanPlanBarrier(
 
     if (trigger) {
         emitEpoch = curEpoch + 1u;
-        if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u) {
+        if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u) {
+            const PlanMove &m = pc.moves[0];
+            cmd = m.cmdKind;
+            headMove = m.headMove;
+            ffnMove = m.ffnMove;
+            fromNode = m.fromNodeIndex;
+            toNode = m.toNodeIndex;
+            printf("🧭 [plan][emit][gpu] node=%u stage=%u layer=%u pos=%u epoch=%u kind=single-move headMove=%u ffnMove=%u from=%u to=%u seq=%u\n",
+                (unsigned)myNode,
+                (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                (unsigned)layerIndex,
+                (unsigned)pos,
+                (unsigned)emitEpoch,
+                (unsigned)headMove,
+                (unsigned)ffnMove,
+                (unsigned)fromNode,
+                (unsigned)toNode,
+                (unsigned)pc.seq);
+        } else if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u) {
             cmd = 4u;
             fromNode = pc.seq;
             printf("🧭 [plan][emit][gpu] node=%u stage=%u layer=%u pos=%u epoch=%u kind=cmdlist seq=%u moves=%u\n",
@@ -709,7 +843,10 @@ static bool handleVulkanPlanApply(
         if (!inStage(f) || !inStage(t) || f == t || !adjacent(f, t)) { reject = true; return; }
         if (h != 0u) {
             if (gqaGroupSize > 1u) {
-                if (!getEnableKvRedundancyDuringMigration() || h > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; return; }
+                const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
+                const bool allowNoShadowHeadMigration = getAllowNoShadowHeadMigration();
+                if (!kvRedundancyEnabled && !allowNoShadowHeadMigration) { reject = true; return; }
+                if (kvRedundancyEnabled && !allowNoShadowHeadMigration && h > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; return; }
             }
             deltaHeadOrKv[f] -= (int)h;
             deltaHeadOrKv[t] += (int)h;
@@ -728,6 +865,7 @@ static bool handleVulkanPlanApply(
             printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u cmdlist missing/mismatch\n",
                 (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)layerIndex, (unsigned)pos);
             std::fflush(stdout);
+            logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "cmdlist_missing_or_mismatch");
             return true;
         }
         const uint32_t maxMovesAllowed = std::min<uint32_t>(DLLAMA_PLAN_CMD_MAX_MOVES, (uint32_t)(2u * st->nNodes));
@@ -735,6 +873,7 @@ static bool handleVulkanPlanApply(
             printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u reject: nMoves=%u > maxAllowed=%u\n",
                 (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)pc2.nMoves, (unsigned)maxMovesAllowed);
             std::fflush(stdout);
+            logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "too_many_moves");
             return true;
         }
         for (uint32_t i = 0; i < pc2.nMoves; ++i) {
@@ -749,7 +888,27 @@ static bool handleVulkanPlanApply(
         printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u reject: bad move\n",
             (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)layerIndex, (unsigned)pos);
         std::fflush(stdout);
+        logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "bad_move");
         return true;
+    }
+
+    if (gqaGroupSize > 1u &&
+        getEnableKvRedundancyDuringMigration() &&
+        !getAllowNoShadowHeadMigration() &&
+        hasHeadDeltaForStageVulkan(deltaHeadOrKv, st)) {
+        char reason[96] = {0};
+        if (!validateKvShadowCoverageVulkan(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
+            printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
+                (unsigned)myNode,
+                (unsigned)onlyStage,
+                (unsigned)msgEpoch,
+                (unsigned)layerIndex,
+                (unsigned)pos,
+                reason);
+            std::fflush(stdout);
+            logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, reason);
+            return true;
+        }
     }
 
     bool changed = false;
@@ -820,6 +979,7 @@ static bool handleVulkanPlanApply(
         printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u reject: split underflow\n",
             (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)layerIndex, (unsigned)pos);
         std::fflush(stdout);
+        logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "split_underflow");
         return true;
     }
 
@@ -835,6 +995,7 @@ static bool handleVulkanPlanApply(
             (unsigned)(plan->headSplit.lengths ? plan->headSplit.lengths[myNode] : 0u),
             (unsigned)(plan->ffnSplit.lengths ? plan->ffnSplit.lengths[myNode] : 0u));
         std::fflush(stdout);
+        logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, true, "");
         device->setPlanEpoch(msgEpoch);
     }
     return true;
@@ -1611,10 +1772,20 @@ void NnVulkanDeviceSegment::setPartitionPlan(const NnUnevenPartitionPlan *plan) 
 }
 
 
-bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow) {
-    kRow.assign(kvDim, 0.0f);
-    vRow.assign(kvDim, 0.0f);
-    if (data == nullptr || segmentConfig == nullptr || kvDim == 0u) return false;
+bool NnVulkanDeviceSegment::exportLayerKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    NnUint kvDim,
+    std::vector<float> &kRow,
+    std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
+    const bool partial = rangeLen != 0u;
+    const NnUint outDim = partial ? rangeLen : kvDim;
+    kRow.assign(outDim, 0.0f);
+    vRow.assign(outDim, 0.0f);
+    if (data == nullptr || segmentConfig == nullptr || kvDim == 0u || outDim == 0u) return false;
+    if (partial && rangeStart + rangeLen > kvDim) return false;
 
     bool readAny = false;
     for (NnUint i = 0; i < segmentConfig->nOps; ++i) {
@@ -1629,12 +1800,13 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
             if (bSize == nullptr || bSize->floatType != F_32 || bSize->x == 0u || bSize->y == 0u) return;
             if (position >= bSize->y) return;
 
-            const NnUint srcStart = cfg->kvStart;
-            const NnUint needLen = cfg->kvDim0;
-            if (srcStart >= bSize->x || srcStart >= dstRow.size() || needLen == 0u) return;
+            const NnUint srcStart = partial ? rangeStart : cfg->kvStart;
+            const NnUint dstStart = partial ? 0u : cfg->kvStart;
+            const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+            if (srcStart >= bSize->x || dstStart >= dstRow.size() || needLen == 0u) return;
 
             const NnUint srcAvail = bSize->x - srcStart;
-            const NnUint dstAvail = (NnUint)dstRow.size() - srcStart;
+            const NnUint dstAvail = (NnUint)dstRow.size() - dstStart;
             const NnUint readLen = std::min(needLen, std::min(srcAvail, dstAvail));
             if (readLen == 0u) return;
 
@@ -1642,10 +1814,10 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
             NnVulkanBuffer *buffer = data->resolveBufferByIndex(bufIdx);
             const NnSize offset = ((NnSize)position * (NnSize)bSize->x + (NnSize)srcStart) * sizeof(float);
             const NnSize nBytes = (NnSize)readLen * sizeof(float);
-            buffer->read((NnByte *)(dstRow.data() + srcStart), offset, nBytes);
+            buffer->read((NnByte *)(dstRow.data() + dstStart), offset, nBytes);
             readAny = true;
 
-            std::printf("🧩 [kv-export-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u range=[%u,%u)\n",
+            std::printf("🧩 [kv-export-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                 (unsigned)(data ? data->getNodeIndex() : 0u),
                 (unsigned)segmentIndex,
                 (unsigned)layerIndex,
@@ -1653,7 +1825,10 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
                 tag,
                 (unsigned)bufIdx,
                 (unsigned)srcStart,
-                (unsigned)(srcStart + readLen));
+                (unsigned)(srcStart + readLen),
+                (unsigned)dstStart,
+                (unsigned)(dstStart + readLen),
+                partial ? 1u : 0u);
             std::fflush(stdout);
         };
 
@@ -1663,9 +1838,16 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
     return readAny;
 }
 
-bool NnVulkanDeviceSegment::applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
+bool NnVulkanDeviceSegment::applyTransferredKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    const std::vector<float> &kRow,
+    const std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
     if (data == nullptr || segmentConfig == nullptr) return false;
     if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return false;
+    if (rangeLen != 0u && rangeLen != kRow.size()) return false;
 
     bool wroteAny = false;
     for (NnUint i = 0; i < segmentConfig->nOps; ++i) {
@@ -1680,23 +1862,25 @@ bool NnVulkanDeviceSegment::applyTransferredKvRow(NnUint layerIndex, NnUint posi
             if (bSize == nullptr || bSize->floatType != F_32 || bSize->x == 0u || bSize->y == 0u) return;
             if (position >= bSize->y) return;
 
-            const NnUint srcStart = cfg->kvStart;
-            const NnUint needLen = cfg->kvDim0;
-            if (srcStart >= srcRow.size() || srcStart >= bSize->x || needLen == 0u) return;
+            const bool partial = rangeLen != 0u;
+            const NnUint dstStart = partial ? rangeStart : cfg->kvStart;
+            const NnUint srcStart = partial ? 0u : cfg->kvStart;
+            const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+            if (srcStart >= srcRow.size() || dstStart >= bSize->x || needLen == 0u) return;
 
             const NnUint srcAvail = (NnUint)srcRow.size() - srcStart;
-            const NnUint dstAvail = bSize->x - srcStart;
+            const NnUint dstAvail = bSize->x - dstStart;
             const NnUint writeLen = std::min(needLen, std::min(srcAvail, dstAvail));
             if (writeLen == 0u) return;
 
             context->device.waitIdle();
             NnVulkanBuffer *buffer = data->resolveBufferByIndex(bufIdx);
-            const NnSize offset = ((NnSize)position * (NnSize)bSize->x + (NnSize)srcStart) * sizeof(float);
+            const NnSize offset = ((NnSize)position * (NnSize)bSize->x + (NnSize)dstStart) * sizeof(float);
             const NnSize nBytes = (NnSize)writeLen * sizeof(float);
             buffer->write((const NnByte *)(srcRow.data() + srcStart), offset, nBytes);
             wroteAny = true;
 
-            std::printf("🧩 [kv-write-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u range=[%u,%u)\n",
+            std::printf("🧩 [kv-write-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                 (unsigned)(data ? data->getNodeIndex() : 0u),
                 (unsigned)segmentIndex,
                 (unsigned)layerIndex,
@@ -1704,7 +1888,10 @@ bool NnVulkanDeviceSegment::applyTransferredKvRow(NnUint layerIndex, NnUint posi
                 tag,
                 (unsigned)bufIdx,
                 (unsigned)srcStart,
-                (unsigned)(srcStart + writeLen));
+                (unsigned)(srcStart + writeLen),
+                (unsigned)dstStart,
+                (unsigned)(dstStart + writeLen),
+                partial ? 1u : 0u);
             std::fflush(stdout);
         };
 

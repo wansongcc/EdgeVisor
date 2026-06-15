@@ -189,8 +189,21 @@ public:
     void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) override;
     void setPartitionPlan(const NnUnevenPartitionPlan *plan) override;
     void refreshPointers() override;
-    bool exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow) override;
-    bool applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) override;
+    bool exportLayerKvRow(
+        NnUint layerIndex,
+        NnUint position,
+        NnUint kvDim,
+        std::vector<float> &kRow,
+        std::vector<float> &vRow,
+        NnUint rangeStart = 0u,
+        NnUint rangeLen = 0u) override;
+    bool applyTransferredKvRow(
+        NnUint layerIndex,
+        NnUint position,
+        const std::vector<float> &kRow,
+        const std::vector<float> &vRow,
+        NnUint rangeStart = 0u,
+        NnUint rangeLen = 0u) override;
 };
 
 #endif

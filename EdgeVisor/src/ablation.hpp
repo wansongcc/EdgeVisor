@@ -37,6 +37,8 @@ struct EdgeVisorAblationConfig {
     PointerSwizzlingMode pointerSwizzlingMode = PointerSwizzlingMode::ENABLED;
     JitMode jitMode = JitMode::ENABLED;
     VgMode vgMode = VgMode::ENABLED;
+    bool disableShardingController = false;
+    bool disablePipelineBalancer = false;
     std::string fallbackPolicy = "disabled_unless_necessary";
     std::string ablationLogPath;
     std::string experimentId = "default";
@@ -88,6 +90,8 @@ EdgeVisorAblationConfig edgevisorAblationConfigFromSources(
     const char *pointerSwizzlingModeCli,
     const char *jitModeCli,
     const char *vgModeCli,
+    const char *disableShardingControllerCli,
+    const char *disablePipelineBalancerCli,
     const char *fallbackPolicyCli,
     const char *ablationLogPathCli,
     const char *experimentIdCli);

@@ -62,6 +62,8 @@ public:
     char *pointerSwizzlingModeStr;
     char *jitModeStr;
     char *vgModeStr;
+    char *disableShardingControllerStr;
+    char *disablePipelineBalancerStr;
     char *fallbackPolicyStr;
     char *ablationLogPath;
     char *experimentId;

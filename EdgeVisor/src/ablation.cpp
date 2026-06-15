@@ -19,6 +19,18 @@ static bool hasValue(const char *value) {
     return value != nullptr && value[0] != '\0';
 }
 
+static bool parseBoolValue(const std::string &value, bool &out) {
+    if (value == "1" || value == "true" || value == "True" || value == "yes" || value == "on") {
+        out = true;
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "False" || value == "no" || value == "off") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
 const char *toString(ShadowKvMode mode) {
     switch (mode) {
         case ShadowKvMode::ENABLED: return "enabled";
@@ -117,6 +129,8 @@ static void applyJsonConfig(EdgeVisorAblationConfig &cfg, const json &j) {
     cfg.fallbackPolicy = j.value("fallback_policy", cfg.fallbackPolicy);
     cfg.ablationLogPath = j.value("ablation_log_path", cfg.ablationLogPath);
     cfg.experimentId = j.value("experiment_id", cfg.experimentId);
+    cfg.disableShardingController = j.value("disable_sharding_controller", cfg.disableShardingController);
+    cfg.disablePipelineBalancer = j.value("disable_pipeline_balancer", cfg.disablePipelineBalancer);
 }
 
 static void applyEnvConfig(EdgeVisorAblationConfig &cfg) {
@@ -138,6 +152,14 @@ static void applyEnvConfig(EdgeVisorAblationConfig &cfg) {
     }
     const std::string fallback = envValue("EDGEVISOR_FALLBACK_POLICY");
     if (!fallback.empty()) cfg.fallbackPolicy = fallback;
+    const std::string disableSharding = envValue("EDGEVISOR_DISABLE_SHARDING_CONTROLLER");
+    if (!disableSharding.empty() && !parseBoolValue(disableSharding, cfg.disableShardingController)) {
+        throw std::runtime_error("Invalid EDGEVISOR_DISABLE_SHARDING_CONTROLLER: " + disableSharding);
+    }
+    const std::string disablePipeline = envValue("EDGEVISOR_DISABLE_PIPELINE_BALANCER");
+    if (!disablePipeline.empty() && !parseBoolValue(disablePipeline, cfg.disablePipelineBalancer)) {
+        throw std::runtime_error("Invalid EDGEVISOR_DISABLE_PIPELINE_BALANCER: " + disablePipeline);
+    }
     const std::string logPath = envValue("EDGEVISOR_ABLATION_LOG_PATH");
     if (!logPath.empty()) cfg.ablationLogPath = logPath;
     const std::string experiment = envValue("EDGEVISOR_EXPERIMENT_ID");
@@ -150,6 +172,8 @@ EdgeVisorAblationConfig edgevisorAblationConfigFromSources(
     const char *pointerSwizzlingModeCli,
     const char *jitModeCli,
     const char *vgModeCli,
+    const char *disableShardingControllerCli,
+    const char *disablePipelineBalancerCli,
     const char *fallbackPolicyCli,
     const char *ablationLogPathCli,
     const char *experimentIdCli) {
@@ -181,6 +205,14 @@ EdgeVisorAblationConfig edgevisorAblationConfigFromSources(
         const std::string value(vgModeCli);
         if (!parseVgMode(value, cfg.vgMode)) throw std::runtime_error("Invalid --vg-mode: " + value);
     }
+    if (hasValue(disableShardingControllerCli)) {
+        const std::string value(disableShardingControllerCli);
+        if (!parseBoolValue(value, cfg.disableShardingController)) throw std::runtime_error("Invalid --disable-sharding-controller: " + value);
+    }
+    if (hasValue(disablePipelineBalancerCli)) {
+        const std::string value(disablePipelineBalancerCli);
+        if (!parseBoolValue(value, cfg.disablePipelineBalancer)) throw std::runtime_error("Invalid --disable-pipeline-balancer: " + value);
+    }
     if (hasValue(fallbackPolicyCli)) cfg.fallbackPolicy = fallbackPolicyCli;
     if (hasValue(ablationLogPathCli)) cfg.ablationLogPath = ablationLogPathCli;
     if (hasValue(experimentIdCli)) cfg.experimentId = experimentIdCli;
@@ -202,6 +234,8 @@ json edgevisorAblationConfigToJson(const EdgeVisorAblationConfig &config) {
         {"pointer_swizzling_mode", toString(config.pointerSwizzlingMode)},
         {"jit_mode", toString(config.jitMode)},
         {"vg_mode", toString(config.vgMode)},
+        {"disable_sharding_controller", config.disableShardingController},
+        {"disable_pipeline_balancer", config.disablePipelineBalancer},
         {"fallback_policy", config.fallbackPolicy},
         {"ablation_log_path", config.ablationLogPath},
         {"experiment_id", config.experimentId},

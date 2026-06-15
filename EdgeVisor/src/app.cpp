@@ -277,6 +277,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.pointerSwizzlingModeStr = nullptr;
     args.jitModeStr = nullptr;
     args.vgModeStr = nullptr;
+    args.disableShardingControllerStr = nullptr;
+    args.disablePipelineBalancerStr = nullptr;
     args.fallbackPolicyStr = nullptr;
     args.ablationLogPath = nullptr;
     args.experimentId = nullptr;
@@ -408,6 +410,28 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.runtimeRedundantSegEnabled = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--disable-sharding-controller") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.disableShardingControllerStr = argv[i + 1];
+                i += 2;
+            } else {
+                args.disableShardingControllerStr = (char *)"1";
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--disable-pipeline-balancer") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.disablePipelineBalancerStr = argv[i + 1];
+                i += 2;
+            } else {
+                args.disablePipelineBalancerStr = (char *)"1";
                 i += 1;
             }
             continue;
@@ -3044,6 +3068,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         args->pointerSwizzlingModeStr,
         args->jitModeStr,
         args->vgModeStr,
+        args->disableShardingControllerStr,
+        args->disablePipelineBalancerStr,
         args->fallbackPolicyStr,
         args->ablationLogPath,
         args->experimentId);

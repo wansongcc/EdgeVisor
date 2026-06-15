@@ -433,6 +433,18 @@ def uds_request(socket_path: str, req: Dict[str, Any], timeout_s: float = 2.0) -
     return json.loads(buf.decode("utf-8"))
 
 
+def _dynamic_plan_has_head_move(plan: Dict[str, Any]) -> bool:
+    if str(plan.get("plan_op", "set_plan")) == "set_pp_migration":
+        return False
+    moves = plan.get("moves")
+    if isinstance(moves, list):
+        for move in moves:
+            if isinstance(move, dict) and int(move.get("headMove", 0) or 0) > 0:
+                return True
+        return False
+    return int(plan.get("heads", plan.get("nHeadsToMove", 0)) or 0) > 0
+
+
 class Backend:
     name = "base"
 
@@ -829,6 +841,18 @@ class EdgeVisorBackend(Backend):
         shadow_mode = str(cfg.get("shadow_kv_mode", "enabled"))
         allow_head_kv_migration = bool(cfg.get("allow_head_kv_migration", False))
         is_pp_plan = str(plan.get("plan_op", "set_plan")) == "set_pp_migration"
+        has_head_move = _dynamic_plan_has_head_move(plan)
+
+        if cfg.get("disable_pipeline_balancer") and is_pp_plan:
+            plan["enabled"] = False
+            plan["jit_decision_reason"] = "rejected_by_pipeline_balancer_disabled"
+            plan["fallbackReason"] = "pipeline_balancer_disabled"
+            return plan
+        if cfg.get("disable_sharding_controller") and has_head_move:
+            plan["enabled"] = False
+            plan["jit_decision_reason"] = "rejected_by_sharding_controller_disabled"
+            plan["fallbackReason"] = "sharding_controller_disabled"
+            return plan
 
         if jit_mode == "static" and not is_pp_plan:
             plan["stage"] = int(plan.get("stage", 0))
@@ -1003,6 +1027,10 @@ class EdgeVisorBackend(Backend):
                 root_cmd.extend(["--jit-mode", str(cfg.get("jit_mode", "enabled"))])
                 root_cmd.extend(["--vg-mode", str(cfg.get("vg_mode", "enabled"))])
                 root_cmd.extend(["--fallback-policy", str(cfg.get("fallback_policy", "disabled_unless_necessary"))])
+                if cfg.get("disable_sharding_controller"):
+                    root_cmd.extend(["--disable-sharding-controller", "1"])
+                if cfg.get("disable_pipeline_balancer"):
+                    root_cmd.extend(["--disable-pipeline-balancer", "1"])
                 if cfg.get("config_path"):
                     root_cmd.extend(["--edgevisor-ablation-config", str(cfg["config_path"])])
             if self.extra_root_args:
@@ -1096,6 +1124,18 @@ class EdgeVisorBackend(Backend):
                 command_plan.update(item)
                 command_plan.pop("commands", None)
                 command_plan.setdefault("delay_s", 0.0 if idx == 0 else float(shared.get("inter_command_delay_s", 0.0) or 0.0))
+                if not bool(command_plan.get("enabled", True)):
+                    events.append(
+                        {
+                            "event": "jit_plan_filtered",
+                            "command_index": idx,
+                            "jit_decision_reason": command_plan.get("jit_decision_reason", "disabled"),
+                            "fallback_reason": command_plan.get("fallbackReason", command_plan.get("fallback_reason")),
+                            "plan_op": command_plan.get("plan_op", "set_plan"),
+                            "plan": command_plan,
+                        }
+                    )
+                    continue
                 events.extend(
                     self._drive_dynamic_plan_command(
                         socket_path,
@@ -1105,6 +1145,19 @@ class EdgeVisorBackend(Backend):
                         ablation_log_path=ablation_log_path,
                     )
                 )
+            return events
+
+        if not bool(dynamic_plan.get("enabled", True)):
+            events.append(
+                {
+                    "event": "jit_plan_filtered",
+                    "command_index": 0,
+                    "jit_decision_reason": dynamic_plan.get("jit_decision_reason", "disabled"),
+                    "fallback_reason": dynamic_plan.get("fallbackReason", dynamic_plan.get("fallback_reason")),
+                    "plan_op": dynamic_plan.get("plan_op", "set_plan"),
+                    "plan": dynamic_plan,
+                }
+            )
             return events
 
         events.extend(
@@ -1212,6 +1265,16 @@ class EdgeVisorBackend(Backend):
                     "fluctuation_type": dynamic_plan.get("fluctuation_type", "unspecified"),
                 }
             )
+            if isinstance(set_resp, dict) and not bool(set_resp.get("ok", False)):
+                events.append(
+                    {
+                        "event": "jit_plan_rejected",
+                        "command_index": command_index,
+                        "reason": set_resp.get("reason"),
+                        "response": set_resp,
+                    }
+                )
+                return events
         except Exception as exc:
             events.append({"event": "set_plan_error", "error": str(exc), "request": cmd})
             return events
@@ -1749,6 +1812,10 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             root_cmd.extend(["--jit-mode", str(cfg.get("jit_mode", "enabled"))])
             root_cmd.extend(["--vg-mode", str(cfg.get("vg_mode", "enabled"))])
             root_cmd.extend(["--fallback-policy", str(cfg.get("fallback_policy", "disabled_unless_necessary"))])
+            if cfg.get("disable_sharding_controller"):
+                root_cmd.extend(["--disable-sharding-controller", "1"])
+            if cfg.get("disable_pipeline_balancer"):
+                root_cmd.extend(["--disable-pipeline-balancer", "1"])
             if cfg.get("config_path"):
                 root_cmd.extend(["--edgevisor-ablation-config", str(cfg["config_path"])])
             if self.extra_root_args:

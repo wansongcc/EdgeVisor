@@ -5,3 +5,4 @@ __pycache__/
 agent_bench_results/
 .DS_Store
 artifacts/shadowkv_ablation_20260615/
+artifacts/pointer_swizzling_microbench_20260615/

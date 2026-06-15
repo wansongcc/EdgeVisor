@@ -762,8 +762,9 @@ class EdgeVisorBackend(Backend):
             return ["--enable-plan-barrier", "--kv-redundancy", "2"]
         shadow_mode = str(self.ablation_config.get("shadow_kv_mode", "enabled"))
         allow_head_kv_migration = bool(self.ablation_config.get("allow_head_kv_migration", False))
+        kv_redundancy = str(self.ablation_config.get("kv_redundancy", "2"))
         if shadow_mode == "enabled":
-            args = ["--enable-plan-barrier", "--kv-redundancy", "2"]
+            args = ["--enable-plan-barrier", "--kv-redundancy", kv_redundancy]
             if allow_head_kv_migration:
                 args = [
                     "--enable-plan-barrier",
@@ -771,26 +772,33 @@ class EdgeVisorBackend(Backend):
                     "--enable-kv-redundancy-during-migration",
                     "1",
                     "--kv-redundancy",
-                    "2",
+                    kv_redundancy,
                 ]
             return self._append_pp_migration_args(args)
-        return self._append_pp_migration_args([
+        args = [
             "--enable-plan-barrier",
             "--kv-redundancy",
             "0",
             "--enable-kv-redundancy-during-migration",
             "0",
-        ])
+        ]
+        if allow_head_kv_migration:
+            args.append("--allow-no-shadow-head-migration")
+        return self._append_pp_migration_args(args)
 
     def _append_pp_migration_args(self, args: List[str]) -> List[str]:
         if not self.ablation_config or not self.ablation_config.get("enable_pp_migration", False):
             return args
         out = list(args)
+        if "--enable-stage-full-weights" not in out:
+            out.append("--enable-stage-full-weights")
         out.append("--enable-pp-migration")
         boundary_layers = int(self.ablation_config.get("runtime_redundant_boundary_layers", 1))
         out.extend(["--runtime-redundant-boundary-layers", str(max(0, boundary_layers))])
         out.extend(["--runtime-active-seg-enabled", "1"])
-        out.extend(["--runtime-redundant-seg-enabled", "0"])
+        shadow_mode = str(self.ablation_config.get("shadow_kv_mode", "enabled"))
+        redundant_enabled = "1" if shadow_mode == "enabled" else "0"
+        out.extend(["--runtime-redundant-seg-enabled", redundant_enabled])
         return out
 
     def _ablation_dynamic_plan(self, dynamic_plan: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -798,6 +806,24 @@ class EdgeVisorBackend(Backend):
             return dynamic_plan
         cfg = self.ablation_config
         plan = dict(dynamic_plan)
+        if isinstance(plan.get("commands"), list):
+            base = {k: v for k, v in plan.items() if k != "commands"}
+            seq_base = int(plan.get("seq_base", int(time.time()) % 100000))
+            commands: List[Dict[str, Any]] = []
+            for idx, item in enumerate(plan.get("commands", [])):
+                if not isinstance(item, dict):
+                    continue
+                merged = dict(base)
+                merged.update(item)
+                merged.pop("commands", None)
+                merged.setdefault("seq", seq_base + idx + 1)
+                command_plan = self._ablation_dynamic_plan(merged)
+                if isinstance(command_plan, dict):
+                    commands.append(command_plan)
+            plan["commands"] = commands
+            plan["candidateCount"] = int(plan.get("candidate_count", len(commands) or 1))
+            plan["expected_command_count"] = int(plan.get("expected_command_count", len(commands)))
+            return plan
         jit_mode = str(cfg.get("jit_mode", "enabled"))
         vg_mode = str(cfg.get("vg_mode", "enabled"))
         shadow_mode = str(cfg.get("shadow_kv_mode", "enabled"))
@@ -845,58 +871,41 @@ class EdgeVisorBackend(Backend):
         if self.virtual_topology:
             plan["nodeGpuMap"] = plan.get("node_gpu_map", json.dumps(self.virtual_topology["node_gpu_map"], sort_keys=True))
 
-        state_prepare_ms = float(plan.get("state_prepare_ms", plan.get("tStatePrepareMs", 0.0)) or 0.0)
         if shadow_mode == "disabled_transfer":
             plan["fallbackCount"] = int(plan.get("fallback_count", 1))
-            plan["stateTransferBytes"] = int(plan.get("state_transfer_bytes", 0))
-            plan["tStatePrepareMs"] = state_prepare_ms
-            plan["stallTimeMs"] = max(float(plan.get("stallTimeMs", 0.0) or 0.0), state_prepare_ms)
         elif shadow_mode == "disabled_recompute":
             plan["fallbackCount"] = int(plan.get("fallback_count", 1))
-            plan["recomputeTokensOrLayers"] = int(plan.get("recompute_tokens_or_layers", 0))
-            plan["tStatePrepareMs"] = state_prepare_ms
-            plan["stallTimeMs"] = max(float(plan.get("stallTimeMs", 0.0) or 0.0), state_prepare_ms)
         if isinstance(plan.get("moves"), list):
-            safe_moves = []
-            rejected = int(plan.get("rejectedMoves", 0))
-            removed_head_move = False
-            original_moves = []
-            for move in plan["moves"]:
-                if not isinstance(move, dict):
-                    safe_moves.append(move)
-                    continue
-                m = dict(move)
-                original_moves.append(dict(m))
-                if int(m.get("headMove", 0) or 0) > 0 and (
-                    not allow_head_kv_migration or shadow_mode in {"disabled_transfer", "disabled_recompute"}
-                ):
-                    rejected += 1
-                    removed_head_move = True
-                    m["headMove"] = 0
-                    if int(m.get("ffnMove", 0) or 0) > 0:
-                        m["cmdKind"] = 2
-                    else:
-                        m["cmdKind"] = 0
-                    m["fallbackReason"] = "kv_head_move_removed_until_state_transfer_validated"
-                safe_moves.append(m)
-            plan["moves"] = [m for m in safe_moves if not (isinstance(m, dict) and int(m.get("headMove", 0) or 0) == 0 and int(m.get("ffnMove", 0) or 0) == 0)]
-            if removed_head_move:
-                plan["originalMoves"] = original_moves
-                plan["rejectedMoves"] = rejected
-                plan["fallbackCount"] = max(int(plan.get("fallbackCount", 0)), 1)
-                plan["fallbackReason"] = "kv_head_move_removed_until_state_transfer_validated"
-                plan["allowHeadKvMigration"] = allow_head_kv_migration
-                if shadow_mode == "disabled_transfer" and int(plan.get("stateTransferBytes", 0) or 0) == 0:
-                    bytes_per_head = int(plan.get("estimated_state_transfer_bytes_per_head", 1024 * 1024))
-                    plan["stateTransferBytes"] = max(0, rejected * bytes_per_head)
-                elif shadow_mode == "disabled_recompute" and int(plan.get("recomputeTokensOrLayers", 0) or 0) == 0:
-                    plan["recomputeTokensOrLayers"] = rejected
-                if float(plan.get("tStatePrepareMs", 0.0) or 0.0) == 0.0:
-                    plan["tStatePrepareMs"] = state_prepare_ms
-                plan["stallTimeMs"] = max(
-                    float(plan.get("stallTimeMs", 0.0) or 0.0),
-                    float(plan.get("tStatePrepareMs", 0.0) or 0.0),
-                )
+            if not allow_head_kv_migration:
+                safe_moves = []
+                rejected = int(plan.get("rejectedMoves", 0))
+                for move in plan["moves"]:
+                    if not isinstance(move, dict):
+                        safe_moves.append(move)
+                        continue
+                    m = dict(move)
+                    if int(m.get("headMove", 0) or 0) > 0:
+                        rejected += 1
+                        m["headMove"] = 0
+                        if int(m.get("ffnMove", 0) or 0) > 0:
+                            m["cmdKind"] = 2
+                        else:
+                            m["cmdKind"] = 0
+                    safe_moves.append(m)
+                plan["moves"] = [
+                    m for m in safe_moves
+                    if not (
+                        isinstance(m, dict) and
+                        int(m.get("headMove", 0) or 0) == 0 and
+                        int(m.get("ffnMove", 0) or 0) == 0
+                    )
+                ]
+                if rejected:
+                    plan["rejectedMoves"] = rejected
+                    plan["fallbackCount"] = max(int(plan.get("fallbackCount", 0)), 1)
+                    plan["fallbackReason"] = "kv_head_move_requires_allow_head_kv_migration"
+            else:
+                plan["allowHeadKvMigration"] = True
         return plan
 
     def generate(
@@ -1007,7 +1016,7 @@ class EdgeVisorBackend(Backend):
                     proxy.activate()
 
             if socket_path:
-                dynamic_events.extend(self._drive_dynamic_plan(socket_path, root_proc, dynamic_plan or {}))
+                dynamic_events.extend(self._drive_dynamic_plan(socket_path, root_proc, dynamic_plan or {}, ablation_log_path))
 
             try:
                 rc = root_proc.wait(timeout=self.timeout_s)
@@ -1058,6 +1067,7 @@ class EdgeVisorBackend(Backend):
         socket_path: str,
         root_proc: subprocess.Popen[Any],
         dynamic_plan: Dict[str, Any],
+        ablation_log_path: Optional[Path] = None,
     ) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
         deadline = time.time() + float(dynamic_plan.get("ready_timeout_s", 30.0))
@@ -1074,8 +1084,65 @@ class EdgeVisorBackend(Backend):
             events.append({"event": "uds_not_ready"})
             return events
 
+        if isinstance(dynamic_plan.get("commands"), list):
+            shared = {k: v for k, v in dynamic_plan.items() if k != "commands"}
+            for idx, item in enumerate(dynamic_plan.get("commands", [])):
+                if root_proc.poll() is not None:
+                    events.append({"event": "root_exited_before_plan", "command_index": idx})
+                    break
+                if not isinstance(item, dict):
+                    continue
+                command_plan = dict(shared)
+                command_plan.update(item)
+                command_plan.pop("commands", None)
+                command_plan.setdefault("delay_s", 0.0 if idx == 0 else float(shared.get("inter_command_delay_s", 0.0) or 0.0))
+                events.extend(
+                    self._drive_dynamic_plan_command(
+                        socket_path,
+                        root_proc,
+                        command_plan,
+                        command_index=idx,
+                        ablation_log_path=ablation_log_path,
+                    )
+                )
+            return events
+
+        events.extend(
+            self._drive_dynamic_plan_command(
+                socket_path,
+                root_proc,
+                dynamic_plan,
+                command_index=0,
+                ablation_log_path=ablation_log_path,
+            )
+        )
+        return events
+
+    def _drive_dynamic_plan_command(
+        self,
+        socket_path: str,
+        root_proc: subprocess.Popen[Any],
+        dynamic_plan: Dict[str, Any],
+        *,
+        command_index: int = 0,
+        ablation_log_path: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
         delay_s = float(dynamic_plan.get("delay_s", 0.5))
         time.sleep(max(0.0, delay_s))
+        dynamic_plan = dict(dynamic_plan)
+        trigger_pos_strategy = str(dynamic_plan.get("trigger_pos_strategy", "")).strip().lower()
+        if trigger_pos_strategy in {"status_offset", "current_offset", "future_status_offset"}:
+            try:
+                st = uds_request(socket_path, {"op": "status"}, timeout_s=1.0)
+                events.append({"event": "pre_trigger_status", "response": st})
+                cur_pos = int(st.get("position", 0) or 0)
+                offset = max(1, int(dynamic_plan.get("trigger_pos_offset", 1) or 1))
+                dynamic_plan["trigger_pos"] = cur_pos + offset
+                dynamic_plan["triggerPos"] = cur_pos + offset
+                dynamic_plan["resolved_trigger_pos"] = cur_pos + offset
+            except Exception as exc:
+                events.append({"event": "pre_trigger_status_error", "error": str(exc)})
         seq = int(dynamic_plan.get("seq", int(time.time()) % 100000))
         cmd: Dict[str, Any] = {
             "seq": seq,
@@ -1086,8 +1153,6 @@ class EdgeVisorBackend(Backend):
             "candidateCount",
             "rejectedMoves",
             "fallbackCount",
-            "stateTransferBytes",
-            "recomputeTokensOrLayers",
             "layerCount",
             "tDecisionMs",
             "tStatePrepareMs",
@@ -1097,6 +1162,8 @@ class EdgeVisorBackend(Backend):
             "stallTimeMs",
             "fallbackReason",
             "fallback_reason",
+            "triggerPos",
+            "triggerLayer",
             "vgMappingBefore",
             "vgMappingAfter",
             "physicalDeviceGroup",
@@ -1104,6 +1171,10 @@ class EdgeVisorBackend(Backend):
         ):
             if key in dynamic_plan:
                 cmd[key] = dynamic_plan[key]
+        if "trigger_pos" in dynamic_plan:
+            cmd["triggerPos"] = dynamic_plan["trigger_pos"]
+        if "trigger_layer" in dynamic_plan:
+            cmd["triggerLayer"] = dynamic_plan["trigger_layer"]
         plan_op = str(dynamic_plan.get("plan_op", "set_plan"))
         if plan_op == "set_pp_migration":
             cmd.update(
@@ -1130,6 +1201,7 @@ class EdgeVisorBackend(Backend):
             events.append(
                 {
                     "event": plan_op,
+                    "command_index": command_index,
                     "request": cmd,
                     "response": set_resp,
                     "ablation_config": dict(self.ablation_config),
@@ -1145,16 +1217,51 @@ class EdgeVisorBackend(Backend):
             return events
 
         consume_deadline = time.time() + float(dynamic_plan.get("consume_timeout_s", 20.0))
+        ablation_offset = ablation_log_path.stat().st_size if ablation_log_path is not None and ablation_log_path.exists() else 0
+        expected_trigger_pos = int(cmd.get("triggerPos", -1) or -1)
+        expected_trigger_layer = int(cmd.get("triggerLayer", -1) or -1)
+        shadow_mode = str((self.ablation_config or {}).get("shadow_kv_mode", "enabled"))
+        scope = str(dynamic_plan.get("shadow_scope", (self.ablation_config or {}).get("shadow_scope", "")))
+        if shadow_mode == "enabled":
+            observed_event_ids = {"pp_migration_recover"} if plan_op == "set_pp_migration" else {"plan_command_apply"}
+        elif scope == "inter_stage_layers" or plan_op == "set_pp_migration":
+            observed_event_ids = {"pp_migration_recover"}
+        else:
+            observed_event_ids = {"head_migration_recover"}
         while time.time() < consume_deadline and root_proc.poll() is None:
             try:
                 st = uds_request(socket_path, {"op": "status"}, timeout_s=1.0)
                 events.append({"event": "status", "response": st})
                 cmd_state = st.get("cmd") if isinstance(st, dict) else None
                 if isinstance(cmd_state, dict) and cmd_state.get("mode") == "none":
-                    events.append({"event": "plan_consumed"})
+                    events.append({"event": "plan_consumed", "command_index": command_index})
                     break
             except Exception as exc:
                 events.append({"event": "status_error", "error": str(exc)})
+            if ablation_log_path is not None:
+                records, ablation_offset = jsonl_records_since(ablation_log_path, ablation_offset)
+                for rec in records:
+                    event_id = str(rec.get("event_id", ""))
+                    if event_id not in observed_event_ids:
+                        continue
+                    if not bool(rec.get("apply_success", False)):
+                        continue
+                    rec_pos = int(rec.get("trigger_pos", -2) or -2)
+                    rec_layer = int(rec.get("trigger_layer", -2) or -2)
+                    if expected_trigger_pos >= 0 and rec_pos != expected_trigger_pos:
+                        continue
+                    if expected_trigger_layer >= 0 and rec_layer < expected_trigger_layer:
+                        continue
+                    events.append(
+                        {
+                            "event": "plan_observed_applied",
+                            "command_index": command_index,
+                            "event_id": event_id,
+                            "trigger_pos": rec_pos,
+                            "trigger_layer": rec_layer,
+                        }
+                    )
+                    return events
             time.sleep(0.2)
         return events
 
@@ -1468,6 +1575,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             ablation_config=config,
             virtual_topology=virtual_topology,
             extra_env=extra_env,
+            enable_benchmark=False,
         )
         self.persistent = persistent
         self.api_port = api_port
@@ -1579,6 +1687,9 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         env = self._persistent_env()
         env["DLLAMA_PLAN_CTRL_SOCKET"] = socket_path
         env["DLLAMA_ENABLE_PLAN_BARRIER"] = "1"
+        layer_prof_path = out_dir / "persistent_layer_prof_stage0_root0.bin"
+        env["DLLAMA_LAYER_PROF_PATH"] = str(layer_prof_path)
+        env["DLLAMA_DYN_LAYER_PROF_PATH"] = str(layer_prof_path)
 
         procs: List[subprocess.Popen[Any]] = []
         worker_cmds: List[List[str]] = []
@@ -1721,7 +1832,12 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             root_proc = self._persistent_procs[-1]
 
             def drive_plan() -> None:
-                plan_box["events"] = self._drive_dynamic_plan(self._persistent_socket_path or "", root_proc, dynamic_plan or {})
+                plan_box["events"] = self._drive_dynamic_plan(
+                    self._persistent_socket_path or "",
+                    root_proc,
+                    dynamic_plan or {},
+                    self._persistent_ablation_log_path,
+                )
 
             plan_thread = threading.Thread(target=drive_plan, daemon=True)
             plan_thread.start()

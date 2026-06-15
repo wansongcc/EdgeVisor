@@ -2034,7 +2034,22 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                     trigger = false;
                 } else {
                 if (pc.mode == PLAN_CMD_MODE_EXACT) {
-                    trigger = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                    const bool exactMatch = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                    const bool missedExact =
+                        (pc.triggerPos != 0xFFFFFFFFu) &&
+                        (pc.triggerLayer != 0xFFFFFFFFu) &&
+                        ((pos > pc.triggerPos) || (pos == pc.triggerPos && layerIndex > pc.triggerLayer));
+                    trigger = exactMatch || missedExact;
+                    if (missedExact && !exactMatch) {
+                        printf("🧭 [plan][emit] node=%u stage=%u layer=%u pos=%u late-trigger for exact target layer=%u pos=%u\n",
+                            (unsigned)myNode,
+                            (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                            (unsigned)layerIndex,
+                            (unsigned)pos,
+                            (unsigned)pc.triggerLayer,
+                            (unsigned)pc.triggerPos);
+                        std::fflush(stdout);
+                    }
                 } else if (pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) {
                     trigger = true;
                 }
@@ -2284,6 +2299,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                             bool reject = false;
                             const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
                             const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
+                            const bool allowNoShadowHeadMigration = getAllowNoShadowHeadMigration();
                             for (uint32_t i = 0; i < pc2.nMoves; ++i) {
                                 const PlanMove &m = pc2.moves[i];
                                 const NnUint f = (NnUint)m.fromNodeIndex;
@@ -2294,8 +2310,8 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     // KV-head migration safety (GQA lockstep): without KV cache transfer, we
                                     // require KV redundancy to be enabled AND moved heads within the precomputed pad.
                                     if (gqaLockstep) {
-                                        if (!kvRedundancyEnabled) { reject = true; break; }
-                                        if (m.headMove > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; break; }
+                                        if (!kvRedundancyEnabled && !allowNoShadowHeadMigration) { reject = true; break; }
+                                        if (kvRedundancyEnabled && !allowNoShadowHeadMigration && m.headMove > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; break; }
                                     }
                                     deltaHeadOrKv[f] -= (int)m.headMove;
                                     deltaHeadOrKv[t] += (int)m.headMove;
@@ -2316,7 +2332,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 return;
                             }
 
-                            if (gqaLockstep && hasHeadDeltaForStage(deltaHeadOrKv, st)) {
+                            if (gqaLockstep && kvRedundancyEnabled && !allowNoShadowHeadMigration && hasHeadDeltaForStage(deltaHeadOrKv, st)) {
                                 char reason[96] = {0};
                                 if (!validateKvShadowCoverage(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
                                     printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
@@ -2499,7 +2515,8 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                 const bool gqaLockstep = (gqaGroupSize > 1u) && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths;
                                 if (gqaLockstep) {
                                     const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
-                                    if (!kvRedundancyEnabled) {
+                                    const bool allowNoShadowHeadMigration = getAllowNoShadowHeadMigration();
+                                    if (!kvRedundancyEnabled && !allowNoShadowHeadMigration) {
                                         printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV redundancy disabled (--enable-kv-redundancy-during-migration=0)\n",
                                             (unsigned)myNode,
                                             (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
@@ -2511,7 +2528,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                         return;
                                     }
                                     const NnUint kvMove = headMove;
-                                    if (kvMove > NN_KV_REDUNDANCY_PAD_HEADS) {
+                                    if (kvRedundancyEnabled && !allowNoShadowHeadMigration && kvMove > NN_KV_REDUNDANCY_PAD_HEADS) {
                                         printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: KV move=%u exceeds pad=%u\n",
                                             (unsigned)myNode,
                                             (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,
@@ -2542,7 +2559,8 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                                     deltaHeadOrKv[fromNode] -= (int)kvMove;
                                     deltaHeadOrKv[toNode] += (int)kvMove;
                                     char reason[96] = {0};
-                                    if (!validateKvShadowCoverage(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
+                                    if (kvRedundancyEnabled && !allowNoShadowHeadMigration &&
+                                        !validateKvShadowCoverage(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
                                         printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
                                             (unsigned)myNode,
                                             (unsigned)((const NnPlanApplyOpCodeConfig *)context->opConfig)->onlyStageIndex,

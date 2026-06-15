@@ -675,7 +675,22 @@ static bool handleVulkanPlanBarrier(
         const unsigned int lastEmitted = device->getLastPlanCmdSeqEmitted();
         if (!(pc.seq != 0u && pc.seq <= lastEmitted)) {
             if (pc.mode == PLAN_CMD_MODE_EXACT) {
-                trigger = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                const bool exactMatch = (layerIndex == pc.triggerLayer) && (pos == pc.triggerPos);
+                const bool missedExact =
+                    (pc.triggerPos != 0xFFFFFFFFu) &&
+                    (pc.triggerLayer != 0xFFFFFFFFu) &&
+                    ((pos > pc.triggerPos) || (pos == pc.triggerPos && layerIndex > pc.triggerLayer));
+                trigger = exactMatch || missedExact;
+                if (missedExact && !exactMatch) {
+                    printf("🧭 [plan][emit][gpu] node=%u stage=%u layer=%u pos=%u late-trigger for exact target layer=%u pos=%u\n",
+                        (unsigned)myNode,
+                        (unsigned)(myStage != nullptr ? myStage->stageIndex : 0u),
+                        (unsigned)layerIndex,
+                        (unsigned)pos,
+                        (unsigned)pc.triggerLayer,
+                        (unsigned)pc.triggerPos);
+                    std::fflush(stdout);
+                }
             } else {
                 trigger = true;
             }
@@ -828,7 +843,10 @@ static bool handleVulkanPlanApply(
         if (!inStage(f) || !inStage(t) || f == t || !adjacent(f, t)) { reject = true; return; }
         if (h != 0u) {
             if (gqaGroupSize > 1u) {
-                if (!getEnableKvRedundancyDuringMigration() || h > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; return; }
+                const bool kvRedundancyEnabled = getEnableKvRedundancyDuringMigration();
+                const bool allowNoShadowHeadMigration = getAllowNoShadowHeadMigration();
+                if (!kvRedundancyEnabled && !allowNoShadowHeadMigration) { reject = true; return; }
+                if (kvRedundancyEnabled && !allowNoShadowHeadMigration && h > NN_KV_REDUNDANCY_PAD_HEADS) { reject = true; return; }
             }
             deltaHeadOrKv[f] -= (int)h;
             deltaHeadOrKv[t] += (int)h;
@@ -874,7 +892,10 @@ static bool handleVulkanPlanApply(
         return true;
     }
 
-    if (gqaGroupSize > 1u && hasHeadDeltaForStageVulkan(deltaHeadOrKv, st)) {
+    if (gqaGroupSize > 1u &&
+        getEnableKvRedundancyDuringMigration() &&
+        !getAllowNoShadowHeadMigration() &&
+        hasHeadDeltaForStageVulkan(deltaHeadOrKv, st)) {
         char reason[96] = {0};
         if (!validateKvShadowCoverageVulkan(plan, st, deltaHeadOrKv, reason, sizeof(reason))) {
             printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
@@ -1751,10 +1772,20 @@ void NnVulkanDeviceSegment::setPartitionPlan(const NnUnevenPartitionPlan *plan) 
 }
 
 
-bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow) {
-    kRow.assign(kvDim, 0.0f);
-    vRow.assign(kvDim, 0.0f);
-    if (data == nullptr || segmentConfig == nullptr || kvDim == 0u) return false;
+bool NnVulkanDeviceSegment::exportLayerKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    NnUint kvDim,
+    std::vector<float> &kRow,
+    std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
+    const bool partial = rangeLen != 0u;
+    const NnUint outDim = partial ? rangeLen : kvDim;
+    kRow.assign(outDim, 0.0f);
+    vRow.assign(outDim, 0.0f);
+    if (data == nullptr || segmentConfig == nullptr || kvDim == 0u || outDim == 0u) return false;
+    if (partial && rangeStart + rangeLen > kvDim) return false;
 
     bool readAny = false;
     for (NnUint i = 0; i < segmentConfig->nOps; ++i) {
@@ -1769,12 +1800,13 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
             if (bSize == nullptr || bSize->floatType != F_32 || bSize->x == 0u || bSize->y == 0u) return;
             if (position >= bSize->y) return;
 
-            const NnUint srcStart = cfg->kvStart;
-            const NnUint needLen = cfg->kvDim0;
-            if (srcStart >= bSize->x || srcStart >= dstRow.size() || needLen == 0u) return;
+            const NnUint srcStart = partial ? rangeStart : cfg->kvStart;
+            const NnUint dstStart = partial ? 0u : cfg->kvStart;
+            const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+            if (srcStart >= bSize->x || dstStart >= dstRow.size() || needLen == 0u) return;
 
             const NnUint srcAvail = bSize->x - srcStart;
-            const NnUint dstAvail = (NnUint)dstRow.size() - srcStart;
+            const NnUint dstAvail = (NnUint)dstRow.size() - dstStart;
             const NnUint readLen = std::min(needLen, std::min(srcAvail, dstAvail));
             if (readLen == 0u) return;
 
@@ -1782,10 +1814,10 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
             NnVulkanBuffer *buffer = data->resolveBufferByIndex(bufIdx);
             const NnSize offset = ((NnSize)position * (NnSize)bSize->x + (NnSize)srcStart) * sizeof(float);
             const NnSize nBytes = (NnSize)readLen * sizeof(float);
-            buffer->read((NnByte *)(dstRow.data() + srcStart), offset, nBytes);
+            buffer->read((NnByte *)(dstRow.data() + dstStart), offset, nBytes);
             readAny = true;
 
-            std::printf("🧩 [kv-export-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u range=[%u,%u)\n",
+            std::printf("🧩 [kv-export-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                 (unsigned)(data ? data->getNodeIndex() : 0u),
                 (unsigned)segmentIndex,
                 (unsigned)layerIndex,
@@ -1793,7 +1825,10 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
                 tag,
                 (unsigned)bufIdx,
                 (unsigned)srcStart,
-                (unsigned)(srcStart + readLen));
+                (unsigned)(srcStart + readLen),
+                (unsigned)dstStart,
+                (unsigned)(dstStart + readLen),
+                partial ? 1u : 0u);
             std::fflush(stdout);
         };
 
@@ -1803,9 +1838,16 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(NnUint layerIndex, NnUint position,
     return readAny;
 }
 
-bool NnVulkanDeviceSegment::applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
+bool NnVulkanDeviceSegment::applyTransferredKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    const std::vector<float> &kRow,
+    const std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
     if (data == nullptr || segmentConfig == nullptr) return false;
     if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return false;
+    if (rangeLen != 0u && rangeLen != kRow.size()) return false;
 
     bool wroteAny = false;
     for (NnUint i = 0; i < segmentConfig->nOps; ++i) {
@@ -1820,23 +1862,25 @@ bool NnVulkanDeviceSegment::applyTransferredKvRow(NnUint layerIndex, NnUint posi
             if (bSize == nullptr || bSize->floatType != F_32 || bSize->x == 0u || bSize->y == 0u) return;
             if (position >= bSize->y) return;
 
-            const NnUint srcStart = cfg->kvStart;
-            const NnUint needLen = cfg->kvDim0;
-            if (srcStart >= srcRow.size() || srcStart >= bSize->x || needLen == 0u) return;
+            const bool partial = rangeLen != 0u;
+            const NnUint dstStart = partial ? rangeStart : cfg->kvStart;
+            const NnUint srcStart = partial ? 0u : cfg->kvStart;
+            const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+            if (srcStart >= srcRow.size() || dstStart >= bSize->x || needLen == 0u) return;
 
             const NnUint srcAvail = (NnUint)srcRow.size() - srcStart;
-            const NnUint dstAvail = bSize->x - srcStart;
+            const NnUint dstAvail = bSize->x - dstStart;
             const NnUint writeLen = std::min(needLen, std::min(srcAvail, dstAvail));
             if (writeLen == 0u) return;
 
             context->device.waitIdle();
             NnVulkanBuffer *buffer = data->resolveBufferByIndex(bufIdx);
-            const NnSize offset = ((NnSize)position * (NnSize)bSize->x + (NnSize)srcStart) * sizeof(float);
+            const NnSize offset = ((NnSize)position * (NnSize)bSize->x + (NnSize)dstStart) * sizeof(float);
             const NnSize nBytes = (NnSize)writeLen * sizeof(float);
             buffer->write((const NnByte *)(srcRow.data() + srcStart), offset, nBytes);
             wroteAny = true;
 
-            std::printf("🧩 [kv-write-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u range=[%u,%u)\n",
+            std::printf("🧩 [kv-write-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                 (unsigned)(data ? data->getNodeIndex() : 0u),
                 (unsigned)segmentIndex,
                 (unsigned)layerIndex,
@@ -1844,7 +1888,10 @@ bool NnVulkanDeviceSegment::applyTransferredKvRow(NnUint layerIndex, NnUint posi
                 tag,
                 (unsigned)bufIdx,
                 (unsigned)srcStart,
-                (unsigned)(srcStart + writeLen));
+                (unsigned)(srcStart + writeLen),
+                (unsigned)dstStart,
+                (unsigned)(dstStart + writeLen),
+                partial ? 1u : 0u);
             std::fflush(stdout);
         };
 

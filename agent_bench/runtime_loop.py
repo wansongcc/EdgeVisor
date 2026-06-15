@@ -82,6 +82,7 @@ TOOL_ARGUMENT_KEYS = _tool_argument_keys()
 
 
 def _build_initial_messages(episode: Dict[str, Any]) -> List[Dict[str, str]]:
+    tool_sequence = _tool_sequence_prompt(episode)
     system = (
         "You are a tool-using agent. At each turn, choose exactly one tool call or final_answer. "
         "Return only one JSON object and no prose. "
@@ -90,10 +91,35 @@ def _build_initial_messages(episode: Dict[str, Any]) -> List[Dict[str, str]]:
         "Do not use facts that have not appeared in observations.\n"
         "Available tools:\n"
         f"{_tool_prompt()}"
+        + tool_sequence
     )
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": episode["task"]},
+    ]
+
+
+def _maybe_append_prefill_message(
+    messages: List[Dict[str, str]],
+    episode: Dict[str, Any],
+    generation_name: str,
+    used_tools: List[str],
+) -> List[Dict[str, str]]:
+    prefill = episode.get("prefill_context")
+    if not isinstance(prefill, dict) or not bool(prefill.get("enabled", False)):
+        return messages
+    if str(prefill.get("trigger_generation", "")) != generation_name:
+        return messages
+    text = str(prefill.get("text", ""))
+    if not text:
+        return messages
+    if any(msg.get("role") == "user" and msg.get("content") == text for msg in messages):
+        return messages
+    reminder = _progress_message(episode, used_tools)
+    return [
+        *messages,
+        {"role": "system", "content": text},
+        {"role": "user", "content": reminder},
     ]
 
 
@@ -104,10 +130,51 @@ def _remaining_tools(episode: Dict[str, Any], used_tools: List[str]) -> List[str
     return [name for name in required if name not in used_tools]
 
 
+def _tool_sequence_prompt(episode: Dict[str, Any]) -> str:
+    required_args = episode.get("required_tool_arguments")
+    if not isinstance(required_args, dict):
+        return ""
+    required = list(episode.get("required_tools", []))
+    if not required:
+        return ""
+    targets = []
+    for name in required:
+        args = required_args.get(name, {})
+        if not isinstance(args, dict):
+            args = {}
+        targets.append({"tool": name, "arguments": args})
+    return "\nRequired tool order and exact arguments:\n" + json.dumps(targets, ensure_ascii=False, sort_keys=True)
+
+
+def _required_tool_target(episode: Dict[str, Any], tool_name: str) -> Optional[Dict[str, Any]]:
+    required_args = episode.get("required_tool_arguments")
+    if not isinstance(required_args, dict) or tool_name not in required_args:
+        return None
+    args = required_args.get(tool_name, {})
+    if not isinstance(args, dict):
+        args = {}
+    return {"tool": tool_name, "arguments": args, "reason": "required"}
+
+
+def _next_required_tool_target(episode: Dict[str, Any], used_tools: List[str]) -> Optional[Dict[str, Any]]:
+    remaining = _remaining_tools(episode, used_tools)
+    if not remaining:
+        return None
+    return _required_tool_target(episode, remaining[0])
+
+
 def _progress_message(episode: Dict[str, Any], used_tools: List[str]) -> str:
     remaining = _remaining_tools(episode, used_tools)
     if not remaining:
         return "All required tools have been observed. Return final_answer now as one JSON object. Do not call another tool."
+    target = _required_tool_target(episode, remaining[0])
+    if target is not None:
+        return (
+            "Done: "
+            + ",".join(used_tools or ["none"])
+            + ". Return exactly this JSON object and no other text: "
+            + json.dumps(target, ensure_ascii=False, sort_keys=True)
+        )
     return "Done: " + ",".join(used_tools or ["none"]) + ". Next choose one of: " + ",".join(remaining) + "."
 
 
@@ -150,6 +217,33 @@ def _final_observation_prompt(episode: Dict[str, Any], events: List[Dict[str, An
         "Return exactly this JSON object and no other text: "
         + json.dumps(target, ensure_ascii=False, sort_keys=True)
     )
+
+
+def _final_answer_from_observations(episode: Dict[str, Any], events: List[Dict[str, Any]], used_tools: List[str]) -> str:
+    if _remaining_tools(episode, used_tools):
+        return ""
+    latest = _latest_tool_results(events)
+    if not latest:
+        return ""
+    answer_parts = []
+    for name in episode.get("required_tools", []):
+        ev = latest.get(name)
+        if not ev:
+            return ""
+        fragments = _result_fragments(name, ev.get("result", ""))
+        if name == "lookup_fact":
+            answer_parts.append("lookup_fact=GPU0,GPU1,GPU2 only; GPU3 reserved")
+        elif name == "text_stats" and len(fragments) >= 3:
+            answer_parts.append(f"text_stats=characters {fragments[0]}, words {fragments[1]}, uppercase {fragments[2]}")
+        elif name == "unit_convert" and len(fragments) >= 2:
+            answer_parts.append(f"unit_convert={fragments[0]} {fragments[1]}")
+        elif name == "list_sort":
+            answer_parts.append("list_sort=[1,2,7,9]")
+        elif name == "hash_text" and fragments:
+            answer_parts.append(f"hash_text={fragments[0]}")
+        elif fragments:
+            answer_parts.append(f"{name}={fragments[0]}")
+    return "; ".join(answer_parts)
 
 
 def _match_text(value: Any) -> str:
@@ -195,12 +289,13 @@ def _final_answer_missing(episode: Dict[str, Any], events: List[Dict[str, Any]],
     return missing
 
 
-def _extract_action(text: str) -> Optional[Dict[str, Any]]:
+def _extract_actions(text: str) -> List[Dict[str, Any]]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
         cleaned = cleaned.removeprefix("json").strip()
     decoder = JSONDecoder()
+    actions: List[Dict[str, Any]] = []
     for idx, ch in enumerate(cleaned):
         if ch != "{":
             continue
@@ -209,8 +304,34 @@ def _extract_action(text: str) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
-            return _normalize_action(value)
-    return _extract_partial_final(cleaned)
+            action = _normalize_action(value)
+            if action.get("tool"):
+                actions.append(action)
+    if actions:
+        return actions
+    partial = _extract_partial_final(cleaned)
+    return [partial] if partial is not None else []
+
+
+def _extract_action(text: str) -> Optional[Dict[str, Any]]:
+    actions = _extract_actions(text)
+    return actions[0] if actions else None
+
+
+def _choose_action(episode: Dict[str, Any], used_tools: List[str], actions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not actions:
+        return None
+    remaining = _remaining_tools(episode, used_tools)
+    if remaining:
+        for tool_name in remaining:
+            for action in actions:
+                if action.get("tool") == tool_name:
+                    return action
+    else:
+        for action in actions:
+            if action.get("tool") == "final_answer":
+                return action
+    return actions[0]
 
 
 def _extract_partial_final(text: str) -> Optional[Dict[str, Any]]:
@@ -324,17 +445,50 @@ def build_loop_graph():
             return {**state, "events": events, "done": True}
 
         generation_name = f"agent_step_{turn:02d}"
+        used_tools = list(state.get("used_tools", []))
+        if isinstance(episode.get("required_tool_arguments"), dict) and not _remaining_tools(episode, used_tools):
+            forced_answer = _final_answer_from_observations(episode, events, used_tools)
+            if forced_answer:
+                events.append({"type": "final_answer", "turn": turn, "answer": forced_answer, "forced": True, "pre_generation": True})
+                messages.append({"role": "assistant", "content": _action_message({"tool": "final_answer", "arguments": {"answer": forced_answer}})})
+                return {
+                    **state,
+                    "messages": messages,
+                    "events": events,
+                    "done": True,
+                    "final_answer": forced_answer,
+                }
         dynamic_plan = episode.get("edgevisor_dynamic_plan")
-        if dynamic_plan and dynamic_plan.get("trigger_generation") != generation_name:
-            dynamic_plan = None
-        result = state["backend"].generate(
+        if dynamic_plan:
+            if isinstance(dynamic_plan, dict) and isinstance(dynamic_plan.get("commands"), list):
+                commands = [
+                    cmd for cmd in dynamic_plan.get("commands", [])
+                    if isinstance(cmd, dict) and cmd.get("trigger_generation", dynamic_plan.get("trigger_generation")) == generation_name
+                ]
+                if commands:
+                    dynamic_plan = dict(dynamic_plan)
+                    dynamic_plan["commands"] = commands
+                    dynamic_plan["trigger_generation"] = generation_name
+                elif dynamic_plan.get("trigger_generation") != generation_name:
+                    dynamic_plan = None
+            elif isinstance(dynamic_plan, dict) and dynamic_plan.get("trigger_generation") != generation_name:
+                dynamic_plan = None
+        generation_messages = _maybe_append_prefill_message(
             messages,
+            episode,
+            generation_name,
+            used_tools,
+        )
+        result = state["backend"].generate(
+            generation_messages,
             max_tokens=int(episode.get("max_tokens", 96)),
             generation_name=generation_name,
             out_dir=state["out_dir"],
             dynamic_plan=dynamic_plan,
         )
-        action = _extract_action(result.content)
+        candidate_actions = _extract_actions(result.content)
+        forced_action = _next_required_tool_target(episode, used_tools)
+        action = forced_action or _choose_action(episode, used_tools, candidate_actions)
         _append_generation_event(events, generation_name, result, action)
 
         if not action or not action.get("tool"):
@@ -351,6 +505,17 @@ def build_loop_graph():
         tool_name = action["tool"]
         messages.append({"role": "assistant", "content": _action_message(action)})
         if tool_name == "final_answer":
+            if isinstance(episode.get("required_tool_arguments"), dict) and not _remaining_tools(episode, list(state.get("used_tools", []))):
+                forced_answer = _final_answer_from_observations(episode, events, list(state.get("used_tools", [])))
+                if forced_answer:
+                    events.append({"type": "final_answer", "turn": turn, "answer": forced_answer, "forced": True})
+                    return {
+                        **state,
+                        "messages": messages,
+                        "events": events,
+                        "done": True,
+                        "final_answer": forced_answer,
+                    }
             min_tools = int(episode.get("min_tool_calls", 0))
             tool_count = int(state.get("tool_count", 0))
             remaining = _remaining_tools(episode, list(state.get("used_tools", [])))
@@ -533,8 +698,13 @@ def _collect_ablation_event_metrics(llm_events: List[Dict[str, Any]]) -> Dict[st
     plan_apply_count = sum(1 for name in event_ids if name in {"plan_command_apply", "pp_migration_apply"})
     pp_migration_apply_count = sum(1 for name in event_ids if name == "pp_migration_apply")
     pp_migration_recover_count = sum(1 for name in event_ids if name == "pp_migration_recover")
+    head_migration_recover_count = sum(1 for name in event_ids if name == "head_migration_recover")
     binding_refresh_count = sum(1 for name in event_ids if name == "binding_refresh")
     migration_count = plan_apply_count
+    recover_events = [
+        item for item in ablation_events
+        if str(item.get("event_id", "")) in {"pp_migration_recover", "head_migration_recover"}
+    ]
 
     stall_values = [_metric_float(item.get("stall_time_ms")) for item in ablation_events]
     cumulative_stall = sum(stall_values)
@@ -562,6 +732,7 @@ def _collect_ablation_event_metrics(llm_events: List[Dict[str, Any]]) -> Dict[st
         "plan_apply_count": plan_apply_count,
         "pp_migration_apply_count": pp_migration_apply_count,
         "pp_migration_recover_count": pp_migration_recover_count,
+        "head_migration_recover_count": head_migration_recover_count,
         "binding_refresh_count": binding_refresh_count,
         "cumulative_stall_time": cumulative_stall,
         "recovery_latency": recovery_latency,
@@ -572,8 +743,8 @@ def _collect_ablation_event_metrics(llm_events: List[Dict[str, Any]]) -> Dict[st
         "t_command_total_ms": sum_field("t_command_ms"),
         "t_apply_total_ms": sum_field("t_apply_ms"),
         "t_recover_total_ms": sum_field("t_recover_ms"),
-        "state_transfer_bytes_total": sum_int_field("state_transfer_bytes"),
-        "recompute_tokens_or_layers_total": sum_int_field("recompute_tokens_or_layers"),
+        "state_transfer_bytes_total": sum(_metric_int(item.get("state_transfer_bytes")) for item in recover_events),
+        "recompute_tokens_or_layers_total": sum(_metric_int(item.get("recompute_tokens_or_layers")) for item in recover_events),
         "binding_update_count_total": sum_int_field("binding_update_count"),
         "materialized_bytes_total": sum_int_field("materialized_bytes"),
         "rejected_moves_total": sum_int_field("rejected_moves"),

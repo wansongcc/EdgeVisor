@@ -5,6 +5,7 @@
 #include <deque>
 #include <mutex>
 #include <chrono>
+#include <utility>
 #include "nn/nn-core.hpp"
 #include "nn/nn-cpu.hpp"
 #include "nn/nn-network.hpp"
@@ -49,6 +50,7 @@ public:
     bool enablePlanBarrier; // Enable plan barrier for online migration
     bool enableStageFullWeights; // Enable stage full residency (full weights and buffers)
     bool enableKvRedundancyDuringMigration; // Keep KV redundancy enabled during online migration
+    bool allowNoShadowHeadMigration; // Allow head migration when runtime will recover KV state
     bool enableKvAggregate; // Build KV aggregate pipes (KC/VC)
     bool enablePpMigration; // Enable PP layer migration control path
     NnUint runtimeRedundantBoundaryLayers; // Runtime redundant boundary span in layers
@@ -84,6 +86,8 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_HAS_PLAN_CMD = 1u << 1,
     LLM_CTRL_HAS_KV_TRANSFER = 1u << 2,
     LLM_CTRL_HAS_LAYER_SWITCH = 1u << 3,
+    LLM_CTRL_HAS_KV_EXPORT_REQUEST = 1u << 4,
+    LLM_CTRL_CONTROL_ONLY = 1u << 5,
 };
 
 typedef struct {
@@ -91,10 +95,11 @@ typedef struct {
     NnUint version;        // 1
     NnUint layerIndex;
     NnUint position;
-    NnUint kvDim;
+    NnUint kvDim;          // Payload width in floats. Full-row transfers use model kvDim.
     NnUint fromNodeIndex;
     NnUint targetNodeIndex;
-    NnUint reserved;
+    NnUint rangeStart;     // Destination/source column offset for partial KV transfers.
+    NnUint rangeLen;       // 0 means full-row legacy semantics; otherwise payload width.
 } LlmKvTransferHeader;
 
 typedef struct {
@@ -138,18 +143,46 @@ typedef struct {
     NnUint reserved;
 } LlmLayerSwitchBatchHeader;
 
+typedef struct {
+    NnUint magic;          // 'KXTR'
+    NnUint version;        // 1
+    NnUint requestId;
+    NnUint fromNodeIndex;
+    NnUint targetStageRootNodeIndex;
+    NnUint endPosition;
+    NnUint layerCount;
+    NnUint kvDim;
+    NnUint rangeStart;
+    NnUint rangeLen;
+} LlmKvExportRequestHeader;
+
+typedef struct {
+    NnUint magic;          // 'KXRS'
+    NnUint version;        // 1
+    NnUint requestId;
+    NnUint fromNodeIndex;
+    NnUint rowCount;
+    NnUint kvDim;
+    NnUint exportedRows;
+    NnUint reserved;
+} LlmKvExportResponseHeader;
+
 static constexpr NnUint LLM_KV_TRANSFER_MAGIC = 0x5254564bu; // 'KVTR'
 static constexpr NnUint LLM_KV_ACK_MAGIC = 0x4b41564bu;      // 'KVAK'
 static constexpr NnUint LLM_LAYER_SWITCH_MAGIC = 0x5753564cu; // 'LVSW'
 static constexpr NnUint LLM_KV_TRANSFER_BATCH_MAGIC = 0x4254564bu; // 'KVTB'
 static constexpr NnUint LLM_KV_ACK_BATCH_MAGIC = 0x5442414bu; // 'KABT'
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_MAGIC = 0x4257534cu; // 'LSWB'
+static constexpr NnUint LLM_KV_EXPORT_REQUEST_MAGIC = 0x5254584bu; // 'KXTR'
+static constexpr NnUint LLM_KV_EXPORT_RESPONSE_MAGIC = 0x5352584bu; // 'KXRS'
 static constexpr NnUint LLM_KV_TRANSFER_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_VERSION = 1u;
 static constexpr NnUint LLM_KV_TRANSFER_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_VERSION = 1u;
+static constexpr NnUint LLM_KV_EXPORT_REQUEST_VERSION = 1u;
+static constexpr NnUint LLM_KV_EXPORT_RESPONSE_VERSION = 1u;
 
 typedef struct {
     NnUint position;
@@ -170,6 +203,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_ENABLE_KV_REDUNDANCY_DURING_MIGRATION = 1u << 4,
     LLM_BOOTSTRAP_HAS_PRIMARY_SKIP_LAYERS = 1u << 5,
     LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE = 1u << 6,
+    LLM_BOOTSTRAP_HAS_KV_REDUNDANCY = 1u << 7,
 };
 
 typedef struct {
@@ -180,6 +214,7 @@ typedef struct {
     NnUint enablePlanBarrier; // 0/1, enables plan barrier for online migration
     NnUint enableStageFullWeights; // 0/1, enables stage full residency (full weights and buffers)
     NnUint enableKvRedundancyDuringMigration; // 0/1, keeps KV redundancy enabled during migration
+    NnUint allowNoShadowHeadMigration; // 0/1, permits no-shadow head migration with recovery
     NnUint enableKvAggregate; // 0/1, builds KV aggregate pipes (KC/VC)
     NnUint runtimeRedundantBoundaryLayers; // boundary span in layers for runtime redundant plan
     NnUint runtimeActiveSegEnabled; // 0/1 default primary segment gate
@@ -189,10 +224,11 @@ typedef struct {
     NnUint modelPathLen; // bytes including '\0' if present
     NnUint ratiosLen;    // bytes including '\0' if present
     NnUint primarySkipLayersLen; // bytes including '\0' if present
+    NnUint kvRedundancyLen; // bytes including '\0' if present
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 8u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 10u;
 
 typedef struct {
     NnUint layerIndex;
@@ -240,7 +276,13 @@ public:
     int getMigrationAckLayer() const { return migrationAckLayer; }
     bool hasAsyncKvCollector() const;
     bool tryPopAsyncKvRow(RootKvAggRowPacket &packet);
-    KvTransferSubmitStatus submitBoundaryKvTransferDetailed(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
+    KvTransferSubmitStatus submitBoundaryKvTransferDetailed(
+        NnUint layerIndex,
+        NnUint position,
+        const std::vector<float> &kRow,
+        const std::vector<float> &vRow,
+        NnUint rangeStart = 0u,
+        NnUint rangeLen = 0u);
     bool submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
 private:
     float *tokenPipe = nullptr;
@@ -272,20 +314,50 @@ private:
     std::vector<NnUint> waitingKvAckNodeReceived;
     std::vector<NnUint> pendingLayerSwitchLayers;
     std::vector<NnUint> migrationLayers;
+    std::vector<int> tokenHistory;
     int migrationStageStartLayer = -1;
     int migrationStageEndLayer = -1;
     int migrationLayerCount = 1;
     bool ppMigrationEnabled = false;
     bool migrationBatchSubmitted = false;
+    bool migrationExportRequested = false;
     bool migrationLayerListPinnedByEnv = false;
     int boundaryLayerForMigration = -1;
     bool migrationAckSeen = false;
     int migrationAckPos = -1;
     int migrationAckLayer = -1;
     unsigned long long lastPpPlanCacheSeqApplied = 0ull;
+    unsigned long long lastHeadRecoveryPlanCacheSeqApplied = 0ull;
+    unsigned long long headRecoveryRangeCacheSeq = 0ull;
+    bool headRecoveryRangeCached = false;
+    bool headRecoveryPlanAfterApply = false;
+    NnUint headRecoveryStageIndex = 0xFFFFFFFFu;
+    NnUint headRecoveryFromNode = 0u;
+    NnUint headRecoveryToNode = 0u;
+    NnUint headRecoveryRangeHeadStart = 0u;
+    NnUint headRecoveryRangeHeadLen = 0u;
     NnUint migrationFromNodeIndex = 0u;
     NnUint nextStageRootNode = (NnUint)-1;
     int kvAckSocketIndex = -1;
+    NnUint nextKvExportRequestId = 1u;
+    uint64_t lastMigrationStateTransferBytes = 0u;
+    uint64_t lastMigrationExportedRows = 0u;
+    bool collectSourceStageKvTransfers(NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
+    bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
+    bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
+    bool sendPendingLayerSwitchControlOnly();
+    void collectProfilePackets();
+    bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
+    bool replayHistoryForHeadMigrationRecompute(const PlanCommand &cmd, NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
+    bool recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUint triggerPos);
+    void emitPpMigrationRecoverEvent(
+        bool applySuccess,
+        uint64_t stateTransferBytes,
+        uint64_t recomputeTokensOrLayers,
+        double statePrepareMs,
+        double recoverMs,
+        double stallMs,
+        const std::string &fallbackReason);
 public:
     RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled);
     void setBatchSize(NnUint batchSize);
@@ -306,6 +378,12 @@ public:
     bool consumeLayerSwitch(LlmLayerSwitchPacket &packet);
     void flushPendingKvAck();
     bool consumePendingKvTransfer(LlmKvTransferHeader &hdr, std::vector<float> &kRow, std::vector<float> &vRow);
+    bool consumeKvExportRequest(LlmKvExportRequestHeader &hdr, std::vector<NnUint> &layers);
+    void flushKvExportResponse(
+        const LlmKvExportRequestHeader &req,
+        const std::vector<NnUint> &layers,
+        NnUint kvDim,
+        NnExecutor *executor);
 private:
     float *positionPipe;
     NnNetExecution *execution;
@@ -316,6 +394,7 @@ private:
     std::deque<PendingKvTransferItem> pendingKvTransfers;
     std::vector<LlmKvAckPacket> pendingKvAcks;
     std::deque<LlmLayerSwitchPacket> pendingLayerSwitches;
+    std::deque<std::pair<LlmKvExportRequestHeader, std::vector<NnUint>>> pendingKvExportRequests;
 public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex);
     bool tryReadControlPacket();

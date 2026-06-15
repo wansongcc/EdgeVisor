@@ -15,8 +15,21 @@ public:
     virtual void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) = 0;
     virtual void setPartitionPlan(const NnUnevenPartitionPlan * /*plan*/) {}
     virtual void refreshPointers() {}
-    virtual bool exportLayerKvRow(NnUint /*layerIndex*/, NnUint /*position*/, NnUint /*kvDim*/, std::vector<float> & /*kRow*/, std::vector<float> & /*vRow*/) { return false; }
-    virtual bool applyTransferredKvRow(NnUint /*layerIndex*/, NnUint /*position*/, const std::vector<float> & /*kRow*/, const std::vector<float> & /*vRow*/) { return false; }
+    virtual bool exportLayerKvRow(
+        NnUint /*layerIndex*/,
+        NnUint /*position*/,
+        NnUint /*kvDim*/,
+        std::vector<float> & /*kRow*/,
+        std::vector<float> & /*vRow*/,
+        NnUint /*rangeStart*/ = 0u,
+        NnUint /*rangeLen*/ = 0u) { return false; }
+    virtual bool applyTransferredKvRow(
+        NnUint /*layerIndex*/,
+        NnUint /*position*/,
+        const std::vector<float> & /*kRow*/,
+        const std::vector<float> & /*vRow*/,
+        NnUint /*rangeStart*/ = 0u,
+        NnUint /*rangeLen*/ = 0u) { return false; }
 };
 
 class NnDevice {
@@ -158,8 +171,21 @@ public:
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
     void setRedundantLayerEnabled(NnUint layerIndex, bool enabled);
-    bool exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow);
-    bool applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
+    bool exportLayerKvRow(
+        NnUint layerIndex,
+        NnUint position,
+        NnUint kvDim,
+        std::vector<float> &kRow,
+        std::vector<float> &vRow,
+        NnUint rangeStart = 0u,
+        NnUint rangeLen = 0u);
+    bool applyTransferredKvRow(
+        NnUint layerIndex,
+        NnUint position,
+        const std::vector<float> &kRow,
+        const std::vector<float> &vRow,
+        NnUint rangeStart = 0u,
+        NnUint rangeLen = 0u);
     NnUint getTotalTime(NnExecutorStepType type);
 };
 

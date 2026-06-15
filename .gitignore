@@ -3,3 +3,5 @@ __pycache__/
 *.py[cod]
 *.log
 agent_bench_results/
+.DS_Store
+artifacts/shadowkv_ablation_20260615/

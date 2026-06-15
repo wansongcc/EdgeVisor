@@ -32,6 +32,7 @@ RUN_COLUMNS = [
     "plan_apply_count",
     "pp_migration_apply_count",
     "pp_migration_recover_count",
+    "head_migration_recover_count",
     "binding_refresh_count",
     "cumulative_stall_time",
     "recovery_latency",

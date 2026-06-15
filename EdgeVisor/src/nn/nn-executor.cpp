@@ -594,10 +594,20 @@ void NnExecutor::setRedundantLayerEnabled(NnUint layerIndex, bool enabled) {
     std::fflush(stdout);
 }
 
-bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvDim, std::vector<float> &kRow, std::vector<float> &vRow) {
-    kRow.assign(kvDim, 0.0f);
-    vRow.assign(kvDim, 0.0f);
-    if (nodeConfig == nullptr || segments.empty() || kvDim == 0u) return false;
+bool NnExecutor::exportLayerKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    NnUint kvDim,
+    std::vector<float> &kRow,
+    std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
+    const bool partial = rangeLen != 0u;
+    const NnUint outDim = partial ? rangeLen : kvDim;
+    kRow.assign(outDim, 0.0f);
+    vRow.assign(outDim, 0.0f);
+    if (nodeConfig == nullptr || segments.empty() || kvDim == 0u || outDim == 0u) return false;
+    if (partial && rangeStart + rangeLen > kvDim) return false;
 
     bool readAny = false;
     std::unordered_set<NnUint> readK;
@@ -609,7 +619,7 @@ bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvD
         if (baseSeg == nullptr) continue;
         auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(baseSeg);
         if (cpuSeg == nullptr || cpuSeg->device == nullptr) {
-            if (baseSeg->exportLayerKvRow(layerIndex, position, kvDim, kRow, vRow)) {
+            if (baseSeg->exportLayerKvRow(layerIndex, position, kvDim, kRow, vRow, rangeStart, rangeLen)) {
                 readAny = true;
             }
             continue;
@@ -630,29 +640,33 @@ bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvD
                 if (bSize.floatType != F_32 || bSize.x == 0u || bSize.y == 0u) return;
                 if (position >= bSize.y) return;
 
-                const NnUint srcStart = cfg->kvStart;
-                const NnUint needLen = cfg->kvDim0;
-                if (srcStart >= bSize.x || srcStart >= dstRow.size() || needLen == 0u) return;
+                const NnUint srcStart = partial ? rangeStart : cfg->kvStart;
+                const NnUint dstStart = partial ? 0u : cfg->kvStart;
+                const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+                if (srcStart >= bSize.x || dstStart >= dstRow.size() || needLen == 0u) return;
 
                 const NnUint srcAvail = bSize.x - srcStart;
-                const NnUint dstAvail = (NnUint)dstRow.size() - srcStart;
+                const NnUint dstAvail = (NnUint)dstRow.size() - dstStart;
                 const NnUint readLen = std::min(needLen, std::min(srcAvail, dstAvail));
                 if (readLen == 0u) return;
 
                 const float *buf = (const float *)cpuSeg->device->buffers[bufIdx];
                 const float *src = buf + (NnSize)position * (NnSize)bSize.x + (NnSize)srcStart;
-                std::memcpy(dstRow.data() + srcStart, src, (size_t)readLen * sizeof(float));
+                std::memcpy(dstRow.data() + dstStart, src, (size_t)readLen * sizeof(float));
                 seen.insert(bufIdx);
                 readAny = true;
 
-                std::printf("🧩 [kv-export] node=%u seg=%u layer=%u pos=%u buf=%u range=[%u,%u)\n",
+                std::printf("🧩 [kv-export] node=%u seg=%u layer=%u pos=%u buf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                     (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
                     (unsigned)s,
                     (unsigned)layerIndex,
                     (unsigned)position,
                     (unsigned)bufIdx,
                     (unsigned)srcStart,
-                    (unsigned)(srcStart + readLen));
+                    (unsigned)(srcStart + readLen),
+                    (unsigned)dstStart,
+                    (unsigned)(dstStart + readLen),
+                    partial ? 1u : 0u);
             };
 
             readOne(cfg->keyCacheBufferIndex, kRow, readK);
@@ -671,9 +685,16 @@ bool NnExecutor::exportLayerKvRow(NnUint layerIndex, NnUint position, NnUint kvD
     return readAny;
 }
 
-bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow) {
+bool NnExecutor::applyTransferredKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    const std::vector<float> &kRow,
+    const std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
     if (nodeConfig == nullptr || segments.empty()) return false;
     if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return false;
+    if (rangeLen != 0u && rangeLen != kRow.size()) return false;
 
     bool wroteAny = false;
     std::unordered_set<NnUint> writtenK;
@@ -685,7 +706,7 @@ bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const
         if (baseSeg == nullptr) continue;
         auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(baseSeg);
         if (cpuSeg == nullptr || cpuSeg->device == nullptr) {
-            if (baseSeg->applyTransferredKvRow(layerIndex, position, kRow, vRow)) {
+            if (baseSeg->applyTransferredKvRow(layerIndex, position, kRow, vRow, rangeStart, rangeLen)) {
                 wroteAny = true;
             }
             continue;
@@ -707,22 +728,24 @@ bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const
                 if (bSize.floatType != F_32 || bSize.x == 0u || bSize.y == 0u) return;
                 if (position >= bSize.y) return;
 
-                const NnUint srcStart = cfg->kvStart;
-                const NnUint needLen = cfg->kvDim0;
-                if (srcStart >= srcRow.size() || srcStart >= bSize.x || needLen == 0u) return;
+                const bool partial = rangeLen != 0u;
+                const NnUint dstStart = partial ? rangeStart : cfg->kvStart;
+                const NnUint srcStart = partial ? 0u : cfg->kvStart;
+                const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+                if (srcStart >= srcRow.size() || dstStart >= bSize.x || needLen == 0u) return;
 
                 const NnUint srcAvail = (NnUint)srcRow.size() - srcStart;
-                const NnUint dstAvail = bSize.x - srcStart;
+                const NnUint dstAvail = bSize.x - dstStart;
                 const NnUint writeLen = std::min(needLen, std::min(srcAvail, dstAvail));
                 if (writeLen == 0u) return;
 
                 float *buf = (float *)cpuSeg->device->buffers[bufIdx];
-                float *dst = buf + (NnSize)position * (NnSize)bSize.x + (NnSize)srcStart;
+                float *dst = buf + (NnSize)position * (NnSize)bSize.x + (NnSize)dstStart;
                 std::memcpy(dst, srcRow.data() + srcStart, (size_t)writeLen * sizeof(float));
                 written.insert(bufIdx);
                 wroteAny = true;
 
-                std::printf("🧩 [kv-write] node=%u seg=%u layer=%u pos=%u %sBuf=%u bufX=%u srcRange=[%u,%u) dstRange=[%u,%u)\n",
+                std::printf("🧩 [kv-write] node=%u seg=%u layer=%u pos=%u %sBuf=%u bufX=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                     (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
                     (unsigned)s,
                     (unsigned)layerIndex,
@@ -732,8 +755,9 @@ bool NnExecutor::applyTransferredKvRow(NnUint layerIndex, NnUint position, const
                     (unsigned)bSize.x,
                     (unsigned)srcStart,
                     (unsigned)(srcStart + writeLen),
-                    (unsigned)srcStart,
-                    (unsigned)(srcStart + writeLen));
+                    (unsigned)dstStart,
+                    (unsigned)(dstStart + writeLen),
+                    partial ? 1u : 0u);
                 std::fflush(stdout);
             };
 

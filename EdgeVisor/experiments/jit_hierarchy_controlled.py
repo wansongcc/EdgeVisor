@@ -31,6 +31,12 @@ class JitRow:
     repeat: int
     plan_op: str
     expected_path: str
+    shadow_kv_mode: str
+    controlled_recovery_mode: str
+    controlled_state_bytes: int
+    controlled_state_ms: float
+    controlled_state_ok: bool
+    effective_recovery_ms: float
     disable_sharding_controller: bool
     disable_pipeline_balancer: bool
     command_sent: bool
@@ -52,7 +58,11 @@ class JitRow:
     pp_recover_count: int
     rejected_event_count: int
     cumulative_stall_ms: float
+    t_state_prepare_ms: float
+    t_recover_ms: float
     state_transfer_bytes: int
+    recompute_tokens_or_layers: int
+    fallback_reasons: str
     output_dir: str
 
 
@@ -96,15 +106,32 @@ def load_jsonl(path):
 
 def summarize_events(records):
     ids = [str(r.get("event_id", "")) for r in records]
+    recover_records = [r for r in records if str(r.get("event_id", "")) in {"head_migration_recover", "pp_migration_recover"}]
+    fallback_reasons = sorted({str(r.get("fallback_reason", "")) for r in recover_records if str(r.get("fallback_reason", ""))})
     return {
         "plan_emit_count": sum(1 for x in ids if x in {"plan_command_emit", "pp_migration_emit"}),
         "plan_apply_count": sum(1 for x in ids if x in {"plan_command_apply", "pp_migration_apply"}),
         "head_recover_count": sum(1 for x in ids if x == "head_migration_recover"),
         "pp_recover_count": sum(1 for x in ids if x == "pp_migration_recover"),
         "rejected_event_count": sum(1 for x in ids if x == "jit_plan_rejected"),
-        "cumulative_stall_ms": sum(float(r.get("stall_time_ms", 0.0) or 0.0) for r in records),
-        "state_transfer_bytes": sum(int(r.get("state_transfer_bytes", 0) or 0) for r in records),
+        "cumulative_stall_ms": sum(float(r.get("stall_time_ms", 0.0) or 0.0) for r in recover_records),
+        "t_state_prepare_ms": sum(float(r.get("t_state_prepare_ms", 0.0) or 0.0) for r in recover_records),
+        "t_recover_ms": sum(float(r.get("t_recover_ms", 0.0) or 0.0) for r in recover_records),
+        "state_transfer_bytes": sum(int(r.get("state_transfer_bytes", 0) or 0) for r in recover_records),
+        "recompute_tokens_or_layers": sum(int(r.get("recompute_tokens_or_layers", 0) or 0) for r in recover_records),
+        "fallback_reasons": ";".join(fallback_reasons),
     }
+
+
+def pp_layer_kv_state_bytes(model_info, context_len, layer_count=1):
+    return int(
+        context_len
+        * model_info["head_dim"]
+        * model_info["kv_heads"]
+        * 2
+        * 4
+        * max(1, int(layer_count))
+    )
 
 
 def wait_for_ablation_event(path, event_ids, timeout_s=30):
@@ -184,6 +211,8 @@ def variant_config(variant):
         return {
             "plan_op": "set_plan",
             "expected_path": "head_sharding_controller",
+            "shadow_kv_mode": "enabled",
+            "controlled_recovery_mode": "none",
             "disable_sharding": False,
             "disable_pipeline": False,
             "extra": (
@@ -199,6 +228,8 @@ def variant_config(variant):
         return {
             "plan_op": "set_pp_migration",
             "expected_path": "pipeline_balancer_fallback",
+            "shadow_kv_mode": "enabled",
+            "controlled_recovery_mode": "none",
             "disable_sharding": True,
             "disable_pipeline": False,
             "extra": (
@@ -211,10 +242,48 @@ def variant_config(variant):
                 "--disable-sharding-controller 1"
             ),
         }
+    if variant == "no_sharding_transfer":
+        return {
+            "plan_op": "set_pp_migration",
+            "expected_path": "pipeline_balancer_transfer_recovery",
+            "shadow_kv_mode": "enabled",
+            "controlled_recovery_mode": "transfer",
+            "disable_sharding": True,
+            "disable_pipeline": False,
+            "extra": (
+                "--ablation-log-path /out/ablation.jsonl --experiment-id jit_no_sharding_transfer "
+                "--enable-plan-barrier --kv-redundancy 0 "
+                "--enable-kv-redundancy-during-migration 0 "
+                "--enable-stage-full-weights --enable-pp-migration "
+                "--runtime-redundant-boundary-layers 1 "
+                "--runtime-active-seg-enabled 1 --runtime-redundant-seg-enabled 0 "
+                "--disable-sharding-controller 1"
+            ),
+        }
+    if variant == "no_sharding_recompute":
+        return {
+            "plan_op": "set_pp_migration",
+            "expected_path": "pipeline_balancer_recompute_recovery",
+            "shadow_kv_mode": "enabled",
+            "controlled_recovery_mode": "recompute",
+            "disable_sharding": True,
+            "disable_pipeline": False,
+            "extra": (
+                "--ablation-log-path /out/ablation.jsonl --experiment-id jit_no_sharding_recompute "
+                "--enable-plan-barrier --kv-redundancy 0 "
+                "--enable-kv-redundancy-during-migration 0 "
+                "--enable-stage-full-weights --enable-pp-migration "
+                "--runtime-redundant-boundary-layers 1 "
+                "--runtime-active-seg-enabled 1 --runtime-redundant-seg-enabled 0 "
+                "--disable-sharding-controller 1"
+            ),
+        }
     if variant == "no_pipeline":
         return {
             "plan_op": "none",
             "expected_path": "no_structural_recovery",
+            "shadow_kv_mode": "enabled",
+            "controlled_recovery_mode": "none",
             "disable_sharding": True,
             "disable_pipeline": True,
             "extra": (
@@ -251,6 +320,9 @@ def run_variant(variant, repeat, steps=96):
     reject_reason = ""
     apply_seen = False
     recover_seen = False
+    controlled_state_bytes = 0
+    controlled_state_ms = 0.0
+    controlled_state_ok = True
     try:
         if not suite.wait_for_uds(sock, timeout_s=180):
             raise RuntimeError(f"UDS not ready: {sock}")
@@ -258,7 +330,7 @@ def run_variant(variant, repeat, steps=96):
             raise RuntimeError("root did not reach pos 8")
 
         command_sent = cfg["plan_op"] != "none" or variant == "no_pipeline"
-        if variant in {"no_sharding", "no_pipeline"}:
+        if cfg["disable_sharding"]:
             _rc, _t_cmd, out = suite.uds_set_plan(sock, 100, 1, 0, stage=0, head=1, ffn=0, mode="next_barrier")
             (test_dir / "jit_head_probe.json").write_text(out)
             resp = parse_uds_stdout(out)
@@ -288,6 +360,40 @@ def run_variant(variant, repeat, steps=96):
                 first_apply_pos = int(mm.group(1)) if mm else -1
             recover_seen = apply_seen
         elif cfg["plan_op"] == "set_pp_migration":
+            if cfg["controlled_recovery_mode"] != "none":
+                context_len = int(os.environ.get("B01_JIT_STATE_CONTEXT", "4096"))
+                layer_count = 1
+                controlled_state_bytes = pp_layer_kv_state_bytes(suite.MODELS["3B"], context_len, layer_count=layer_count)
+                if cfg["controlled_recovery_mode"] == "transfer":
+                    controlled_state_ms, controlled_state_ok, state_log = suite.transfer_bytes(
+                        meta["all_names"][2],
+                        meta["all_names"][3],
+                        controlled_state_bytes,
+                        port=26000 + repeat * 10,
+                    )
+                elif cfg["controlled_recovery_mode"] == "recompute":
+                    controlled_state_ms, controlled_state_ok, state_log = suite.recompute_bytes(
+                        meta["all_names"][3],
+                        controlled_state_bytes,
+                    )
+                else:
+                    state_log = ""
+                    controlled_state_ok = False
+                (test_dir / "controlled_state.log").write_text(
+                    json.dumps(
+                        {
+                            "mode": cfg["controlled_recovery_mode"],
+                            "context_len": context_len,
+                            "layer_count": layer_count,
+                            "state_bytes": controlled_state_bytes,
+                            "state_ms": controlled_state_ms,
+                            "ok": controlled_state_ok,
+                        },
+                        indent=2,
+                    )
+                    + "\n--- raw ---\n"
+                    + (state_log or "")
+                )
             _rc, _t_cmd, out = send_pp_plan(sock, 1, 2, 3, stage=0, layer_count=1, mode="next_barrier")
             (test_dir / "jit_cmd.json").write_text(out)
             resp = parse_uds_stdout(out)
@@ -315,12 +421,19 @@ def run_variant(variant, repeat, steps=96):
                 if str(rec.get("event_id", "")) in {"plan_command_apply", "pp_migration_apply"}:
                     first_apply_pos = int(rec.get("trigger_pos", -1) or -1)
                     break
+        effective_recovery_ms = ev["cumulative_stall_ms"] + ev["t_state_prepare_ms"] + controlled_state_ms
         rows.append(
             JitRow(
                 variant=variant,
                 repeat=repeat,
                 plan_op=cfg["plan_op"],
                 expected_path=cfg["expected_path"],
+                shadow_kv_mode=cfg["shadow_kv_mode"],
+                controlled_recovery_mode=cfg["controlled_recovery_mode"],
+                controlled_state_bytes=controlled_state_bytes,
+                controlled_state_ms=controlled_state_ms,
+                controlled_state_ok=controlled_state_ok,
+                effective_recovery_ms=effective_recovery_ms,
                 disable_sharding_controller=cfg["disable_sharding"],
                 disable_pipeline_balancer=cfg["disable_pipeline"],
                 command_sent=command_sent,
@@ -342,7 +455,11 @@ def run_variant(variant, repeat, steps=96):
                 pp_recover_count=ev["pp_recover_count"],
                 rejected_event_count=ev["rejected_event_count"],
                 cumulative_stall_ms=ev["cumulative_stall_ms"],
+                t_state_prepare_ms=ev["t_state_prepare_ms"],
+                t_recover_ms=ev["t_recover_ms"],
                 state_transfer_bytes=ev["state_transfer_bytes"],
+                recompute_tokens_or_layers=ev["recompute_tokens_or_layers"],
+                fallback_reasons=ev["fallback_reasons"],
                 output_dir=str(test_dir),
             )
         )
@@ -382,7 +499,10 @@ def main():
     try:
         repeats = int(os.environ.get("B01_JIT_REPEAT", "2"))
         steps = int(os.environ.get("B01_JIT_STEPS", "96"))
-        variants = ["full_jit", "no_sharding", "no_pipeline"]
+        variants_env = os.environ.get("B01_JIT_VARIANTS", "")
+        variants = [v.strip() for v in variants_env.split(",") if v.strip()]
+        if not variants:
+            variants = ["full_jit", "no_sharding", "no_sharding_transfer", "no_sharding_recompute", "no_pipeline"]
         if os.environ.get("B01_JIT_SMOKE") == "1":
             repeats = 1
             variants = ["full_jit"]

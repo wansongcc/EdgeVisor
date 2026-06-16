@@ -39,6 +39,19 @@ static inline void logRootControlSend(const LlmControlPacket& p) {
 #endif
 }
 
+static bool envFlagEnabledDefault(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    if (std::strcmp(value, "0") == 0 ||
+        std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "False") == 0 ||
+        std::strcmp(value, "off") == 0 ||
+        std::strcmp(value, "OFF") == 0) {
+        return false;
+    }
+    return true;
+}
+
 static bool parseEnvInt(const char *name, int &out) {
     const char *v = std::getenv(name);
     if (v == nullptr || v[0] == '\0') return false;
@@ -3159,6 +3172,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     NnNetwork *network = nullptr;
 
     const bool profileEnabled = args->benchmark;
+    const bool layerProfileEnabled = profileEnabled && envFlagEnabledDefault("DLLAMA_LAYER_PROF_ENABLE", false);
 
     if (nNodes == 1) {
         synchronizer.reset(new NnFakeNodeSynchronizer());
@@ -3173,7 +3187,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         }
 
         // 初始化 Synchronizer (传入 Plan)
-        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get(), profileEnabled));
+        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get(), layerProfileEnabled));
 
         NnRootConfigWriter configWriter(network);
         configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
@@ -3323,7 +3337,8 @@ void runWorkerApp(AppCliArgs *args) {
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
         // Initialize Synchronizer with Plan
-        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get(), bootBenchmarkEnabled);
+        const bool layerProfileEnabled = bootBenchmarkEnabled && envFlagEnabledDefault("DLLAMA_LAYER_PROF_ENABLE", false);
+        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get(), layerProfileEnabled);
         
         // Benchmark flag is provided by root to keep all nodes consistent.
         // Worker CLI --benchmark is no longer required.

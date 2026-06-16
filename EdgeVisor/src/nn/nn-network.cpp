@@ -30,6 +30,7 @@ typedef SSIZE_T ssize_t;
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #endif
 
 #define SOCKET_LAST_ERRCODE errno
@@ -1871,11 +1872,17 @@ void NnNetworkNodeSynchronizer::maybeInitLayerPerfSnapshot() {
     if (myStage == nullptr || nodeConfig == nullptr) return;
     if (nodeConfig->nodeIndex != myStage->rootNodeIndex) return;
 
-    // Default path includes stage+root to avoid collisions in multi-process setups.
+    // Default path is user and process scoped to avoid cross-user /tmp collisions.
     if (layerPerfPath.empty()) {
         char buf[256];
-        std::snprintf(buf, sizeof(buf), "/tmp/dllama_layer_prof_stage%u_root%u.bin",
-                      (unsigned)myStage->stageIndex, (unsigned)myStage->rootNodeIndex);
+        const char *user = std::getenv("USER");
+        if (user == nullptr || user[0] == '\0') user = "unknown";
+        std::snprintf(buf, sizeof(buf), "/tmp/dllama_layer_prof_%s_uid%u_stage%u_root%u_pid%u.bin",
+                      user,
+                      (unsigned)::getuid(),
+                      (unsigned)myStage->stageIndex,
+                      (unsigned)myStage->rootNodeIndex,
+                      (unsigned)::getpid());
         layerPerfPath = std::string(buf);
     }
 

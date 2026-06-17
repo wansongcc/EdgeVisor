@@ -7,6 +7,7 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <cstdint>
 
 #define ROOT_SOCKET_INDEX 0
 
@@ -46,12 +47,55 @@ struct NnSocketIo {
     NnSize size;
 };
 
+struct NnCommProfileStats {
+    std::uint64_t sendCalls = 0;
+    std::uint64_t recvCalls = 0;
+    std::uint64_t sendBytes = 0;
+    std::uint64_t recvBytes = 0;
+    std::uint64_t smallSendCalls = 0;
+    std::uint64_t smallRecvCalls = 0;
+    std::uint64_t smallSendBytes = 0;
+    std::uint64_t smallRecvBytes = 0;
+    std::uint64_t sendEagain = 0;
+    std::uint64_t recvEagain = 0;
+    std::uint64_t ackWrites = 0;
+    std::uint64_t ackReads = 0;
+    std::uint64_t writeManyCalls = 0;
+    std::uint64_t readManyCalls = 0;
+    std::uint64_t syncSteps = 0;
+};
+
 class NnNetwork {
 private:
     int *sockets;
     NnUint *peerNodeBySocket;
     NnSize *sentBytes;
     NnSize *recvBytes;
+    bool commProfileEnabled = false;
+    std::uint64_t commProfileSeq = 0;
+    std::atomic<std::uint64_t> commSendCalls{0};
+    std::atomic<std::uint64_t> commRecvCalls{0};
+    std::atomic<std::uint64_t> commSendBytes{0};
+    std::atomic<std::uint64_t> commRecvBytes{0};
+    std::atomic<std::uint64_t> commSmallSendCalls{0};
+    std::atomic<std::uint64_t> commSmallRecvCalls{0};
+    std::atomic<std::uint64_t> commSmallSendBytes{0};
+    std::atomic<std::uint64_t> commSmallRecvBytes{0};
+    std::atomic<std::uint64_t> commSendEagain{0};
+    std::atomic<std::uint64_t> commRecvEagain{0};
+    std::atomic<std::uint64_t> commAckWrites{0};
+    std::atomic<std::uint64_t> commAckReads{0};
+    std::atomic<std::uint64_t> commWriteManyCalls{0};
+    std::atomic<std::uint64_t> commReadManyCalls{0};
+    std::atomic<std::uint64_t> commSyncSteps{0};
+
+    void recordCommSend(NnSize size);
+    void recordCommRecv(NnSize size);
+    void recordCommSendEagain();
+    void recordCommRecvEagain();
+    NnCommProfileStats getCommProfileStats() const;
+    void resetCommProfileStats();
+    void printCommProfile(const char *label, const NnCommProfileStats &stats, bool includeSeq);
 
 public:
     static std::unique_ptr<NnNetwork> serve(int port);
@@ -77,6 +121,8 @@ public:
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
     void sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size);
+    bool isCommProfileEnabled() const;
+    void recordSyncStepComplete();
     void recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size);
     int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const;
     void resetStats();

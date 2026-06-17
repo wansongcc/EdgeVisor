@@ -64,6 +64,19 @@ static inline unsigned long getIoTimeoutMs() {
     return cached.load(std::memory_order_acquire);
 }
 
+static inline bool envFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return false;
+    if (std::strcmp(value, "0") == 0 ||
+        std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "False") == 0 ||
+        std::strcmp(value, "off") == 0 ||
+        std::strcmp(value, "OFF") == 0) {
+        return false;
+    }
+    return true;
+}
+
 static inline bool isEagainError() {
     #ifdef _WIN32
     return WSAGetLastError() == WSAEWOULDBLOCK;
@@ -909,9 +922,13 @@ NnNetwork::NnNetwork(std::vector<NnSocket> *sockets, std::vector<NnUint> *peerNo
     }
     this->sentBytes = new NnSize[nSockets];
     this->recvBytes = new NnSize[nSockets];
+    this->commProfileEnabled = envFlagEnabled("DLLAMA_COMM_PROFILE");
 }
 
 NnNetwork::~NnNetwork() {
+    if (commProfileEnabled) {
+        printCommProfile("total", getCommProfileStats(), false);
+    }
     delete[] peerNodeBySocket;
     delete[] sentBytes;
     delete[] recvBytes;
@@ -927,6 +944,121 @@ void NnNetwork::setTurbo(bool enabled) {
     }
 }
 
+bool NnNetwork::isCommProfileEnabled() const {
+    return commProfileEnabled;
+}
+
+void NnNetwork::recordCommSend(NnSize size) {
+    if (!commProfileEnabled) return;
+    commSendCalls.fetch_add(1u, std::memory_order_relaxed);
+    commSendBytes.fetch_add((std::uint64_t)size, std::memory_order_relaxed);
+    if (size <= 256u) {
+        commSmallSendCalls.fetch_add(1u, std::memory_order_relaxed);
+        commSmallSendBytes.fetch_add((std::uint64_t)size, std::memory_order_relaxed);
+    }
+}
+
+void NnNetwork::recordCommRecv(NnSize size) {
+    if (!commProfileEnabled) return;
+    commRecvCalls.fetch_add(1u, std::memory_order_relaxed);
+    commRecvBytes.fetch_add((std::uint64_t)size, std::memory_order_relaxed);
+    if (size <= 256u) {
+        commSmallRecvCalls.fetch_add(1u, std::memory_order_relaxed);
+        commSmallRecvBytes.fetch_add((std::uint64_t)size, std::memory_order_relaxed);
+    }
+}
+
+void NnNetwork::recordCommSendEagain() {
+    if (commProfileEnabled) commSendEagain.fetch_add(1u, std::memory_order_relaxed);
+}
+
+void NnNetwork::recordCommRecvEagain() {
+    if (commProfileEnabled) commRecvEagain.fetch_add(1u, std::memory_order_relaxed);
+}
+
+void NnNetwork::recordSyncStepComplete() {
+    if (commProfileEnabled) commSyncSteps.fetch_add(1u, std::memory_order_relaxed);
+}
+
+NnCommProfileStats NnNetwork::getCommProfileStats() const {
+    NnCommProfileStats s;
+    s.sendCalls = commSendCalls.load(std::memory_order_relaxed);
+    s.recvCalls = commRecvCalls.load(std::memory_order_relaxed);
+    s.sendBytes = commSendBytes.load(std::memory_order_relaxed);
+    s.recvBytes = commRecvBytes.load(std::memory_order_relaxed);
+    s.smallSendCalls = commSmallSendCalls.load(std::memory_order_relaxed);
+    s.smallRecvCalls = commSmallRecvCalls.load(std::memory_order_relaxed);
+    s.smallSendBytes = commSmallSendBytes.load(std::memory_order_relaxed);
+    s.smallRecvBytes = commSmallRecvBytes.load(std::memory_order_relaxed);
+    s.sendEagain = commSendEagain.load(std::memory_order_relaxed);
+    s.recvEagain = commRecvEagain.load(std::memory_order_relaxed);
+    s.ackWrites = commAckWrites.load(std::memory_order_relaxed);
+    s.ackReads = commAckReads.load(std::memory_order_relaxed);
+    s.writeManyCalls = commWriteManyCalls.load(std::memory_order_relaxed);
+    s.readManyCalls = commReadManyCalls.load(std::memory_order_relaxed);
+    s.syncSteps = commSyncSteps.load(std::memory_order_relaxed);
+    return s;
+}
+
+void NnNetwork::resetCommProfileStats() {
+    commSendCalls.store(0u, std::memory_order_relaxed);
+    commRecvCalls.store(0u, std::memory_order_relaxed);
+    commSendBytes.store(0u, std::memory_order_relaxed);
+    commRecvBytes.store(0u, std::memory_order_relaxed);
+    commSmallSendCalls.store(0u, std::memory_order_relaxed);
+    commSmallRecvCalls.store(0u, std::memory_order_relaxed);
+    commSmallSendBytes.store(0u, std::memory_order_relaxed);
+    commSmallRecvBytes.store(0u, std::memory_order_relaxed);
+    commSendEagain.store(0u, std::memory_order_relaxed);
+    commRecvEagain.store(0u, std::memory_order_relaxed);
+    commAckWrites.store(0u, std::memory_order_relaxed);
+    commAckReads.store(0u, std::memory_order_relaxed);
+    commWriteManyCalls.store(0u, std::memory_order_relaxed);
+    commReadManyCalls.store(0u, std::memory_order_relaxed);
+    commSyncSteps.store(0u, std::memory_order_relaxed);
+}
+
+void NnNetwork::printCommProfile(const char *label, const NnCommProfileStats &s, bool includeSeq) {
+    if (includeSeq) {
+        std::printf("[comm-profile] label=%s seq=%llu sync_steps=%llu send_calls=%llu recv_calls=%llu send_bytes=%llu recv_bytes=%llu small_send_calls=%llu small_recv_calls=%llu small_send_bytes=%llu small_recv_bytes=%llu eagain_send=%llu eagain_recv=%llu ack_writes=%llu ack_reads=%llu write_many=%llu read_many=%llu\n",
+            label,
+            (unsigned long long)(++commProfileSeq),
+            (unsigned long long)s.syncSteps,
+            (unsigned long long)s.sendCalls,
+            (unsigned long long)s.recvCalls,
+            (unsigned long long)s.sendBytes,
+            (unsigned long long)s.recvBytes,
+            (unsigned long long)s.smallSendCalls,
+            (unsigned long long)s.smallRecvCalls,
+            (unsigned long long)s.smallSendBytes,
+            (unsigned long long)s.smallRecvBytes,
+            (unsigned long long)s.sendEagain,
+            (unsigned long long)s.recvEagain,
+            (unsigned long long)s.ackWrites,
+            (unsigned long long)s.ackReads,
+            (unsigned long long)s.writeManyCalls,
+            (unsigned long long)s.readManyCalls);
+    } else {
+        std::printf("[comm-profile] label=%s sync_steps=%llu send_calls=%llu recv_calls=%llu send_bytes=%llu recv_bytes=%llu small_send_calls=%llu small_recv_calls=%llu small_send_bytes=%llu small_recv_bytes=%llu eagain_send=%llu eagain_recv=%llu ack_writes=%llu ack_reads=%llu write_many=%llu read_many=%llu\n",
+            label,
+            (unsigned long long)s.syncSteps,
+            (unsigned long long)s.sendCalls,
+            (unsigned long long)s.recvCalls,
+            (unsigned long long)s.sendBytes,
+            (unsigned long long)s.recvBytes,
+            (unsigned long long)s.smallSendCalls,
+            (unsigned long long)s.smallRecvCalls,
+            (unsigned long long)s.smallSendBytes,
+            (unsigned long long)s.smallRecvBytes,
+            (unsigned long long)s.sendEagain,
+            (unsigned long long)s.recvEagain,
+            (unsigned long long)s.ackWrites,
+            (unsigned long long)s.ackReads,
+            (unsigned long long)s.writeManyCalls,
+            (unsigned long long)s.readManyCalls);
+    }
+}
+
 void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize size) {
     assert(socketIndex < nSockets);
 
@@ -936,6 +1068,7 @@ void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize s
         NnSize chunkSize = chunk + MAX_CHUNK_SIZE < size ? MAX_CHUNK_SIZE : size - chunk;
         writeSocket(s, current, chunkSize);
         current += chunkSize;
+        recordCommSend(chunkSize);
     }
     sentBytes[socketIndex] += size;
 }
@@ -949,6 +1082,7 @@ void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
         NnSize chunkSize = chunk + MAX_CHUNK_SIZE < size ? MAX_CHUNK_SIZE : size - chunk;
         readSocket(s, current, chunkSize);
         current += chunkSize;
+        recordCommRecv(chunkSize);
     }
     recvBytes[socketIndex] += size;
 }
@@ -956,11 +1090,15 @@ void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
 void NnNetwork::writeAck(const NnUint socketIndex) {
     assert(socketIndex >= 0 && socketIndex < nSockets);
     writeAckPacket(sockets[socketIndex]);
+    if (commProfileEnabled) commAckWrites.fetch_add(1u, std::memory_order_relaxed);
+    recordCommSend(sizeof(NnUint));
 }
 
 void NnNetwork::readAck(const NnUint socketIndex) {
     assert(socketIndex >= 0 && socketIndex < nSockets);
     readAckPacket(sockets[socketIndex]);
+    if (commProfileEnabled) commAckReads.fetch_add(1u, std::memory_order_relaxed);
+    recordCommRecv(sizeof(NnUint));
 }
 
 void NnNetwork::readAckWithTimeout(const NnUint socketIndex, unsigned long timeoutMs) {
@@ -992,6 +1130,8 @@ void NnNetwork::writeAckWithPayload(const NnUint socketIndex, const void *payloa
     assert(socketIndex >= 0 && socketIndex < nSockets);
     writeAckPacket(sockets[socketIndex]);
     sentBytes[socketIndex] += sizeof(int);
+    if (commProfileEnabled) commAckWrites.fetch_add(1u, std::memory_order_relaxed);
+    recordCommSend(sizeof(NnUint));
     if (payloadSize > 0) {
         write(socketIndex, payload, payloadSize);
     }
@@ -1001,6 +1141,8 @@ void NnNetwork::readAckWithPayload(const NnUint socketIndex, void *payload, cons
     assert(socketIndex >= 0 && socketIndex < nSockets);
     readAckPacket(sockets[socketIndex]);
     recvBytes[socketIndex] += sizeof(int);
+    if (commProfileEnabled) commAckReads.fetch_add(1u, std::memory_order_relaxed);
+    recordCommRecv(sizeof(NnUint));
     if (payloadSize > 0) {
         read(socketIndex, payload, payloadSize);
     }
@@ -1038,6 +1180,7 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
     assert(socketIndex >= 0 && socketIndex < nSockets);
     if (tryReadSocket(sockets[socketIndex], data, size, maxAttempts)) {
         recvBytes[socketIndex] += size;
+        recordCommRecv(size);
         return true;
     }
     return false;
@@ -1045,6 +1188,7 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     bool isWriting;
+    if (commProfileEnabled) commWriteManyCalls.fetch_add(1u, std::memory_order_relaxed);
     NnSize nBytes = 0;
     const unsigned long timeoutMs = getIoTimeoutMs();
     const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
@@ -1071,6 +1215,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 ssize_t s = send(socket, (const char*)io->data, chunkSize, 0);
                 if (s < 0) {
                     if (isEagainError()) {
+                        recordCommSendEagain();
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
@@ -1078,6 +1223,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 } else if (s == 0) {
                     throw NnTransferSocketException(0, "Socket closed");
                 }
+                recordCommSend((NnSize)s);
                 eagainSpins = 0u;
                 io->size -= s;
                 io->data = (char*)io->data + s;
@@ -1099,6 +1245,7 @@ void NnNetwork::writeAll(const void *data, NnSize size) {
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     bool isReading;
+    if (commProfileEnabled) commReadManyCalls.fetch_add(1u, std::memory_order_relaxed);
     NnSize nBytes = 0;
     const unsigned long timeoutMs = getIoTimeoutMs();
     const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
@@ -1124,6 +1271,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                 ssize_t r = recv(socket, (char*)io->data, io->size, 0);
                 if (r < 0) {
                     if (isEagainError()) {
+                        recordCommRecvEagain();
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
@@ -1131,6 +1279,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                 } else if (r == 0) {
                     throw NnTransferSocketException(0, "Socket closed");
                 }
+                recordCommRecv((NnSize)r);
                 eagainSpins = 0u;
                 io->size -= r;
                 io->data = (char*)io->data + r;
@@ -1147,6 +1296,11 @@ void NnNetwork::getStats(NnSize *sentBytes, NnSize *recvBytes) {
         *recvBytes += this->recvBytes[i];
     }
     resetStats();
+    if (commProfileEnabled) {
+        NnCommProfileStats stats = getCommProfileStats();
+        printCommProfile("delta", stats, true);
+        resetCommProfileStats();
+    }
 }
 
 void NnNetwork::resetStats() {
@@ -1980,6 +2134,7 @@ void NnNetworkNodeSynchronizer::onSyncStepComplete(NnUint segmentIndex) {
     (void)segmentIndex;
     // NOTE: Do not send network traffic here.
     // Post-sync hooks are not aligned across nodes and can desynchronize socket streams.
+    if (network != nullptr) network->recordSyncStepComplete();
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {

@@ -52,6 +52,27 @@ static bool envFlagEnabledDefault(const char *name, bool fallback) {
     return true;
 }
 
+static bool bubbleShadowKvEnabled() {
+    return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV", false);
+}
+
+static void maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
+    if (!bubbleShadowKvEnabled() || executor == nullptr) return;
+    NnBubbleShadowStats stats = executor->runBubbleShadowRedundant(0u);
+    std::printf(
+        "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u segments=%u ops=%u skipped_sync=%u budget_hit=%u elapsed_us=%llu\n",
+        who == nullptr ? "unknown" : who,
+        (unsigned)nodeIndex,
+        (unsigned)position,
+        (unsigned)batchSize,
+        (unsigned)stats.segmentsVisited,
+        (unsigned)stats.opStepsExecuted,
+        (unsigned)stats.skippedSyncSteps,
+        (unsigned)stats.budgetHit,
+        (unsigned long long)stats.elapsedUs);
+    std::fflush(stdout);
+}
+
 static bool parseEnvInt(const char *name, int &out) {
     const char *v = std::getenv(name);
     if (v == nullptr || v[0] == '\0') return false;
@@ -156,7 +177,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.enableKvAggregate = args->enableKvAggregate ? 1u : 0u;
     p.runtimeRedundantBoundaryLayers = args->runtimeRedundantBoundaryLayers;
     p.runtimeActiveSegEnabled = args->runtimeActiveSegEnabled ? 1u : 0u;
-    p.runtimeRedundantSegEnabled = args->runtimeRedundantSegEnabled ? 1u : 0u;
+    p.runtimeRedundantSegEnabled = (args->runtimeRedundantSegEnabled && !bubbleShadowKvEnabled()) ? 1u : 0u;
     p.maxSeqLen = args->maxSeqLen;
     p.syncType = (NnUint)args->syncType;
     p.modelPathLen = 0u;
@@ -2362,6 +2383,7 @@ void RootLlmInference::forward() {
         }
     }
     executor->forward();
+    maybeRunBubbleShadowKv(executor, "root", 0u, controlPacket.position, controlPacket.batchSize);
 
     if (network != nullptr && waitingKvAck) {
         const NnStageConfig *targetStage = findStageForNodeLocal(plan, nextStageRootNode);
@@ -3120,7 +3142,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     setRuntimeRedundantEnv(
         args->runtimeRedundantBoundaryLayers,
         args->runtimeActiveSegEnabled,
-        args->runtimeRedundantSegEnabled,
+        args->runtimeRedundantSegEnabled && !bubbleShadowKvEnabled(),
         args->runtimePrimarySkipLayersStr);
 
     if(args->ratiosStr != nullptr){
@@ -3297,7 +3319,7 @@ void runWorkerApp(AppCliArgs *args) {
         setRuntimeRedundantEnv(
             bootRuntimeRedundantBoundaryLayers,
             bootRuntimeActiveSegEnabled,
-            bootRuntimeRedundantSegEnabled,
+            bootRuntimeRedundantSegEnabled && !bubbleShadowKvEnabled(),
             bootPrimarySkipLayers.c_str());
 
         NnWorkerConfigReader configReader(network);
@@ -3492,6 +3514,7 @@ void runWorkerApp(AppCliArgs *args) {
                 }
 
                 executor.forward();
+                maybeRunBubbleShadowKv(&executor, "worker", nodeConfig.nodeIndex, inference.position(), inference.batchSize());
                 inference.flushPendingKvAck();
 
                 // Send per-forward profile packet to root (optional)

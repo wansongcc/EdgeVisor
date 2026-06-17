@@ -135,6 +135,14 @@ typedef struct {
     PthreadHandler handler;
 } NnExecutorThread;
 
+typedef struct {
+    NnUint segmentsVisited;
+    NnUint opStepsExecuted;
+    NnUint skippedSyncSteps;
+    NnUint budgetHit;
+    unsigned long long elapsedUs;
+} NnBubbleShadowStats;
+
 class NnExecutorException : public std::runtime_error {
 public:
     NnExecutorException(const std::string message);
@@ -160,6 +168,7 @@ public:
     ~NnExecutor();
     void loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight);
     void forward();
+    NnBubbleShadowStats runBubbleShadowRedundant(NnUint budgetUs);
     // CPU-only today: update partition plan used for PNTR_BATCHED_SLICE resolution.
     void setPartitionPlan(const NnUnevenPartitionPlan *plan);
     // CPU-only today: re-resolve segment pointers after updating partition plan.

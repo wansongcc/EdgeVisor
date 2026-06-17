@@ -631,8 +631,68 @@ void NnExecutor::forward() {
     for (threadIndex = 1; threadIndex < nThreads; threadIndex++)
         pthread_join(threads[threadIndex].handler, NULL);
 
-    if (!context.isAlive.load())
+    const bool completed = context.isAlive.load();
+    context.isAlive.store(false);
+    if (!completed)
         throw NnExecutorException("Execution failed in one of the threads");
+}
+
+NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
+    NnBubbleShadowStats stats{0u, 0u, 0u, 0u, 0ull};
+    if (context.isAlive.load()) {
+        throw std::runtime_error("Cannot run bubble shadow work while executor is running");
+    }
+    if (netExecution == nullptr || netExecution->batchSize == 0u) return stats;
+    if (netExecution->nThreads != 1u) {
+        // First experimental version is deliberately single-thread only.
+        // Current GPU benchmark paths use nthreads=1, and this avoids adding a
+        // second executor scheduler before the idea is validated.
+        return stats;
+    }
+
+    const auto start = std::chrono::high_resolution_clock::now();
+    auto elapsedUs = [&]() -> unsigned long long {
+        return (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    };
+
+    context.batchSize = netExecution->batchSize;
+    NnExecutorThread thread;
+    thread.threadIndex = 0u;
+    thread.context = &context;
+
+    NnUint lastSegment = (NnUint)-1;
+    for (NnUint i = 0; i < steps.size(); ++i) {
+        NnExecutorStep *step = &steps[i];
+        if (step->segmentIndex >= segmentRuntimeRoles.size()) continue;
+        if (segmentRuntimeRoles[step->segmentIndex] != SEG_ROLE_REDUNDANT) continue;
+
+        if (lastSegment != step->segmentIndex) {
+            lastSegment = step->segmentIndex;
+            stats.segmentsVisited += 1u;
+        }
+
+        if (budgetUs > 0u && elapsedUs() >= (unsigned long long)budgetUs) {
+            stats.budgetHit = 1u;
+            break;
+        }
+
+        if (step->type == STEP_SYNC_NODES) {
+            stats.skippedSyncSteps += 1u;
+            continue;
+        }
+        if (step->type != STEP_EXECUTE_OP) continue;
+        if (step->segment == nullptr) continue;
+
+        step->segment->forward(step->arg0, 1u, 0u, context.batchSize);
+        stats.opStepsExecuted += 1u;
+    }
+
+    stats.elapsedUs = elapsedUs();
+    if (context.timer != nullptr) {
+        context.timer->reset();
+    }
+    return stats;
 }
 
 void NnExecutor::refreshPointers() {

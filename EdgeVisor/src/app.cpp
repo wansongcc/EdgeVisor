@@ -72,7 +72,7 @@ static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const ch
     stats = asyncMode ? executor->getLastBubbleShadowStats() : executor->runBubbleShadowRedundant(0u);
     if (bubbleShadowKvLogEnabled()) {
         std::printf(
-            "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u mode=%s segments=%u attn=%u ffn=%u other=%u layers=%u ops=%u skipped_sync=%u budget_hit=%u elapsed_us=%llu\n",
+            "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u mode=%s segments=%u attn=%u ffn=%u other=%u layers=%u ops=%u skipped_sync=%u budget_hit=%u completed=%u drain_us=%u elapsed_us=%llu\n",
             who == nullptr ? "unknown" : who,
             (unsigned)nodeIndex,
             (unsigned)position,
@@ -86,6 +86,8 @@ static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const ch
             (unsigned)stats.opStepsExecuted,
             (unsigned)stats.skippedSyncSteps,
             (unsigned)stats.budgetHit,
+            (unsigned)stats.completed,
+            (unsigned)stats.drainUs,
             (unsigned long long)stats.elapsedUs);
         std::fflush(stdout);
     }

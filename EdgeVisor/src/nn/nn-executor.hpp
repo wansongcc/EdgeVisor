@@ -149,6 +149,8 @@ typedef struct {
     NnUint otherSegments;
     NnUint uniqueLayers;
     NnUint budgetHit;
+    NnUint completed;
+    NnUint drainUs;
     unsigned long long elapsedUs;
 } NnBubbleShadowStats;
 
@@ -177,7 +179,14 @@ private:
     NnBubbleShadowStats lastBubbleShadowStats;
     bool bubbleShadowAsyncRunning;
     bool bubbleShadowAsyncStarted;
+    bool bubbleShadowStopRequested;
+    bool bubbleShadowComplete;
+    NnUint bubbleShadowCursor;
+    NnUint bubbleShadowDrainUs;
+    std::vector<NnUint> bubbleShadowStepIndices;
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
+    NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning);
+    void resetBubbleShadowStateForForward();
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
     ~NnExecutor();
@@ -187,6 +196,8 @@ public:
     bool isBubbleShadowAsyncModeEnabled() const;
     void maybeStartBubbleShadowAsyncBeforeSync();
     void joinBubbleShadowAsync();
+    void pauseBubbleShadowAsyncAfterSync();
+    void drainBubbleShadowAsync();
     NnBubbleShadowStats getLastBubbleShadowStats() const;
     // CPU-only today: update partition plan used for PNTR_BATCHED_SLICE resolution.
     void setPartitionPlan(const NnUnevenPartitionPlan *plan);

@@ -252,9 +252,12 @@ DLLAMA_BUBBLE_SHADOW_KV=1 ./dllama inference ... \
 ```
 
 The root bootstrap packet propagates the bubble mode to workers, so workers do not need
-a separate environment variable when they are launched by EdgeVisor. Optional per-token
-bubble tracing is available with `DLLAMA_BUBBLE_SHADOW_KV_LOG=1`; leave it off for
-performance measurements.
+a separate environment variable when they are launched by EdgeVisor. By default, bubble
+shadow work starts asynchronously before node sync and is joined before the next
+main-path compute step, allowing it to overlap PP bubble/sync wait time. Set
+`DLLAMA_BUBBLE_SHADOW_KV_ASYNC=0` to use the older post-forward synchronous bubble hook;
+this fallback is also propagated to workers. Optional per-token bubble tracing is
+available with `DLLAMA_BUBBLE_SHADOW_KV_LOG=1`; leave it off for performance measurements.
 
 Scope of this first version:
 

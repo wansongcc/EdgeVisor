@@ -57,6 +57,10 @@ static bool bubbleShadowKvEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV", false);
 }
 
+static bool bubbleShadowKvAsyncEnabled() {
+    return bubbleShadowKvEnabled() && envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", true);
+}
+
 static bool bubbleShadowKvLogEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_LOG", false);
 }
@@ -64,14 +68,16 @@ static bool bubbleShadowKvLogEnabled() {
 static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
     NnBubbleShadowStats stats{};
     if (!bubbleShadowKvEnabled() || executor == nullptr) return stats;
-    stats = executor->runBubbleShadowRedundant(0u);
+    const bool asyncMode = executor->isBubbleShadowAsyncModeEnabled();
+    stats = asyncMode ? executor->getLastBubbleShadowStats() : executor->runBubbleShadowRedundant(0u);
     if (bubbleShadowKvLogEnabled()) {
         std::printf(
-            "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u segments=%u attn=%u ffn=%u other=%u layers=%u ops=%u skipped_sync=%u budget_hit=%u elapsed_us=%llu\n",
+            "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u mode=%s segments=%u attn=%u ffn=%u other=%u layers=%u ops=%u skipped_sync=%u budget_hit=%u elapsed_us=%llu\n",
             who == nullptr ? "unknown" : who,
             (unsigned)nodeIndex,
             (unsigned)position,
             (unsigned)batchSize,
+            asyncMode ? "async" : "sync",
             (unsigned)stats.segmentsVisited,
             (unsigned)stats.attnSegments,
             (unsigned)stats.ffnSegments,
@@ -194,6 +200,9 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.bubbleShadowKvEnabled = bubbleShadowKvEnabled() ? 1u : 0u;
     if (p.bubbleShadowKvEnabled != 0u) {
         p.flags |= LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV;
+        if (!bubbleShadowKvAsyncEnabled()) {
+            p.flags |= LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC;
+        }
     }
     p.maxSeqLen = args->maxSeqLen;
     p.syncType = (NnUint)args->syncType;
@@ -3331,8 +3340,14 @@ void runWorkerApp(AppCliArgs *args) {
         const bool bootBubbleShadowKvEnabled = ((boot.flags & LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV) != 0u) || boot.bubbleShadowKvEnabled != 0u;
         if (bootBubbleShadowKvEnabled) {
             setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
+            if ((boot.flags & LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC) != 0u) {
+                setenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", "0", 1);
+            } else {
+                unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+            }
         } else {
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
+            unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
         }
 
         // Set enable plan barrier flag from bootstrap packet

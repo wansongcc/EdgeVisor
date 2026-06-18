@@ -103,6 +103,14 @@ static bool isSegRuntimePrintEnabled() {
     return cached == 1;
 }
 
+static bool isBubbleShadowKvEnabledForExecutor() {
+    return parseEnvBoolOr("DLLAMA_BUBBLE_SHADOW_KV", false);
+}
+
+static bool isBubbleShadowKvAsyncEnabledForExecutor() {
+    return isBubbleShadowKvEnabledForExecutor() && parseEnvBoolOr("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", true);
+}
+
 static std::unordered_set<NnUint> parseLayerSetEnv(const char *name) {
     std::unordered_set<NnUint> out;
     const char *v = std::getenv(name);
@@ -342,6 +350,7 @@ NnExecutorException::NnExecutorException(const std::string message)
 
 NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *devices, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark)
     : netExecution(netExecution), nodeConfig(nodeConfig), segments(nodeConfig->nSegments), steps(), segmentKinds(), segmentRuntimeRoles(), segmentLayerIndex(), segmentHasExecOps(), segmentEnabled(nullptr), threads(nullptr)
+    , bubbleShadowThread(), bubbleShadowMutex(), lastBubbleShadowStats{}, bubbleShadowAsyncRunning(false), bubbleShadowAsyncStarted(false)
 {
     NnUint maxNThreads = 0;
     for (NnExecutorDevice &d : *devices) {
@@ -464,6 +473,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.segmentLayerIndex = segmentLayerIndex.empty() ? nullptr : segmentLayerIndex.data();
     context.segmentHasExecOps = segmentHasExecOps.empty() ? nullptr : segmentHasExecOps.data();
     context.nSegments = (this->nodeConfig != nullptr) ? this->nodeConfig->nSegments : 0u;
+    context.owner = this;
     context.currentStepIndex.store(0u);
     context.doneThreadCount.store(0u);
     context.isAlive.store(false);
@@ -482,6 +492,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
 }
 
 NnExecutor::~NnExecutor() {
+    joinBubbleShadowAsync();
     if (context.timer != nullptr)
         delete context.timer;
     delete[] threads;
@@ -533,6 +544,14 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
 
         if (!enabled) {
             return;
+        }
+    }
+
+    if (isThread0 && context != nullptr && context->owner != nullptr) {
+        if (step->type == STEP_EXECUTE_OP) {
+            context->owner->joinBubbleShadowAsync();
+        } else if (step->type == STEP_SYNC_NODES) {
+            context->owner->maybeStartBubbleShadowAsyncBeforeSync();
         }
     }
 
@@ -613,6 +632,14 @@ void NnExecutor::forward() {
     context.doneThreadCount.exchange(0);
     context.batchSize = netExecution->batchSize;
 
+    joinBubbleShadowAsync();
+    {
+        std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+        lastBubbleShadowStats = NnBubbleShadowStats{};
+        bubbleShadowAsyncStarted = false;
+        bubbleShadowAsyncRunning = false;
+    }
+
     if (context.timer != nullptr) {
         std::memset(context.totalTime, 0, sizeof(context.totalTime));
         context.timer->reset();
@@ -631,15 +658,16 @@ void NnExecutor::forward() {
     for (threadIndex = 1; threadIndex < nThreads; threadIndex++)
         pthread_join(threads[threadIndex].handler, NULL);
 
+    joinBubbleShadowAsync();
     const bool completed = context.isAlive.load();
     context.isAlive.store(false);
     if (!completed)
         throw NnExecutorException("Execution failed in one of the threads");
 }
 
-NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
+NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning) {
     NnBubbleShadowStats stats{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0ull};
-    if (context.isAlive.load()) {
+    if (!allowWhileRunning && context.isAlive.load()) {
         throw std::runtime_error("Cannot run bubble shadow work while executor is running");
     }
     if (netExecution == nullptr || netExecution->batchSize == 0u) return stats;
@@ -656,11 +684,7 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
             std::chrono::high_resolution_clock::now() - start).count();
     };
 
-    context.batchSize = netExecution->batchSize;
-    NnExecutorThread thread;
-    thread.threadIndex = 0u;
-    thread.context = &context;
-
+    const NnUint batchSize = netExecution->batchSize;
     NnUint lastSegment = (NnUint)-1;
     std::unordered_set<NnUint> visitedLayers;
     for (NnUint i = 0; i < steps.size(); ++i) {
@@ -696,16 +720,74 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
         if (step->type != STEP_EXECUTE_OP) continue;
         if (step->segment == nullptr) continue;
 
-        step->segment->forward(step->arg0, 1u, 0u, context.batchSize);
+        step->segment->forward(step->arg0, 1u, 0u, batchSize);
         stats.opStepsExecuted += 1u;
     }
 
     stats.uniqueLayers = (NnUint)visitedLayers.size();
     stats.elapsedUs = elapsedUs();
-    if (context.timer != nullptr) {
+    if (!allowWhileRunning && context.timer != nullptr) {
         context.timer->reset();
     }
     return stats;
+}
+
+NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
+    return runBubbleShadowRedundantInternal(budgetUs, false);
+}
+
+bool NnExecutor::isBubbleShadowAsyncModeEnabled() const {
+    return isBubbleShadowKvAsyncEnabledForExecutor();
+}
+
+void NnExecutor::maybeStartBubbleShadowAsyncBeforeSync() {
+    if (!isBubbleShadowAsyncModeEnabled()) return;
+    if (netExecution == nullptr || netExecution->batchSize == 0u || netExecution->nThreads != 1u) return;
+
+    {
+        std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+        if (bubbleShadowAsyncStarted || bubbleShadowAsyncRunning) return;
+        bubbleShadowAsyncStarted = true;
+        bubbleShadowAsyncRunning = true;
+    }
+
+    bubbleShadowThread = std::thread([this]() {
+        NnBubbleShadowStats stats{};
+        bool ok = true;
+        try {
+            stats = this->runBubbleShadowRedundantInternal(0u, true);
+        } catch (const std::exception &e) {
+            ok = false;
+            std::printf("[bubble-shadow-kv] async error: %s\n", e.what());
+            std::fflush(stdout);
+        } catch (...) {
+            ok = false;
+            std::printf("[bubble-shadow-kv] async error: unknown exception\n");
+            std::fflush(stdout);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(this->bubbleShadowMutex);
+            this->lastBubbleShadowStats = stats;
+            this->bubbleShadowAsyncRunning = false;
+        }
+        if (!ok) {
+            this->context.isAlive.store(false);
+        }
+    });
+}
+
+void NnExecutor::joinBubbleShadowAsync() {
+    if (bubbleShadowThread.joinable()) {
+        bubbleShadowThread.join();
+    }
+    std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+    bubbleShadowAsyncRunning = false;
+}
+
+NnBubbleShadowStats NnExecutor::getLastBubbleShadowStats() const {
+    std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+    return lastBubbleShadowStats;
 }
 
 void NnExecutor::refreshPointers() {

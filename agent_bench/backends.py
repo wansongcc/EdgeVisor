@@ -17,12 +17,12 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 ROOT = Path(os.environ.get("B01_ROOT", "/home/byh/B01"))
-EDGE_PROJECT = ROOT / "EdgeVisor"
-EDGE_ENGINE = EDGE_PROJECT / "EdgeVisor"
-EDGE_DLLAMA = EDGE_ENGINE / "dllama"
-EDGE_DLLAMA_API = EDGE_ENGINE / "dllama-api"
-EDGE_MODEL = ROOT / "models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m"
-EDGE_TOKENIZER = ROOT / "models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
+EDGE_PROJECT = Path(os.environ.get("EDGE_PROJECT", str(ROOT / "EdgeVisor")))
+EDGE_ENGINE = Path(os.environ.get("EDGE_ENGINE", str(EDGE_PROJECT / "EdgeVisor")))
+EDGE_DLLAMA = Path(os.environ.get("EDGE_DLLAMA", str(EDGE_ENGINE / "dllama")))
+EDGE_DLLAMA_API = Path(os.environ.get("EDGE_DLLAMA_API", str(EDGE_ENGINE / "dllama-api")))
+EDGE_MODEL = Path(os.environ.get("EDGE_MODEL", str(ROOT / "models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m")))
+EDGE_TOKENIZER = Path(os.environ.get("EDGE_TOKENIZER", str(ROOT / "models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t")))
 
 EDGE_EXO_PROJECT = ROOT / "EdgeVisor-EXO"
 EDGE_EXO_ENGINE = EDGE_EXO_PROJECT / "EdgeVisor"
@@ -263,10 +263,11 @@ def parse_edge_metrics(log_text: str) -> Dict[str, Any]:
     stage_profile: List[Dict[str, Any]] = []
     for match in re.finditer(
         r"Stage\s+(\d+)\s+Node\s+(\d+):\s+per-fwd total=\s*([0-9.]+)\s*ms"
-        r"\s+\(exec=\s*([0-9.]+)\s+sync=\s*([0-9.]+)\)"
+        r"\s+\(exec=\s*([0-9.]+)\s+sync=\s*([0-9.]+)(?:\s+bubble=\s*([0-9.]+))?\)"
         r"\s+\|\s+per-tok total=\s*([0-9.]+)\s*ms"
-        r"\s+\(exec=\s*([0-9.]+)\s+sync=\s*([0-9.]+)\)"
-        r"\s+\|\s+fwd=(\d+)\s+tok=(\d+)",
+        r"\s+\(exec=\s*([0-9.]+)\s+sync=\s*([0-9.]+)(?:\s+bubble=\s*([0-9.]+))?\)"
+        r"(?:\s+\|\s+bubbleSeg=(\d+)\s+bubbleOps=(\d+))?"
+        r"\s+fwd=(\d+)\s+tok=(\d+)",
         log_text,
     ):
         stage_profile.append(
@@ -276,11 +277,15 @@ def parse_edge_metrics(log_text: str) -> Dict[str, Any]:
                 "per_fwd_total_ms": float(match.group(3)),
                 "per_fwd_exec_ms": float(match.group(4)),
                 "per_fwd_sync_ms": float(match.group(5)),
-                "per_tok_total_ms": float(match.group(6)),
-                "per_tok_exec_ms": float(match.group(7)),
-                "per_tok_sync_ms": float(match.group(8)),
-                "forward_count": int(match.group(9)),
-                "token_count": int(match.group(10)),
+                "per_fwd_bubble_ms": float(match.group(6) or 0.0),
+                "per_tok_total_ms": float(match.group(7)),
+                "per_tok_exec_ms": float(match.group(8)),
+                "per_tok_sync_ms": float(match.group(9)),
+                "per_tok_bubble_ms": float(match.group(10) or 0.0),
+                "bubble_segments": int(match.group(11) or 0),
+                "bubble_ops": int(match.group(12) or 0),
+                "forward_count": int(match.group(13)),
+                "token_count": int(match.group(14)),
             }
         )
     stage_profile.sort(key=lambda x: int(x["stage"]))
@@ -1627,6 +1632,16 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         extra_env: Optional[Dict[str, str]] = None,
     ):
         config = dict(ablation_config or {})
+        runtime_boundary_layers = max(0, int(config.get("runtime_redundant_boundary_layers", 0) or 0))
+        extra_root_args = []
+        if runtime_boundary_layers > 0:
+            extra_root_args.extend([
+                "--runtime-redundant-boundary-layers",
+                str(runtime_boundary_layers),
+                "--runtime-active-seg-enabled",
+                "1",
+                "--runtime-redundant-seg-enabled",
+            ])
         super().__init__(
             cuda_visible=cuda_visible,
             ctx=ctx,
@@ -1637,8 +1652,9 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             backend_name=self.name,
             ablation_config=config,
             virtual_topology=virtual_topology,
+            extra_root_args=extra_root_args,
             extra_env=extra_env,
-            enable_benchmark=False,
+            enable_benchmark=bool(config.get("enable_benchmark", False)),
         )
         self.persistent = persistent
         self.api_port = api_port

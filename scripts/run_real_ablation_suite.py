@@ -518,6 +518,10 @@ def build_episode_command(
         "--runtime-redundant-boundary-layers",
         str(args.runtime_redundant_boundary_layers),
     ]
+    if getattr(args, "bubble_shadow_kv", False):
+        cmd.append("--bubble-shadow-kv")
+    if getattr(args, "edge_benchmark", False):
+        cmd.append("--edge-benchmark")
     if args.shadow_scope == "inter_stage_layers":
         cmd.append("--enable-pp-migration")
     if args.shadow_scope == "intra_stage_heads":
@@ -803,6 +807,8 @@ def main() -> int:
     parser.add_argument("--edge-steps", type=int, default=256)
     parser.add_argument("--edge-virtual-launch-stagger-s", type=float, default=2.0)
     parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=0)
+    parser.add_argument("--bubble-shadow-kv", action="store_true", default=os.environ.get("BUBBLE_SHADOW_KV", "0") == "1")
+    parser.add_argument("--edge-benchmark", action="store_true", default=os.environ.get("EDGE_BENCHMARK", "0") == "1")
     parser.add_argument(
         "--migration-layer-count",
         type=int,
@@ -921,6 +927,8 @@ def main() -> int:
             "expected_migration_count": len(multi_trigger_positions) if multi_trigger_positions else 1,
             "prefill_tokens": args.prefill_tokens,
             "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
+            "bubble_shadow_kv": bool(args.bubble_shadow_kv),
+            "edge_benchmark": bool(args.edge_benchmark),
         },
         "perturbation": {
             "compute": "background dllama inference on target GPU",

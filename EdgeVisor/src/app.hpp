@@ -193,6 +193,10 @@ typedef struct {
     NnUint stageIndex;
     NnUint execUs;
     NnUint syncUs;
+    NnUint bubbleUs;
+    NnUint bubbleSegments;
+    NnUint bubbleOps;
+    NnUint bubbleSkippedSyncs;
 } LlmPerfPacket;
 
 // Bootstrap settings sent from root to worker after socket connect and before
@@ -206,6 +210,8 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_HAS_PRIMARY_SKIP_LAYERS = 1u << 5,
     LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE = 1u << 6,
     LLM_BOOTSTRAP_HAS_KV_REDUNDANCY = 1u << 7,
+    LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV = 1u << 8,
+    LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC = 1u << 9,
 };
 
 typedef struct {
@@ -227,10 +233,14 @@ typedef struct {
     NnUint ratiosLen;    // bytes including '\0' if present
     NnUint primarySkipLayersLen; // bytes including '\0' if present
     NnUint kvRedundancyLen; // bytes including '\0' if present
+    NnUint bubbleShadowKvEnabled; // 0/1, compute runtime redundant segments after primary forward
+    NnUint reserved0;
+    NnUint reserved1;
+    NnUint reserved2;
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 10u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 11u;
 
 typedef struct {
     NnUint layerIndex;
@@ -300,6 +310,7 @@ private:
     const NnUnevenPartitionPlan* plan = nullptr;
     std::vector<LlmPerfPacket> lastPerf;
     NnUint lastPlanCmdSeqSent = 0u;
+    NnBubbleShadowStats lastBubbleShadowStats{};
     int asyncKvCollectLayer = -1;
     int asyncKvCollectPos = -1;
     std::deque<RootKvAggRowPacket> asyncKvRows;

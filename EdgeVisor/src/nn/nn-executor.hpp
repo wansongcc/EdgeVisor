@@ -6,7 +6,11 @@
 #include <algorithm>
 #include <vector>
 #include <stdexcept>
+#include <mutex>
+#include <thread>
 #include "pthread.h"
+
+class NnExecutor;
 
 class NnDeviceSegment {
 public:
@@ -127,6 +131,7 @@ typedef struct {
     const int *segmentLayerIndex;
     const NnByte *segmentHasExecOps;
     NnUint nSegments;
+    NnExecutor *owner;
 } NnExecutorContext;
 
 typedef struct {
@@ -134,6 +139,20 @@ typedef struct {
     NnExecutorContext *context;
     PthreadHandler handler;
 } NnExecutorThread;
+
+typedef struct {
+    NnUint segmentsVisited;
+    NnUint opStepsExecuted;
+    NnUint skippedSyncSteps;
+    NnUint attnSegments;
+    NnUint ffnSegments;
+    NnUint otherSegments;
+    NnUint uniqueLayers;
+    NnUint budgetHit;
+    NnUint completed;
+    NnUint drainUs;
+    unsigned long long elapsedUs;
+} NnBubbleShadowStats;
 
 class NnExecutorException : public std::runtime_error {
 public:
@@ -155,11 +174,31 @@ private:
     std::unique_ptr<std::atomic_uint8_t[]> segmentEnabled;
     NnExecutorThread *threads;
     NnExecutorContext context;
+    std::thread bubbleShadowThread;
+    mutable std::mutex bubbleShadowMutex;
+    NnBubbleShadowStats lastBubbleShadowStats;
+    bool bubbleShadowAsyncRunning;
+    bool bubbleShadowAsyncStarted;
+    bool bubbleShadowStopRequested;
+    bool bubbleShadowComplete;
+    NnUint bubbleShadowCursor;
+    NnUint bubbleShadowDrainUs;
+    std::vector<NnUint> bubbleShadowStepIndices;
+    NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
+    NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning);
+    void resetBubbleShadowStateForForward();
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
     ~NnExecutor();
     void loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight);
     void forward();
+    NnBubbleShadowStats runBubbleShadowRedundant(NnUint budgetUs);
+    bool isBubbleShadowAsyncModeEnabled() const;
+    void maybeStartBubbleShadowAsyncBeforeSync();
+    void joinBubbleShadowAsync();
+    void pauseBubbleShadowAsyncAfterSync();
+    void drainBubbleShadowAsync();
+    NnBubbleShadowStats getLastBubbleShadowStats() const;
     // CPU-only today: update partition plan used for PNTR_BATCHED_SLICE resolution.
     void setPartitionPlan(const NnUnevenPartitionPlan *plan);
     // CPU-only today: re-resolve segment pointers after updating partition plan.

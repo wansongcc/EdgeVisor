@@ -237,6 +237,55 @@ Shadow KV、Pointer Swizzling、JIT、VG 四组分表。所有数值均从真实
 - Pointer `operator_rebuild` / `weight_rematerialize` 保持安全 pointer refresh，
   但将替代式 rebinding / rematerialization 成本字段写入统一 JSONL。
 
+
+## Bubble Shadow KV v1
+
+Bubble Shadow KV v1 moves runtime redundant Shadow KV computation out of the primary
+forward path. Enable it on the root process with:
+
+```bash
+DLLAMA_BUBBLE_SHADOW_KV=1 ./dllama inference ... \
+  --runtime-redundant-boundary-layers 2 \
+  --runtime-active-seg-enabled 1 \
+  --runtime-redundant-seg-enabled \
+  --kv-redundancy 2
+```
+
+The root bootstrap packet propagates the bubble mode to workers, so workers do not need
+a separate environment variable when they are launched by EdgeVisor. Optional per-token
+bubble tracing is available with `DLLAMA_BUBBLE_SHADOW_KV_LOG=1`; leave it off for
+performance measurements.
+
+Scope of this first version:
+
+- Supports runtime redundant segment execution after each primary forward.
+- Covers both intra-stage head redundancy (`--kv-redundancy 2`) and inter-stage layer
+  redundancy (`--runtime-redundant-boundary-layers 2`).
+- Does not implement JIT-aware dynamic Shadow KV coverage selection yet.
+- Benchmark profile packets include `bubble` time separately; distributed TPOT should be
+  read from the Stage/Node critical path (`per-tok total` max), not only from root
+  `Prediction ms/tok`.
+
+Validated smoke topology:
+
+```text
+ratios: 1:1:1*1:1:1*1:1
+logical node GPUs: 0,1,2,0,1,2,0,1
+head redundancy: 2 heads
+PP boundary redundancy: 2 layers
+```
+
+Agentic runs can use the same mode through:
+
+```bash
+/home/byh/B01/agent_langgraph_venv/bin/python -m agent_bench.run_loop_episode \
+  --backend edgevisor_ablation \
+  --edge-virtual-pp-tp-3stage \
+  --runtime-redundant-boundary-layers 2 \
+  --edge-benchmark \
+  --bubble-shadow-kv
+```
+
 ## LinguaLinked 复现路线
 
 LinguaLinked 复现版本独立维护在：

@@ -104,6 +104,8 @@ def main() -> int:
     parser.add_argument("--edgevisor-ablation-config", type=Path, default=None)
     parser.add_argument("--edge-fixed-port-base", type=int, default=0, help="Use a fixed worker port base for tc-based loopback shaping.")
     parser.add_argument("--enable-pp-migration", action="store_true", help="Enable EdgeVisor PP layer migration control path.")
+    parser.add_argument("--bubble-shadow-kv", action="store_true", help="Compute runtime redundant Shadow KV segments after the primary forward path.")
+    parser.add_argument("--edge-benchmark", action="store_true", help="Enable EdgeVisor --benchmark for agentic TPOT/profile runs.")
     parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=1)
     parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
     parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
@@ -171,6 +173,8 @@ def main() -> int:
         extra_env: Dict[str, str] = {}
         if args.edge_fixed_port_base > 0:
             extra_env["EDGEVISOR_FIXED_PORT_BASE"] = str(args.edge_fixed_port_base)
+        if args.bubble_shadow_kv:
+            extra_env["DLLAMA_BUBBLE_SHADOW_KV"] = "1"
         ablation_config = load_ablation_config(args.edgevisor_ablation_config)
         ablation_config.update(
             {
@@ -184,6 +188,8 @@ def main() -> int:
                 "allow_head_kv_migration": args.allow_head_kv_migration,
                 "enable_pp_migration": args.enable_pp_migration,
                 "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
+                "bubble_shadow_kv": args.bubble_shadow_kv,
+                "enable_benchmark": args.edge_benchmark,
                 "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
                 "config_path": str(args.edgevisor_ablation_config) if args.edgevisor_ablation_config else "",
             }

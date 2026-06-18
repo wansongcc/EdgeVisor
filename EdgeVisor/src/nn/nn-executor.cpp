@@ -638,7 +638,7 @@ void NnExecutor::forward() {
 }
 
 NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
-    NnBubbleShadowStats stats{0u, 0u, 0u, 0u, 0ull};
+    NnBubbleShadowStats stats{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0ull};
     if (context.isAlive.load()) {
         throw std::runtime_error("Cannot run bubble shadow work while executor is running");
     }
@@ -662,6 +662,7 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
     thread.context = &context;
 
     NnUint lastSegment = (NnUint)-1;
+    std::unordered_set<NnUint> visitedLayers;
     for (NnUint i = 0; i < steps.size(); ++i) {
         NnExecutorStep *step = &steps[i];
         if (step->segmentIndex >= segmentRuntimeRoles.size()) continue;
@@ -670,6 +671,17 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
         if (lastSegment != step->segmentIndex) {
             lastSegment = step->segmentIndex;
             stats.segmentsVisited += 1u;
+            const NnByte kind = step->segmentIndex < segmentKinds.size() ? segmentKinds[step->segmentIndex] : SEG_KIND_OTHER;
+            if (kind == SEG_KIND_ATTN) {
+                stats.attnSegments += 1u;
+            } else if (kind == SEG_KIND_FFN) {
+                stats.ffnSegments += 1u;
+            } else {
+                stats.otherSegments += 1u;
+            }
+            if (step->segmentIndex < segmentLayerIndex.size() && segmentLayerIndex[step->segmentIndex] >= 0) {
+                visitedLayers.insert((NnUint)segmentLayerIndex[step->segmentIndex]);
+            }
         }
 
         if (budgetUs > 0u && elapsedUs() >= (unsigned long long)budgetUs) {
@@ -688,6 +700,7 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
         stats.opStepsExecuted += 1u;
     }
 
+    stats.uniqueLayers = (NnUint)visitedLayers.size();
     stats.elapsedUs = elapsedUs();
     if (context.timer != nullptr) {
         context.timer->reset();

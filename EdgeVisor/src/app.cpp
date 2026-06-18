@@ -14,6 +14,7 @@
 #include <map>
 #include <utility>
 #include <ctime>
+#include <cstdint>
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
@@ -56,21 +57,33 @@ static bool bubbleShadowKvEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV", false);
 }
 
-static void maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
-    if (!bubbleShadowKvEnabled() || executor == nullptr) return;
-    NnBubbleShadowStats stats = executor->runBubbleShadowRedundant(0u);
-    std::printf(
-        "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u segments=%u ops=%u skipped_sync=%u budget_hit=%u elapsed_us=%llu\n",
-        who == nullptr ? "unknown" : who,
-        (unsigned)nodeIndex,
-        (unsigned)position,
-        (unsigned)batchSize,
-        (unsigned)stats.segmentsVisited,
-        (unsigned)stats.opStepsExecuted,
-        (unsigned)stats.skippedSyncSteps,
-        (unsigned)stats.budgetHit,
-        (unsigned long long)stats.elapsedUs);
-    std::fflush(stdout);
+static bool bubbleShadowKvLogEnabled() {
+    return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_LOG", false);
+}
+
+static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
+    NnBubbleShadowStats stats{};
+    if (!bubbleShadowKvEnabled() || executor == nullptr) return stats;
+    stats = executor->runBubbleShadowRedundant(0u);
+    if (bubbleShadowKvLogEnabled()) {
+        std::printf(
+            "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u segments=%u attn=%u ffn=%u other=%u layers=%u ops=%u skipped_sync=%u budget_hit=%u elapsed_us=%llu\n",
+            who == nullptr ? "unknown" : who,
+            (unsigned)nodeIndex,
+            (unsigned)position,
+            (unsigned)batchSize,
+            (unsigned)stats.segmentsVisited,
+            (unsigned)stats.attnSegments,
+            (unsigned)stats.ffnSegments,
+            (unsigned)stats.otherSegments,
+            (unsigned)stats.uniqueLayers,
+            (unsigned)stats.opStepsExecuted,
+            (unsigned)stats.skippedSyncSteps,
+            (unsigned)stats.budgetHit,
+            (unsigned long long)stats.elapsedUs);
+        std::fflush(stdout);
+    }
+    return stats;
 }
 
 static bool parseEnvInt(const char *name, int &out) {
@@ -165,7 +178,7 @@ static void maybeSeedPlanCommandFromLegacyEnv() {
 }
 
 static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const AppCliArgs *args) {
-    LlmBootstrapPacket p;
+    LlmBootstrapPacket p{};
     p.magic = LLM_BOOTSTRAP_MAGIC;
     p.version = LLM_BOOTSTRAP_VERSION;
     p.flags = 0u;
@@ -178,6 +191,10 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.runtimeRedundantBoundaryLayers = args->runtimeRedundantBoundaryLayers;
     p.runtimeActiveSegEnabled = args->runtimeActiveSegEnabled ? 1u : 0u;
     p.runtimeRedundantSegEnabled = (args->runtimeRedundantSegEnabled && !bubbleShadowKvEnabled()) ? 1u : 0u;
+    p.bubbleShadowKvEnabled = bubbleShadowKvEnabled() ? 1u : 0u;
+    if (p.bubbleShadowKvEnabled != 0u) {
+        p.flags |= LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV;
+    }
     p.maxSeqLen = args->maxSeqLen;
     p.syncType = (NnUint)args->syncType;
     p.modelPathLen = 0u;
@@ -1158,6 +1175,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
     this->controlPacket.planCmdSeq = 0u;
     this->lastPlanCmdSeqSent = 0u;
+    this->lastBubbleShadowStats = {};
     this->asyncKvCollectLayer = -1;
     this->asyncKvCollectPos = -1;
     waitingKvAckReceivedCount = 0u;
@@ -1969,13 +1987,17 @@ void RootLlmInference::collectProfilePackets() {
     lastPerf.clear();
     lastPerf.reserve((network != nullptr ? network->nSockets : 0u) + 1u);
 
-    LlmPerfPacket rootPacket;
+    LlmPerfPacket rootPacket{};
     rootPacket.position = controlPacket.position;
     rootPacket.batchSize = controlPacket.batchSize;
     rootPacket.nodeIndex = 0;
     rootPacket.stageIndex = getStageIndexForNode(plan, 0);
     rootPacket.execUs = executor != nullptr ? executor->getTotalTime(STEP_EXECUTE_OP) : 0u;
     rootPacket.syncUs = executor != nullptr ? executor->getTotalTime(STEP_SYNC_NODES) : 0u;
+    rootPacket.bubbleUs = (NnUint)std::min<unsigned long long>(lastBubbleShadowStats.elapsedUs, (unsigned long long)UINT32_MAX);
+    rootPacket.bubbleSegments = lastBubbleShadowStats.segmentsVisited;
+    rootPacket.bubbleOps = lastBubbleShadowStats.opStepsExecuted;
+    rootPacket.bubbleSkippedSyncs = lastBubbleShadowStats.skippedSyncSteps;
     lastPerf.push_back(rootPacket);
 
     if (network != nullptr && network->nSockets > 0) {
@@ -2229,6 +2251,7 @@ bool RootLlmInference::recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUi
 }
 
 void RootLlmInference::forward() {
+    lastBubbleShadowStats = {};
     bool sendKvTransfer = false;
     bool sendLayerSwitch = false;
     std::vector<PendingKvTransferItem> kvTransfers;
@@ -2383,7 +2406,7 @@ void RootLlmInference::forward() {
         }
     }
     executor->forward();
-    maybeRunBubbleShadowKv(executor, "root", 0u, controlPacket.position, controlPacket.batchSize);
+    lastBubbleShadowStats = maybeRunBubbleShadowKv(executor, "root", 0u, controlPacket.position, controlPacket.batchSize);
 
     if (network != nullptr && waitingKvAck) {
         const NnStageConfig *targetStage = findStageForNodeLocal(plan, nextStageRootNode);
@@ -3305,6 +3328,12 @@ void runWorkerApp(AppCliArgs *args) {
         const NnUint bootRuntimeRedundantBoundaryLayers = boot.runtimeRedundantBoundaryLayers;
         const bool bootRuntimeActiveSegEnabled = boot.runtimeActiveSegEnabled != 0u;
         const bool bootRuntimeRedundantSegEnabled = boot.runtimeRedundantSegEnabled != 0u;
+        const bool bootBubbleShadowKvEnabled = ((boot.flags & LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV) != 0u) || boot.bubbleShadowKvEnabled != 0u;
+        if (bootBubbleShadowKvEnabled) {
+            setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
+        } else {
+            unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
+        }
 
         // Set enable plan barrier flag from bootstrap packet
         setEnablePlanBarrier(bootEnablePlanBarrier);
@@ -3500,7 +3529,7 @@ void runWorkerApp(AppCliArgs *args) {
                 if ((inference.flags() & LLM_CTRL_CONTROL_ONLY) != 0u) {
                     inference.flushPendingKvAck();
                     if ((inference.flags() & LLM_CTRL_PROFILE) != 0u) {
-                        LlmPerfPacket p;
+                        LlmPerfPacket p{};
                         p.position = inference.position();
                         p.batchSize = inference.batchSize();
                         p.nodeIndex = nodeConfig.nodeIndex;
@@ -3514,7 +3543,7 @@ void runWorkerApp(AppCliArgs *args) {
                 }
 
                 executor.forward();
-                maybeRunBubbleShadowKv(&executor, "worker", nodeConfig.nodeIndex, inference.position(), inference.batchSize());
+                NnBubbleShadowStats bubbleStats = maybeRunBubbleShadowKv(&executor, "worker", nodeConfig.nodeIndex, inference.position(), inference.batchSize());
                 inference.flushPendingKvAck();
 
                 // Send per-forward profile packet to root (optional)
@@ -3522,13 +3551,17 @@ void runWorkerApp(AppCliArgs *args) {
                 // So workers must reply whenever the control packet requests profiling,
                 // even if the worker binary was started without --benchmark (times may be 0).
                 if ((inference.flags() & LLM_CTRL_PROFILE) != 0u) {
-                    LlmPerfPacket p;
+                    LlmPerfPacket p{};
                     p.position = inference.position();
                     p.batchSize = inference.batchSize();
                     p.nodeIndex = nodeConfig.nodeIndex;
                     p.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
                     p.execUs = executor.getTotalTime(STEP_EXECUTE_OP);
                     p.syncUs = executor.getTotalTime(STEP_SYNC_NODES);
+                    p.bubbleUs = (NnUint)std::min<unsigned long long>(bubbleStats.elapsedUs, (unsigned long long)UINT32_MAX);
+                    p.bubbleSegments = bubbleStats.segmentsVisited;
+                    p.bubbleOps = bubbleStats.opStepsExecuted;
+                    p.bubbleSkippedSyncs = bubbleStats.skippedSyncSteps;
                     network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
                 }
                 isFirstAttempt = true;

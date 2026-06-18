@@ -553,6 +553,10 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     struct NodePerfAgg {
         unsigned long long execUs = 0;
         unsigned long long syncUs = 0;
+        unsigned long long bubbleUs = 0;
+        unsigned long long bubbleSegments = 0;
+        unsigned long long bubbleOps = 0;
+        unsigned long long bubbleSkippedSyncs = 0;
         unsigned long long forwardCount = 0;
         unsigned long long tokenCount = 0;
         NnUint stageIndex = 0;
@@ -561,6 +565,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     struct TokenNodePerf {
         unsigned long long execUs = 0;
         unsigned long long syncUs = 0;
+        unsigned long long bubbleUs = 0;
         bool hasValue = false;
     };
     struct TokenPerfSample {
@@ -596,13 +601,19 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 
         context->inference->forward();
 
+        NnUint evalBubbleTime = 0;
         if (context->args->benchmark) {
             const std::vector<LlmPerfPacket>& perf = context->inference->getLastPerf();
             for (const LlmPerfPacket& p : perf) {
+                if (p.nodeIndex == 0u) evalBubbleTime += p.bubbleUs;
                 if (p.nodeIndex >= perfAgg.size()) continue;
                 NodePerfAgg& a = perfAgg[p.nodeIndex];
                 a.execUs += p.execUs;
                 a.syncUs += p.syncUs;
+                a.bubbleUs += p.bubbleUs;
+                a.bubbleSegments += p.bubbleSegments;
+                a.bubbleOps += p.bubbleOps;
+                a.bubbleSkippedSyncs += p.bubbleSkippedSyncs;
                 a.forwardCount += 1;
                 a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
                 a.stageIndex = p.stageIndex;
@@ -680,7 +691,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             sentBytes, recvBytes);
         printRootLogitsSplitStats("eval", pos, logitsRow, vocabSize);
         debugSyncTopkTrace(logitsRow, vocabSize, "eval", pos, statBatch);
-        evalTotalTime += evalTime + syncTime;
+        evalTotalTime += evalTime + syncTime + evalBubbleTime;
     }
 
     // 生成阶段的起始 token 应该是 prompt 的最后一个 token（位置为 nInputTokens-1）
@@ -716,13 +727,19 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
         }
 
+        NnUint predBubbleTime = 0;
         if (context->args->benchmark) {
             const std::vector<LlmPerfPacket>& perf = context->inference->getLastPerf();
             for (const LlmPerfPacket& p : perf) {
+                if (p.nodeIndex == 0u) predBubbleTime += p.bubbleUs;
                 if (p.nodeIndex >= perfAgg.size()) continue;
                 NodePerfAgg& a = perfAgg[p.nodeIndex];
                 a.execUs += p.execUs;
                 a.syncUs += p.syncUs;
+                a.bubbleUs += p.bubbleUs;
+                a.bubbleSegments += p.bubbleSegments;
+                a.bubbleOps += p.bubbleOps;
+                a.bubbleSkippedSyncs += p.bubbleSkippedSyncs;
                 a.forwardCount += 1;
                 a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
                 a.stageIndex = p.stageIndex;
@@ -736,6 +753,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 if (p.nodeIndex >= sample.nodePerf.size()) continue;
                 sample.nodePerf[p.nodeIndex].execUs = p.execUs;
                 sample.nodePerf[p.nodeIndex].syncUs = p.syncUs;
+                sample.nodePerf[p.nodeIndex].bubbleUs = p.bubbleUs;
                 sample.nodePerf[p.nodeIndex].hasValue = true;
             }
             predPerfHistory.push_back(std::move(sample));
@@ -763,6 +781,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 struct WindowAgg {
                     unsigned long long execUs = 0;
                     unsigned long long syncUs = 0;
+                    unsigned long long bubbleUs = 0;
                     unsigned long long count = 0;
                 };
 
@@ -809,18 +828,22 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                     for (NnUint node = 0; node < nNodes; ++node) {
                         const double bExecMs = (double)beforeAgg[node].execUs / 1000.0 / (double)beforeAgg[node].count;
                         const double bSyncMs = (double)beforeAgg[node].syncUs / 1000.0 / (double)beforeAgg[node].count;
+                        const double bBubbleMs = (double)beforeAgg[node].bubbleUs / 1000.0 / (double)beforeAgg[node].count;
                         const double aExecMs = (double)afterAgg[node].execUs / 1000.0 / (double)afterAgg[node].count;
                         const double aSyncMs = (double)afterAgg[node].syncUs / 1000.0 / (double)afterAgg[node].count;
-                        const double bTotalMs = bExecMs + bSyncMs;
-                        const double aTotalMs = aExecMs + aSyncMs;
-                        std::printf("  • Node %u: before=%6.2f ms (exec=%6.2f sync=%6.2f) | after=%6.2f ms (exec=%6.2f sync=%6.2f) | Δ=%+6.2f ms\n",
+                        const double aBubbleMs = (double)afterAgg[node].bubbleUs / 1000.0 / (double)afterAgg[node].count;
+                        const double bTotalMs = bExecMs + bSyncMs + bBubbleMs;
+                        const double aTotalMs = aExecMs + aSyncMs + aBubbleMs;
+                        std::printf("  • Node %u: before=%6.2f ms (exec=%6.2f sync=%6.2f bubble=%6.2f) | after=%6.2f ms (exec=%6.2f sync=%6.2f bubble=%6.2f) | Δ=%+6.2f ms\n",
                             (unsigned)node,
                             bTotalMs,
                             bExecMs,
                             bSyncMs,
+                            bBubbleMs,
                             aTotalMs,
                             aExecMs,
                             aSyncMs,
+                            aBubbleMs,
                             aTotalMs - bTotalMs);
                     }
                     std::printf("\n");
@@ -874,7 +897,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         if (eosType == NOT_EOS || eosType == EOS) {
             eosDetector.reset();
         }
-        predTotalTime += predTime + syncTime;
+        predTotalTime += predTime + syncTime + predBubbleTime;
         if (eosType == EOS) {
             pos++;
             break;
@@ -907,21 +930,27 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 
             const double execPerFwdMs = (double)a.execUs / 1000.0 / (double)a.forwardCount;
             const double syncPerFwdMs = (double)a.syncUs / 1000.0 / (double)a.forwardCount;
-            const double totalPerFwdMs = execPerFwdMs + syncPerFwdMs;
+            const double bubblePerFwdMs = (double)a.bubbleUs / 1000.0 / (double)a.forwardCount;
+            const double totalPerFwdMs = execPerFwdMs + syncPerFwdMs + bubblePerFwdMs;
 
             const double execPerTokMs = (double)a.execUs / 1000.0 / (double)a.tokenCount;
             const double syncPerTokMs = (double)a.syncUs / 1000.0 / (double)a.tokenCount;
-            const double totalPerTokMs = execPerTokMs + syncPerTokMs;
+            const double bubblePerTokMs = (double)a.bubbleUs / 1000.0 / (double)a.tokenCount;
+            const double totalPerTokMs = execPerTokMs + syncPerTokMs + bubblePerTokMs;
 
-            printf("  • Stage %u Node %u: per-fwd total=%6.2f ms (exec=%6.2f sync=%6.2f) | per-tok total=%6.2f ms (exec=%6.2f sync=%6.2f) | fwd=%llu tok=%llu\n",
+            printf("  • Stage %u Node %u: per-fwd total=%6.2f ms (exec=%6.2f sync=%6.2f bubble=%6.2f) | per-tok total=%6.2f ms (exec=%6.2f sync=%6.2f bubble=%6.2f) | bubbleSeg=%llu bubbleOps=%llu fwd=%llu tok=%llu\n",
                 a.hasStage ? a.stageIndex : 0u,
                 node,
                 totalPerFwdMs,
                 execPerFwdMs,
                 syncPerFwdMs,
+                bubblePerFwdMs,
                 totalPerTokMs,
                 execPerTokMs,
                 syncPerTokMs,
+                bubblePerTokMs,
+                (unsigned long long)a.bubbleSegments,
+                (unsigned long long)a.bubbleOps,
                 (unsigned long long)a.forwardCount,
                 (unsigned long long)a.tokenCount);
         }

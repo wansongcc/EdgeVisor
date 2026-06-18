@@ -139,6 +139,10 @@ typedef struct {
     NnUint segmentsVisited;
     NnUint opStepsExecuted;
     NnUint skippedSyncSteps;
+    NnUint attnSegments;
+    NnUint ffnSegments;
+    NnUint otherSegments;
+    NnUint uniqueLayers;
     NnUint budgetHit;
     unsigned long long elapsedUs;
 } NnBubbleShadowStats;

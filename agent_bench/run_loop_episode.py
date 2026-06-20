@@ -106,6 +106,7 @@ def main() -> int:
     parser.add_argument("--enable-pp-migration", action="store_true", help="Enable EdgeVisor PP layer migration control path.")
     parser.add_argument("--bubble-shadow-kv", action="store_true", help="Compute runtime redundant Shadow KV segments after the primary forward path.")
     parser.add_argument("--edge-benchmark", action="store_true", help="Enable EdgeVisor --benchmark for agentic TPOT/profile runs.")
+    parser.add_argument("--edge-last-stage-sampling", action="store_true", help="Let the last PP stage sample locally and return only token ids.")
     parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=1)
     parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
     parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
@@ -141,6 +142,7 @@ def main() -> int:
             "ratios": args.edge_ratios,
             "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
             "virtual_topology": virtual_topology,
+            "last_stage_sampling": args.edge_last_stage_sampling,
         }
     elif args.backend == "dllama":
         backend_kwargs = {
@@ -190,6 +192,7 @@ def main() -> int:
                 "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
                 "bubble_shadow_kv": args.bubble_shadow_kv,
                 "enable_benchmark": args.edge_benchmark,
+                "last_stage_sampling": args.edge_last_stage_sampling,
                 "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
                 "config_path": str(args.edgevisor_ablation_config) if args.edgevisor_ablation_config else "",
             }
@@ -205,6 +208,7 @@ def main() -> int:
             "api_port": args.edge_api_port,
             "virtual_topology": virtual_topology,
             "extra_env": extra_env,
+            "last_stage_sampling": args.edge_last_stage_sampling,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

@@ -65,6 +65,26 @@ static bool bubbleShadowKvLogEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_LOG", false);
 }
 
+static bool lastStageSamplingEnabled() {
+    return envFlagEnabledDefault("DLLAMA_LAST_STAGE_SAMPLING", false);
+}
+
+static bool lastStageSamplingPlanSupported(const NnUnevenPartitionPlan *plan) {
+    if (!lastStageSamplingEnabled()) return false;
+    if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
+    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
+    return last.nNodes == 1u;
+}
+
+static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name) {
+    if (netConfig == nullptr || name == nullptr) return (NnUint)-1;
+    for (NnUint i = 0u; i < netConfig->nPipes; ++i) {
+        const char *pipeName = netConfig->pipes[i].name;
+        if (pipeName != nullptr && std::strcmp(pipeName, name) == 0) return i;
+    }
+    return (NnUint)-1;
+}
+
 static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
     NnBubbleShadowStats stats{};
     if (!bubbleShadowKvEnabled() || executor == nullptr) return stats;
@@ -200,11 +220,17 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.runtimeActiveSegEnabled = args->runtimeActiveSegEnabled ? 1u : 0u;
     p.runtimeRedundantSegEnabled = (args->runtimeRedundantSegEnabled && !bubbleShadowKvEnabled()) ? 1u : 0u;
     p.bubbleShadowKvEnabled = bubbleShadowKvEnabled() ? 1u : 0u;
+    p.samplerTemperature = args->temperature;
+    p.samplerTopP = args->topp;
+    p.samplerSeed = args->seed;
     if (p.bubbleShadowKvEnabled != 0u) {
         p.flags |= LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV;
         if (!bubbleShadowKvAsyncEnabled()) {
             p.flags |= LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC;
         }
+    }
+    if (args->lastStageSampling) {
+        p.flags |= LLM_BOOTSTRAP_LAST_STAGE_SAMPLING;
     }
     p.maxSeqLen = args->maxSeqLen;
     p.syncType = (NnUint)args->syncType;
@@ -315,6 +341,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.topp = 0.9f;
     args.steps = 0;
     args.benchmark = false;
+    args.lastStageSampling = lastStageSamplingEnabled();
     args.seed = (unsigned long long)time(nullptr);
     args.chatTemplateType = TEMPLATE_UNKNOWN;
     args.maxSeqLen = 0;
@@ -383,6 +410,18 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 args.benchmark = true;
                 i += 1;
             }
+            continue;
+        }
+
+        if (std::strcmp(name, "--last-stage-sampling") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.lastStageSampling = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.lastStageSampling = true;
+                i += 1;
+            }
+            setenv("DLLAMA_LAST_STAGE_SAMPLING", args.lastStageSampling ? "1" : "0", 1);
             continue;
         }
 
@@ -1313,6 +1352,29 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
         }
         tokenHistory[pos] = (int)token;
     }
+}
+
+bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *logit) {
+    if (!lastStageSamplingPlanSupported(plan) || network == nullptr) return false;
+    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
+    const NnUint sourceNode = last.nodeIndices[0];
+    if (sourceNode == 0u) return false;
+    const int socketIndex = network->getSocketIndexForNode(sourceNode, 0u);
+    if (socketIndex < 0) return false;
+
+    LlmSampledTokenPacket packet{};
+    network->read((NnUint)socketIndex, &packet, sizeof(packet));
+    if (packet.magic != LLM_SAMPLED_TOKEN_MAGIC || packet.version != LLM_SAMPLED_TOKEN_VERSION) {
+        std::printf("⚠️  [last-stage-sampling] unexpected packet magic=0x%08x version=%u fromNode=%u\n",
+            (unsigned)packet.magic,
+            (unsigned)packet.version,
+            (unsigned)sourceNode);
+        std::fflush(stdout);
+        return false;
+    }
+    token = packet.token;
+    if (logit != nullptr) *logit = packet.logit;
+    return true;
 }
 
 void RootLlmInference::setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments) {
@@ -2895,12 +2957,41 @@ void RootLlmInference::finish() {
     }
 }
 
-WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex) {
+WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex, NnUint logitsPipeIndex, Sampler *lastStageSampler) {
     this->isFinished = false;
     this->execution = execution;
     this->network = network;
     this->localNodeIndex = localNodeIndex;
+    this->logitsPipeIndex = logitsPipeIndex;
+    this->lastStageSampler = lastStageSampler;
     this->positionPipe = (float *)execution->pipes[0];
+    this->logitsPipe = (logitsPipeIndex != (NnUint)-1) ? (float *)execution->pipes[logitsPipeIndex] : nullptr;
+}
+
+void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionPlan *plan) {
+    if (!lastStageSamplingPlanSupported(plan)) return;
+    if (network == nullptr || execution == nullptr || logitsPipe == nullptr || lastStageSampler == nullptr) return;
+    if (controlPacket.batchSize != 1u) return;
+    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
+    if (last.nodeIndices[0] != localNodeIndex) return;
+
+    const NnUint vocabStart = (plan->vocabSplit.starts != nullptr) ? plan->vocabSplit.starts[localNodeIndex] : 0u;
+    const NnUint vocabSize = (plan->vocabSplit.lengths != nullptr) ? plan->vocabSplit.lengths[localNodeIndex] : 0u;
+    if (vocabSize == 0u) return;
+
+    const int localToken = lastStageSampler->sample(logitsPipe);
+    if (localToken < 0) return;
+    const NnUint token = vocabStart + (NnUint)localToken;
+    const float sampledLogit = ((NnUint)localToken < vocabSize) ? logitsPipe[localToken] : 0.0f;
+
+    LlmSampledTokenPacket packet{};
+    packet.magic = LLM_SAMPLED_TOKEN_MAGIC;
+    packet.version = LLM_SAMPLED_TOKEN_VERSION;
+    packet.nodeIndex = localNodeIndex;
+    packet.position = controlPacket.position;
+    packet.token = token;
+    packet.logit = sampledLogit;
+    network->write(ROOT_SOCKET_INDEX, &packet, sizeof(packet));
 }
 
 bool WorkerLlmInference::tryReadControlPacket() {
@@ -3328,6 +3419,7 @@ void runWorkerApp(AppCliArgs *args) {
         const bool hasBootModel = !bootModelPath.empty();
         const bool hasBootRatios = !bootRatios.empty();
         const bool useLocalLoading = hasBootModel && hasBootRatios;
+        NnUint samplerVocabSize = 0u;
         const NnUint bootMaxSeqLen = boot.maxSeqLen;
         const NnFloatType bootSyncType = (NnFloatType)boot.syncType;
         const bool bootBenchmarkEnabled = boot.benchmarkEnabled != 0u;
@@ -3340,6 +3432,7 @@ void runWorkerApp(AppCliArgs *args) {
         const bool bootRuntimeActiveSegEnabled = boot.runtimeActiveSegEnabled != 0u;
         const bool bootRuntimeRedundantSegEnabled = boot.runtimeRedundantSegEnabled != 0u;
         const bool bootBubbleShadowKvEnabled = ((boot.flags & LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV) != 0u) || boot.bubbleShadowKvEnabled != 0u;
+        const bool bootLastStageSamplingEnabled = (boot.flags & LLM_BOOTSTRAP_LAST_STAGE_SAMPLING) != 0u;
         if (bootBubbleShadowKvEnabled) {
             setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
             if ((boot.flags & LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC) != 0u) {
@@ -3350,6 +3443,11 @@ void runWorkerApp(AppCliArgs *args) {
         } else {
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+        }
+        if (bootLastStageSamplingEnabled) {
+            setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+        } else {
+            unsetenv("DLLAMA_LAST_STAGE_SAMPLING");
         }
 
         // Set enable plan barrier flag from bootstrap packet
@@ -3385,6 +3483,7 @@ void runWorkerApp(AppCliArgs *args) {
            if (useLocalLoading) {
                // Worker 需要重新加载 Header 和 Plan 以确定加载逻辑和切分
                LlmHeader header = loadLlmHeader((char*)bootModelPath.c_str(), bootMaxSeqLen, bootSyncType);
+             samplerVocabSize = header.vocabSize;
              
              // [兼容性修复] 自动切换 Q80
              if (header.weightType == F_Q40 && header.syncType != F_Q80) {
@@ -3441,7 +3540,15 @@ void runWorkerApp(AppCliArgs *args) {
             weightReader.read();
         }
 
-        WorkerLlmInference inference(&execution, network, nodeConfig.nodeIndex);
+        const NnUint logitsPipeIndex = findPipeIndexByName(&netConfig, "LG");
+        std::unique_ptr<Sampler> lastStageSampler;
+        if (planPtr.get() != nullptr && planPtr->vocabSplit.lengths != nullptr && nodeConfig.nodeIndex < planPtr->nNodes) {
+            samplerVocabSize = planPtr->vocabSplit.lengths[nodeConfig.nodeIndex];
+        }
+        if (bootLastStageSamplingEnabled && samplerVocabSize > 0u) {
+            lastStageSampler.reset(new Sampler((int)samplerVocabSize, boot.samplerTemperature, boot.samplerTopP, boot.samplerSeed));
+        }
+        WorkerLlmInference inference(&execution, network, nodeConfig.nodeIndex, logitsPipeIndex, lastStageSampler.get());
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
@@ -3581,6 +3688,7 @@ void runWorkerApp(AppCliArgs *args) {
                     p.bubbleSkippedSyncs = bubbleStats.skippedSyncSteps;
                     network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
                 }
+                inference.maybeSendLastStageSampledToken(planPtr.get());
                 isFirstAttempt = true;
             } catch (const NnTransferSocketException &e) {
                 printf("🚨 Network error: %s\n", e.what());

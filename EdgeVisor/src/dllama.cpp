@@ -708,8 +708,14 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         context->inference->setToken(0, token);
         context->inference->forward();
 
+        NnUint lastStageToken = 0u;
+        const bool haveLastStageToken =
+            context->args->lastStageSampling &&
+            context->network != nullptr &&
+            context->inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr);
+
         // In pred stage batchSize==1. Always compute logits stats for debugging.
-        {
+        if (!haveLastStageToken) {
             bool hasNaN = false;
             bool hasInf = false;
             float maxLogit = -1e9f;
@@ -872,7 +878,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 minLogit, maxLogit, maxIndex);
         }
 #endif
-        token = context->sampler->sample(context->inference->logitsPipe);
+        token = haveLastStageToken ? (int)lastStageToken : context->sampler->sample(context->inference->logitsPipe);
 
         char *piece = context->tokenizer->decode(token);
         EosDetectorType eosType = eosDetector.append(token, piece);
@@ -1386,7 +1392,14 @@ static void chat(AppInferenceContext *context) {
             context->inference->setToken(0, token);
             context->inference->forward();
 
-            token = context->sampler->sample(context->inference->logitsPipe);
+            NnUint lastStageToken = 0u;
+            if (context->args->lastStageSampling &&
+                context->network != nullptr &&
+                context->inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr)) {
+                token = (int)lastStageToken;
+            } else {
+                token = context->sampler->sample(context->inference->logitsPipe);
+            }
 
             char *piece = context->tokenizer->decode(token);
             EosDetectorType eosType = eosDetector.append(token, piece);

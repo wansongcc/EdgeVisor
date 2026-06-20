@@ -7,6 +7,7 @@
 #include "llm.hpp"
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <functional>
 #include <algorithm>
@@ -30,6 +31,26 @@ static int getenvIntOrDefaultLlm(const char *name, int fallback) {
     long x = std::strtol(v, &end, 10);
     if (end == v || *end != '\0') return fallback;
     return (int)x;
+}
+
+static bool envFlagEnabledDefaultLlm(const char *name, bool fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    if (std::strcmp(v, "0") == 0 ||
+        std::strcmp(v, "false") == 0 ||
+        std::strcmp(v, "False") == 0 ||
+        std::strcmp(v, "off") == 0 ||
+        std::strcmp(v, "OFF") == 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool lastStageSamplingPlanSupportedLlm(const NnUnevenPartitionPlan *plan) {
+    if (!envFlagEnabledDefaultLlm("DLLAMA_LAST_STAGE_SAMPLING", false)) return false;
+    if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
+    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
+    return last.nNodes == 1u;
 }
 
 static bool graphBuildDumpEnabled() {
@@ -1922,6 +1943,7 @@ static NnNodeConfig buildLlmNodeInternal(
 
     // 6. End Segment (Final Norm & Logits)
     NnSegmentConfigBuilder end;
+    const bool useLastStageSampling = lastStageSamplingPlanSupportedLlm(plan);
     if (isLastStage) {
         end.addOp(OP_MERGE_ADD, "final_merge_add", 0, pointerBatchConfig(SRC_PIPE, n->zqPipeIndex), pointerBatchConfig(SRC_BUFFER, xBufferIndex), size0(), NnMergeAddOpCodeConfig{});
         end.addOp(OP_INV_RMS, "final_norm_pre", 0, pointerBatchConfig(SRC_BUFFER, xBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
@@ -1946,10 +1968,12 @@ static NnNodeConfig buildLlmNodeInternal(
             pointerBatchedSliceConfigTagged(SRC_PIPE, n->logitsPipeIndex, NN_SLICE_VOCAB), // <--- 改回这个！
             size0(), NnCastOpCodeConfig{});
         
-        end.addSync(n->logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
+        if (!useLastStageSampling) {
+            end.addSync(n->logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
+        }
     }
     addSegmentLogged(end, "end", 0u);
-    if (nodeIndex == 0 && !isLastStage) {
+    if (nodeIndex == 0 && !isLastStage && !useLastStageSampling) {
         NnSegmentConfigBuilder rootWaitSeg;
         
         // 这是一个纯同步 Segment，不包含计算 Op

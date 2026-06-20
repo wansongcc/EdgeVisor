@@ -133,7 +133,9 @@ NnVulkanContext::NnVulkanContext(const NnUint gpuIndex) {
         instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
     }
     if (hasPortabilityExtension()) {
-        createInstanceFlags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+#ifdef VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+        createInstanceFlags |= static_cast<vk::InstanceCreateFlags>(VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR);
+#endif
         instanceExtensions.push_back("VK_KHR_portability_enumeration");
         deviceExtension.push_back("VK_KHR_portability_subset");
     }

@@ -37,6 +37,7 @@ public:
     float topp;
     NnUint steps;
     bool benchmark;
+    bool lastStageSampling;
     unsigned long long seed;
     ChatTemplateType chatTemplateType;
     NnUint maxSeqLen;
@@ -212,6 +213,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_HAS_KV_REDUNDANCY = 1u << 7,
     LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV = 1u << 8,
     LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC = 1u << 9,
+    LLM_BOOTSTRAP_LAST_STAGE_SAMPLING = 1u << 10,
 };
 
 typedef struct {
@@ -234,13 +236,25 @@ typedef struct {
     NnUint primarySkipLayersLen; // bytes including '\0' if present
     NnUint kvRedundancyLen; // bytes including '\0' if present
     NnUint bubbleShadowKvEnabled; // 0/1, compute runtime redundant segments after primary forward
-    NnUint reserved0;
-    NnUint reserved1;
-    NnUint reserved2;
+    float samplerTemperature;
+    float samplerTopP;
+    unsigned long long samplerSeed;
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 11u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 12u;
+
+static constexpr NnUint LLM_SAMPLED_TOKEN_MAGIC = 0x4b545344u; // 'DSTK' little-endian
+static constexpr NnUint LLM_SAMPLED_TOKEN_VERSION = 1u;
+
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint nodeIndex;
+    NnUint position;
+    NnUint token;
+    float logit;
+} LlmSampledTokenPacket;
 
 typedef struct {
     NnUint layerIndex;
@@ -286,6 +300,7 @@ public:
     bool hasMigrationAck() const { return migrationAckSeen; }
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
+    bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
     bool hasAsyncKvCollector() const;
     bool tryPopAsyncKvRow(RootKvAggRowPacket &packet);
     KvTransferSubmitStatus submitBoundaryKvTransferDetailed(
@@ -397,10 +412,14 @@ public:
         const std::vector<NnUint> &layers,
         NnUint kvDim,
         NnExecutor *executor);
+    void maybeSendLastStageSampledToken(const NnUnevenPartitionPlan *plan);
 private:
     float *positionPipe;
+    float *logitsPipe;
     NnNetExecution *execution;
     NnNetwork *network;
+    Sampler *lastStageSampler;
+    NnUint logitsPipeIndex = (NnUint)-1;
     NnUint localNodeIndex = 0u;
     LlmControlPacket controlPacket;
     NnUint lastPlanCmdSeqRecv = 0u;
@@ -409,7 +428,7 @@ private:
     std::deque<LlmLayerSwitchPacket> pendingLayerSwitches;
     std::deque<std::pair<LlmKvExportRequestHeader, std::vector<NnUint>>> pendingKvExportRequests;
 public:
-    WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex);
+    WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex, NnUint logitsPipeIndex, Sampler *lastStageSampler);
     bool tryReadControlPacket();
 };
 

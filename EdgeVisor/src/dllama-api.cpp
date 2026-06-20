@@ -345,6 +345,7 @@ private:
     RootLlmInference *inference;
     Tokenizer *tokenizer;
     Sampler *sampler;
+    NnNetwork *network;
     AppCliArgs *args;
     LlmHeader *header;
     EosDetector *eosDetector;
@@ -352,10 +353,11 @@ private:
     NaiveCache naiveCache;
 
 public:
-    ApiServer(RootLlmInference *inference, Tokenizer *tokenizer, Sampler *sampler, AppCliArgs *args, LlmHeader *header, EosDetector *eosDetector, ChatTemplateGenerator *templateGenerator) {
+    ApiServer(RootLlmInference *inference, Tokenizer *tokenizer, Sampler *sampler, NnNetwork *network, AppCliArgs *args, LlmHeader *header, EosDetector *eosDetector, ChatTemplateGenerator *templateGenerator) {
         this->inference = inference;
         this->tokenizer = tokenizer;
         this->sampler = sampler;
+        this->network = network;
         this->args = args;
         this->header = header;
         this->eosDetector = eosDetector;
@@ -440,7 +442,14 @@ public:
             inference->setToken(0, token);
             inference->forward();
 
-            token = sampler->sample(inference->logitsPipe);
+            NnUint lastStageToken = 0u;
+            if (args->lastStageSampling &&
+                network != nullptr &&
+                inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr)) {
+                token = (int)lastStageToken;
+            } else {
+                token = sampler->sample(inference->logitsPipe);
+            }
 
             char *piece = tokenizer->decode(token);
             EosDetectorType eosType = eosDetector->append(token, piece);
@@ -540,7 +549,7 @@ static void server(AppInferenceContext *context) {
     const char *templateEos = selectChatTemplateEos(context->tokenizer, &stops, context->args->chatTemplateType);
     ChatTemplateGenerator templateGenerator(context->args->chatTemplateType, context->tokenizer->chatTemplate, templateEos);
     EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
-    ApiServer api(context->inference, context->tokenizer, context->sampler, context->args, context->header, &eosDetector, &templateGenerator);
+    ApiServer api(context->inference, context->tokenizer, context->sampler, context->network, context->args, context->header, &eosDetector, &templateGenerator);
 
     printf("Server URL: http://127.0.0.1:%d/v1/\n", context->args->port);
 

@@ -577,6 +577,7 @@ class EdgeVisorBackend(Backend):
         vulkan_project: Optional[Path] = None,
         root_gpu: int = 0,
         enable_benchmark: bool = True,
+        last_stage_sampling: bool = False,
         extra_root_args: Optional[List[str]] = None,
         extra_env: Optional[Dict[str, str]] = None,
         ablation_config: Optional[Dict[str, Any]] = None,
@@ -600,6 +601,7 @@ class EdgeVisorBackend(Backend):
         self.vulkan_project = vulkan_project or project_dir
         self.root_gpu = root_gpu
         self.enable_benchmark = enable_benchmark
+        self.last_stage_sampling = bool(last_stage_sampling)
         self.extra_root_args = list(extra_root_args or [])
         self.extra_env = dict(extra_env or {})
         self.ablation_config = dict(ablation_config or {})
@@ -1017,6 +1019,8 @@ class EdgeVisorBackend(Backend):
             ]
             if self.enable_benchmark:
                 root_cmd.append("--benchmark")
+            if self.last_stage_sampling:
+                root_cmd.append("--last-stage-sampling")
             if self.worker_gpus:
                 root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in root_worker_ports]])
                 if self.ratios:
@@ -1630,6 +1634,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         api_port: int = 0,
         virtual_topology: Optional[Dict[str, Any]] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        last_stage_sampling: bool = False,
     ):
         config = dict(ablation_config or {})
         runtime_boundary_layers = max(0, int(config.get("runtime_redundant_boundary_layers", 0) or 0))
@@ -1655,6 +1660,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             extra_root_args=extra_root_args,
             extra_env=extra_env,
             enable_benchmark=bool(config.get("enable_benchmark", False)),
+            last_stage_sampling=bool(last_stage_sampling or config.get("last_stage_sampling", False)),
         )
         self.persistent = persistent
         self.api_port = api_port
@@ -1815,6 +1821,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             ]
             if self.enable_benchmark:
                 root_cmd.append("--benchmark")
+            if self.last_stage_sampling:
+                root_cmd.append("--last-stage-sampling")
             if self.worker_gpus:
                 root_cmd.extend(["--workers", *[f"127.0.0.1:{p}" for p in root_worker_ports]])
                 if self.ratios:

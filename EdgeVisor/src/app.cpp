@@ -73,7 +73,7 @@ static bool lastStageSamplingPlanSupported(const NnUnevenPartitionPlan *plan) {
     if (!lastStageSamplingEnabled()) return false;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
     const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-    return last.nNodes == 1u;
+    return last.nNodes > 0u && last.rootNodeIndex < plan->nNodes;
 }
 
 static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name) {
@@ -1357,8 +1357,8 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
 bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *logit) {
     if (!lastStageSamplingPlanSupported(plan) || network == nullptr) return false;
     const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-    const NnUint sourceNode = last.nodeIndices[0];
-    if (sourceNode == 0u) return false;
+    const NnUint sourceNode = last.rootNodeIndex;
+    if (sourceNode == 0u || sourceNode >= plan->nNodes) return false;
     const int socketIndex = network->getSocketIndexForNode(sourceNode, 0u);
     if (socketIndex < 0) return false;
 
@@ -2973,15 +2973,17 @@ void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionP
     if (network == nullptr || execution == nullptr || logitsPipe == nullptr || lastStageSampler == nullptr) return;
     if (controlPacket.batchSize != 1u) return;
     const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-    if (last.nodeIndices[0] != localNodeIndex) return;
+    if (last.rootNodeIndex != localNodeIndex) return;
 
-    const NnUint vocabStart = (plan->vocabSplit.starts != nullptr) ? plan->vocabSplit.starts[localNodeIndex] : 0u;
-    const NnUint vocabSize = (plan->vocabSplit.lengths != nullptr) ? plan->vocabSplit.lengths[localNodeIndex] : 0u;
+    NnUint vocabSize = 0u;
+    if (plan->vocabSplit.lengths != nullptr) {
+        for (NnUint node = 0u; node < plan->nNodes; ++node) vocabSize += plan->vocabSplit.lengths[node];
+    }
     if (vocabSize == 0u) return;
 
     const int localToken = lastStageSampler->sample(logitsPipe);
     if (localToken < 0) return;
-    const NnUint token = vocabStart + (NnUint)localToken;
+    const NnUint token = (NnUint)localToken;
     const float sampledLogit = ((NnUint)localToken < vocabSize) ? logitsPipe[localToken] : 0.0f;
 
     LlmSampledTokenPacket packet{};
@@ -3542,8 +3544,14 @@ void runWorkerApp(AppCliArgs *args) {
 
         const NnUint logitsPipeIndex = findPipeIndexByName(&netConfig, "LG");
         std::unique_ptr<Sampler> lastStageSampler;
-        if (planPtr.get() != nullptr && planPtr->vocabSplit.lengths != nullptr && nodeConfig.nodeIndex < planPtr->nNodes) {
-            samplerVocabSize = planPtr->vocabSplit.lengths[nodeConfig.nodeIndex];
+        if (bootLastStageSamplingEnabled && lastStageSamplingPlanSupported(planPtr.get())) {
+            const NnStageConfig &last = planPtr->stages[planPtr->nStages - 1u];
+            if (last.rootNodeIndex == nodeConfig.nodeIndex && planPtr->vocabSplit.lengths != nullptr) {
+                samplerVocabSize = 0u;
+                for (NnUint node = 0u; node < planPtr->nNodes; ++node) samplerVocabSize += planPtr->vocabSplit.lengths[node];
+            } else {
+                samplerVocabSize = 0u;
+            }
         }
         if (bootLastStageSamplingEnabled && samplerVocabSize > 0u) {
             lastStageSampler.reset(new Sampler((int)samplerVocabSize, boot.samplerTemperature, boot.samplerTopP, boot.samplerSeed));

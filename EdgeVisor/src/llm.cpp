@@ -108,7 +108,7 @@ static bool lastStageSamplingPlanSupportedLlm(const NnUnevenPartitionPlan *plan)
     if (!envFlagEnabledDefaultLlm("DLLAMA_LAST_STAGE_SAMPLING", false)) return false;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
     const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-    return last.nNodes == 1u;
+    return last.nNodes > 0u && last.rootNodeIndex < plan->nNodes;
 }
 
 static bool graphBuildDumpEnabled() {
@@ -2035,7 +2035,11 @@ static NnNodeConfig buildLlmNodeInternal(
             pointerBatchedSliceConfigTagged(SRC_PIPE, n->logitsPipeIndex, NN_SLICE_VOCAB), // <--- 改回这个！
             size0(), NnCastOpCodeConfig{});
         
-        if (!useLastStageSampling) {
+        if (useLastStageSampling) {
+            if (myStage != nullptr && myStage->nNodes > 1u) {
+                end.addSync(n->logitsPipeIndex, SYNC_NODE_SLICES_TO_STAGE_ROOT);
+            }
+        } else {
             end.addSync(n->logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
         }
     }

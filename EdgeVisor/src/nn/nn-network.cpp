@@ -2278,7 +2278,10 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
             }else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeStr = "SYNC_LOGITS";
                 syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements);
-            } 
+            } else if (syncConfig->syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT) {
+                syncTypeStr = "SYNC_STAGE_LOGITS";
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements);
+            }
             else if (syncConfig->syncType == SYNC_PP_SEND) {
                 syncTypeStr = "PP_SEND";
                 // PP 只要单线程执行一次

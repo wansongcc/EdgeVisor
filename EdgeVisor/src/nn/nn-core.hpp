@@ -390,6 +390,7 @@ enum NnSyncType {
     SYNC_WITH_ROOT, // whole pipe to all nodes
     SYNC_NODE_SLICES, // my slice of pipe to all nodes
     SYNC_NODE_SLICES_EXCEPT_ROOT, // only workers send slices to root, root does not send
+    SYNC_NODE_SLICES_TO_STAGE_ROOT, // stage-local gather: workers send slices to their stage root
     SYNC_PP_SEND,                     // PP: 当前 Stage 发送给 Next Stage
     SYNC_PP_RECV                      // PP: 当前 Stage 从 Prev Stage 接收
 };

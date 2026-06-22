@@ -1760,6 +1760,24 @@ static void embeddingForward_F32_F32_Q80(NnUint nThreads, NnUint threadIndex, Nn
     }
 }
 
+static void embeddingForward_F32_Q80_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    ASSERT_EQ(context->weightSize.floatType, F_Q80);
+    ASSERT_EQ(context->weightSize.x, context->outputSize.x);
+    ASSERT_EQ(context->weightSize.x % Q80_BLOCK_SIZE, 0u);
+    const NnUint rowBlocks = context->weightSize.x / Q80_BLOCK_SIZE;
+
+    for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+        NnUint token = (NnUint)*((float *)context->input[batchIndex]);
+        const NnBlockQ80 *row = ((const NnBlockQ80 *)context->weight) + (NnSize)token * rowBlocks;
+        dequantizeQ80toF32(
+            row,
+            (float *)context->output[batchIndex],
+            context->outputSize.x,
+            nThreads,
+            threadIndex);
+    }
+}
+
 static void initInvRmsForward(NnCpuOpContext *context) {
     const NnInvRmsOpConfig *config = (const NnInvRmsOpConfig *)context->opConfig;
     assert(context->outputSize.x >= config->nColumns);
@@ -3341,6 +3359,7 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     if (code == OP_EMBEDDING) {
         if (quantType == F32_F32_F32) return embeddingForward_F32_F32_F32;
         if (quantType == F32_F32_Q80) return embeddingForward_F32_F32_Q80;
+        if (quantType == F32_Q80_F32) return embeddingForward_F32_Q80_F32;
     }
     if (code == OP_INV_RMS) {
         if (quantType == F32_F32_F32) return invRmsForward_F32_F32;

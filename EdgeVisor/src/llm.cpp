@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <functional>
 #include <algorithm>
+#include <thread>
 
 // Global flag to enable plan barrier (set from app via bootstrap packet)
 static bool g_enablePlanBarrier = false;
@@ -44,6 +45,63 @@ static bool envFlagEnabledDefaultLlm(const char *name, bool fallback) {
         return false;
     }
     return true;
+}
+
+static NnSize3D tokenEmbeddingResidentSize(const LlmHeader *h) {
+    return size2D(F_Q80, h->vocabSize, h->dim);
+}
+
+static NnSize3D tokenEmbeddingFileSize(const LlmHeader *h) {
+    return size2D(F_32, h->vocabSize, h->dim);
+}
+
+static NnUint q80EmbeddingLoadThreads() {
+    int requested = getenvIntOrDefaultLlm("DLLAMA_EMBEDDING_Q80_LOAD_THREADS", 0);
+    if (requested <= 0) requested = (int)std::thread::hardware_concurrency();
+    if (requested <= 0) requested = 1;
+    if (requested > 8) requested = 8;
+    return (NnUint)requested;
+}
+
+static void quantizeF32toQ80Chunk(const float *input, NnBlockQ80 *output, NnUint n) {
+    const NnUint nThreads = std::min(q80EmbeddingLoadThreads(), std::max(1u, n / Q80_BLOCK_SIZE));
+    if (nThreads <= 1u) {
+        quantizeF32toQ80(input, output, n, 1u, 0u);
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(nThreads);
+    for (NnUint threadIndex = 0u; threadIndex < nThreads; ++threadIndex) {
+        threads.emplace_back([=]() {
+            quantizeF32toQ80(input, output, n, nThreads, threadIndex);
+        });
+    }
+    for (std::thread &t : threads) t.join();
+}
+
+template <typename Loader>
+static NnSize loadRootTokenEmbeddingQ80(Loader *loader, const LlmHeader *h, NnByte *weight) {
+    assert(h->dim % Q80_BLOCK_SIZE == 0u);
+    const NnSize3D srcSize = tokenEmbeddingFileSize(h);
+    const NnUint blocksPerRow = h->dim / Q80_BLOCK_SIZE;
+    const NnUint rowsPerChunk = 1024u;
+    std::vector<NnBlockQ80> q80Chunk((size_t)rowsPerChunk * (size_t)blocksPerRow);
+    const float *src = (const float *)weight;
+
+    for (NnUint rowStart = 0u; rowStart < h->vocabSize; rowStart += rowsPerChunk) {
+        const NnUint rows = std::min(rowsPerChunk, h->vocabSize - rowStart);
+        const NnUint n = rows * h->dim;
+        quantizeF32toQ80Chunk(src + (NnSize)rowStart * h->dim, q80Chunk.data(), n);
+        loader->loadRootChunk(
+            "embedding",
+            0u,
+            (NnSize)rowStart * blocksPerRow * sizeof(NnBlockQ80),
+            (NnSize)rows * blocksPerRow * sizeof(NnBlockQ80),
+            (NnByte *)q80Chunk.data());
+    }
+
+    return srcSize.nBytes;
 }
 
 static bool lastStageSamplingPlanSupportedLlm(const NnUnevenPartitionPlan *plan) {
@@ -403,7 +461,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
         ffDim = h->moeHiddenDim;
 
     LlmNet n;
-    n.tokenEmbeddingSize = size2D(F_32, h->vocabSize, h->dim);
+    n.tokenEmbeddingSize = tokenEmbeddingResidentSize(h);
     n.rmsNormSize = size1D(F_32, h->dim);
     n.qkRmsNormSize = size1D(F_32, h->headDim);
     n.moeGateSize = size2D(F_32, h->dim, h->nExperts);
@@ -2063,7 +2121,7 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
     n.runtimeStageLayerPlan = buildRuntimeStageLayerPlanStatic(plan, h->nLayers);
 
     // 1. Global Dimensions
-    n.tokenEmbeddingSize = size2D(F_32, h->vocabSize, h->dim);
+    n.tokenEmbeddingSize = tokenEmbeddingResidentSize(h);
     n.rmsNormSize = size1D(F_32, h->dim);
     n.qkRmsNormSize = size1D(F_32, h->headDim);
     n.moeGateSize = size2D(F_32, h->dim, h->nExperts);
@@ -2172,7 +2230,7 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
     Timer timer;
     NnByte *data = (NnByte *)file.data;
     NnByte *b = &data[net->header->headerSize];
-    b += loader->loadRoot("embedding", 0, net->tokenEmbeddingSize.nBytes, b);
+    b += loadRootTokenEmbeddingQ80(loader, net->header, b);
 
     for (NnUint layerIndex = 0u; layerIndex < net->header->nLayers; layerIndex++) {
         b += loader->loadRowMatmulSlices("block_matmul_q", layerIndex, 0u, &net->qSlice, b);
@@ -2284,9 +2342,9 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         ? (nodeIndex == 0u)
         : (nodeIndex == myStage->rootNodeIndex);
     if (isFirstStage && isStageRoot) {
-        b += loader->loadRoot("embedding", 0, net->tokenEmbeddingSize.nBytes, b);
+        b += loadRootTokenEmbeddingQ80(loader, h, b);
     } else {
-        b += net->tokenEmbeddingSize.nBytes;
+        b += tokenEmbeddingFileSize(h).nBytes;
     }
 
     // --- 2. 逐层加载 ---

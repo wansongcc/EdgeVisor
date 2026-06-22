@@ -1210,6 +1210,7 @@ static const char *getShaderFileName(const NnOpCode opCode, const NnOpQuantType 
     }
     if (opCode == OP_EMBEDDING) {
         if (quantType == F32_F32_F32) return "embedding-forward-f32-f32.spv";
+        if (quantType == F32_Q80_F32) return "embedding-forward-f32-q80-f32.spv";
     }
     if (opCode == OP_ROPE) {
         if (quantType == F32_F32_F32) return "rope-forward-f32-f32.spv";

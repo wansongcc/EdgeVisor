@@ -1,0 +1,49 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+#define CHUNK_SIZE 4
+#define Q80_BLOCK_SIZE 32
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+struct BlockQ80 {
+    float16_t d;
+    int8_t qs[Q80_BLOCK_SIZE];
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly buffer weightBuffer { BlockQ80 weight[]; };
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint chunkIndex = gl_WorkGroupID.x;
+    const uint token = uint(x[batchIndex]);
+
+    const BatchInfo info = infos[batchIndex];
+    const uint offset = chunkIndex * CHUNK_SIZE;
+    const uint yOffset = info.outputOffset + offset;
+    const uint rowBlocks = info.outputSizeX / Q80_BLOCK_SIZE;
+    const uint wRowOffset = token * rowBlocks;
+
+    [[unroll]] for (uint i = 0; i < CHUNK_SIZE; i++) {
+        const uint elem = offset + i;
+        const uint blockIndex = wRowOffset + elem / Q80_BLOCK_SIZE;
+        const uint lane = elem % Q80_BLOCK_SIZE;
+        y[yOffset + i] = float(weight[blockIndex].qs[lane]) * float(weight[blockIndex].d);
+    }
+}

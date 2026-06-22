@@ -38,6 +38,10 @@ NnSize NnLocalWeightLoader::loadRoot(const char *opName, NnUint opIndex, NnSize 
     return nBytes;
 }
 
+void NnLocalWeightLoader::loadRootChunk(const char *opName, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) {
+    executor->loadWeight(opName, opIndex, offset, nBytes, weight);
+}
+
 NnSize NnLocalWeightLoader::loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
     // 所有节点都加载完整的权重 (e.g., Norms)
     // printf("DEBUG: loadAll op=%s node=%d size=%lu\n", opName, myNodeIndex, nBytes);

@@ -14,6 +14,7 @@ public:
 
     // 基础加载接口
     NnSize loadRoot(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight);
+    void loadRootChunk(const char *opName, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight);
     NnSize loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight);
 
     // 非均匀加载接口

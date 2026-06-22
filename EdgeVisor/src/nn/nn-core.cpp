@@ -46,6 +46,8 @@ NnOpQuantType getOpQuantType(NnFloatType input, NnFloatType weight, NnFloatType 
     if (input == F_32 && output == F_32) {
         if (weight == F_UNK || weight == F_32)
             return F32_F32_F32;
+        if (weight == F_Q80)
+            return F32_Q80_F32;
         if (weight == F_Q40)
             return F32_Q40_F32;
     }
@@ -103,6 +105,7 @@ const char *opQuantTypeToString(NnOpQuantType type) {
     if (type == F32_Q40_F32) return "F32_Q40_F32";
     if (type == F32_Q40_Q80) return "F32_Q40_Q80";
     if (type == F32_F32_Q80) return "F32_F32_Q80";
+    if (type == F32_Q80_F32) return "F32_Q80_F32";
     if (type == Q80_Q80_Q80) return "Q80_Q80_Q80";
     if (type == Q80_Q80_F32) return "Q80_Q80_F32";
     if (type == Q80_Q40_F32) return "Q80_Q40_F32";

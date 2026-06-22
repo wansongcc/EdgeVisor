@@ -346,6 +346,7 @@ enum NnOpQuantType {
     F32_Q40_F32,
     F32_Q40_Q80,
     F32_F32_Q80,
+    F32_Q80_F32,
     Q80_Q80_Q80,
     Q80_Q80_F32,
     Q80_Q40_F32,

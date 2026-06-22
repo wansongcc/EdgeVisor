@@ -97,6 +97,9 @@ struct NnUnevenPartitionPlan {
 
     NnDimSplit headSplit;
     NnDimSplit kvHeadSplit;
+    // Q/WO compute range (in Q heads) derived from kvHeadComputeSplit.
+    // This is the bounded resident range used for head migration shadow weights.
+    NnDimSplit headComputeSplit;
     // KV compute range (in KV heads) used for redundancy.
     // This does NOT change ownership semantics of kvHeadSplit.
     // When enabled, a device may compute (and possibly store) KV for this broader range.
@@ -109,6 +112,7 @@ struct NnUnevenPartitionPlan {
     NnUnevenPartitionPlan() : nNodes(0), nStages(0), stages(nullptr) {
         std::memset(&headSplit, 0, sizeof(headSplit));
         std::memset(&kvHeadSplit, 0, sizeof(kvHeadSplit));
+        std::memset(&headComputeSplit, 0, sizeof(headComputeSplit));
         std::memset(&kvHeadComputeSplit, 0, sizeof(kvHeadComputeSplit));
         std::memset(&vocabSplit, 0, sizeof(vocabSplit));
         std::memset(&ffnSplit, 0, sizeof(ffnSplit));
@@ -123,6 +127,7 @@ struct NnUnevenPartitionPlan {
         }
         freeSplit(headSplit);
         freeSplit(kvHeadSplit);
+        freeSplit(headComputeSplit);
         freeSplit(kvHeadComputeSplit);
         freeSplit(vocabSplit);
         freeSplit(ffnSplit);
@@ -136,6 +141,7 @@ struct NnUnevenPartitionPlan {
                     stages(other.stages),
                     headSplit(other.headSplit),
                     kvHeadSplit(other.kvHeadSplit),
+                    headComputeSplit(other.headComputeSplit),
                     kvHeadComputeSplit(other.kvHeadComputeSplit),
                     vocabSplit(other.vocabSplit),
                     ffnSplit(other.ffnSplit),
@@ -146,6 +152,7 @@ struct NnUnevenPartitionPlan {
                 other.nStages = 0;
         zeroSplit(other.headSplit);
         zeroSplit(other.kvHeadSplit);
+                zeroSplit(other.headComputeSplit);
                 zeroSplit(other.kvHeadComputeSplit);
         zeroSplit(other.vocabSplit);
         zeroSplit(other.ffnSplit);
@@ -511,6 +518,10 @@ typedef struct {
     NnUint view;
     NnUint inStart;
     NnUint outStart;
+    // Resident base used when a bounded shadow weight tensor stores only
+    // [residentStart, residentStart + residentLen) instead of the full global tensor.
+    NnUint inResidentStart;
+    NnUint outResidentStart;
 
     // Optional: semantic tags for online repartition refresh.
     // When set (non-AUTO), refresh code may recompute inStart/outStart from the
@@ -747,6 +758,8 @@ NnRowMatmulSliceUneven sliceRowMatmulAttUneven(NnFloatType type, NnUint globalIn
 
 NnColMatmulSliceUneven sliceColMatmulAttUneven(NnFloatType type, NnUint globalInDimQ, NnUint globalOutDim, NnUint headDim,
     const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+NnColMatmulSliceUneven sliceColMatmulAttSplitUneven(NnFloatType type, NnUint globalInDimQ, NnUint globalOutDim, NnUint headDim,
+    const NnDimSplit* headSplit, NnUint nodeIndex);
 
 NnRowMatmulSliceUneven sliceRowMatmulFfnUneven(NnFloatType type, NnUint globalInDim, NnUint globalFfnDim,
     const NnUnevenPartitionPlan* plan, NnUint nodeIndex);

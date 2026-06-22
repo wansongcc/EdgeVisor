@@ -480,6 +480,7 @@ NnUnevenPartitionPlan createPartitionPlan(
     
     allocSplit(plan.headSplit);
     allocSplit(plan.kvHeadSplit);
+    allocSplit(plan.headComputeSplit);
     allocSplit(plan.kvHeadComputeSplit);
     allocSplit(plan.vocabSplit);
     allocSplit(plan.ffnSplit);
@@ -578,6 +579,8 @@ NnUnevenPartitionPlan createPartitionPlan(
                 NnUint globalIdx = currentNodeOffset + i;
                 plan.headSplit.starts[globalIdx] = plan.kvHeadSplit.starts[globalIdx] * gqaGroupSize;
                 plan.headSplit.lengths[globalIdx] = plan.kvHeadSplit.lengths[globalIdx] * gqaGroupSize;
+                plan.headComputeSplit.starts[globalIdx] = plan.kvHeadComputeSplit.starts[globalIdx] * gqaGroupSize;
+                plan.headComputeSplit.lengths[globalIdx] = plan.kvHeadComputeSplit.lengths[globalIdx] * gqaGroupSize;
             }
 
             // FFN & Dim (Hidden Size)
@@ -759,12 +762,18 @@ NnRowMatmulSliceUneven sliceRowMatmulAttUneven(NnFloatType type, NnUint globalIn
 NnColMatmulSliceUneven sliceColMatmulAttUneven(NnFloatType type, NnUint globalInDimQ, NnUint globalOutDim, NnUint headDim,
                                                const NnUnevenPartitionPlan* plan, 
                                                NnUint nodeIndex) {
+    return sliceColMatmulAttSplitUneven(type, globalInDimQ, globalOutDim, headDim, &plan->headSplit, nodeIndex);
+}
+
+NnColMatmulSliceUneven sliceColMatmulAttSplitUneven(NnFloatType type, NnUint globalInDimQ, NnUint globalOutDim, NnUint headDim,
+                                                   const NnDimSplit* headSplit,
+                                                   NnUint nodeIndex) {
     NnColMatmulSliceUneven s;
     s.type = type;
 
     // 1. 从 Head 蓝图 (headSplit) 获取分配
-    const NnUint headStart = plan->headSplit.starts[nodeIndex];
-    const NnUint headLen = plan->headSplit.lengths[nodeIndex];
+    const NnUint headStart = headSplit->starts[nodeIndex];
+    const NnUint headLen = headSplit->lengths[nodeIndex];
     
     // 2. 转换为维度，并填入 'outStart'/'outLen' 字段
     s.outStart = headStart * headDim;
@@ -1029,6 +1038,9 @@ void releasePartitionPlan(NnUnevenPartitionPlan* plan) {
     delete[] plan->kvHeadSplit.starts;
     delete[] plan->kvHeadSplit.lengths;
 
+    delete[] plan->headComputeSplit.starts;
+    delete[] plan->headComputeSplit.lengths;
+
     delete[] plan->kvHeadComputeSplit.starts;
     delete[] plan->kvHeadComputeSplit.lengths;
 
@@ -1044,6 +1056,7 @@ void releasePartitionPlan(NnUnevenPartitionPlan* plan) {
     // 将指针设为 null 以防止重复释放
     plan->headSplit = {nullptr, nullptr};
     plan->kvHeadSplit = {nullptr, nullptr};
+    plan->headComputeSplit = {nullptr, nullptr};
     plan->kvHeadComputeSplit = {nullptr, nullptr};
     plan->vocabSplit = {nullptr, nullptr};
     plan->ffnSplit = {nullptr, nullptr};

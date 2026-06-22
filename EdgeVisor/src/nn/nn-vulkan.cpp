@@ -2116,11 +2116,21 @@ void NnVulkanDeviceSegment::refreshPointers() {
                 auto *cfg = (NnMatmulOpConfig *)opConfig->config;
                 if (cfg->view == 1u && cfg->outSliceTag != NN_SLICE_AUTO && cfg->outStartUnit != 0u) {
                     NnUint st = 0u;
-                    if (getSplitStart(cfg->outSliceTag, &st)) cfg->outStart = st * cfg->outStartUnit;
+                    if (getSplitStart(cfg->outSliceTag, &st)) {
+                        cfg->outStart = st * cfg->outStartUnit;
+                        if (cfg->outResidentStart != 0u && cfg->outStart >= cfg->outResidentStart) {
+                            cfg->outStart -= cfg->outResidentStart;
+                        }
+                    }
                 }
                 if (cfg->view == 2u && cfg->inSliceTag != NN_SLICE_AUTO && cfg->inStartUnit != 0u) {
                     NnUint st = 0u;
-                    if (getSplitStart(cfg->inSliceTag, &st)) cfg->inStart = st * cfg->inStartUnit;
+                    if (getSplitStart(cfg->inSliceTag, &st)) {
+                        cfg->inStart = st * cfg->inStartUnit;
+                        if (cfg->inResidentStart != 0u && cfg->inStart >= cfg->inResidentStart) {
+                            cfg->inStart -= cfg->inResidentStart;
+                        }
+                    }
                 }
                 if (cfg->aView.sizeX != 0u) cfg->aView.sizeX = inputSize.x;
                 if (cfg->cView.sizeX != 0u) cfg->cView.sizeX = outputSize.x;

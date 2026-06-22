@@ -3773,12 +3773,18 @@ void NnCpuDeviceSegment::refreshPointers() {
                     NnUint s = 0u;
                     if (getSplitStart(cfg->outSliceTag, &s)) {
                         cfg->outStart = s * cfg->outStartUnit;
+                        if (cfg->outResidentStart != 0u && cfg->outStart >= cfg->outResidentStart) {
+                            cfg->outStart -= cfg->outResidentStart;
+                        }
                     }
                 }
                 if (cfg->view == 2u && cfg->inSliceTag != NN_SLICE_AUTO && cfg->inStartUnit != 0u) {
                     NnUint s = 0u;
                     if (getSplitStart(cfg->inSliceTag, &s)) {
                         cfg->inStart = s * cfg->inStartUnit;
+                        if (cfg->inResidentStart != 0u && cfg->inStart >= cfg->inResidentStart) {
+                            cfg->inStart -= cfg->inResidentStart;
+                        }
                     }
                 }
 

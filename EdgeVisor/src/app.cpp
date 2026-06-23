@@ -658,6 +658,11 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         std::printf("⚠️  [pp-migrate] --enable-pp-migration requires KV aggregate; auto enabling --enable-kv-aggregate\n");
         std::fflush(stdout);
     }
+    if (args.enablePpMigration && !args.enableStageFullWeights) {
+        args.enableStageFullWeights = true;
+        std::printf("⚠️  [pp-migrate] --enable-pp-migration requires stage full weights; auto enabling --enable-stage-full-weights\n");
+        std::fflush(stdout);
+    }
     return args;
 }
 
@@ -735,6 +740,19 @@ static std::vector<NnUint> parseKvRedundancy(const char *redundancyStr, NnUint n
     }
 
     return redundancies;
+}
+
+static NnUint inferRuntimeRedundantBoundaryLayers(const char *redundancyStr, NnUint nNodes, NnUint fallback) {
+    try {
+        std::vector<NnUint> redundancies = parseKvRedundancy(redundancyStr, nNodes);
+        NnUint maxRedundancy = fallback;
+        for (NnUint value : redundancies) {
+            maxRedundancy = std::max(maxRedundancy, value);
+        }
+        return maxRedundancy;
+    } catch (...) {
+        return fallback;
+    }
 }
 
 // [修改] 解析多 Stage 格式: "1.0:10;0.5,0.5:14"
@@ -1221,6 +1239,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->executor = executor;
     this->network = network;
     this->plan = plan;
+    this->runtimePlan = (net != nullptr) ? &net->runtimeStageLayerPlan : nullptr;
     this->profileEnabled = profileEnabled;
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
     this->controlPacket.planCmdSeq = 0u;
@@ -1385,6 +1404,30 @@ void RootLlmInference::setRuntimeLayerGate(bool enablePrimarySegments, bool enab
 void RootLlmInference::setPrimaryLayerEnabled(NnUint layerIndex, bool enabled) {
     if (executor == nullptr) return;
     executor->setPrimaryLayerEnabled(layerIndex, enabled);
+}
+
+void RootLlmInference::setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled) {
+    if (executor == nullptr) return;
+    executor->setShiftedPpStartLayerEnabled(layerIndex, enabled);
+}
+
+void RootLlmInference::maybeEnableShiftedPpStartForSourceStage(
+    const std::vector<NnUint> &switchLayers,
+    NnUint sourceNodeIndex,
+    NnUint targetNodeIndex,
+    bool selfIsSource) {
+    if (!selfIsSource || executor == nullptr || switchLayers.empty()) return;
+    const NnStageConfig *fromStage = findStageForNodeLocal(plan, sourceNodeIndex);
+    const NnStageConfig *toStage = findStageForNodeLocal(plan, targetNodeIndex);
+    if (fromStage == nullptr || toStage == nullptr) return;
+    if (toStage->stageIndex >= fromStage->stageIndex) return;
+
+    // Root applies batched switches. After migrating multiple consecutive
+    // start layers, the first retained layer becomes the new PP entry.
+    const NnUint shiftedStartLayer = *std::max_element(switchLayers.begin(), switchLayers.end()) + 1u;
+    if (shiftedStartLayer < fromStage->endLayer) {
+        executor->setShiftedPpStartLayerEnabled(shiftedStartLayer, true);
+    }
 }
 
 bool RootLlmInference::hasAsyncKvCollector() const {
@@ -2023,6 +2066,11 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
                 if (selfIsSource) executor->setPrimaryLayerEnabled(layer, false);
                 if (selfIsTarget) executor->setRedundantLayerEnabled(layer, true);
             }
+            maybeEnableShiftedPpStartForSourceStage(
+                switchLayers,
+                migrationFromNodeIndex,
+                nextStageRootNode,
+                selfIsSource);
         }
     }
 
@@ -2376,6 +2424,11 @@ void RootLlmInference::forward() {
                         executor->setRedundantLayerEnabled(layer, true);
                     }
                 }
+                maybeEnableShiftedPpStartForSourceStage(
+                    switchLayers,
+                    migrationFromNodeIndex,
+                    nextStageRootNode,
+                    selfIsSource);
             }
         }
     }
@@ -2831,17 +2884,50 @@ void RootLlmInference::forward() {
         double statePrepareMs = 0.0;
         double recoverMs = 0.0;
         std::string fallbackReason;
+        const NnStageConfig *fromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
+        const NnStageConfig *toStage = findStageForNodeLocal(plan, nextStageRootNode);
+        const bool migrateToLaterStage =
+            fromStage != nullptr && toStage != nullptr &&
+            toStage->stageIndex > fromStage->stageIndex;
 
         if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) {
             auto t0 = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> lk(kvTransferMutex);
-                pendingLayerSwitchLayers = migrationLayers;
+            if (migrateToLaterStage) {
+                NnUint exported = 0u;
+                NnUint queued = 0u;
+                uint64_t sourceBytes = 0u;
+                const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
+                auto t1 = std::chrono::steady_clock::now();
+                uint64_t targetBytes = 0u;
+                const bool transferred = collected && flushPendingKvTransfersControlOnly(&targetBytes);
+                const bool switched = transferred && sendPendingLayerSwitchControlOnly();
+                auto t2 = std::chrono::steady_clock::now();
+                statePrepareMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                recoverMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+                stateBytes = sourceBytes + targetBytes;
+                lastMigrationStateTransferBytes = stateBytes;
+                lastMigrationExportedRows = exported;
+                applyOk = switched;
+                fallbackReason = "shadow_kv_forward_real_transfer";
+                std::printf("🧩 [kv-migrate] shadow forward transfer exported=%u queued=%u layers=%u posRange=[0,%u] sourceBytes=%llu targetBytes=%llu targetRoot=%u status=%s\n",
+                    (unsigned)exported,
+                    (unsigned)queued,
+                    (unsigned)migrationLayers.size(),
+                    (unsigned)endPos,
+                    (unsigned long long)sourceBytes,
+                    (unsigned long long)targetBytes,
+                    (unsigned)nextStageRootNode,
+                    applyOk ? "ok" : "fail");
+            } else {
+                {
+                    std::lock_guard<std::mutex> lk(kvTransferMutex);
+                    pendingLayerSwitchLayers = migrationLayers;
+                }
+                applyOk = sendPendingLayerSwitchControlOnly();
+                auto t1 = std::chrono::steady_clock::now();
+                recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                fallbackReason = "shadow_kv_precomputed_redundant_state";
             }
-            applyOk = sendPendingLayerSwitchControlOnly();
-            auto t1 = std::chrono::steady_clock::now();
-            recoverMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            fallbackReason = "shadow_kv_precomputed_redundant_state";
             migrationBatchSubmitted = applyOk;
         } else if (ablationCfg.shadowKvMode == ShadowKvMode::DISABLED_TRANSFER) {
             auto t0 = std::chrono::steady_clock::now();
@@ -3266,6 +3352,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     // IMPORTANT: KV aggregate pipe build is decided during graph construction.
     setEnableKvAggregate(args->enableKvAggregate);
     // Runtime redundant plan/gate defaults (consumed by buildLlmNetUneven + NnExecutor).
+    if (args->enablePpMigration || bubbleShadowKvEnabled()) {
+        args->runtimeRedundantBoundaryLayers = inferRuntimeRedundantBoundaryLayers(
+            args->kvRedundancyStr,
+            nNodes,
+            args->runtimeRedundantBoundaryLayers);
+    }
     setRuntimeRedundantEnv(
         args->runtimeRedundantBoundaryLayers,
         args->runtimeActiveSegEnabled,
@@ -3649,6 +3741,20 @@ void runWorkerApp(AppCliArgs *args) {
                             (unsigned)nodeConfig.nodeIndex,
                             (unsigned)switchPkt.boundaryLayer);
                         std::fflush(stdout);
+                    }
+                    if (localIsSourceStage && planPtr != nullptr) {
+                        const NnStageConfig *fromStage = findStageForNodeLocal(planPtr.get(), switchPkt.fromNodeIndex);
+                        const NnStageConfig *toStage = findStageForNodeLocal(planPtr.get(), switchPkt.toNodeIndex);
+                        if (fromStage != nullptr && toStage != nullptr && toStage->stageIndex < fromStage->stageIndex) {
+                            const NnUint shiftedStartLayer = switchPkt.boundaryLayer + 1u;
+                            if (shiftedStartLayer < fromStage->endLayer) {
+                                executor.setShiftedPpStartLayerEnabled(shiftedStartLayer, true);
+                                std::printf("🔁 [worker-switch] node=%u shifted pp-start layer=%u (source-stage)\n",
+                                    (unsigned)nodeConfig.nodeIndex,
+                                    (unsigned)shiftedStartLayer);
+                                std::fflush(stdout);
+                            }
+                        }
                     }
                 }
 

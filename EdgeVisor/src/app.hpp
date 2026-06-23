@@ -323,6 +323,7 @@ private:
     LlmControlPacket controlPacket;
     bool profileEnabled = false;
     const NnUnevenPartitionPlan* plan = nullptr;
+    const RuntimeStageLayerPlan* runtimePlan = nullptr;
     std::vector<LlmPerfPacket> lastPerf;
     NnUint lastPlanCmdSeqSent = 0u;
     NnBubbleShadowStats lastBubbleShadowStats{};
@@ -374,6 +375,11 @@ private:
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     bool sendPendingLayerSwitchControlOnly();
+    void maybeEnableShiftedPpStartForSourceStage(
+        const std::vector<NnUint> &switchLayers,
+        NnUint sourceNodeIndex,
+        NnUint targetNodeIndex,
+        bool selfIsSource);
     void collectProfilePackets();
     bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
     bool replayHistoryForHeadMigrationRecompute(const PlanCommand &cmd, NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
@@ -393,6 +399,7 @@ public:
     void setToken(NnUint batchIndex, NnUint token);
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
+    void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     void forward();
     void finish();
 };

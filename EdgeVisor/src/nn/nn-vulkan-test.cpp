@@ -2,6 +2,7 @@
 #include <cmath>
 #include "nn-config-builder.hpp"
 #include "nn-quants.hpp"
+#include "nn-test-utils.hpp"
 #include "nn-vulkan.hpp"
 
 #define N_BATCHES 4
@@ -11,11 +12,9 @@ void printOk(const char *name) {
 }
 
 void assertFloat(NnUint position, const float value, const float expectedValue, const float tolerance) {
-    float diff = fabs(expectedValue - value);
-    if (diff > tolerance) {
-        printf("❌ [%d] failed: value=%f, expectedValue=%f, diff=%f\n", position, value, expectedValue, diff);
-        exit(1);
-    }
+    char name[64];
+    std::snprintf(name, sizeof(name), "vulkan[%u]", position);
+    nn_test::requireClose(name, &value, &expectedValue, 1u, tolerance);
 }
 
 void execute(

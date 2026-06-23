@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <vector>     
 #include <numeric>    
+#include <limits>
 
 // utility functions
 
@@ -168,6 +169,271 @@ bool hasPointerContinuousMemory(NnPointerConfig *config) {
     if (config->type == PNTR_BATCH)
         return true;
     return false;
+}
+
+namespace {
+
+const NnStageConfig *findPointerStage(
+    const NnUnevenPartitionPlan *plan,
+    NnUint nodeIndex
+) {
+    if (plan == nullptr || plan->stages == nullptr) return nullptr;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        const NnStageConfig *stage = &plan->stages[s];
+        for (NnUint i = 0; i < stage->nNodes; ++i) {
+            if (stage->nodeIndices[i] == nodeIndex) return stage;
+        }
+    }
+    return nullptr;
+}
+
+NnUint findPointerStageRank(const NnStageConfig *stage, NnUint nodeIndex) {
+    if (stage == nullptr) return nodeIndex;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        if (stage->nodeIndices[i] == nodeIndex) return i;
+    }
+    throw std::invalid_argument("Node is not a member of its resolved stage");
+}
+
+NnUint getPointerSplitTotal(
+    const NnDimSplit *split,
+    const NnStageConfig *stage,
+    NnUint nNodes
+) {
+    if (split == nullptr || split->starts == nullptr || split->lengths == nullptr) return 0u;
+    NnSize total = 0u;
+    if (stage != nullptr) {
+        for (NnUint i = 0; i < stage->nNodes; ++i) {
+            const NnUint node = stage->nodeIndices[i];
+            if (node >= nNodes) throw std::invalid_argument("Stage contains an out-of-range node");
+            total += split->lengths[node];
+        }
+    } else {
+        for (NnUint i = 0; i < nNodes; ++i) total += split->lengths[i];
+    }
+    if (total > std::numeric_limits<NnUint>::max()) {
+        throw std::overflow_error("Pointer split total overflows NnUint");
+    }
+    return (NnUint)total;
+}
+
+const NnSize3D &resolvePointerPhysicalSize(
+    const NnNetConfig *netConfig,
+    const NnNodeConfig *nodeConfig,
+    const NnPointerConfig *config
+) {
+    if (netConfig == nullptr || nodeConfig == nullptr || config == nullptr) {
+        throw std::invalid_argument("Pointer layout requires non-null configs");
+    }
+    switch (config->source) {
+        case SRC_PIPE:
+            if (config->pointerIndex >= netConfig->nPipes) {
+                throw std::out_of_range("Pipe pointer index is out of range");
+            }
+            return netConfig->pipes[config->pointerIndex].size;
+        case SRC_BUFFER:
+            if (config->pointerIndex >= nodeConfig->nBuffers) {
+                throw std::out_of_range("Buffer pointer index is out of range");
+            }
+            return nodeConfig->buffers[config->pointerIndex].size;
+        default:
+            throw std::invalid_argument("Unsupported pointer source");
+    }
+}
+
+} // namespace
+
+NnPointerLayout resolvePointerLayout(
+    const NnNetConfig *netConfig,
+    const NnNodeConfig *nodeConfig,
+    const NnUnevenPartitionPlan *partitionPlan,
+    const NnPointerConfig *config
+) {
+    const NnSize3D sourceSize = resolvePointerPhysicalSize(netConfig, nodeConfig, config);
+    NnPointerLayout result{};
+    result.physicalSize = sourceSize;
+
+    if (config->type == PNTR_RAW) {
+        result.logicalSize = size1D(sourceSize.floatType, sourceSize.length);
+        result.batchStrideBytes = sourceSize.nBytes;
+        result.zStrideBytes = sourceSize.nBytes;
+        return result;
+    }
+    if (config->type != PNTR_BATCH && config->type != PNTR_BATCHED_SLICE) {
+        throw std::invalid_argument("Unsupported pointer type");
+    }
+    if (sourceSize.y != netConfig->nBatches) {
+        throw std::invalid_argument("Batched pointer Y dimension does not match nBatches");
+    }
+
+    result.logicalSize = sourceSize;
+    result.batchStrideBytes = getBytes(sourceSize.floatType, sourceSize.x);
+    result.zStrideBytes = result.batchStrideBytes * sourceSize.y;
+    if (config->type == PNTR_BATCH) return result;
+
+    NnUint offset = 0u;
+    NnUint length = 0u;
+    bool splitFound = false;
+    bool stackedByNode = config->sliceTag == NN_SLICE_STACKED_BY_NODE;
+    const NnUint nodeIndex = nodeConfig->nodeIndex;
+    const NnStageConfig *stage = nullptr;
+
+    if (partitionPlan != nullptr) {
+        if (partitionPlan->nNodes != netConfig->nNodes) {
+            throw std::invalid_argument("Partition plan node count does not match network");
+        }
+        if (nodeIndex >= partitionPlan->nNodes) {
+            throw std::out_of_range("Node index is out of partition-plan range");
+        }
+        stage = partitionPlan->nStages > 0u
+            ? findPointerStage(partitionPlan, nodeIndex)
+            : nullptr;
+        if (partitionPlan->nStages > 0u && stage == nullptr) {
+            throw std::invalid_argument("Node is not assigned to a partition stage");
+        }
+
+        if (!stackedByNode && config->source == SRC_PIPE && stage != nullptr) {
+            const NnUint dimTotal = getPointerSplitTotal(
+                &partitionPlan->dimSplit, stage, partitionPlan->nNodes);
+            if (dimTotal > 0u &&
+                (NnSize)dimTotal * netConfig->nNodes == sourceSize.x) {
+                stackedByNode = true;
+            }
+        }
+
+        const auto trySplit = [&](const NnDimSplit &split, bool allowMultiplier) -> bool {
+            if (stackedByNode || split.starts == nullptr || split.lengths == nullptr) return false;
+            const NnUint total = getPointerSplitTotal(
+                &split, stage, partitionPlan->nNodes);
+            if (total == 0u || sourceSize.x % total != 0u) return false;
+            const NnUint multiplier = sourceSize.x / total;
+            if (!allowMultiplier && multiplier != 1u) return false;
+
+            const NnSize resolvedOffset = (NnSize)split.starts[nodeIndex] * multiplier;
+            const NnSize resolvedLength = (NnSize)split.lengths[nodeIndex] * multiplier;
+            if (resolvedOffset > sourceSize.x ||
+                resolvedLength > sourceSize.x - resolvedOffset) {
+                throw std::out_of_range("Partition slice exceeds physical X dimension");
+            }
+            if (resolvedOffset > std::numeric_limits<NnUint>::max() ||
+                resolvedLength > std::numeric_limits<NnUint>::max()) {
+                throw std::overflow_error("Partition slice overflows NnUint");
+            }
+            offset = (NnUint)resolvedOffset;
+            length = (NnUint)resolvedLength;
+            if (sourceSize.floatType == F_Q80 &&
+                ((offset % Q80_BLOCK_SIZE) != 0u ||
+                 (length % Q80_BLOCK_SIZE) != 0u)) {
+                throw std::invalid_argument("Q80 partition slice is not block aligned");
+            }
+            return true;
+        };
+
+        switch (config->sliceTag) {
+            case NN_SLICE_VOCAB:
+                splitFound = trySplit(partitionPlan->vocabSplit, false);
+                break;
+            case NN_SLICE_FFN:
+                splitFound = trySplit(partitionPlan->ffnSplit, false);
+                break;
+            case NN_SLICE_DIM:
+                splitFound = trySplit(partitionPlan->dimSplit, false);
+                break;
+            case NN_SLICE_HEAD:
+                splitFound = trySplit(partitionPlan->headSplit, true);
+                break;
+            case NN_SLICE_KV_HEAD:
+                splitFound = trySplit(partitionPlan->kvHeadSplit, true);
+                break;
+            case NN_SLICE_AUTO:
+                splitFound = trySplit(partitionPlan->vocabSplit, false);
+                if (!splitFound) splitFound = trySplit(partitionPlan->ffnSplit, false);
+                if (!splitFound) splitFound = trySplit(partitionPlan->dimSplit, false);
+                if (sourceSize.floatType != F_Q80) {
+                    if (!splitFound) splitFound = trySplit(partitionPlan->headSplit, true);
+                    if (!splitFound) splitFound = trySplit(partitionPlan->kvHeadSplit, true);
+                }
+                break;
+            case NN_SLICE_STACKED_BY_NODE:
+                break;
+            default:
+                throw std::invalid_argument("Unsupported slice tag");
+        }
+    }
+
+    if (!splitFound) {
+        if (stackedByNode) {
+            if (netConfig->nNodes == 0u || sourceSize.x % netConfig->nNodes != 0u) {
+                throw std::invalid_argument("Stacked-by-node X dimension is not evenly divisible");
+            }
+            length = sourceSize.x / netConfig->nNodes;
+            offset = length * nodeIndex;
+        } else {
+            const NnUint nSplitNodes = stage != nullptr ? stage->nNodes : netConfig->nNodes;
+            const NnUint rank = stage != nullptr
+                ? findPointerStageRank(stage, nodeIndex)
+                : nodeIndex;
+            if (nSplitNodes == 0u || rank >= nSplitNodes) {
+                throw std::invalid_argument("Invalid uniform slice topology");
+            }
+            length = sourceSize.x / nSplitNodes;
+            offset = length * rank;
+        }
+    }
+
+    if (offset > sourceSize.x || length > sourceSize.x - offset) {
+        throw std::out_of_range("Resolved pointer slice exceeds physical X dimension");
+    }
+    const NnUint blockSize = (NnUint)getBlockSize(sourceSize.floatType);
+    if ((sourceSize.x % blockSize) != 0u ||
+        (offset % blockSize) != 0u ||
+        (length % blockSize) != 0u) {
+        throw std::invalid_argument("Quantized pointer slice is not block aligned");
+    }
+
+    result.logicalOffset = offset;
+    result.byteOffset = getBytes(sourceSize.floatType, offset);
+    result.logicalSize = size3D(
+        sourceSize.floatType, sourceSize.z, sourceSize.y, length);
+    return result;
+}
+
+NnTensorViewLayout resolveTensorView(
+    const NnTensorView *view,
+    NnSize fallbackSizeY,
+    NnSize fallbackSizeX,
+    NnSize physicalElements
+) {
+    const NnTensorView empty{};
+    const NnTensorView &v = view != nullptr ? *view : empty;
+    NnTensorViewLayout result{};
+    result.offset = v.offset;
+    result.sizeY = v.sizeY != 0u ? v.sizeY : (fallbackSizeY != 0u ? fallbackSizeY : 1u);
+    result.sizeX = v.sizeX != 0u ? v.sizeX : fallbackSizeX;
+    result.strideX = v.strideX != 0u ? v.strideX : 1u;
+    result.strideY = v.strideY != 0u ? v.strideY : result.sizeX * result.strideX;
+
+    if (result.sizeX == 0u || result.sizeY == 0u) {
+        result.spanElements = 0u;
+        if (result.offset > physicalElements) {
+            throw std::out_of_range("Empty tensor view offset exceeds physical storage");
+        }
+        return result;
+    }
+    const NnSize max = std::numeric_limits<NnSize>::max();
+    if ((result.sizeY - 1u) > (max - result.offset) / result.strideY) {
+        throw std::overflow_error("Tensor view Y extent overflows");
+    }
+    NnSize last = result.offset + (result.sizeY - 1u) * result.strideY;
+    if ((result.sizeX - 1u) > (max - last) / result.strideX) {
+        throw std::overflow_error("Tensor view X extent overflows");
+    }
+    last += (result.sizeX - 1u) * result.strideX;
+    result.spanElements = last - result.offset + 1u;
+    if (last >= physicalElements) {
+        throw std::out_of_range("Tensor view exceeds physical storage");
+    }
+    return result;
 }
 
 void releaseNetConfig(NnNetConfig *netConfig) {

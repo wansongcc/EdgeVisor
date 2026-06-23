@@ -1,4 +1,5 @@
 #include "nn-cpu-ops.cpp"
+#include "nn-test-utils.hpp"
 #include <vector>
 
 // framework
@@ -9,23 +10,11 @@ void printPassed(const char *name) {
 }
 
 void rand(float *o, const NnUint n, const NnUint seed) {
-    srand(seed + 123456);
-    for (NnUint i = 0; i < n; i++) {
-        float v = (float)(rand() / RAND_MAX);
-        o[i] = v * 2.0f - 1.0f;
-    }
+    nn_test::fillRandom(o, n, seed + 123456u);
 }
 
 void compare_F32(const char *name, const float *a, const float *b, const NnUint n, const float epsilon) {
-    for (NnUint i = 0; i < n; i++) {
-        float error = fabs(a[i] - b[i]);
-        if (error > epsilon) {
-            printf("❌ %s failed\n", name);
-            for (NnUint j = i; j < i + 16 && j < n; j++)
-                printf("   [%3d] %f != %f\n", j, a[j], b[j]);
-            exit(1);
-        }
-    }
+    nn_test::requireClose(name, a, b, n, epsilon);
     printPassed(name);
 }
 

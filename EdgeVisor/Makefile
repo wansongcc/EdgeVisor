@@ -79,10 +79,14 @@ nn-cpu-ops.o: src/nn/nn-cpu-ops.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-cpu.o: src/nn/nn-cpu.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-nn-cpu-test: src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o ablation.o
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
-nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o plan-command.o ablation.o
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-test-runtime-stubs.o: src/nn/nn-test-runtime-stubs.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+nn-cpu-test: src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
+nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
+nn-slice-test: src/nn/nn-slice-test.cpp nn-quants.o nn-core.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-slice-test.cpp nn-quants.o nn-core.o -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -94,8 +98,8 @@ DEPS += $(VULKAN_SHADER_BINS)
 
 %.spv: %.comp
 	$(CGLSLC) -c $< -o $@ --target-env=vulkan1.2
-nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o nn-vulkan.o ablation.o ${DEPS}
-	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
+nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o ${DEPS}
+	$(CXX) $(CXXFLAGS) src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
 endif
 
 # llm

@@ -1635,279 +1635,43 @@ NnCpuDeviceSegment::~NnCpuDeviceSegment() {
 }
 
 std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerConfig *pointerConfig) {
-    NnByte *source;
-    NnSize3D *sourceSize;
-
-    switch (pointerConfig->source) {
-    case SRC_BUFFER:
-        source = buffers[pointerConfig->pointerIndex];
-        sourceSize = &nodeConfig->buffers[pointerConfig->pointerIndex].size;
-        break;
-    case SRC_PIPE:
-        source = netExecution->pipes[pointerConfig->pointerIndex];
-        sourceSize = &netConfig->pipes[pointerConfig->pointerIndex].size;
-        break;
-    default:
-        throw std::invalid_argument("Unsupported pointer type");
+    if (pntrSize == nullptr || pointerConfig == nullptr) {
+        throw std::invalid_argument("resolvePointer requires non-null output and config");
     }
 
-    switch (pointerConfig->type) {
-    case PNTR_RAW: {
-        *pntrSize = size1D(sourceSize->floatType, sourceSize->length);
+    NnByte *source = nullptr;
+    if (pointerConfig->source == SRC_BUFFER) {
+        if (pointerConfig->pointerIndex >= nBuffers) {
+            throw std::out_of_range("Buffer pointer index is out of range");
+        }
+        source = buffers[pointerConfig->pointerIndex];
+    } else if (pointerConfig->source == SRC_PIPE) {
+        if (pointerConfig->pointerIndex >= netConfig->nPipes) {
+            throw std::out_of_range("Pipe pointer index is out of range");
+        }
+        source = netExecution->pipes[pointerConfig->pointerIndex];
+    } else {
+        throw std::invalid_argument("Unsupported pointer source");
+    }
+
+    const NnPointerLayout layout = resolvePointerLayout(
+        netConfig, nodeConfig, partitionPlan, pointerConfig);
+    *pntrSize = layout.logicalSize;
+    if (pointerConfig->type == PNTR_RAW) {
         return std::vector<NnByte *>{source};
     }
-    case PNTR_BATCH:
-    case PNTR_BATCHED_SLICE: {
-        ASSERT_EQ(sourceSize->y, netConfig->nBatches);
-        std::vector<NnByte *> pntr(sourceSize->z * sourceSize->y);
 
-        NnSize batchBytes = getBytes(sourceSize->floatType, sourceSize->x);
-        for (NnUint z = 0u; z < sourceSize->z; z++) {
-            for (NnUint y = 0u; y < sourceSize->y; y++)
-                pntr[z * sourceSize->y + y] = &source[(z * sourceSize->y + y) * batchBytes];
+    std::vector<NnByte *> pointers(
+        layout.physicalSize.z * layout.physicalSize.y);
+    for (NnUint z = 0u; z < layout.physicalSize.z; ++z) {
+        for (NnUint y = 0u; y < layout.physicalSize.y; ++y) {
+            pointers[z * layout.physicalSize.y + y] =
+                source + z * layout.zStrideBytes +
+                y * layout.batchStrideBytes +
+                layout.byteOffset;
         }
-        *pntrSize = *sourceSize;
-
-        if (pointerConfig->type == PNTR_BATCHED_SLICE) {
-            // ====================================================
-            // [重写] 智能非均匀切分逻辑
-            // ====================================================
-            NnUint myOffset = 0;
-            NnUint myLength = 0;
-            bool splitFound = false;
-            bool stackedByNode = (pointerConfig->sliceTag == NN_SLICE_STACKED_BY_NODE);
-
-            const char* matchedName = nullptr;
-            NnUint matchedSplitTotal = 0u;
-            NnUint matchedMultiplier = 0u;
-
-#if DLLAMA_DEBUG_ATTN
-            // Debug: trace how slice offsets/lengths are computed.
-            static std::atomic<NnUint> resolvePrinted{0u};
-            const bool rpDbg = debugResolvePointerEnabled() && debugResolvePointerPassesFilter(pointerConfig->source, pointerConfig->pointerIndex, pointerConfig->type, pointerConfig->sliceTag);
-            const NnUint rpLimit = debugResolvePointerLimit();
-            const NnUint rpIdx = rpDbg ? resolvePrinted.fetch_add(1u) : 0u;
-            const bool rpAllow = rpDbg && (rpLimit == 0u || rpIdx < rpLimit);
-            const NnStageConfig* dbgStage = nullptr;
-            NnUint dbgRank = 0u;
-            NnUint dbgStageNodes = 0u;
-            if (rpAllow) {
-                if (partitionPlan != nullptr && partitionPlan->nStages > 0) {
-                    dbgStage = findStageForNode(partitionPlan, nodeConfig->nodeIndex);
-                    if (dbgStage != nullptr) {
-                        dbgStageNodes = dbgStage->nNodes;
-                        dbgRank = findStageRank(dbgStage, nodeConfig->nodeIndex);
-                    }
-                }
-                printf("🧭 [resolve][begin] src=%s idx=%u type=BATCHED_SLICE tag=%s totalX=%u floatType=%u stageNodes=%u rank=%u\n",
-                    (pointerConfig->source == SRC_BUFFER ? "BUFFER" : "PIPE"),
-                    (unsigned)pointerConfig->pointerIndex,
-                    sliceTagToString(pointerConfig->sliceTag),
-                    (unsigned)sourceSize->x,
-                    (unsigned)sourceSize->floatType,
-                    (unsigned)dbgStageNodes,
-                    (unsigned)dbgRank);
-            }
-#endif
-
-            // 1. 尝试查阅 Partition Plan 来获取精确的非均匀 Offset/Length
-            if (partitionPlan != nullptr && netConfig->nNodes == partitionPlan->nNodes) {
-                NnUint totalDim = sourceSize->x; // 管道的总维度
-                NnUint nodeIdx = nodeConfig->nodeIndex;
-                const NnStageConfig* myStage = (partitionPlan->nStages > 0) ? findStageForNode(partitionPlan, nodeIdx) : nullptr;
-
-                // If tag explicitly says stacked-by-node, do not attempt split matching.
-                // Otherwise, keep legacy stacked-by-node detection for backward compatibility.
-                // IMPORTANT: this heuristic is only valid for PIPES (e.g. ZQ = dim * nNodes).
-                // Applying it to BUFFERS would misclassify full Q/K/V buffers as stacked-by-node
-                // and force a uniform fallback slice (e.g. off=1024), breaking head-based slicing.
-                if (!stackedByNode && pointerConfig->source == SRC_PIPE) {
-                    // ----------------------------------------------------
-                    // [PP Fix] ZQ 等“按 node 堆叠”的 pipe：总维度 == dim * nNodes
-                    // 这种 pipe 的每个 node slice 应该是固定长度 dim，且按【全局 nodeIndex】排布。
-                    // 不能用 dim/head split 进行匹配，否则会把 offset 解释成 interleaved 布局，导致跨 stage 污染。
-                    // ----------------------------------------------------
-                    if (partitionPlan->nStages > 0 && myStage != nullptr) {
-                        NnUint dimTotal = getSplitTotalForStage(&partitionPlan->dimSplit, myStage);
-                        if (dimTotal > 0 && totalDim == dimTotal * netConfig->nNodes) {
-                            stackedByNode = true;
-                        }
-                    }
-                }
-                
-                // Lambda: 检查给定的 split 是否匹配当前维度
-                auto tryApplySplit = [&](const NnDimSplit& split, bool allowMultiplier, const char* name) -> bool {
-                    (void)name;
-                    if (stackedByNode) {
-                        // 对于 stacked-by-node 的 pipe，不允许用任何 split 匹配。
-                        return false;
-                    }
-                    // In PP mode, split arrays are stage-local but stored in a single [nNodes] table.
-                    // Summing across all nodes would produce (dim * nStages) and fail matching.
-                    // So for PP, compute totals only within my stage.
-                    NnUint splitTotal = (myStage != nullptr) ? getSplitTotalForStage(&split, myStage)
-                                                           : getSplitTotal(&split, partitionPlan->nNodes);
-                    if (splitTotal > 0 && totalDim % splitTotal == 0) {
-                        // 命中！计算倍率 (例如 HeadDim) 并应用
-                        NnUint multiplier = totalDim / splitTotal;
-                        
-                        // [Fix] Prevent aggressive matching for ZQ pipe (dim * nNodes)
-                        // If allowMultiplier is false, we require exact match (multiplier == 1)
-                        if (!allowMultiplier && multiplier != 1) return false;
-
-                        myOffset = split.starts[nodeIdx] * multiplier;
-                        myLength = split.lengths[nodeIdx] * multiplier;
-
-#if DLLAMA_DEBUG_ATTN
-                        if (rpAllow) {
-                            matchedName = name;
-                            matchedSplitTotal = splitTotal;
-                            matchedMultiplier = multiplier;
-                        }
-#endif
-
-                        // Q80 requires block-aligned offsets and lengths.
-                        // If we can't satisfy alignment, reject this split match.
-                        if (sourceSize->floatType == F_Q80) {
-                            if ((myOffset % Q80_BLOCK_SIZE) != 0 || (myLength % Q80_BLOCK_SIZE) != 0) {
-                                return false;
-                            }
-                        }
-
-                        return true;
-                    }
-                    return false;
-                };
-
-                // If sliceTag is explicitly set, use it deterministically.
-                // Otherwise, fall back to legacy heuristic matching (Vocab > FFN > Dim > Heads).
-                if (!splitFound && pointerConfig->sliceTag != NN_SLICE_AUTO) {
-                    switch (pointerConfig->sliceTag) {
-                        case NN_SLICE_VOCAB:
-                            splitFound = tryApplySplit(partitionPlan->vocabSplit, false, "vocab");
-                            break;
-                        case NN_SLICE_FFN:
-                            splitFound = tryApplySplit(partitionPlan->ffnSplit, false, "ffn");
-                            break;
-                        case NN_SLICE_DIM:
-                            splitFound = tryApplySplit(partitionPlan->dimSplit, false, "dim");
-                            break;
-                        case NN_SLICE_HEAD:
-                            // Heads have headDim multiplier; explicit tag means the caller knows this buffer is head-sliced.
-                            splitFound = tryApplySplit(partitionPlan->headSplit, true, "head");
-                            break;
-                        case NN_SLICE_KV_HEAD:
-                            splitFound = tryApplySplit(partitionPlan->kvHeadSplit, true, "kvhead");
-                            break;
-                        case NN_SLICE_STACKED_BY_NODE:
-                            // handled by stackedByNode flag
-                            break;
-                        case NN_SLICE_AUTO:
-                        default:
-                            break;
-                    }
-                }
-
-                // Legacy heuristic matching (kept for backward compatibility).
-                if (!splitFound && pointerConfig->sliceTag == NN_SLICE_AUTO) {
-                    // Vocab, FFN, Dim should match exactly (multiplier 1) to avoid matching concatenated pipes like ZQ
-                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->vocabSplit, false, "vocab");
-                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->ffnSplit, false, "ffn");
-                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->dimSplit, false, "dim");
-                    // Heads have headDim multiplier; but for Q80 activation pipes (e.g., ZQ) avoid head split to prevent misaligned offsets
-                    if (sourceSize->floatType != F_Q80) {
-                        if (!splitFound) splitFound = tryApplySplit(partitionPlan->headSplit, true, "head");
-                        if (!splitFound) splitFound = tryApplySplit(partitionPlan->kvHeadSplit, true, "kvhead");
-                    }
-                }
-            }
-
-            // 2. 如果没有 Plan 或没找到匹配，回退到 Legacy 均匀切分
-            if (!splitFound) {
-                // In PP mode:
-                // - If pipe is stacked-by-node (e.g., ZQ = dim * nNodes), use global node slots.
-                // - Otherwise, fall back to uniform split within my stage.
-                const NnStageConfig* myStage = (partitionPlan && partitionPlan->nStages > 0)
-                    ? findStageForNode(partitionPlan, nodeConfig->nodeIndex)
-                    : nullptr;
-
-                if (stackedByNode) {
-                    myLength = sourceSize->x / netConfig->nNodes;
-                    myOffset = myLength * nodeConfig->nodeIndex;
-                } else {
-                    NnUint nSplitNodes = (myStage != nullptr) ? myStage->nNodes : netConfig->nNodes;
-                    NnUint rank = (myStage != nullptr) ? findStageRank(myStage, nodeConfig->nodeIndex) : nodeConfig->nodeIndex;
-
-                    myLength = sourceSize->x / nSplitNodes;
-                    myOffset = myLength * rank;
-                }
-
-#if DLLAMA_DEBUG_ATTN
-                if (rpAllow) {
-                    printf("🧭 [resolve][fallback] src=%s idx=%u tag=%s stackedByNode=%u nSplitNodes=%u rank=%u off=%u len=%u\n",
-                        (pointerConfig->source == SRC_BUFFER ? "BUFFER" : "PIPE"),
-                        (unsigned)pointerConfig->pointerIndex,
-                        sliceTagToString(pointerConfig->sliceTag),
-                        stackedByNode ? 1u : 0u,
-                        (unsigned)((partitionPlan && partitionPlan->nStages > 0 && dbgStage != nullptr) ? dbgStage->nNodes : netConfig->nNodes),
-                        (unsigned)((partitionPlan && partitionPlan->nStages > 0 && dbgStage != nullptr) ? dbgRank : nodeConfig->nodeIndex),
-                        (unsigned)myOffset,
-                        (unsigned)myLength);
-                }
-#endif
-            }
-
-            // 3. 应用偏移量 (带越界保护)
-              // For Q80, getBytes(F_Q80, n) requires n to be block-aligned.
-              // tryApplySplit() enforces alignment for explicit matches; legacy fallback must also be aligned.
-
-            NnSize offsetBytes = getBytes(sourceSize->floatType, myOffset);
-            NnSize totalBytes = getBytes(sourceSize->floatType, sourceSize->x);
-            
-            if (offsetBytes >= totalBytes) {
-                offsetBytes = 0;
-                myLength = 0;
-            }
-
-            for (NnUint z = 0u; z < sourceSize->z; z++) {
-                for (NnUint y = 0u; y < sourceSize->y; y++)
-                    pntr[z * sourceSize->y + y] += offsetBytes; // [Fix] Use += on NnByte* directly
-            }
-            
-            // 更新 size 为实际计算出的 length
-            *pntrSize = size3D(sourceSize->floatType, sourceSize->z, sourceSize->y, myLength);
-
-#if DLLAMA_DEBUG_ATTN
-            if (rpAllow) {
-                const void *base0 = (const void *)&source[0];
-                const void *ret0 = (const void *)pntr[0];
-                printf("🧭 [resolve][done] src=%s idx=%u tag=%s splitFound=%u match=%s splitTotal=%u mult=%u off=%u len=%u base=%p ret=%p deltaB=%zu\n",
-                    (pointerConfig->source == SRC_BUFFER ? "BUFFER" : "PIPE"),
-                    (unsigned)pointerConfig->pointerIndex,
-                    sliceTagToString(pointerConfig->sliceTag),
-                    splitFound ? 1u : 0u,
-                    (matchedName ? matchedName : "-"),
-                    (unsigned)matchedSplitTotal,
-                    (unsigned)matchedMultiplier,
-                    (unsigned)myOffset,
-                    (unsigned)myLength,
-                    base0,
-                    ret0,
-                    (size_t)((const NnByte *)ret0 - (const NnByte *)base0));
-            }
-#endif
-
-        }
-
-        if (pointerConfig->type == PNTR_BATCH) {
-            // PNTR_BATCH keeps full per-batch data without applying per-node slicing.
-            return pntr;
-        }
-        return pntr;
     }
-    default:
-        throw std::invalid_argument("Unsupported pointer config");
-    }
+    return pointers;
 }
 
 void NnCpuDeviceSegment::setPartitionPlan(const NnUnevenPartitionPlan *plan) {

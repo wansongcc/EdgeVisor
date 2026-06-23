@@ -451,13 +451,6 @@ static bool isVulkanControlOp(NnOpCode code) {
     return code == OP_PLAN_BARRIER || code == OP_PLAN_APPLY;
 }
 
-static NnUint getSplitTotalVulkan(const NnDimSplit *split, NnUint nNodes) {
-    if (split == nullptr || split->lengths == nullptr) return 0u;
-    NnUint total = 0u;
-    for (NnUint i = 0; i < nNodes; ++i) total += split->lengths[i];
-    return total;
-}
-
 static const NnStageConfig *findStageForNodeVulkan(const NnUnevenPartitionPlan *plan, NnUint nodeIndex) {
     if (plan == nullptr || plan->stages == nullptr) return nullptr;
     for (NnUint s = 0; s < plan->nStages; ++s) {
@@ -467,21 +460,6 @@ static const NnStageConfig *findStageForNodeVulkan(const NnUnevenPartitionPlan *
         }
     }
     return nullptr;
-}
-
-static NnUint findStageRankVulkan(const NnStageConfig *stage, NnUint nodeIndex) {
-    if (stage == nullptr) return nodeIndex;
-    for (NnUint i = 0; i < stage->nNodes; ++i) {
-        if (stage->nodeIndices[i] == nodeIndex) return i;
-    }
-    return nodeIndex;
-}
-
-static NnUint getSplitTotalForStageVulkan(const NnDimSplit *split, const NnStageConfig *stage) {
-    if (split == nullptr || split->lengths == nullptr || stage == nullptr) return 0u;
-    NnUint total = 0u;
-    for (NnUint i = 0; i < stage->nNodes; ++i) total += split->lengths[stage->nodeIndices[i]];
-    return total;
 }
 
 static bool hasHeadDeltaForStageVulkan(const std::vector<int> &deltaHeadOrKv, const NnStageConfig *stage) {
@@ -544,108 +522,6 @@ static bool validateKvShadowCoverageVulkan(
         newStart = newEnd;
     }
     setReason("");
-    return true;
-}
-
-static bool resolveUnevenSliceVulkan(
-    NnNetConfig *netConfig,
-    NnNodeConfig *nodeConfig,
-    NnPointerConfig *pointerConfig,
-    const NnSize3D &sourceSize,
-    NnUint *outOffset,
-    NnUint *outLength
-) {
-    if (outOffset == nullptr || outLength == nullptr) return false;
-    if (pointerConfig->type != PNTR_BATCHED_SLICE) return false;
-
-    const NnUnevenPartitionPlan *plan = (nodeConfig != nullptr) ? nodeConfig->partitionPlan : nullptr;
-    const NnUint nodeIdx = (nodeConfig != nullptr) ? nodeConfig->nodeIndex : 0u;
-    bool stackedByNode = (pointerConfig->sliceTag == NN_SLICE_STACKED_BY_NODE);
-    bool splitFound = false;
-    NnUint myOffset = 0u;
-    NnUint myLength = 0u;
-
-    const NnStageConfig *myStage = (plan != nullptr && plan->nStages > 0u)
-        ? findStageForNodeVulkan(plan, nodeIdx)
-        : nullptr;
-
-    if (plan != nullptr && netConfig != nullptr && netConfig->nNodes == plan->nNodes) {
-        const NnUint totalDim = sourceSize.x;
-
-        if (!stackedByNode && pointerConfig->source == SRC_PIPE && myStage != nullptr) {
-            const NnUint dimTotal = getSplitTotalForStageVulkan(&plan->dimSplit, myStage);
-            if (dimTotal > 0u && totalDim == dimTotal * netConfig->nNodes) {
-                stackedByNode = true;
-            }
-        }
-
-        auto tryApplySplit = [&](const NnDimSplit &split, bool allowMultiplier) -> bool {
-            if (stackedByNode || split.starts == nullptr || split.lengths == nullptr) return false;
-            const NnUint splitTotal = (myStage != nullptr)
-                ? getSplitTotalForStageVulkan(&split, myStage)
-                : getSplitTotalVulkan(&split, plan->nNodes);
-            if (splitTotal == 0u || totalDim % splitTotal != 0u) return false;
-            const NnUint multiplier = totalDim / splitTotal;
-            if (!allowMultiplier && multiplier != 1u) return false;
-            myOffset = split.starts[nodeIdx] * multiplier;
-            myLength = split.lengths[nodeIdx] * multiplier;
-            if (sourceSize.floatType == F_Q80) {
-                if ((myOffset % Q80_BLOCK_SIZE) != 0u || (myLength % Q80_BLOCK_SIZE) != 0u) {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        if (pointerConfig->sliceTag != NN_SLICE_AUTO) {
-            switch (pointerConfig->sliceTag) {
-                case NN_SLICE_VOCAB:
-                    splitFound = tryApplySplit(plan->vocabSplit, false);
-                    break;
-                case NN_SLICE_FFN:
-                    splitFound = tryApplySplit(plan->ffnSplit, false);
-                    break;
-                case NN_SLICE_DIM:
-                    splitFound = tryApplySplit(plan->dimSplit, false);
-                    break;
-                case NN_SLICE_HEAD:
-                    splitFound = tryApplySplit(plan->headSplit, true);
-                    break;
-                case NN_SLICE_KV_HEAD:
-                    splitFound = tryApplySplit(plan->kvHeadSplit, true);
-                    break;
-                case NN_SLICE_STACKED_BY_NODE:
-                case NN_SLICE_AUTO:
-                default:
-                    break;
-            }
-        } else {
-            splitFound = tryApplySplit(plan->vocabSplit, false);
-            if (!splitFound) splitFound = tryApplySplit(plan->ffnSplit, false);
-            if (!splitFound) splitFound = tryApplySplit(plan->dimSplit, false);
-            if (!splitFound && sourceSize.floatType != F_Q80) splitFound = tryApplySplit(plan->headSplit, true);
-            if (!splitFound && sourceSize.floatType != F_Q80) splitFound = tryApplySplit(plan->kvHeadSplit, true);
-        }
-    }
-
-    if (!splitFound) {
-        if (stackedByNode && netConfig != nullptr && netConfig->nNodes != 0u) {
-            myLength = sourceSize.x / netConfig->nNodes;
-            myOffset = myLength * nodeIdx;
-        } else {
-            const NnUint nSplitNodes = (myStage != nullptr) ? myStage->nNodes : (netConfig ? netConfig->nNodes : 1u);
-            const NnUint rank = (myStage != nullptr) ? findStageRankVulkan(myStage, nodeIdx) : nodeIdx;
-            myLength = (nSplitNodes != 0u) ? sourceSize.x / nSplitNodes : sourceSize.x;
-            myOffset = myLength * rank;
-        }
-    }
-
-    if (myOffset > sourceSize.x) {
-        myOffset = 0u;
-        myLength = 0u;
-    }
-    *outOffset = myOffset;
-    *outLength = myLength;
     return true;
 }
 
@@ -1086,47 +962,28 @@ NnVulkanBuffer *NnVulkanDeviceData::resolvePointerVulkanBuffer(NnPointerConfig *
 
 NnUint NnVulkanDeviceData::resolveBufferBatchOffset(NnPointerConfig *config, NnUint batchIndex, NnUint zIndex) {
     assert(batchIndex < netConfig->nBatches);
-    if (config->type == PNTR_RAW)
-        return 0;
-
-    const NnSize3D bufferSize = resolveBufferSize(config);
-    const NnSize blockSize = getBlockSize(bufferSize.floatType);
-    assert(bufferSize.x % blockSize == 0);
-    const NnUint sizeX = bufferSize.x / blockSize;
-    const NnUint offsetZ = sizeX * netConfig->nBatches * zIndex;
-
-    if (config->type == PNTR_BATCH)
-        return offsetZ + sizeX * batchIndex;
-    if (config->type == PNTR_BATCHED_SLICE) {
-        NnUint logicalOffset = 0u;
-        NnUint logicalLength = bufferSize.x;
-        resolveUnevenSliceVulkan(netConfig, nodeConfig, config, bufferSize, &logicalOffset, &logicalLength);
-        (void)logicalLength;
-        assert((logicalOffset % blockSize) == 0u);
-        return offsetZ + sizeX * batchIndex + (logicalOffset / blockSize);
+    const NnPointerLayout layout = resolvePointerLayout(
+        netConfig, nodeConfig, nodeConfig->partitionPlan, config);
+    if (config->type == PNTR_RAW) return 0u;
+    if (layout.physicalSize.z == 0u) {
+        throw std::invalid_argument("Vulkan pointer has an empty Z dimension");
     }
-    throw std::runtime_error("Cannot determine buffer offset");
+    // Some reduction/broadcast ops build batch metadata using the larger of
+    // input/output Z. A one-plane operand is intentionally reused.
+    const NnUint physicalZ = zIndex % layout.physicalSize.z;
+    const NnSize blockSize = getBlockSize(layout.physicalSize.floatType);
+    const NnSize rowBlocks = layout.physicalSize.x / blockSize;
+    return (NnUint)(
+        rowBlocks * netConfig->nBatches * physicalZ +
+        rowBlocks * batchIndex +
+        layout.logicalOffset / blockSize);
 }
 
 NnUint NnVulkanDeviceData::resolveBufferBatchWidth(NnPointerConfig *config) {
-    const NnSize3D bufferSize = resolveBufferSize(config);
-    const NnSize blockSize = getBlockSize(bufferSize.floatType);
-    assert(bufferSize.x % blockSize == 0);
-    const NnUint sizeX = bufferSize.x / blockSize;
-
-    if (config->type == PNTR_RAW)
-        return sizeX;
-    if (config->type == PNTR_BATCH)
-        return sizeX;
-    if (config->type == PNTR_BATCHED_SLICE) {
-        NnUint logicalOffset = 0u;
-        NnUint logicalLength = bufferSize.x;
-        resolveUnevenSliceVulkan(netConfig, nodeConfig, config, bufferSize, &logicalOffset, &logicalLength);
-        (void)logicalOffset;
-        assert((logicalLength % blockSize) == 0u);
-        return logicalLength / blockSize;
-    }
-    throw std::runtime_error("Cannot determine buffer width");
+    const NnPointerLayout layout = resolvePointerLayout(
+        netConfig, nodeConfig, nodeConfig->partitionPlan, config);
+    const NnSize blockSize = getBlockSize(layout.logicalSize.floatType);
+    return (NnUint)(layout.logicalSize.x / blockSize);
 }
 
 NnVulkanBuffer *NnVulkanDeviceData::resolvePipeByIndex(NnUint pipeIndex) {

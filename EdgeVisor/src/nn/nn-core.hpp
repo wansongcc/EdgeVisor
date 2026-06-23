@@ -338,6 +338,7 @@ enum NnOpCode {
     // CPU-only: plan migration barrier/apply (used for testing online repartition)
     OP_PLAN_BARRIER,
     OP_PLAN_APPLY,
+    OP_COUNT,
 };
 
 enum NnOpQuantType {
@@ -353,7 +354,7 @@ enum NnOpQuantType {
     Q80_F32_F32,
 };
 
-#define N_OP_CODES (OP_SHIFT + 1)
+static const NnUint N_OP_CODES = OP_COUNT;
 #define N_OP_QUANTS (Q80_F32_F32 + 1)
 
 enum NnPointerSource {
@@ -443,6 +444,27 @@ typedef struct {
     NnUint strideY;
     NnUint strideX;
 } NnTensorView;
+
+// Device-independent interpretation of a pointer config. Byte offsets are
+// relative to the beginning of each physical (z, batch) row.
+typedef struct {
+    NnSize3D physicalSize;
+    NnSize3D logicalSize;
+    NnUint logicalOffset;
+    NnSize byteOffset;
+    NnSize batchStrideBytes;
+    NnSize zStrideBytes;
+} NnPointerLayout;
+
+// Fully resolved tensor view. All values remain in elements.
+typedef struct {
+    NnSize offset;
+    NnSize sizeY;
+    NnSize sizeX;
+    NnSize strideY;
+    NnSize strideX;
+    NnSize spanElements;
+} NnTensorViewLayout;
 
 typedef struct {
     NnOpCode code;
@@ -685,6 +707,16 @@ NnPointerConfig pointerBatchedSliceConfig(NnPointerSource source, NnUint index);
 NnPointerConfig pointerBatchedSliceConfigTagged(NnPointerSource source, NnUint index, NnSliceTag sliceTag);
 NnPointerConfig pointerRawConfig(NnPointerSource source, NnUint index);
 bool hasPointerContinuousMemory(NnPointerConfig *config);
+NnPointerLayout resolvePointerLayout(
+    const NnNetConfig *netConfig,
+    const NnNodeConfig *nodeConfig,
+    const NnUnevenPartitionPlan *partitionPlan,
+    const NnPointerConfig *config);
+NnTensorViewLayout resolveTensorView(
+    const NnTensorView *view,
+    NnSize fallbackSizeY,
+    NnSize fallbackSizeX,
+    NnSize physicalElements);
 
 void releaseNetConfig(NnNetConfig *netConfig);
 void releaseNodeConfig(NnNodeConfig *nodeConfig);

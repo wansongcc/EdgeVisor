@@ -1102,11 +1102,24 @@ void NnExecutor::setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled) 
         if (role == SEG_ROLE_SHIFTED_PP_START) {
             segmentEnabled[s].store(enabled ? 1u : 0u, std::memory_order_relaxed);
             shiftedMatched += 1u;
-        } else if (role == SEG_ROLE_PRIMARY && s < segmentKinds.size() && segmentKinds[s] == SEG_KIND_ATTN) {
+        }
+    }
+    if (shiftedMatched > 0u) {
+        for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+            if (s >= segmentRuntimeRoles.size()) continue;
+            const NnSegmentConfig *seg = &nodeConfig->segments[s];
+            int activeLayer = -1;
+            int redundantLayer = -1;
+            inferActiveAndRedundantLayer(seg, &activeLayer, &redundantLayer);
+            if (activeLayer < 0 || (NnUint)activeLayer != layerIndex) continue;
+
+            const NnByte role = segmentRuntimeRoles[s];
+            if (role == SEG_ROLE_PRIMARY && s < segmentKinds.size() && segmentKinds[s] == SEG_KIND_ATTN) {
             // Shifted PP start reads from X pipe; primary attention reads from
             // ZQ. They are mutually exclusive for the same layer.
-            segmentEnabled[s].store(enabled ? 0u : 1u, std::memory_order_relaxed);
-            primaryAttMatched += 1u;
+                segmentEnabled[s].store(enabled ? 0u : 1u, std::memory_order_relaxed);
+                primaryAttMatched += 1u;
+            }
         }
     }
     std::printf("🛂 [layer-gate] node=%u role=shifted-pp-start layer=%u enabled=%u matchedSegs=%u primaryAttToggled=%u\n",

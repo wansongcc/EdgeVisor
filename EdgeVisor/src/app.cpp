@@ -2152,6 +2152,12 @@ bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double 
     for (NnUint i = 0u; i < savedBatchSize; ++i) {
         savedTokens[i] = tokenPipe[i];
     }
+    std::vector<float> savedLogits;
+    if (logitsPipe != nullptr && header->vocabSize > 0u && savedBatchSize > 0u) {
+        savedLogits.assign(
+            logitsPipe,
+            logitsPipe + ((size_t)savedBatchSize * (size_t)header->vocabSize));
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     const NnUint replayBatch = 1u;
@@ -2180,6 +2186,9 @@ bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double 
     for (NnUint i = 0u; i < savedBatchSize; ++i) {
         positionPipe[i] = (float)(savedPosition + i);
         tokenPipe[i] = savedTokens[i];
+    }
+    if (!savedLogits.empty() && logitsPipe != nullptr) {
+        std::memcpy(logitsPipe, savedLogits.data(), savedLogits.size() * sizeof(float));
     }
 
     if (recomputeMs != nullptr) {
@@ -3742,10 +3751,10 @@ void runWorkerApp(AppCliArgs *args) {
                             (unsigned)switchPkt.boundaryLayer);
                         std::fflush(stdout);
                     }
-                    if (localIsSourceStage && planPtr != nullptr) {
+                    if (planPtr != nullptr) {
                         const NnStageConfig *fromStage = findStageForNodeLocal(planPtr.get(), switchPkt.fromNodeIndex);
                         const NnStageConfig *toStage = findStageForNodeLocal(planPtr.get(), switchPkt.toNodeIndex);
-                        if (fromStage != nullptr && toStage != nullptr && toStage->stageIndex < fromStage->stageIndex) {
+                        if (localIsSourceStage && fromStage != nullptr && toStage != nullptr && toStage->stageIndex < fromStage->stageIndex) {
                             const NnUint shiftedStartLayer = switchPkt.boundaryLayer + 1u;
                             if (shiftedStartLayer < fromStage->endLayer) {
                                 executor.setShiftedPpStartLayerEnabled(shiftedStartLayer, true);

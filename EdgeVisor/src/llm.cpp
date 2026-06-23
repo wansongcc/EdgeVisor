@@ -1688,6 +1688,12 @@ static NnNodeConfig buildLlmNodeInternal(
                 w2ExpertSliceSize,
                 w2Cfg);
         } else {
+            if (yBufferIndex != yqBufferIndex) {
+                takeoverFf.addOp(OP_CAST, "block_cast_y3", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    size0(), NnCastOpCodeConfig{});
+            }
             const NnPointerConfig dSlicePtr = fullFfnBuffers
                 ? pointerBatchedSliceConfigTagged(SRC_BUFFER, dBufferIndex, NN_SLICE_FFN)
                 : pointerBatchConfig(SRC_BUFFER, dBufferIndex);
@@ -1706,6 +1712,41 @@ static NnNodeConfig buildLlmNodeInternal(
                 pointerBatchConfig(SRC_BUFFER, yqBufferIndex), lSlicePtr,
                 w3Slice.sliceSize,
                 makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w3Slice.n, w3Slice.inLen, w3Slice.inStart));
+            {
+                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+                const NnUint actDim = w1Slice.inLen;
+                if (testSplit && layerIndex == 0u && actDim >= 2u) {
+                    const NnUint half = actDim / 2u;
+                    takeoverFf.addOp(OP_SILU, "block_act_v0", layerIndex,
+                        dSlicePtr, dSlicePtr,
+                        size0(),
+                        NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
+                    takeoverFf.addOp(OP_SILU, "block_act_v1", layerIndex,
+                        dSlicePtr, dSlicePtr,
+                        size0(),
+                        NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
+                } else {
+                    takeoverFf.addOp(OP_SILU, "block_act", layerIndex,
+                        dSlicePtr, dSlicePtr,
+                        size0(),
+                        NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                }
+            }
+            NnMulOpCodeConfig mulCfg = NnMulOpCodeConfig{lBufferIndex};
+            if (fullFfnBuffers) {
+                const NnUint ffnStart0 = (plan && plan->ffnSplit.starts) ? plan->ffnSplit.starts[nodeIndex] : 0u;
+                const NnUint ffnLen0 = (plan && plan->ffnSplit.lengths) ? plan->ffnSplit.lengths[nodeIndex] : w1Slice.inLen;
+                mulCfg.view = NnTensorView{ffnStart0, 0u, ffnLen0, 0u, 1u};
+            }
+            takeoverFf.addOp(OP_MUL, "block_mul", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                size0(), mulCfg);
+            if (dBufferIndex != dqBufferIndex) {
+                takeoverFf.addOp(OP_CAST, "block_cast_d2", layerIndex,
+                    dSlicePtr, dqSlicePtr,
+                    size0(), NnCastOpCodeConfig{});
+            }
             takeoverFf.addOp(OP_MATMUL, "block_matmul_w2", layerIndex,
                 dqSlicePtr, pointerBatchConfig(SRC_BUFFER, yBufferIndex),
                 w2Slice.sliceSize,
@@ -1735,19 +1776,10 @@ static NnNodeConfig buildLlmNodeInternal(
     for (NnUint i = 0; i < redundantLayers.size(); ++i) {
         const NnUint layerIndex = redundantLayers[i];
         if (layerIndex < startLayer) {
-            const bool hasPrevLeftRedundant =
-                layerIndex > 0u &&
-                std::find(redundantLayers.begin(), redundantLayers.end(), layerIndex - 1u) != redundantLayers.end() &&
-                layerIndex - 1u < startLayer;
-            const bool hasNextLeftRedundant =
-                std::find(redundantLayers.begin(), redundantLayers.end(), layerIndex + 1u) != redundantLayers.end() &&
-                layerIndex + 1u < startLayer;
-            // Consecutive left-boundary takeover layers form a local chain:
-            // only the first reads PP X, internal layers consume ZQ like normal
-            // intra-stage layers, and only the last writes X for the original
-            // stage-start layer. This avoids an extra PP-pipe quantization hop
-            // between takeover layers.
-            addRedundantWeightHolderForLayer(layerIndex, !hasPrevLeftRedundant, !hasNextLeftRedundant);
+            // Runtime migration may enable any suffix of the built redundant
+            // boundary set. Keep each takeover layer self-contained through
+            // X so both single-layer and consecutive-layer takeover work.
+            addRedundantWeightHolderForLayer(layerIndex, true, true);
             printf("⚠️ [seg-build] Adding redundant weight holder for layer %u before startLayer %u\n", layerIndex, startLayer);
         }
     }

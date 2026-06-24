@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <fstream>
 #include <sstream>
+#include <chrono>
 
 static void computeLogitsStats(const float* logits, NnUint vocabSize,
                               bool &hasNaN, bool &hasInf,
@@ -703,6 +704,9 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     context->tokenizer->resetDecoder();
 
     const NnUint maxPos = std::min(context->header->seqLen, steps);
+    // Root-side wall-clock prediction time includes the full prediction loop:
+    // forward(), worker/profile waits, sampling/decoding, and token output/flush.
+    const auto predWallStart = std::chrono::steady_clock::now();
     for (; pos < maxPos; pos++) {
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
@@ -909,11 +913,13 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             break;
         }
     }
+    const auto predWallEnd = std::chrono::steady_clock::now();
 
     NnUint nEvalTokens = nInputTokens - 1;
     NnUint nPredTokens = pos - nEvalTokens;
     float evalTotalTimeMs = evalTotalTime / 1000.0;
     float predTotalTimeMs = predTotalTime / 1000.0;
+    const double predWallTimeMs = std::chrono::duration<double, std::milli>(predWallEnd - predWallStart).count();
     printf("\n");
     printf("Evaluation\n");
     printf("   nBatches: %d\n", context->args->nBatches);
@@ -923,9 +929,22 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         evalTotalTimeMs / ((float) nEvalTokens));
     printf("Prediction\n");
     printf("    nTokens: %d\n", nPredTokens);
-    printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
-        (nPredTokens * 1000) / predTotalTimeMs,
-        predTotalTimeMs / ((float) nPredTokens));
+    if (nPredTokens > 0 && predTotalTimeMs > 0.0f) {
+        printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
+            (nPredTokens * 1000) / predTotalTimeMs,
+            predTotalTimeMs / ((float) nPredTokens));
+    } else {
+        printf("   tokens/s: n/a\n");
+    }
+    printf("Prediction (root wall-clock)\n");
+    printf("    nTokens: %d\n", nPredTokens);
+    if (nPredTokens > 0 && predWallTimeMs > 0.0) {
+        printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
+            ((double)nPredTokens * 1000.0) / predWallTimeMs,
+            predWallTimeMs / (double)nPredTokens);
+    } else {
+        printf("   tokens/s: n/a\n");
+    }
 
     if (context->args->benchmark && !perfAgg.empty()) {
         printf("\n");

@@ -18,11 +18,20 @@
 
 class AppCliArgs {
 public:
+    enum Backend {
+        BACKEND_AUTO,
+        BACKEND_CPU,
+        BACKEND_VULKAN,
+        BACKEND_CUDA,
+    };
+
     char *mode;
     NnUint nThreads;
     NnUint nBatches;
     bool info;
     bool help;
+    Backend backend;
+    char *backendStr;
 
     // inference
     char *modelPath;
@@ -73,6 +82,7 @@ public:
     NnUint port;
 
     static AppCliArgs parse(int argc, char **argv, bool hasMode);
+    static const char *backendToString(Backend backend);
     ~AppCliArgs();
 
 };

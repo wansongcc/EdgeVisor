@@ -1,5 +1,8 @@
 CXX = g++
 CXXFLAGS = -std=c++11 -Werror -Wformat -Werror=format-security -Isrc
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+CUDA_ARCHS ?= 75
 
 # Auto-generate header dependencies for correct incremental builds.
 # Without this, changing headers can silently produce ABI mismatches (e.g., sizeof changes)
@@ -43,6 +46,14 @@ else
 endif
 
 	DEPS += nn-vulkan.o
+endif
+
+ifdef DLLAMA_CUDA
+	CXXFLAGS += -DDLLAMA_CUDA -I$(CUDA_HOME)/include
+	LIBS += -L$(CUDA_HOME)/lib64 -lcudart
+	NVCCFLAGS += -std=c++11 -Isrc -DDLLAMA_CUDA
+	NVCCFLAGS += $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch))
+	DEPS += nn-cuda.o
 endif
 
 ifeq ($(TOPK), 1)
@@ -89,6 +100,8 @@ nn-slice-test: src/nn/nn-slice-test.cpp nn-quants.o nn-core.o
 	$(CXX) $(CXXFLAGS) src/nn/nn-slice-test.cpp nn-quants.o nn-core.o -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+nn-cuda.o: src/nn/nn-cuda.cu
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 
 ifdef DLLAMA_VULKAN
@@ -100,6 +113,11 @@ DEPS += $(VULKAN_SHADER_BINS)
 	$(CGLSLC) -c $< -o $@ --target-env=vulkan1.2
 nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o ${DEPS}
 	$(CXX) $(CXXFLAGS) src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
+endif
+
+ifdef DLLAMA_CUDA
+nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o -o $@ $(LIBS)
 endif
 
 # llm

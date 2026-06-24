@@ -589,6 +589,7 @@ static void server(AppInferenceContext *context) {
 void usage() {
     fprintf(stderr, "Usage: %s {--model <path>} {--tokenizer <path>} [--port <p>]\n", EXECUTABLE_NAME);
     fprintf(stderr, "        [--buffer-float-type {f32|f16|q40|q80}]\n");
+    fprintf(stderr, "        [--backend {cpu|vulkan|cuda}] [--gpu-index <index>]\n");
     fprintf(stderr, "        [--weights-float-type {f32|f16|q40|q80}]\n");
     fprintf(stderr, "        [--max-seq-len <max>]\n");
     fprintf(stderr, "        [--nthreads <n>]\n");

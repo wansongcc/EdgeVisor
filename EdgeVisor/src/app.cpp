@@ -19,6 +19,9 @@
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
 #endif
+#if defined(DLLAMA_CUDA)
+    #include "nn/nn-cuda.hpp"
+#endif
 
 // 引入 LLM 头文件以获取 createPartitionPlan 等定义
 #include "llm.hpp"
@@ -321,10 +324,29 @@ static ChatTemplateType parseChatTemplateType(char *val) {
     throw std::runtime_error("Invalid chat template type: " + std::string(val));
 }
 
+static AppCliArgs::Backend parseBackendType(char *val) {
+    if (std::strcmp(val, "cpu") == 0) return AppCliArgs::BACKEND_CPU;
+    if (std::strcmp(val, "vulkan") == 0) return AppCliArgs::BACKEND_VULKAN;
+    if (std::strcmp(val, "cuda") == 0) return AppCliArgs::BACKEND_CUDA;
+    throw std::runtime_error("Invalid backend: " + std::string(val) + " (expected cpu, vulkan, or cuda)");
+}
+
+const char *AppCliArgs::backendToString(AppCliArgs::Backend backend) {
+    switch (backend) {
+        case BACKEND_AUTO: return "auto";
+        case BACKEND_CPU: return "cpu";
+        case BACKEND_VULKAN: return "vulkan";
+        case BACKEND_CUDA: return "cuda";
+        default: return "unknown";
+    }
+}
+
 AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     AppCliArgs args;
     args.info = true;
     args.help = false;
+    args.backend = BACKEND_AUTO;
+    args.backendStr = nullptr;
     args.mode = nullptr;
     args.nBatches = 32;
     args.nThreads = 1;
@@ -592,6 +614,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.prompt = value;
         } else if (std::strcmp(name, "--buffer-float-type") == 0) {
             args.syncType = parseFloatType(value);
+        } else if (std::strcmp(name, "--backend") == 0) {
+            args.backend = parseBackendType(value);
+            args.backendStr = value;
         } else if (std::strcmp(name, "--ratios") == 0) {
             args.ratiosStr = value;
         } else if (std::strcmp(name, "--kv-redundancy") == 0) {
@@ -653,6 +678,27 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
     if (args.nThreads < 1)
         throw std::runtime_error("Number of threads must be at least 1");
+    if (args.backend == BACKEND_CPU && args.gpuIndex >= 0) {
+        throw std::runtime_error("--backend cpu conflicts with --gpu-index; remove --gpu-index or choose --backend vulkan/cuda");
+    }
+    if (args.backend == BACKEND_CPU && (args.gpuSegmentFrom >= 0 || args.gpuSegmentTo >= 0)) {
+        throw std::runtime_error("--backend cpu conflicts with --gpu-segments; CPU mode cannot own GPU segments");
+    }
+    if (args.backend == BACKEND_AUTO) {
+        args.backend = (args.gpuIndex >= 0) ? BACKEND_VULKAN : BACKEND_CPU;
+    } else if ((args.backend == BACKEND_VULKAN || args.backend == BACKEND_CUDA) && args.gpuIndex < 0) {
+        args.gpuIndex = 0;
+    }
+#if !defined(DLLAMA_VULKAN)
+    if (args.backend == BACKEND_VULKAN) {
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+    }
+#endif
+#if !defined(DLLAMA_CUDA)
+    if (args.backend == BACKEND_CUDA) {
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+    }
+#endif
     if (args.enablePpMigration && !args.enableKvAggregate) {
         args.enableKvAggregate = true;
         std::printf("⚠️  [pp-migrate] --enable-pp-migration requires KV aggregate; auto enabling --enable-kv-aggregate\n");
@@ -1057,7 +1103,12 @@ void printPartitionPlanDebug(const NnUnevenPartitionPlan* plan) {
 static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr) {
     std::vector<NnExecutorDevice> devices;
 
-    if (args->gpuIndex >= 0) {
+    if (args->backend == AppCliArgs::BACKEND_CPU) {
+        devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan), -1, -1));
+        return devices;
+    }
+
+    if (args->backend == AppCliArgs::BACKEND_VULKAN) {
 #if defined(DLLAMA_VULKAN)
         devices.push_back(NnExecutorDevice(
             new NnVulkanDevice(args->gpuIndex, netConfig, nodeConfig, netExecution, plan),
@@ -1065,11 +1116,23 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
             args->gpuSegmentTo
         ));
 #else
-        throw std::runtime_error("This build does not support GPU");
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
 #endif
+    } else if (args->backend == AppCliArgs::BACKEND_CUDA) {
+#if defined(DLLAMA_CUDA)
+        devices.push_back(NnExecutorDevice(
+            new NnCudaDevice(args->gpuIndex, netConfig, nodeConfig, netExecution, plan),
+            args->gpuSegmentFrom,
+            args->gpuSegmentTo
+        ));
+#else
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+#endif
+    } else {
+        throw std::runtime_error("Internal error: unresolved backend " + std::string(AppCliArgs::backendToString(args->backend)));
     }
 
-    if (args->gpuIndex < 0 || (args->gpuSegmentFrom >= 0 && args->gpuSegmentTo >= 0)) {
+    if (args->gpuSegmentFrom >= 0 && args->gpuSegmentTo >= 0) {
         devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan), -1, -1));
     }
     return devices;

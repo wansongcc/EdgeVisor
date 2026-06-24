@@ -13,6 +13,9 @@
 #if defined(DLLAMA_VULKAN)
     #include "nn/nn-vulkan.hpp"
 #endif
+#if defined(DLLAMA_CUDA)
+    #include "nn/nn-cuda.hpp"
+#endif
 
 // --- 辅助函数 ---
 
@@ -29,6 +32,23 @@ static ChatTemplateType parseChatTemplateType(char *val) {
     if (std::strcmp(val, "llama3") == 0) return TEMPLATE_LLAMA3;
     if (std::strcmp(val, "deepSeek3") == 0) return TEMPLATE_DEEP_SEEK3;
     throw std::runtime_error("Invalid chat template type: " + std::string(val));
+}
+
+static AppCliArgs::Backend parseBackendType(char *val) {
+    if (std::strcmp(val, "cpu") == 0) return AppCliArgs::BACKEND_CPU;
+    if (std::strcmp(val, "vulkan") == 0) return AppCliArgs::BACKEND_VULKAN;
+    if (std::strcmp(val, "cuda") == 0) return AppCliArgs::BACKEND_CUDA;
+    throw std::runtime_error("Invalid backend: " + std::string(val));
+}
+
+const char *AppCliArgs::backendToString(AppCliArgs::Backend backend) {
+    switch (backend) {
+        case BACKEND_AUTO: return "auto";
+        case BACKEND_CPU: return "cpu";
+        case BACKEND_VULKAN: return "vulkan";
+        case BACKEND_CUDA: return "cuda";
+        default: return "unknown";
+    }
 }
 
 // [新增] 解析逗号分隔的比例字符串
@@ -62,6 +82,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     AppCliArgs args;
     args.info = true;
     args.help = false;
+    args.backend = BACKEND_AUTO;
+    args.backendStr = nullptr;
     args.mode = nullptr;
     args.nBatches = 32;
     args.nThreads = 1;
@@ -109,6 +131,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.prompt = value;
         } else if (std::strcmp(name, "--buffer-float-type") == 0) {
             args.syncType = parseFloatType(value);
+        } else if (std::strcmp(name, "--backend") == 0) {
+            args.backend = parseBackendType(value);
+            args.backendStr = value;
         } else if (std::strcmp(name, "--workers") == 0) {
             int j = i + 1;
             for (; j < argc && argv[j][0] != '-'; j++);
@@ -167,6 +192,20 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
     if (args.nThreads < 1)
         throw std::runtime_error("Number of threads must be at least 1");
+    if (args.backend == BACKEND_CPU && args.gpuIndex >= 0)
+        throw std::runtime_error("--backend cpu conflicts with --gpu-index");
+    if (args.backend == BACKEND_AUTO)
+        args.backend = (args.gpuIndex >= 0) ? BACKEND_VULKAN : BACKEND_CPU;
+    else if ((args.backend == BACKEND_VULKAN || args.backend == BACKEND_CUDA) && args.gpuIndex < 0)
+        args.gpuIndex = 0;
+#if !defined(DLLAMA_VULKAN)
+    if (args.backend == BACKEND_VULKAN)
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+#endif
+#if !defined(DLLAMA_CUDA)
+    if (args.backend == BACKEND_CUDA)
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+#endif
     return args;
 }
 
@@ -185,7 +224,12 @@ AppCliArgs::~AppCliArgs() {
 static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr) {
     std::vector<NnExecutorDevice> devices;
 
-    if (args->gpuIndex >= 0) {
+    if (args->backend == AppCliArgs::BACKEND_CPU) {
+        devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan), -1, -1));
+        return devices;
+    }
+
+    if (args->backend == AppCliArgs::BACKEND_VULKAN) {
 #if defined(DLLAMA_VULKAN)
         devices.push_back(NnExecutorDevice(
             new NnVulkanDevice(args->gpuIndex, netConfig, nodeConfig, netExecution),
@@ -193,11 +237,23 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
             args->gpuSegmentTo
         ));
 #else
-        throw std::runtime_error("This build does not support GPU");
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
 #endif
+    } else if (args->backend == AppCliArgs::BACKEND_CUDA) {
+#if defined(DLLAMA_CUDA)
+        devices.push_back(NnExecutorDevice(
+            new NnCudaDevice(args->gpuIndex, netConfig, nodeConfig, netExecution, plan),
+            args->gpuSegmentFrom,
+            args->gpuSegmentTo
+        ));
+#else
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+#endif
+    } else {
+        throw std::runtime_error("Internal error: unresolved backend " + std::string(AppCliArgs::backendToString(args->backend)));
     }
 
-    if (args->gpuIndex < 0 || (args->gpuSegmentFrom >= 0 && args->gpuSegmentTo >= 0)) {
+    if (args->gpuSegmentFrom >= 0 && args->gpuSegmentTo >= 0) {
         // 传入 plan 以支持非均匀切分时的稳定性检查和指针计算
         devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan), -1, -1));
     }

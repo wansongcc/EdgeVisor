@@ -276,6 +276,31 @@ __global__ static void mergeAddF32Kernel(
     out[x] = v;
 }
 
+__global__ static void mergeAddQ80F32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    NnUint nSlices,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * output.logicalSize.x;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint x = (NnUint)(tid % output.logicalSize.x);
+    const NnUint y = (NnUint)(tid / output.logicalSize.x);
+    const NnUint block = x / Q80_BLOCK_SIZE;
+    const NnUint lane = x - block * Q80_BLOCK_SIZE;
+    const NnUint blocksPerSlice = output.logicalSize.x / Q80_BLOCK_SIZE;
+    const NnBlockQ80 *in = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
+    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+    float v = out[x];
+    for (NnUint s = 0u; s < nSlices; ++s) {
+        const NnBlockQ80 *b = in + s * blocksPerSlice + block;
+        v += (float)b->qs[lane] * cudaHalfBitsToFloat(b->d);
+    }
+    out[x] = v;
+}
+
 __global__ static void mergeSumF32Kernel(
     const NnByte *inputBase,
     NnPointerLayout input,
@@ -364,6 +389,54 @@ __global__ static void embeddingF32F32Kernel(
     const NnUint token = (NnUint)tokenPtr[0];
     float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
     out[x] = weight[(NnSize)token * output.logicalSize.x + x];
+}
+
+__global__ static void embeddingQ40F32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const NnBlockQ40 *weight,
+    NnUint rowBlocks,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * output.logicalSize.x;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint x = (NnUint)(tid % output.logicalSize.x);
+    const NnUint y = (NnUint)(tid / output.logicalSize.x);
+    const float *tokenPtr = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
+    const NnUint token = (NnUint)tokenPtr[0];
+    const NnUint block = x / Q40_BLOCK_SIZE;
+    const NnUint lane = x - block * Q40_BLOCK_SIZE;
+    const NnBlockQ40 *b = weight + (NnSize)token * rowBlocks + block;
+    const NnUint packed = lane < (Q40_BLOCK_SIZE / 2u) ? lane : lane - (Q40_BLOCK_SIZE / 2u);
+    const int q = lane < (Q40_BLOCK_SIZE / 2u)
+        ? (int)(b->qs[packed] & 0x0fu) - 8
+        : (int)(b->qs[packed] >> 4) - 8;
+    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+    out[x] = (float)q * cudaHalfBitsToFloat(b->d);
+}
+
+__global__ static void embeddingQ80F32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const NnBlockQ80 *weight,
+    NnUint rowBlocks,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * output.logicalSize.x;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint x = (NnUint)(tid % output.logicalSize.x);
+    const NnUint y = (NnUint)(tid / output.logicalSize.x);
+    const float *tokenPtr = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
+    const NnUint token = (NnUint)tokenPtr[0];
+    const NnUint block = x / Q80_BLOCK_SIZE;
+    const NnUint lane = x - block * Q80_BLOCK_SIZE;
+    const NnBlockQ80 *b = weight + (NnSize)token * rowBlocks + block;
+    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+    out[x] = (float)b->qs[lane] * cudaHalfBitsToFloat(b->d);
 }
 
 __global__ static void invRmsF32Kernel(
@@ -556,6 +629,151 @@ __global__ static void softmaxF32SerialKernel(
     for (NnUint i = 0u; i < view.sizeX; ++i) {
         const NnUint idx = view.offset + i * view.strideX;
         out[idx] = out[idx] / sum;
+    }
+}
+
+__global__ static void moeGateF32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    float *indexes,
+    NnUint k,
+    NnUint normTopk,
+    NnUint indexRowStride,
+    NnUint batchSize) {
+    const NnUint y = blockIdx.x * blockDim.x + threadIdx.x;
+    if (y >= batchSize) return;
+
+    const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
+    float sum = 0.0f;
+    for (NnUint rank = 0u; rank < k; ++rank) {
+        float bestVal = -3.4028234663852886e38f;
+        NnUint bestIdx = 0u;
+        for (NnUint i = 0u; i < input.logicalSize.x; ++i) {
+            bool alreadySelected = false;
+            for (NnUint prev = 0u; prev < rank; ++prev) {
+                if ((NnUint)indexes[(NnSize)y * indexRowStride + prev] == i) {
+                    alreadySelected = true;
+                    break;
+                }
+            }
+            const float v = in[i];
+            if (!alreadySelected && v > bestVal) {
+                bestVal = v;
+                bestIdx = i;
+            }
+        }
+
+        indexes[(NnSize)y * indexRowStride + rank] = (float)bestIdx;
+        float *out = (float *)cudaRowBase(outputBase, output, rank, y);
+        out[0] = bestVal;
+        sum += bestVal;
+    }
+
+    const float denom = normTopk == 1u ? sum : 1.0f;
+    for (NnUint rank = 0u; rank < k; ++rank) {
+        float *out = (float *)cudaRowBase(outputBase, output, rank, y);
+        out[0] = out[0] / denom;
+    }
+}
+
+__device__ static inline void cudaMhaOffsets(
+    NnMultiHeadAttOpConfig config,
+    NnUint h,
+    NnUint y,
+    NnUint *qOffset,
+    NnUint *kvOffset,
+    NnUint *attOffset) {
+    const NnUint kvMul = config.nHeads / config.nKvHeads;
+    const NnUint qHeadStart = config.qStart / config.headDim;
+    const NnUint kvHeadStart = config.kvStart / config.headDim;
+    const NnUint globalQHead = qHeadStart + h;
+    const NnUint globalKvHead = globalQHead / kvMul;
+    const NnUint localKvHead = globalKvHead - kvHeadStart;
+    *qOffset = y * config.qStride + config.qStart + h * config.headDim;
+    *kvOffset = config.kvStart + localKvHead * config.headDim;
+    *attOffset = y * config.nHeads0 * config.seqLen + h * config.seqLen;
+}
+
+__global__ static void multiheadAttScoreF32Kernel(
+    const float *positions,
+    const float *query,
+    const float *keyCache,
+    float *att,
+    NnMultiHeadAttOpConfig config,
+    NnUint batchSize) {
+    const NnUint h = blockIdx.x;
+    const NnUint y = blockIdx.y;
+    if (h >= config.nHeads0 || y >= batchSize) return;
+    const NnUint pos = (NnUint)positions[y];
+    NnUint qOffset = 0u;
+    NnUint kvOffset = 0u;
+    NnUint attOffset = 0u;
+    cudaMhaOffsets(config, h, y, &qOffset, &kvOffset, &attOffset);
+    const float invHeadDimRoot = rsqrtf((float)config.headDim);
+    for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
+        float score = 0.0f;
+        const NnUint kOffset = p * config.kvStride + kvOffset;
+        for (NnUint i = 0u; i < config.headDim; ++i) {
+            score += query[qOffset + i] * keyCache[kOffset + i];
+        }
+        att[attOffset + p] = score * invHeadDimRoot;
+    }
+}
+
+__global__ static void multiheadAttSoftmaxSerialF32Kernel(
+    const float *positions,
+    float *att,
+    NnMultiHeadAttOpConfig config,
+    NnUint batchSize) {
+    const NnUint h = blockIdx.x;
+    const NnUint y = blockIdx.y;
+    if (h >= config.nHeads0 || y >= batchSize) return;
+    const NnUint pos = (NnUint)positions[y];
+    const NnUint attOffset = y * config.nHeads0 * config.seqLen + h * config.seqLen;
+    float maxScore = -3.4028234663852886e38f;
+    for (NnUint p = 0u; p <= pos; ++p) {
+        const float v = att[attOffset + p];
+        maxScore = maxScore > v ? maxScore : v;
+    }
+    float sum = 0.0f;
+    for (NnUint p = 0u; p <= pos; ++p) {
+        const float v = expf(att[attOffset + p] - maxScore);
+        att[attOffset + p] = v;
+        sum += v;
+    }
+    const float invSum = 1.0f / sum;
+    for (NnUint p = 0u; p <= pos; ++p) {
+        att[attOffset + p] *= invSum;
+    }
+}
+
+__global__ static void multiheadAttValueF32Kernel(
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const float *positions,
+    const float *valueCache,
+    const float *att,
+    NnMultiHeadAttOpConfig config,
+    NnUint batchSize) {
+    const NnUint h = blockIdx.x;
+    const NnUint y = blockIdx.y;
+    if (h >= config.nHeads0 || y >= batchSize) return;
+    const NnUint pos = (NnUint)positions[y];
+    NnUint qOffset = 0u;
+    NnUint kvOffset = 0u;
+    NnUint attOffset = 0u;
+    cudaMhaOffsets(config, h, y, &qOffset, &kvOffset, &attOffset);
+    (void)qOffset;
+    float *out = (float *)cudaRowBase(outputBase, output, 0u, y) + h * config.headDim;
+    for (NnUint i = threadIdx.x; i < config.headDim; i += blockDim.x) {
+        float acc = 0.0f;
+        const NnUint vOffset = kvOffset + i;
+        for (NnUint p = 0u; p <= pos; ++p) {
+            acc += att[attOffset + p] * valueCache[p * config.kvStride + vOffset];
+        }
+        out[i] = acc;
     }
 }
 
@@ -1126,21 +1344,50 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
 
     switch (op.code) {
         case OP_EMBEDDING: {
-            if (in.layout.logicalSize.floatType != F_32 ||
-                op.weightSize.floatType != F_32 ||
-                out.layout.logicalSize.floatType != F_32) {
+            if (in.layout.logicalSize.floatType != F_32 || out.layout.logicalSize.floatType != F_32) {
                 throw std::runtime_error(unsupportedOpMessage(opIndex));
             }
+            if (op.weightSize.x != out.layout.logicalSize.x) {
+                throw std::runtime_error("CUDA EMBEDDING weight/output width mismatch");
+            }
             const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
-            if (total != 0u) {
+            if (total == 0u) return;
+            if (op.weightSize.floatType == F_32) {
                 embeddingF32F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)weightBuffers[opIndex]->data(),
                     batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
+                return;
             }
-            return;
+            if (op.weightSize.floatType == F_Q40) {
+                if ((op.weightSize.x % Q40_BLOCK_SIZE) != 0u) {
+                    throw std::runtime_error("CUDA EMBEDDING Q40 requires block-aligned embedding width");
+                }
+                embeddingQ40F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
+                    op.weightSize.x / Q40_BLOCK_SIZE,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            if (op.weightSize.floatType == F_Q80) {
+                if ((op.weightSize.x % Q80_BLOCK_SIZE) != 0u) {
+                    throw std::runtime_error("CUDA EMBEDDING Q80 requires block-aligned embedding width");
+                }
+                embeddingQ80F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (const NnBlockQ80 *)weightBuffers[opIndex]->data(),
+                    op.weightSize.x / Q80_BLOCK_SIZE,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            throw std::runtime_error(unsupportedOpMessage(opIndex));
         }
         case OP_INV_RMS: {
             const NnInvRmsOpConfig *config = (const NnInvRmsOpConfig *)op.config;
@@ -1415,6 +1662,91 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             return;
         }
+        case OP_MULTIHEAD_ATT: {
+            const NnMultiHeadAttOpConfig *configPtr = (const NnMultiHeadAttOpConfig *)op.config;
+            if (configPtr == nullptr) throw std::runtime_error("CUDA MULTIHEAD_ATT missing config");
+            if (out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            NnMultiHeadAttOpConfig config = *configPtr;
+            config.qStride = config.qStride == 0u ? config.qSliceD0 : config.qStride;
+            config.kvStride = config.kvStride == 0u ? config.kvDim0 : config.kvStride;
+            if (config.nHeads == 0u || config.nHeads0 == 0u || config.nKvHeads == 0u ||
+                config.headDim == 0u || config.seqLen == 0u) {
+                throw std::runtime_error("CUDA MULTIHEAD_ATT invalid zero dimension");
+            }
+            if ((config.nHeads % config.nKvHeads) != 0u) {
+                throw std::runtime_error("CUDA MULTIHEAD_ATT requires nHeads divisible by nKvHeads for GQA");
+            }
+            if ((config.qStart % config.headDim) != 0u ||
+                (config.kvStart % config.headDim) != 0u ||
+                (config.qSliceD0 % config.headDim) != 0u ||
+                (config.kvDim0 % config.headDim) != 0u) {
+                throw std::runtime_error("CUDA MULTIHEAD_ATT requires q/kv ranges aligned to headDim");
+            }
+            if (config.nHeads0 * config.headDim != config.qSliceD0 ||
+                out.layout.logicalSize.x < config.qSliceD0 ||
+                config.qStart + config.qSliceD0 > config.qStride ||
+                config.kvStart + config.kvDim0 > config.kvStride) {
+                throw std::runtime_error("CUDA MULTIHEAD_ATT shape/stride mismatch");
+            }
+            const NnUint qHeadStart = config.qStart / config.headDim;
+            const NnUint kvHeadStart = config.kvStart / config.headDim;
+            const NnUint kvHeads0 = config.kvDim0 / config.headDim;
+            if (qHeadStart + config.nHeads0 > config.nHeads ||
+                kvHeadStart + kvHeads0 > config.nKvHeads) {
+                throw std::runtime_error("CUDA MULTIHEAD_ATT local head range exceeds global head count");
+            }
+            const NnUint kvMul = config.nHeads / config.nKvHeads;
+            const NnUint firstGlobalKvHead = qHeadStart / kvMul;
+            const NnUint lastGlobalKvHead = (qHeadStart + config.nHeads0 - 1u) / kvMul;
+            if (firstGlobalKvHead < kvHeadStart || lastGlobalKvHead >= kvHeadStart + kvHeads0) {
+                throw std::runtime_error("CUDA MULTIHEAD_ATT q-head range is not covered by local KV range");
+            }
+            NnCudaBuffer *positionPipe = device->data.resolvePipe(config.positionPipeIndex);
+            NnCudaBuffer *queryBuffer = device->data.resolveBuffer(config.queryBufferIndex);
+            NnCudaBuffer *keyCacheBuffer = device->data.resolveBuffer(config.keyCacheBufferIndex);
+            NnCudaBuffer *valueCacheBuffer = device->data.resolveBuffer(config.valueCacheBufferIndex);
+            NnCudaBuffer *attBuffer = device->data.resolveBuffer(config.attBufferIndex);
+            const NnSize3D &querySize = nodeConfig->buffers[config.queryBufferIndex].size;
+            const NnSize3D &keySize = nodeConfig->buffers[config.keyCacheBufferIndex].size;
+            const NnSize3D &valueSize = nodeConfig->buffers[config.valueCacheBufferIndex].size;
+            const NnSize3D &attSize = nodeConfig->buffers[config.attBufferIndex].size;
+            if (querySize.floatType != F_32 || keySize.floatType != F_32 ||
+                valueSize.floatType != F_32 || attSize.floatType != F_32 ||
+                querySize.x < config.qStride ||
+                keySize.length < (NnSize)config.seqLen * config.kvStride ||
+                valueSize.length < (NnSize)config.seqLen * config.kvStride ||
+                attSize.length < (NnSize)netConfig->nBatches * config.nHeads0 * config.seqLen) {
+                throw std::runtime_error("CUDA MULTIHEAD_ATT backing buffer shape mismatch");
+            }
+            dim3 grid(config.nHeads0, batchSize, 1u);
+            if (batchSize != 0u) {
+                multiheadAttScoreF32Kernel<<<grid, 256, 0, stream>>>(
+                    (const float *)positionPipe->data(),
+                    (const float *)queryBuffer->data(),
+                    (const float *)keyCacheBuffer->data(),
+                    (float *)attBuffer->data(),
+                    config,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+                multiheadAttSoftmaxSerialF32Kernel<<<grid, 1, 0, stream>>>(
+                    (const float *)positionPipe->data(),
+                    (float *)attBuffer->data(),
+                    config,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+                multiheadAttValueF32Kernel<<<grid, 256, 0, stream>>>(
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (const float *)positionPipe->data(),
+                    (const float *)valueCacheBuffer->data(),
+                    (const float *)attBuffer->data(),
+                    config,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
         case OP_CAST: {
             if (in.layout.logicalSize.floatType == F_32 && out.layout.logicalSize.floatType == F_32) {
                 const NnTensorViewLayout view = resolveOpView(op, out.layout.logicalSize, out.layout.logicalSize.x);
@@ -1497,7 +1829,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             return;
         }
         case OP_MERGE_ADD: {
-            if (in.layout.logicalSize.floatType != F_32 || out.layout.logicalSize.floatType != F_32) {
+            if (out.layout.logicalSize.floatType != F_32) {
                 throw std::runtime_error(unsupportedOpMessage(opIndex));
             }
             if (out.layout.logicalSize.x == 0u || (in.layout.logicalSize.x % out.layout.logicalSize.x) != 0u) {
@@ -1505,14 +1837,27 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnUint nSlices = in.layout.logicalSize.x / out.layout.logicalSize.x;
             const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
-            if (total != 0u) {
+            if (total == 0u) return;
+            if (in.layout.logicalSize.floatType == F_32) {
                 mergeAddF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     nSlices, batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
+                return;
             }
-            return;
+            if (in.layout.logicalSize.floatType == F_Q80) {
+                if ((out.layout.logicalSize.x % Q80_BLOCK_SIZE) != 0u) {
+                    throw std::runtime_error("CUDA MERGE_ADD Q80 input requires block-aligned output width");
+                }
+                mergeAddQ80F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    nSlices, batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            throw std::runtime_error(unsupportedOpMessage(opIndex));
         }
         case OP_MERGE_SUM: {
             if (in.layout.logicalSize.floatType != F_32 || out.layout.logicalSize.floatType != F_32) {
@@ -1591,6 +1936,41 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                         view,
                         batchSize);
                 }
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
+        case OP_MOE_GATE: {
+            const NnMoeGateOpCodeConfig *config = (const NnMoeGateOpCodeConfig *)op.config;
+            if (config == nullptr) throw std::runtime_error("CUDA MOE_GATE missing config");
+            if (in.layout.logicalSize.floatType != F_32 || out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            if (config->k == 0u ||
+                in.layout.logicalSize.z != 1u ||
+                in.layout.logicalSize.x < config->k ||
+                out.layout.logicalSize.z != config->k ||
+                out.layout.logicalSize.x != 1u ||
+                out.layout.logicalSize.y < batchSize) {
+                throw std::runtime_error("CUDA MOE_GATE shape mismatch");
+            }
+            if (config->indexesBufferIndex >= nodeConfig->nBuffers) {
+                throw std::runtime_error("CUDA MOE_GATE indexes buffer index out of range");
+            }
+            const NnSize3D &idxSize = nodeConfig->buffers[config->indexesBufferIndex].size;
+            if (idxSize.floatType != F_32 || idxSize.x < config->k || idxSize.y < batchSize) {
+                throw std::runtime_error("CUDA MOE_GATE indexes buffer shape mismatch");
+            }
+            NnCudaBuffer *indexesBuf = device->data.resolveBuffer(config->indexesBufferIndex);
+            if (batchSize != 0u) {
+                moeGateF32Kernel<<<cudaBlocks(batchSize), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (float *)indexesBuf->data(),
+                    config->k,
+                    config->normTopk,
+                    idxSize.x,
+                    batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
             }
             return;

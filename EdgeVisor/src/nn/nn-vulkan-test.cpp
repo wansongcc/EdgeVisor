@@ -767,6 +767,7 @@ void testMultiheadAtt_F32_F32() {
                 pointerBatchConfig(SRC_PIPE, xPipeIndex),
                 size0(),
                 NnMultiHeadAttOpConfig{nHeads, nHeads, nKvHeads, headDim, seqLen, qSliceD0, kvDim0,
+                    0u, qSliceD0, 0u, kvDim0,
                     posPipeIndex, qBufferIndex, kCacheBufferIndex, vCacheBufferIndex, attCacheBufferIndex});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {

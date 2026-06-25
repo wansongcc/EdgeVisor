@@ -91,6 +91,17 @@ static void expectF32NearAbsRel(const char *name, const std::vector<float> &actu
     std::printf("%s: ok max_abs_error=%g max_relative_error=%g\n", name, maxAbs, maxRel);
 }
 
+static void expectAllFinite(const char *name, const std::vector<float> &actual) {
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (!std::isfinite(actual[i])) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg), "%s non-finite value at %zu: %g", name, i, actual[i]);
+            throw std::runtime_error(msg);
+        }
+    }
+    std::printf("%s: ok all finite\n", name);
+}
+
 static void expectQ80DequantNear(
     const char *name,
     const std::vector<NnBlockQ80> &actual,
@@ -288,6 +299,98 @@ static void applySoftmaxExpected(std::vector<float> &x, const NnSize3D &size, Nn
         for (NnUint i = 0u; i < len; ++i) {
             const NnUint idx = offset + i * stride;
             row[idx] = std::exp(row[idx] - maxv) / sum;
+        }
+    }
+}
+
+static void applyMoeGateExpected(
+    const std::vector<float> &input,
+    const NnSize3D &inputSize,
+    NnUint k,
+    NnUint normTopk,
+    std::vector<float> &output,
+    const NnSize3D &outputSize,
+    std::vector<float> &indexes,
+    NnUint indexRowStride,
+    NnUint batchSize) {
+    for (NnUint y = 0u; y < batchSize; ++y) {
+        float sum = 0.0f;
+        for (NnUint rank = 0u; rank < k; ++rank) {
+            float bestVal = -std::numeric_limits<float>::max();
+            NnUint bestIdx = 0u;
+            for (NnUint i = 0u; i < inputSize.x; ++i) {
+                bool alreadySelected = false;
+                for (NnUint prev = 0u; prev < rank; ++prev) {
+                    if ((NnUint)indexes[(NnSize)y * indexRowStride + prev] == i) {
+                        alreadySelected = true;
+                        break;
+                    }
+                }
+                const float v = input[f32Index(inputSize, 0u, y, i)];
+                if (!alreadySelected && v > bestVal) {
+                    bestVal = v;
+                    bestIdx = i;
+                }
+            }
+            indexes[(NnSize)y * indexRowStride + rank] = (float)bestIdx;
+            output[f32Index(outputSize, rank, y, 0u)] = bestVal;
+            sum += bestVal;
+        }
+        const float denom = normTopk == 1u ? sum : 1.0f;
+        for (NnUint rank = 0u; rank < k; ++rank) {
+            output[f32Index(outputSize, rank, y, 0u)] /= denom;
+        }
+    }
+}
+
+static void applyMultiheadAttExpected(
+    std::vector<float> &output,
+    const NnSize3D &outputSize,
+    const std::vector<float> &query,
+    const std::vector<float> &keyCache,
+    const std::vector<float> &valueCache,
+    const std::vector<float> &positions,
+    NnMultiHeadAttOpConfig config,
+    NnUint batchSize) {
+    config.qStride = config.qStride == 0u ? config.qSliceD0 : config.qStride;
+    config.kvStride = config.kvStride == 0u ? config.kvDim0 : config.kvStride;
+    const NnUint kvMul = config.nHeads / config.nKvHeads;
+    const NnUint qHeadStart = config.qStart / config.headDim;
+    const NnUint kvHeadStart = config.kvStart / config.headDim;
+    const float invHeadDimRoot = 1.0f / std::sqrt((float)config.headDim);
+    std::vector<float> scores(config.seqLen, 0.0f);
+    for (NnUint y = 0u; y < batchSize; ++y) {
+        const NnUint pos = (NnUint)positions[y];
+        for (NnUint h = 0u; h < config.nHeads0; ++h) {
+            const NnUint globalQHead = qHeadStart + h;
+            const NnUint globalKvHead = globalQHead / kvMul;
+            const NnUint localKvHead = globalKvHead - kvHeadStart;
+            const NnUint qOffset = y * config.qStride + config.qStart + h * config.headDim;
+            const NnUint kvOffset = config.kvStart + localKvHead * config.headDim;
+            float maxScore = -std::numeric_limits<float>::infinity();
+            for (NnUint p = 0u; p <= pos; ++p) {
+                float score = 0.0f;
+                const NnUint kOffset = p * config.kvStride + kvOffset;
+                for (NnUint i = 0u; i < config.headDim; ++i) {
+                    score += query[qOffset + i] * keyCache[kOffset + i];
+                }
+                score *= invHeadDimRoot;
+                scores[p] = score;
+                maxScore = std::max(maxScore, score);
+            }
+            float sum = 0.0f;
+            for (NnUint p = 0u; p <= pos; ++p) {
+                scores[p] = std::exp(scores[p] - maxScore);
+                sum += scores[p];
+            }
+            for (NnUint i = 0u; i < config.headDim; ++i) {
+                float acc = 0.0f;
+                const NnUint vOffset = kvOffset + i;
+                for (NnUint p = 0u; p <= pos; ++p) {
+                    acc += (scores[p] / sum) * valueCache[p * config.kvStride + vOffset];
+                }
+                output[f32Index(outputSize, 0u, y, h * config.headDim + i)] = acc;
+            }
         }
     }
 }
@@ -1331,6 +1434,382 @@ static void runPr7Q80Q40MatmulTest(NnUint gpuIndex) {
     std::printf("CUDA PR7 Q80xQ40 custom matmul tests: ok\n");
 }
 
+static void runPr8MultiheadAttentionTest(NnUint gpuIndex) {
+    const NnUint maxBatch = 128u;
+    const NnUint prefillTokens = 128u;
+    const NnUint decodeTokens = 32u;
+    const NnUint seqLen = prefillTokens + decodeTokens;
+    const NnUint nHeads = 8u;
+    const NnUint nHeads0 = 4u;
+    const NnUint nKvHeads = 2u;
+    const NnUint headDim = 8u;
+    const NnUint qStart = 4u * headDim;
+    const NnUint qSliceD0 = nHeads0 * headDim;
+    const NnUint qStride = nHeads * headDim + 16u;
+    const NnUint kvStart = 1u * headDim;
+    const NnUint kvDim0 = headDim;
+    const NnUint kvStride = nKvHeads * headDim + 8u;
+    const float sentinel = -123.0f;
+
+    NnPipeConfig pipes[4];
+    pipes[0] = {(char *)"mha_out", size2D(F_32, maxBatch, qSliceD0)};
+    pipes[1] = {(char *)"mha_position", size2D(F_32, maxBatch, 1u)};
+    pipes[2] = {(char *)"mha_k_in", size2D(F_32, maxBatch, kvDim0)};
+    pipes[3] = {(char *)"mha_v_in", size2D(F_32, maxBatch, kvDim0)};
+
+    NnBufferConfig buffers[4];
+    buffers[0] = {(char *)"mha_query", size2D(F_32, maxBatch, qStride)};
+    buffers[1] = {(char *)"mha_key_cache", size1D(F_32, seqLen * kvStride)};
+    buffers[2] = {(char *)"mha_value_cache", size1D(F_32, seqLen * kvStride)};
+    buffers[3] = {(char *)"mha_att", size1D(F_32, maxBatch * nHeads0 * seqLen)};
+
+    NnShiftOpCodeConfig shiftKCfg{1u, kvStart, kvStride, headDim};
+    NnShiftOpCodeConfig shiftVCfg{1u, kvStart, kvStride, headDim};
+    NnMultiHeadAttOpConfig mhaCfg{
+        nHeads,
+        nHeads0,
+        nKvHeads,
+        headDim,
+        seqLen,
+        qSliceD0,
+        kvDim0,
+        qStart,
+        qStride,
+        kvStart,
+        kvStride,
+        1u,
+        0u,
+        1u,
+        2u,
+        3u};
+
+    NnOpConfig ops[3];
+    std::memset(ops, 0, sizeof(ops));
+    ops[0].code = OP_SHIFT; ops[0].name = (char *)"mha_shift_k"; ops[0].index = 0u;
+    ops[0].input = pointerBatchConfig(SRC_PIPE, 2u); ops[0].output = pointerRawConfig(SRC_BUFFER, 1u);
+    ops[0].weightSize = size0(); ops[0].config = (NnByte *)&shiftKCfg; ops[0].configSize = sizeof(shiftKCfg);
+    ops[1].code = OP_SHIFT; ops[1].name = (char *)"mha_shift_v"; ops[1].index = 1u;
+    ops[1].input = pointerBatchConfig(SRC_PIPE, 3u); ops[1].output = pointerRawConfig(SRC_BUFFER, 2u);
+    ops[1].weightSize = size0(); ops[1].config = (NnByte *)&shiftVCfg; ops[1].configSize = sizeof(shiftVCfg);
+    ops[2].code = OP_MULTIHEAD_ATT; ops[2].name = (char *)"mha"; ops[2].index = 2u;
+    ops[2].input = pointerBatchConfig(SRC_PIPE, 0u); ops[2].output = pointerBatchConfig(SRC_PIPE, 0u);
+    ops[2].weightSize = size0(); ops[2].config = (NnByte *)&mhaCfg; ops[2].configSize = sizeof(mhaCfg);
+
+    NnSegmentConfig segments[1];
+    segments[0].nOps = 3u;
+    segments[0].ops = ops;
+    segments[0].nSyncs = 0u;
+    segments[0].syncs = nullptr;
+
+    NnNetConfig netConfig{};
+    netConfig.nBatches = maxBatch;
+    netConfig.nNodes = 1u;
+    netConfig.nPipes = 4u;
+    netConfig.pipes = pipes;
+    netConfig.nPreSyncs = 0u;
+    netConfig.preSyncs = nullptr;
+
+    NnNodeConfig nodeConfig{};
+    nodeConfig.nodeIndex = 0u;
+    nodeConfig.nBuffers = 4u;
+    nodeConfig.buffers = buffers;
+    nodeConfig.nSegments = 1u;
+    nodeConfig.segments = segments;
+
+    NnNetExecution execution(1u, &netConfig);
+    execution.setBatchSize(maxBatch);
+    NnCudaDevice device(gpuIndex, &netConfig, &nodeConfig, &execution, nullptr);
+    std::unique_ptr<NnCudaDeviceSegment> segment((NnCudaDeviceSegment *)device.createSegment(0u));
+
+    std::vector<float> query(buffers[0].size.length, sentinel);
+    std::vector<float> keyExpected(buffers[1].size.length, sentinel);
+    std::vector<float> valueExpected(buffers[2].size.length, sentinel);
+    std::vector<float> keyInitial = keyExpected;
+    std::vector<float> valueInitial = valueExpected;
+    std::vector<float> positions(maxBatch, 0.0f);
+    std::vector<float> kIn(pipes[2].size.length, 0.0f);
+    std::vector<float> vIn(pipes[3].size.length, 0.0f);
+    std::vector<float> outInitial(pipes[0].size.length, sentinel);
+    std::vector<float> expectedOut(pipes[0].size.length, sentinel);
+    std::vector<float> gotOut(pipes[0].size.length, 0.0f);
+
+    device.writeBuffer(1u, (const NnByte *)keyInitial.data(), 0u, buffers[1].size.nBytes);
+    device.writeBuffer(2u, (const NnByte *)valueInitial.data(), 0u, buffers[2].size.nBytes);
+    std::memcpy(execution.pipes[0], outInitial.data(), pipes[0].size.nBytes);
+
+    for (NnUint y = 0u; y < prefillTokens; ++y) {
+        positions[y] = (float)y;
+        for (NnUint i = 0u; i < qStride; ++i) {
+            const int v = (int)((y * 31u + i * 7u + 3u) % 67u) - 33;
+            query[y * qStride + i] = (float)v * 0.013f;
+        }
+        for (NnUint i = 0u; i < kvDim0; ++i) {
+            const float k = (float)((int)((y * 19u + i * 5u + 11u) % 53u) - 26) * 0.017f;
+            const float v = (float)((int)((y * 23u + i * 3u + 17u) % 59u) - 29) * 0.015f;
+            kIn[y * kvDim0 + i] = k;
+            vIn[y * kvDim0 + i] = v;
+            keyExpected[y * kvStride + kvStart + i] = k;
+            valueExpected[y * kvStride + kvStart + i] = v;
+        }
+    }
+    std::memcpy(execution.pipes[1], positions.data(), pipes[1].size.nBytes);
+    std::memcpy(execution.pipes[2], kIn.data(), pipes[2].size.nBytes);
+    std::memcpy(execution.pipes[3], vIn.data(), pipes[3].size.nBytes);
+    device.writeBuffer(0u, (const NnByte *)query.data(), 0u, buffers[0].size.nBytes);
+
+    expectedOut = outInitial;
+    applyMultiheadAttExpected(expectedOut, pipes[0].size, query, keyExpected, valueExpected, positions, mhaCfg, prefillTokens);
+    segment->forward(0u, 1u, 0u, prefillTokens);
+    std::memcpy(gotOut.data(), execution.pipes[0], pipes[0].size.nBytes);
+    expectF32Near("CUDA MULTIHEAD_ATT prefill oracle", gotOut, expectedOut, 2.0e-4f);
+    expectAllFinite("CUDA MULTIHEAD_ATT prefill output finite", gotOut);
+
+    std::vector<float> gotKey(buffers[1].size.length, 0.0f);
+    std::vector<float> gotValue(buffers[2].size.length, 0.0f);
+    device.readBuffer(1u, (NnByte *)gotKey.data(), 0u, buffers[1].size.nBytes);
+    device.readBuffer(2u, (NnByte *)gotValue.data(), 0u, buffers[2].size.nBytes);
+    expectF32Near("CUDA MULTIHEAD_ATT KV prefill key cache", gotKey, keyExpected, 1.0e-6f);
+    expectF32Near("CUDA MULTIHEAD_ATT KV prefill value cache", gotValue, valueExpected, 1.0e-6f);
+
+    for (NnUint step = 0u; step < decodeTokens; ++step) {
+        const NnUint pos = prefillTokens + step;
+        std::fill(positions.begin(), positions.end(), 0.0f);
+        positions[0] = (float)pos;
+        std::fill(kIn.begin(), kIn.end(), 0.0f);
+        std::fill(vIn.begin(), vIn.end(), 0.0f);
+        for (NnUint i = 0u; i < qStride; ++i) {
+            const int v = (int)((pos * 37u + i * 11u + 5u) % 71u) - 35;
+            query[i] = (float)v * 0.012f;
+        }
+        for (NnUint i = 0u; i < kvDim0; ++i) {
+            const float k = (float)((int)((pos * 13u + i * 7u + 19u) % 61u) - 30) * 0.014f;
+            const float v = (float)((int)((pos * 17u + i * 5u + 23u) % 73u) - 36) * 0.011f;
+            kIn[i] = k;
+            vIn[i] = v;
+            keyExpected[pos * kvStride + kvStart + i] = k;
+            valueExpected[pos * kvStride + kvStart + i] = v;
+        }
+        std::memcpy(execution.pipes[0], outInitial.data(), pipes[0].size.nBytes);
+        std::memcpy(execution.pipes[1], positions.data(), pipes[1].size.nBytes);
+        std::memcpy(execution.pipes[2], kIn.data(), pipes[2].size.nBytes);
+        std::memcpy(execution.pipes[3], vIn.data(), pipes[3].size.nBytes);
+        device.writeBuffer(0u, (const NnByte *)query.data(), 0u, getBytes(F_32, qStride));
+
+        expectedOut = outInitial;
+        applyMultiheadAttExpected(expectedOut, pipes[0].size, query, keyExpected, valueExpected, positions, mhaCfg, 1u);
+        segment->forward(0u, 1u, 0u, 1u);
+        std::memcpy(gotOut.data(), execution.pipes[0], pipes[0].size.nBytes);
+        expectF32Near("CUDA MULTIHEAD_ATT decode oracle", gotOut, expectedOut, 2.0e-4f);
+        expectAllFinite("CUDA MULTIHEAD_ATT decode output finite", gotOut);
+    }
+
+    device.readBuffer(1u, (NnByte *)gotKey.data(), 0u, buffers[1].size.nBytes);
+    device.readBuffer(2u, (NnByte *)gotValue.data(), 0u, buffers[2].size.nBytes);
+    expectF32Near("CUDA MULTIHEAD_ATT KV prefill+decode key cache", gotKey, keyExpected, 1.0e-6f);
+    expectF32Near("CUDA MULTIHEAD_ATT KV prefill+decode value cache", gotValue, valueExpected, 1.0e-6f);
+    std::printf("CUDA PR8 multihead attention tests: ok\n");
+}
+
+static void runPr9Qwen3MoeChainTest(NnUint gpuIndex) {
+    const NnUint nBatches = 3u;
+    const NnUint nExperts = 5u;
+    const NnUint k = 2u;
+    const NnUint inDim = 64u;
+    const NnUint hiddenDim = 64u;
+    const NnUint outDim = 4u;
+
+    NnPipeConfig pipes[3];
+    pipes[0] = {(char *)"moe_y", size2D(F_32, nBatches, inDim)};
+    pipes[1] = {(char *)"moe_gate_logits", size2D(F_32, nBatches, nExperts)};
+    pipes[2] = {(char *)"moe_out", size2D(F_32, nBatches, outDim)};
+
+    NnBufferConfig buffers[8];
+    buffers[0] = {(char *)"act_exp_ix", size2D(F_32, nBatches, k)};
+    buffers[1] = {(char *)"moe_yq", size3D(F_Q80, k, nBatches, inDim)};
+    buffers[2] = {(char *)"moe_s", size3D(F_32, k, nBatches, 1u)};
+    buffers[3] = {(char *)"moe_w1", size3D(F_32, k, nBatches, hiddenDim)};
+    buffers[4] = {(char *)"moe_w3", size3D(F_32, k, nBatches, hiddenDim)};
+    buffers[5] = {(char *)"moe_dq", size3D(F_Q80, k, nBatches, hiddenDim)};
+    buffers[6] = {(char *)"moe_w2", size3D(F_32, k, nBatches, outDim)};
+    buffers[7] = {(char *)"unused", size1D(F_32, 1u)};
+
+    NnRepeatZOpCodeConfig repeatCfg{};
+    NnSoftmaxOpCodeConfig softmaxCfg{};
+    NnMoeGateOpCodeConfig gateCfg{k, 1u, 0u};
+    NnMatmulOpConfig w1Cfg{};
+    w1Cfg.nExperts = nExperts;
+    w1Cfg.nActiveExperts = k;
+    w1Cfg.activeExpertIndexesBufferIndex = 0u;
+    NnMatmulOpConfig w3Cfg = w1Cfg;
+    NnSiluOpCodeConfig siluCfg{};
+    NnMulOpCodeConfig mulCfg{4u};
+    NnCastOpCodeConfig castCfg{};
+    NnMatmulOpConfig w2Cfg{};
+    w2Cfg.nExperts = nExperts;
+    w2Cfg.nActiveExperts = k;
+    w2Cfg.activeExpertIndexesBufferIndex = 0u;
+    NnScaleOpCodeConfig scaleCfg{2u};
+    NnMergeSumOpCodeConfig mergeCfg{};
+
+    NnOpConfig ops[11];
+    std::memset(ops, 0, sizeof(ops));
+    ops[0].code = OP_REPEAT_Z; ops[0].name = (char *)"moe_repeat_z"; ops[0].index = 0u;
+    ops[0].input = pointerBatchConfig(SRC_PIPE, 0u); ops[0].output = pointerBatchConfig(SRC_BUFFER, 1u);
+    ops[0].weightSize = size0(); ops[0].config = (NnByte *)&repeatCfg; ops[0].configSize = sizeof(repeatCfg);
+    ops[1].code = OP_SOFTMAX; ops[1].name = (char *)"moe_softmax"; ops[1].index = 1u;
+    ops[1].input = pointerBatchConfig(SRC_PIPE, 1u); ops[1].output = pointerBatchConfig(SRC_PIPE, 1u);
+    ops[1].weightSize = size0(); ops[1].config = (NnByte *)&softmaxCfg; ops[1].configSize = sizeof(softmaxCfg);
+    ops[2].code = OP_MOE_GATE; ops[2].name = (char *)"moe_gate"; ops[2].index = 2u;
+    ops[2].input = pointerBatchConfig(SRC_PIPE, 1u); ops[2].output = pointerBatchConfig(SRC_BUFFER, 2u);
+    ops[2].weightSize = size0(); ops[2].config = (NnByte *)&gateCfg; ops[2].configSize = sizeof(gateCfg);
+    ops[3].code = OP_MATMUL; ops[3].name = (char *)"moe_w1"; ops[3].index = 3u;
+    ops[3].input = pointerBatchConfig(SRC_BUFFER, 1u); ops[3].output = pointerBatchConfig(SRC_BUFFER, 3u);
+    ops[3].weightSize = size3D(F_Q40, nExperts, inDim, hiddenDim); ops[3].config = (NnByte *)&w1Cfg; ops[3].configSize = sizeof(w1Cfg);
+    ops[4].code = OP_MATMUL; ops[4].name = (char *)"moe_w3"; ops[4].index = 4u;
+    ops[4].input = pointerBatchConfig(SRC_BUFFER, 1u); ops[4].output = pointerBatchConfig(SRC_BUFFER, 4u);
+    ops[4].weightSize = size3D(F_Q40, nExperts, inDim, hiddenDim); ops[4].config = (NnByte *)&w3Cfg; ops[4].configSize = sizeof(w3Cfg);
+    ops[5].code = OP_SILU; ops[5].name = (char *)"moe_silu"; ops[5].index = 5u;
+    ops[5].input = pointerBatchConfig(SRC_BUFFER, 3u); ops[5].output = pointerBatchConfig(SRC_BUFFER, 3u);
+    ops[5].weightSize = size0(); ops[5].config = (NnByte *)&siluCfg; ops[5].configSize = sizeof(siluCfg);
+    ops[6].code = OP_MUL; ops[6].name = (char *)"moe_mul"; ops[6].index = 6u;
+    ops[6].input = pointerBatchConfig(SRC_BUFFER, 3u); ops[6].output = pointerBatchConfig(SRC_BUFFER, 3u);
+    ops[6].weightSize = size0(); ops[6].config = (NnByte *)&mulCfg; ops[6].configSize = sizeof(mulCfg);
+    ops[7].code = OP_CAST; ops[7].name = (char *)"moe_cast_q80"; ops[7].index = 7u;
+    ops[7].input = pointerBatchConfig(SRC_BUFFER, 3u); ops[7].output = pointerBatchConfig(SRC_BUFFER, 5u);
+    ops[7].weightSize = size0(); ops[7].config = (NnByte *)&castCfg; ops[7].configSize = sizeof(castCfg);
+    ops[8].code = OP_MATMUL; ops[8].name = (char *)"moe_w2"; ops[8].index = 8u;
+    ops[8].input = pointerBatchConfig(SRC_BUFFER, 5u); ops[8].output = pointerBatchConfig(SRC_BUFFER, 6u);
+    ops[8].weightSize = size3D(F_Q40, nExperts, hiddenDim, outDim); ops[8].config = (NnByte *)&w2Cfg; ops[8].configSize = sizeof(w2Cfg);
+    ops[9].code = OP_SCALE; ops[9].name = (char *)"moe_scale"; ops[9].index = 9u;
+    ops[9].input = pointerBatchConfig(SRC_BUFFER, 6u); ops[9].output = pointerBatchConfig(SRC_BUFFER, 6u);
+    ops[9].weightSize = size0(); ops[9].config = (NnByte *)&scaleCfg; ops[9].configSize = sizeof(scaleCfg);
+    ops[10].code = OP_MERGE_SUM; ops[10].name = (char *)"moe_merge_sum"; ops[10].index = 10u;
+    ops[10].input = pointerBatchConfig(SRC_BUFFER, 6u); ops[10].output = pointerBatchConfig(SRC_PIPE, 2u);
+    ops[10].weightSize = size0(); ops[10].config = (NnByte *)&mergeCfg; ops[10].configSize = sizeof(mergeCfg);
+
+    NnSegmentConfig segments[1];
+    segments[0].nOps = 11u;
+    segments[0].ops = ops;
+    segments[0].nSyncs = 0u;
+    segments[0].syncs = nullptr;
+
+    NnNetConfig netConfig{};
+    netConfig.nBatches = nBatches;
+    netConfig.nNodes = 1u;
+    netConfig.nPipes = 3u;
+    netConfig.pipes = pipes;
+    netConfig.nPreSyncs = 0u;
+    netConfig.preSyncs = nullptr;
+
+    NnNodeConfig nodeConfig{};
+    nodeConfig.nodeIndex = 0u;
+    nodeConfig.nBuffers = 8u;
+    nodeConfig.buffers = buffers;
+    nodeConfig.nSegments = 1u;
+    nodeConfig.segments = segments;
+
+    NnNetExecution execution(1u, &netConfig);
+    execution.setBatchSize(nBatches);
+    NnCudaDevice device(gpuIndex, &netConfig, &nodeConfig, &execution, nullptr);
+    std::unique_ptr<NnCudaDeviceSegment> segment((NnCudaDeviceSegment *)device.createSegment(0u));
+
+    std::vector<float> input = qPattern(pipes[0].size.length, 0u, 0.017f, -0.05f);
+    std::vector<float> gateLogits(pipes[1].size.length, 0.0f);
+    const float rawGate[nBatches][nExperts] = {
+        {1.7f, -0.2f, 0.9f, 2.4f, 0.1f},
+        {-0.5f, 1.3f, 2.1f, 0.4f, 1.8f},
+        {0.2f, 2.8f, -0.7f, 1.6f, 0.9f}
+    };
+    for (NnUint y = 0u; y < nBatches; ++y)
+        for (NnUint x = 0u; x < nExperts; ++x)
+            gateLogits[f32Index(pipes[1].size, 0u, y, x)] = rawGate[y][x];
+    std::vector<float> outInitial(pipes[2].size.length, -77.0f);
+
+    std::memcpy(execution.pipes[0], input.data(), pipes[0].size.nBytes);
+    std::memcpy(execution.pipes[1], gateLogits.data(), pipes[1].size.nBytes);
+    std::memcpy(execution.pipes[2], outInitial.data(), pipes[2].size.nBytes);
+
+    std::vector<NnBlockQ40> w1(ops[3].weightSize.length / Q40_BLOCK_SIZE);
+    std::vector<NnBlockQ40> w3(ops[4].weightSize.length / Q40_BLOCK_SIZE);
+    std::vector<NnBlockQ40> w2(ops[8].weightSize.length / Q40_BLOCK_SIZE);
+    std::vector<float> w1F = qPattern(ops[3].weightSize.length, 0u, 0.019f, 0.03f);
+    std::vector<float> w3F = qPattern(ops[4].weightSize.length, 3u, 0.015f, -0.01f);
+    std::vector<float> w2F = qPattern(ops[8].weightSize.length, 2u, 0.013f, 0.02f);
+    quantizeF32toQ40(w1F.data(), w1.data(), (NnUint)w1F.size(), 1u, 0u);
+    quantizeF32toQ40(w3F.data(), w3.data(), (NnUint)w3F.size(), 1u, 0u);
+    quantizeF32toQ40(w2F.data(), w2.data(), (NnUint)w2F.size(), 1u, 0u);
+    segment->loadWeight(3u, 0u, ops[3].weightSize.nBytes, (NnByte *)w1.data());
+    segment->loadWeight(4u, 0u, ops[4].weightSize.nBytes, (NnByte *)w3.data());
+    segment->loadWeight(8u, 0u, ops[8].weightSize.nBytes, (NnByte *)w2.data());
+
+    std::vector<float> expectedGate = gateLogits;
+    applySoftmaxExpected(expectedGate, pipes[1].size, nBatches, 0u, nExperts, 1u);
+    std::vector<float> expectedIdx(buffers[0].size.length, 0.0f);
+    std::vector<float> expectedScale(buffers[2].size.length, 0.0f);
+    applyMoeGateExpected(expectedGate, pipes[1].size, k, 1u, expectedScale, buffers[2].size, expectedIdx, buffers[0].size.x, nBatches);
+
+    std::vector<NnBlockQ80> expectedYq(buffers[1].size.length / Q80_BLOCK_SIZE);
+    for (NnUint y = 0u; y < nBatches; ++y) {
+        NnBlockQ80 row[inDim / Q80_BLOCK_SIZE];
+        quantizeF32toQ80(&input[f32Index(pipes[0].size, 0u, y, 0u)], row, inDim, 1u, 0u);
+        for (NnUint z = 0u; z < k; ++z) {
+            std::memcpy(
+                &expectedYq[q80Index(buffers[1].size, z, y, 0u)],
+                row,
+                sizeof(row));
+        }
+    }
+
+    std::vector<float> expectedW1(buffers[3].size.length, 0.0f);
+    std::vector<float> expectedW3(buffers[4].size.length, 0.0f);
+    applyMatmulQ80Q40Expected(expectedW1, buffers[3].size, expectedYq, buffers[1].size, w1, ops[3].weightSize, w1Cfg, expectedIdx, buffers[0].size.x, nBatches);
+    applyMatmulQ80Q40Expected(expectedW3, buffers[4].size, expectedYq, buffers[1].size, w3, ops[4].weightSize, w3Cfg, expectedIdx, buffers[0].size.x, nBatches);
+    for (NnUint z = 0u; z < k; ++z)
+        for (NnUint y = 0u; y < nBatches; ++y)
+            for (NnUint x = 0u; x < hiddenDim; ++x) {
+                const NnSize idx = f32Index(buffers[3].size, z, y, x);
+                expectedW1[idx] = expectedW1[idx] / (1.0f + std::exp(-expectedW1[idx])) * expectedW3[idx];
+            }
+
+    std::vector<NnBlockQ80> expectedDq(buffers[5].size.length / Q80_BLOCK_SIZE);
+    for (NnUint z = 0u; z < k; ++z)
+        for (NnUint y = 0u; y < nBatches; ++y)
+            quantizeF32toQ80(
+                &expectedW1[f32Index(buffers[3].size, z, y, 0u)],
+                &expectedDq[q80Index(buffers[5].size, z, y, 0u)],
+                hiddenDim,
+                1u,
+                0u);
+
+    std::vector<float> expectedW2(buffers[6].size.length, 0.0f);
+    applyMatmulQ80Q40Expected(expectedW2, buffers[6].size, expectedDq, buffers[5].size, w2, ops[8].weightSize, w2Cfg, expectedIdx, buffers[0].size.x, nBatches);
+    for (NnUint z = 0u; z < k; ++z)
+        for (NnUint y = 0u; y < nBatches; ++y)
+            for (NnUint x = 0u; x < outDim; ++x)
+                expectedW2[f32Index(buffers[6].size, z, y, x)] *= expectedScale[f32Index(buffers[2].size, z, y, 0u)];
+
+    std::vector<float> expectedOut(pipes[2].size.length, 0.0f);
+    for (NnUint y = 0u; y < nBatches; ++y)
+        for (NnUint x = 0u; x < outDim; ++x)
+            for (NnUint z = 0u; z < k; ++z)
+                expectedOut[f32Index(pipes[2].size, 0u, y, x)] += expectedW2[f32Index(buffers[6].size, z, y, x)];
+
+    segment->forward(0u, 1u, 0u, nBatches);
+
+    std::vector<float> gotIdx(expectedIdx.size(), 0.0f);
+    std::vector<float> gotScale(expectedScale.size(), 0.0f);
+    std::vector<float> gotOut(expectedOut.size(), 0.0f);
+    device.readBuffer(0u, (NnByte *)gotIdx.data(), 0u, buffers[0].size.nBytes);
+    device.readBuffer(2u, (NnByte *)gotScale.data(), 0u, buffers[2].size.nBytes);
+    std::memcpy(gotOut.data(), execution.pipes[2], pipes[2].size.nBytes);
+
+    expectF32Near("CUDA MOE_GATE active expert indexes oracle", gotIdx, expectedIdx, 0.0f);
+    expectF32Near("CUDA MOE_GATE top-k weights oracle", gotScale, expectedScale, 1.0e-6f);
+    expectF32NearAbsRel("CUDA Qwen3-MoE repeat/gate/expert/scale/merge chain oracle", gotOut, expectedOut, 3.0e-3f, 1.5e-2f);
+    expectAllFinite("CUDA Qwen3-MoE chain output finite", gotOut);
+    std::printf("CUDA PR9 Qwen3-MoE gate and expert chain tests: ok\n");
+}
+
 int main(int argc, char **argv) {
     NnUint gpuIndex = 0u;
     for (int i = 1; i < argc; ++i) {
@@ -1359,6 +1838,8 @@ int main(int argc, char **argv) {
         runPr5EmbeddingNormRopeShiftSoftmaxTest(gpuIndex);
         runPr6F32MatmulTest(gpuIndex);
         runPr7Q80Q40MatmulTest(gpuIndex);
+        runPr8MultiheadAttentionTest(gpuIndex);
+        runPr9Qwen3MoeChainTest(gpuIndex);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "CUDA test failed: %s\n", e.what());
         return EXIT_FAILURE;

@@ -44,6 +44,7 @@ Top-level `run_semantic_*.sh` and `run_gpu_*.sh` files are kept as compatibility
 - Last-stage local sampling, including TP last-stage gather before sampling, to avoid sending a full vocabulary logits tensor back to the root.
 - Q80-resident root token embedding to reduce root memory footprint while keeping the model file format unchanged.
 - Agentic workload and ablation harnesses for multi-generation, tool-using tasks.
+- Auto warmup selection: automatically probes candidate partition topologies and worker subsets, then selects the configuration that minimizes the slowest node's per-token time.
 
 ### Environment
 
@@ -111,6 +112,31 @@ A two-stage GPU smoke configuration with Stage 0 on GPU0 and Stage 1 using TP on
 --ratios '1@14*1:1@14' \
 --last-stage-sampling
 ```
+
+### Auto Warmup Selection
+
+When `--ratios` is not provided, `--warmup` enables automatic topology and worker-subset selection before inference. The warmup phase probes a configurable set of candidate configurations (pure TP, pure PP, hybrid PP/TP with dynamic layer counts, and different worker subsets), runs a short profiling generation pass on each, and selects the configuration that minimizes the slowest stage/node per-token time.
+
+```bash
+# Enable auto warmup (no --ratios needed)
+./dllama --model model.m --tokenizer tokenizer.t \
+  --workers 127.0.0.1:25101 127.0.0.1:25102 127.0.0.1:25103 \
+  --warmup --warmup-steps 16 --warmup-budget 8
+
+# With explicit candidate override (semicolon or whitespace separated)
+./dllama --model model.m --tokenizer tokenizer.t \
+  --workers 127.0.0.1:25101 127.0.0.1:25102 \
+  --warmup --warmup-candidates "1@14*1:1@14 1@7*1@7*1@7*1@7"
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--warmup` | disabled | Enable auto topology/worker-subset selection |
+| `--warmup-steps` | 16 | Generation steps per candidate probe |
+| `--warmup-budget` | 8 | Maximum number of candidates to probe |
+| `--warmup-candidates` | (auto) | Explicit candidate override (semicolon/whitespace separated) |
+
+Warmup scoring uses the minimax metric: the slowest stage/node per-token total time (exec + sync + bubble). Workers must be running and reachable before starting the root with `--warmup`. The inter-probe relisten delay is controlled by the `DLLAMA_WARMUP_RELISTEN_DELAY_MS` environment variable (default 1000 ms; set to 0 to disable). If `--ratios` is also provided, warmup is skipped and the explicit ratios are used.
 
 ### Regression Tests
 
@@ -191,6 +217,7 @@ EdgeVisor_GPU_Version/
 - 最后 Stage 本地采样；当最后 Stage 内部使用 TP 时，会先在最后 Stage 内部汇聚 logits slice，再由 Stage root 采样，避免把完整 vocab logits 回传给全局 Root。
 - Root token embedding 使用 Q80 常驻，降低 Root 内存占用，同时不改变原始模型文件格式。
 - 支持多轮 generation、工具调用和迁移注入的 Agentic workload 与 ablation harness。
+- 自动预热选优：自动探测候选切分拓扑和 Worker 组合，选择最小化最慢节点每 token 耗时的配置。
 
 ### 环境配置
 
@@ -258,6 +285,31 @@ bash run_gpu_pp_migration.sh
 --ratios '1@14*1:1@14' \
 --last-stage-sampling
 ```
+
+### 自动预热选优
+
+当未提供 `--ratios` 时，`--warmup` 在推理前启用自动拓扑和 Worker 子集选择。预热阶段探测一组可配置的候选配置（纯 TP、纯 PP、混合 PP/TP 及不同 Worker 子集），对每个候选运行短时间的性能采样生成，并选择最小化最慢 Stage/节点每 token 耗时的配置。
+
+```bash
+# 启用自动预热（无需 --ratios）
+./dllama --model model.m --tokenizer tokenizer.t \
+  --workers 127.0.0.1:25101 127.0.0.1:25102 127.0.0.1:25103 \
+  --warmup --warmup-steps 16 --warmup-budget 8
+
+# 使用显式候选覆盖（分号或空格分隔）
+./dllama --model model.m --tokenizer tokenizer.t \
+  --workers 127.0.0.1:25101 127.0.0.1:25102 \
+  --warmup --warmup-candidates "1@14*1:1@14 1@7*1@7*1@7*1@7"
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--warmup` | 关闭 | 启用自动拓扑/Worker 子集选择 |
+| `--warmup-steps` | 16 | 每个候选探针的生成步数 |
+| `--warmup-budget` | 8 | 最多探测的候选数量 |
+| `--warmup-candidates` | (自动) | 显式候选覆盖（分号/空格分隔） |
+
+预热使用 minimax 指标评分：最慢 Stage/节点的每 token 总耗时（exec + sync + bubble）。Worker 必须在启动带 `--warmup` 的 Root 之前已运行并可达。探测间隔的 relisten 延迟由环境变量 `DLLAMA_WARMUP_RELISTEN_DELAY_MS` 控制（默认 1000 ms；设为 0 可关闭）。若同时提供 `--ratios`，则跳过预热直接使用显式 ratios。
 
 ### 六项验收回归
 

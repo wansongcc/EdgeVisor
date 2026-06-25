@@ -116,8 +116,8 @@ nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o ll
 endif
 
 ifdef DLLAMA_CUDA
-nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o
-	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o -o $@ $(LIBS)
+nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
 endif
 
 # llm

@@ -2,12 +2,62 @@
 #define NN_CUDA_HPP
 
 #include <atomic>
+#include <memory>
 #include <string>
+#include <vector>
 #include "nn-executor.hpp"
 
 int nnCudaDeviceCount();
 std::string nnCudaDeviceInfo(NnUint gpuIndex);
 void nnCudaPrintDeviceInfo(NnUint gpuIndex);
+
+class NnCudaPinnedStaging {
+private:
+    void *hostPointer;
+    NnSize allocatedSize;
+public:
+    NnCudaPinnedStaging();
+    ~NnCudaPinnedStaging();
+    void *ensure(NnSize size);
+    void release();
+};
+
+class NnCudaBuffer {
+private:
+    void *devicePointer;
+public:
+    std::string name;
+    NnSize bufferSize;
+
+    NnCudaBuffer(const char *name, NnSize bufferSize);
+    ~NnCudaBuffer();
+    NnCudaBuffer(const NnCudaBuffer&) = delete;
+    NnCudaBuffer& operator=(const NnCudaBuffer&) = delete;
+
+    void write(const NnByte *data, NnSize offset, NnSize nBytes, void *stream, NnCudaPinnedStaging *staging);
+    void read(NnByte *data, NnSize offset, NnSize nBytes, void *stream, NnCudaPinnedStaging *staging);
+    void clear(void *stream);
+    NnSize calcSliceSize(NnSize nominator, NnSize denominator) const;
+    void *data() const { return devicePointer; }
+};
+
+class NnCudaDeviceData {
+private:
+    NnNetConfig *netConfig;
+    NnNodeConfig *nodeConfig;
+public:
+    std::vector<std::unique_ptr<NnCudaBuffer>> pipes;
+    std::vector<std::unique_ptr<NnCudaBuffer>> buffers;
+
+    NnCudaDeviceData();
+    NnCudaDeviceData(NnNetConfig *netConfig, NnNodeConfig *nodeConfig);
+    NnCudaDeviceData(NnCudaDeviceData&& other) noexcept;
+    NnCudaDeviceData& operator=(NnCudaDeviceData&& other) noexcept;
+    NnCudaDeviceData(const NnCudaDeviceData&) = delete;
+    NnCudaDeviceData& operator=(const NnCudaDeviceData&) = delete;
+    NnCudaBuffer *resolvePipe(NnUint pipeIndex);
+    NnCudaBuffer *resolveBuffer(NnUint bufferIndex);
+};
 
 class NnCudaDevice : public NnDevice {
 private:
@@ -19,6 +69,8 @@ private:
     const NnUnevenPartitionPlan *partitionPlan;
     std::atomic_uint planEpoch{0u};
 public:
+    NnCudaPinnedStaging staging;
+    NnCudaDeviceData data;
     NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan = nullptr);
     ~NnCudaDevice() override;
     NnUint maxNThreads() override;
@@ -31,6 +83,15 @@ public:
     NnUint getGpuIndex() const { return gpuIndex; }
     void *getStream() const { return stream; }
     NnSize3D resolvePointerLogicalSize(const NnPointerConfig *config) const;
+    NnNetConfig *getNetConfig() const { return netConfig; }
+    NnNodeConfig *getNodeConfig() const { return nodeConfig; }
+    NnNetExecution *getNetExecution() const { return netExecution; }
+
+    void writePipe(NnUint pipeIndex, const NnByte *data, NnSize offset, NnSize nBytes);
+    void readPipe(NnUint pipeIndex, NnByte *data, NnSize offset, NnSize nBytes);
+    void writeBuffer(NnUint bufferIndex, const NnByte *data, NnSize offset, NnSize nBytes);
+    void readBuffer(NnUint bufferIndex, NnByte *data, NnSize offset, NnSize nBytes);
+    void synchronize();
 };
 
 class NnCudaDeviceSegment : public NnDeviceSegment {
@@ -40,8 +101,13 @@ private:
     NnSegmentConfig *segmentConfig;
     NnNetExecution *netExecution;
     std::atomic_uint planEpochReady{0u};
+    std::vector<std::unique_ptr<NnCudaBuffer>> weightBuffers;
+    std::vector<std::unique_ptr<NnCudaBuffer>> configBuffers;
 
     std::string unsupportedOpMessage(NnUint opIndex) const;
+    void uploadSegmentInputs(NnUint batchSize);
+    void downloadSegmentOutputs(NnUint batchSize);
+    void executeOp(NnUint opIndex, NnUint batchSize);
 public:
     NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);
     ~NnCudaDeviceSegment() override;
@@ -49,6 +115,7 @@ public:
     void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) override;
     void setPartitionPlan(const NnUnevenPartitionPlan *plan) override;
     void refreshPointers() override;
+    void readWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *out);
 };
 
 #endif

@@ -15,6 +15,10 @@
 #include <utility>
 #include <ctime>
 #include <cstdint>
+#include <limits>
+#include <set>
+#include <string>
+#include <thread>
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
@@ -334,6 +338,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.interactive = false;
     args.syncType = F_32;
     args.nWorkers = 0;
+    args.workerAllocCount = 0;
     args.workerHosts = nullptr;
     args.workerPorts = nullptr;
     args.port = 9990;
@@ -350,6 +355,10 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
     args.ratiosStr = nullptr;
+    args.warmupEnabled = false;
+    args.warmupSteps = 16u;
+    args.warmupBudget = 8u;
+    args.warmupCandidatesStr = nullptr;
     args.kvRedundancyStr = nullptr;
     args.enablePlanBarrier = false;
     args.enableStageFullWeights = false;
@@ -494,6 +503,17 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             continue;
         }
 
+        if (std::strcmp(name, "--warmup") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.warmupEnabled = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.warmupEnabled = true;
+                i += 1;
+            }
+            continue;
+        }
+
         if (std::strcmp(name, "--runtime-active-seg-enabled") == 0) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 args.runtimeActiveSegEnabled = std::atoi(argv[i + 1]) != 0;
@@ -559,6 +579,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 throw std::runtime_error("--workers requires at least one worker in host:port format");
 
             args.nWorkers = count;
+            args.workerAllocCount = count;
             args.workerHosts = new char*[count];
             args.workerPorts = new NnUint[count];
 
@@ -594,6 +615,16 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.syncType = parseFloatType(value);
         } else if (std::strcmp(name, "--ratios") == 0) {
             args.ratiosStr = value;
+        } else if (std::strcmp(name, "--warmup-steps") == 0) {
+            int x = std::atoi(value);
+            if (x < 1) x = 1;
+            args.warmupSteps = (NnUint)x;
+        } else if (std::strcmp(name, "--warmup-budget") == 0) {
+            int x = std::atoi(value);
+            if (x < 1) x = 1;
+            args.warmupBudget = (NnUint)x;
+        } else if (std::strcmp(name, "--warmup-candidates") == 0) {
+            args.warmupCandidatesStr = value;
         } else if (std::strcmp(name, "--kv-redundancy") == 0) {
             args.kvRedundancyStr = value;
         } else if (std::strcmp(name, "--port") == 0) {
@@ -668,7 +699,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
 AppCliArgs::~AppCliArgs() {
     if (workerHosts != nullptr) {
-        for (NnUint i = 0; i < nWorkers; i++)
+        for (NnUint i = 0; i < workerAllocCount; i++)
             delete[] workerHosts[i];
         delete[] workerHosts;
     }
@@ -1033,6 +1064,528 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
     }
 }
 
+struct WarmupCandidateResult {
+    std::string ratios;
+    NnUint nWorkers = 0u;
+    std::vector<NnUint> workerIndices;
+    double scoreMs = std::numeric_limits<double>::infinity();
+    bool ok = false;
+    std::string error;
+};
+
+struct WarmupCandidate {
+    NnUint nWorkers = 0u;
+    std::vector<NnUint> workerIndices;
+    std::string ratios;
+};
+
+struct WarmupSelection {
+    NnUint nWorkers = 0u;
+    std::vector<NnUint> workerIndices;
+    std::string ratios;
+    double scoreMs = std::numeric_limits<double>::infinity();
+};
+
+struct ArgsRestoreGuard {
+    AppCliArgs *args;
+    char *ratios;
+    bool benchmark;
+    NnUint nWorkers;
+    ~ArgsRestoreGuard() {
+        args->ratiosStr = ratios;
+        args->benchmark = benchmark;
+        args->nWorkers = nWorkers;
+    }
+};
+
+struct InferenceFinishGuard {
+    RootLlmInference *inference;
+    bool active;
+    ~InferenceFinishGuard() {
+        if (active && inference != nullptr) inference->finish();
+    }
+    void finishNow() {
+        if (!active || inference == nullptr) return;
+        inference->finish();
+        active = false;
+    }
+};
+
+static std::vector<NnExecutorDevice> resolveDevices(
+    AppCliArgs *args,
+    NnNetConfig *netConfig,
+    NnNodeConfig *nodeConfig,
+    NnNetExecution *netExecution,
+    const NnUnevenPartitionPlan *plan = nullptr);
+
+static std::vector<std::string> splitWarmupCandidates(const char *raw) {
+    std::vector<std::string> out;
+    if (raw == nullptr || raw[0] == '\0') return out;
+    std::string s(raw);
+    for (char &c : s) {
+        if (c == ';' || c == '\n' || c == '\t') c = ' ';
+    }
+    std::stringstream ss(s);
+    std::string item;
+    while (ss >> item) {
+        if (!item.empty()) out.push_back(item);
+    }
+    return out;
+}
+
+static std::string joinUniformTp(NnUint n) {
+    std::ostringstream oss;
+    for (NnUint i = 0u; i < n; ++i) {
+        if (i != 0u) oss << ":";
+        oss << "1";
+    }
+    return oss.str();
+}
+
+static std::string makePpRatios(const std::vector<NnUint> &stageSizes, NnUint nLayers) {
+    if (stageSizes.empty()) return "";
+    std::ostringstream oss;
+    const NnUint nStages = (NnUint)stageSizes.size();
+    NnUint assigned = 0u;
+    for (NnUint i = 0u; i < nStages; ++i) {
+        if (i != 0u) oss << "*";
+        NnUint layers = 0u;
+        if (i + 1u == nStages) {
+            layers = nLayers - assigned;
+        } else {
+            layers = nLayers / nStages;
+            if (i < (nLayers % nStages)) layers += 1u;
+            assigned += layers;
+        }
+        oss << joinUniformTp(stageSizes[i]) << "@" << layers;
+    }
+    return oss.str();
+}
+
+static std::string makePpRatiosWithLayerCounts(const std::vector<NnUint> &stageSizes, const std::vector<NnUint> &layerCounts) {
+    if (stageSizes.empty() || stageSizes.size() != layerCounts.size()) return "";
+    std::ostringstream oss;
+    for (size_t i = 0; i < stageSizes.size(); ++i) {
+        if (i != 0u) oss << "*";
+        oss << joinUniformTp(stageSizes[i]) << "@" << layerCounts[i];
+    }
+    return oss.str();
+}
+
+static void appendTopologyCandidates(std::vector<std::string> &candidates, NnUint nNodes, NnUint nLayers) {
+    std::set<std::string> seen(candidates.begin(), candidates.end());
+    auto add = [&](const std::string &s) {
+        if (s.empty()) return;
+        if (seen.insert(s).second) candidates.push_back(s);
+    };
+
+    add(joinUniformTp(nNodes));
+
+    std::vector<NnUint> purePp(nNodes, 1u);
+    add(makePpRatios(purePp, nLayers));
+    if (nNodes == 3u && nLayers >= 3u) {
+        const NnUint base = nLayers / 3u;
+        const NnUint rem = nLayers % 3u;
+        std::vector<NnUint> counts{base, base, base};
+        for (NnUint i = 0u; i < rem; ++i) counts[i] += 1u;
+        add(makePpRatiosWithLayerCounts({1u, 1u, 1u}, {counts[1], counts[2], counts[0]}));
+        add(makePpRatiosWithLayerCounts({1u, 1u, 1u}, {counts[2], counts[0], counts[1]}));
+    }
+
+    for (NnUint group = 2u; group <= std::min<NnUint>(nNodes, 4u); ++group) {
+        if (nNodes % group == 0u) {
+            std::vector<NnUint> sizes(nNodes / group, group);
+            add(makePpRatios(sizes, nLayers));
+        }
+    }
+    if (nNodes >= 4u) {
+        add(makePpRatios({2u, nNodes - 2u}, nLayers));
+        add(makePpRatios({nNodes - 2u, 2u}, nLayers));
+    }
+    if (nNodes >= 5u) {
+        add(makePpRatios({1u, 2u, nNodes - 3u}, nLayers));
+        add(makePpRatios({nNodes - 3u, 2u, 1u}, nLayers));
+    }
+}
+
+static std::vector<WarmupCandidate> buildWarmupCandidates(NnUint maxWorkers, NnUint nLayers, const AppCliArgs *args) {
+    std::vector<WarmupCandidate> candidates;
+    std::set<std::string> seen;
+    auto add = [&](const std::vector<NnUint> &workerIndices, const std::string &ratios) {
+        std::ostringstream key;
+        for (NnUint idx : workerIndices) key << idx << ",";
+        key << "|" << ratios;
+        if (seen.insert(key.str()).second) {
+            WarmupCandidate c;
+            c.nWorkers = (NnUint)workerIndices.size();
+            c.workerIndices = workerIndices;
+            c.ratios = ratios;
+            candidates.push_back(c);
+        }
+    };
+    auto prefixWorkers = [](NnUint nWorkers) {
+        std::vector<NnUint> out;
+        out.reserve(nWorkers);
+        for (NnUint i = 0u; i < nWorkers; ++i) out.push_back(i);
+        return out;
+    };
+
+    std::vector<std::string> overrideCandidates = splitWarmupCandidates(args->warmupCandidatesStr);
+    if (!overrideCandidates.empty()) {
+        for (const std::string &r : overrideCandidates) add(prefixWorkers(maxWorkers), r);
+        return candidates;
+    }
+
+    // First pass: front-load representative configurations so the default
+    // budget covers both small-model subsets and full-worker PP/TP variants.
+    // nWorkers=0 means root-only single-device inference.
+    add({}, std::string());
+    if (maxWorkers > 0u) {
+        std::vector<NnUint> fullSubset = prefixWorkers(maxWorkers);
+        add(fullSubset, joinUniformTp(maxWorkers + 1u));
+    }
+    for (NnUint idx = 0u; idx < maxWorkers; ++idx) {
+        add({idx}, joinUniformTp(2u));
+    }
+    if (maxWorkers > 0u) {
+        const NnUint nNodes = maxWorkers + 1u;
+        std::vector<NnUint> fullSubset = prefixWorkers(maxWorkers);
+        std::vector<std::string> fullRatios;
+        appendTopologyCandidates(fullRatios, nNodes, nLayers);
+        for (const std::string &r : fullRatios) add(fullSubset, r);
+    }
+    for (NnUint workers = 2u; workers < maxWorkers; ++workers) {
+        add(prefixWorkers(workers), joinUniformTp(workers + 1u));
+    }
+
+    // Second pass: add bounded PP/hybrid variants for smaller prefix subsets.
+    for (NnUint workers = 1u; workers < maxWorkers; ++workers) {
+        const NnUint nNodes = workers + 1u;
+        std::vector<NnUint> subset = prefixWorkers(workers);
+        std::vector<std::string> ratios;
+        appendTopologyCandidates(ratios, nNodes, nLayers);
+        for (const std::string &r : ratios) add(subset, r);
+    }
+    return candidates;
+}
+
+static int warmupRelistenDelayMs() {
+    int delayMs = 1000;
+    parseEnvInt("DLLAMA_WARMUP_RELISTEN_DELAY_MS", delayMs);
+    if (delayMs < 0) delayMs = 0;
+    return delayMs;
+}
+
+static void waitForWarmupWorkersToRelisten() {
+    const int delayMs = warmupRelistenDelayMs();
+    if (delayMs <= 0) return;
+    // Workers loop back to serve() after receiving finish(). Give them a bounded
+    // relisten window before the next root connects.
+    std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+}
+
+static void buildCandidateWorkerArrays(
+    AppCliArgs *args,
+    const WarmupCandidate &candidate,
+    std::vector<char*> &hosts,
+    std::vector<NnUint> &ports) {
+    hosts.clear();
+    ports.clear();
+    hosts.reserve(candidate.workerIndices.size());
+    ports.reserve(candidate.workerIndices.size());
+    for (NnUint idx : candidate.workerIndices) {
+        if (idx >= args->workerAllocCount) {
+            throw std::runtime_error("warmup worker subset index out of range");
+        }
+        hosts.push_back(args->workerHosts[idx]);
+        ports.push_back(args->workerPorts[idx]);
+    }
+}
+
+static void applyWarmupWorkerSubset(AppCliArgs *args, const WarmupSelection &selection) {
+    if (selection.nWorkers == args->nWorkers && selection.workerIndices.empty()) return;
+    if (selection.nWorkers == 0u) {
+        args->nWorkers = 0u;
+        return;
+    }
+    std::vector<bool> selected(args->workerAllocCount, false);
+    std::vector<char*> newHosts;
+    std::vector<NnUint> newPorts;
+    newHosts.reserve(args->workerAllocCount);
+    newPorts.reserve(args->workerAllocCount);
+    for (NnUint idx : selection.workerIndices) {
+        if (idx >= args->workerAllocCount) throw std::runtime_error("warmup selected worker index out of range");
+        if (selected[idx]) continue;
+        selected[idx] = true;
+        newHosts.push_back(args->workerHosts[idx]);
+        newPorts.push_back(args->workerPorts[idx]);
+    }
+    for (NnUint idx = 0u; idx < args->workerAllocCount; ++idx) {
+        if (selected[idx]) continue;
+        newHosts.push_back(args->workerHosts[idx]);
+        newPorts.push_back(args->workerPorts[idx]);
+    }
+    for (NnUint idx = 0u; idx < args->workerAllocCount; ++idx) {
+        args->workerHosts[idx] = newHosts[idx];
+        args->workerPorts[idx] = newPorts[idx];
+    }
+    args->nWorkers = (NnUint)selection.workerIndices.size();
+}
+
+static std::string warmupWorkerIndicesString(const std::vector<NnUint> &indices) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < indices.size(); ++i) {
+        if (i != 0u) oss << ",";
+        oss << indices[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+static const char *warmupRatiosLabel(const std::string &ratios) {
+    return ratios.empty() ? "(single)" : ratios.c_str();
+}
+
+static void accumulateWarmupPerf(
+    const std::vector<LlmPerfPacket> &perf,
+    std::vector<unsigned long long> &execUs,
+    std::vector<unsigned long long> &syncUs,
+    std::vector<unsigned long long> &bubbleUs,
+    std::vector<unsigned long long> &tokens,
+    std::vector<NnUint> &stageIndex,
+    std::vector<bool> &hasStage) {
+    for (const LlmPerfPacket &p : perf) {
+        if (p.nodeIndex >= execUs.size()) continue;
+        execUs[p.nodeIndex] += p.execUs;
+        syncUs[p.nodeIndex] += p.syncUs;
+        bubbleUs[p.nodeIndex] += p.bubbleUs;
+        tokens[p.nodeIndex] += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
+        stageIndex[p.nodeIndex] = p.stageIndex;
+        hasStage[p.nodeIndex] = true;
+    }
+}
+
+static double warmupMaxStageNodeMs(
+    const std::vector<unsigned long long> &execUs,
+    const std::vector<unsigned long long> &syncUs,
+    const std::vector<unsigned long long> &bubbleUs,
+    const std::vector<unsigned long long> &tokens,
+    const std::string &ratios) {
+    double maxMs = 0.0;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == 0ull) continue;
+        const double ms = (double)(execUs[i] + syncUs[i] + bubbleUs[i]) / 1000.0 / (double)tokens[i];
+        if (ms > maxMs) maxMs = ms;
+    }
+    if (maxMs <= 0.0) {
+        throw std::runtime_error("warmup produced no stage/node profile packets for ratios=" + ratios);
+    }
+    return maxMs;
+}
+
+static WarmupCandidateResult probeWarmupCandidate(
+    AppCliArgs *args,
+    LlmHeader *header,
+    Tokenizer *tokenizer,
+    const WarmupCandidate &candidate) {
+    WarmupCandidateResult result;
+    result.ratios = candidate.ratios;
+    result.nWorkers = candidate.nWorkers;
+    result.workerIndices = candidate.workerIndices;
+    try {
+        const NnUint nWorkers = candidate.nWorkers;
+        const NnUint nNodes = nWorkers + 1u;
+        const bool distributed = nWorkers > 0u;
+        const bool uneven = distributed && !candidate.ratios.empty();
+        printf("🔥 [warmup] probing workers=%u workerIndices=%s nNodes=%u ratios=%s\n",
+            (unsigned)nWorkers,
+            warmupWorkerIndicesString(candidate.workerIndices).c_str(),
+            (unsigned)nNodes,
+            warmupRatiosLabel(candidate.ratios));
+        std::fflush(stdout);
+
+        std::unique_ptr<NnUnevenPartitionPlan> planPtr;
+        if (uneven) {
+            std::vector<NnStageDef> stageDefs = parseStageDefs(candidate.ratios.c_str(), nNodes, header->nLayers);
+            const NnUint ffDim = (header->archType == QWEN3_MOE) ? header->moeHiddenDim : header->hiddenDim;
+            std::vector<NnUint> kvRedundancyPerNode = parseKvRedundancy(args->kvRedundancyStr, nNodes);
+            planPtr.reset(new NnUnevenPartitionPlan(
+                createPartitionPlan(stageDefs, header->nHeads, header->nKvHeads, header->vocabSize, ffDim, header->dim, kvRedundancyPerNode)
+            ));
+        }
+
+        LlmNet net = uneven
+            ? buildLlmNetUneven(header, nNodes, args->nBatches, planPtr.get())
+            : buildLlmNet(header, nNodes, args->nBatches);
+        std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
+        NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
+        NnNetExecution execution(args->nThreads, &net.netConfig);
+        std::vector<char*> candidateHosts;
+        std::vector<NnUint> candidatePorts;
+        if (distributed) buildCandidateWorkerArrays(args, candidate, candidateHosts, candidatePorts);
+        std::unique_ptr<NnNetwork> networkPtr = distributed
+            ? NnNetwork::connect(nWorkers, candidateHosts.data(), candidatePorts.data())
+            : std::unique_ptr<NnNetwork>(nullptr);
+        NnNetwork *network = networkPtr.get();
+
+        char *savedRatios = args->ratiosStr;
+        const bool savedBenchmark = args->benchmark;
+        const NnUint savedWorkers = args->nWorkers;
+        ArgsRestoreGuard argsGuard{args, savedRatios, savedBenchmark, savedWorkers};
+        std::string probeRatios = candidate.ratios;
+        args->nWorkers = nWorkers;
+        args->ratiosStr = uneven ? const_cast<char*>(probeRatios.c_str()) : nullptr;
+        args->benchmark = true;
+        for (NnUint nodeIndex = 1u; nodeIndex < nNodes && network != nullptr; ++nodeIndex) {
+            writeBootstrapPacket(network, nodeIndex - 1u, args);
+        }
+        args->ratiosStr = savedRatios;
+        args->benchmark = savedBenchmark;
+        args->nWorkers = savedWorkers;
+
+        std::unique_ptr<NnNodeSynchronizer> synchronizer;
+        if (distributed) {
+            synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get(), false));
+            NnRootConfigWriter configWriter(network);
+            configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
+        } else {
+            synchronizer.reset(new NnFakeNodeSynchronizer());
+        }
+        std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
+        NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), true);
+
+        if (uneven) {
+            NnLocalWeightLoader localLoader(&executor, 0);
+            loadLlmNetWeightUneven(args->modelPath, &net, &localLoader, planPtr.get(), 0);
+        } else {
+            NnRootWeightLoader weightLoader(&executor, network, nNodes);
+            loadLlmNetWeight(args->modelPath, &net, &weightLoader);
+        }
+
+        RootLlmInference inference(&net, &execution, &executor, network, planPtr.get(), true, args->enablePpMigration);
+        InferenceFinishGuard finishGuard{&inference, true};
+        if (network != nullptr) {
+            network->resetStats();
+            if (args->netTurbo) network->setTurbo(true);
+        }
+
+        const char *prompt = (args->prompt != nullptr && args->prompt[0] != '\0')
+            ? args->prompt
+            : "Write a comma-separated list of the numbers from 1 to 20.";
+        std::string effectivePrompt(prompt);
+        std::vector<int> inputTokensVec(effectivePrompt.size() + 3);
+        int *inputTokens = inputTokensVec.data();
+        int nInputTokens = (int)inputTokensVec.size();
+        tokenizer->encode(const_cast<char*>(effectivePrompt.c_str()), inputTokens, &nInputTokens, true, true);
+        if (nInputTokens <= 1) throw std::runtime_error("warmup prompt produced too few tokens");
+        NnUint steps = std::max<NnUint>((NnUint)nInputTokens + args->warmupSteps, 2u);
+        steps = std::min<NnUint>(steps, header->seqLen);
+
+        std::vector<unsigned long long> execUs(nNodes, 0ull);
+        std::vector<unsigned long long> syncUs(nNodes, 0ull);
+        std::vector<unsigned long long> bubbleUs(nNodes, 0ull);
+        std::vector<unsigned long long> tokens(nNodes, 0ull);
+        std::vector<NnUint> stageIndex(nNodes, 0u);
+        std::vector<bool> hasStage(nNodes, false);
+
+        NnUint pos = 0u;
+        while ((long)(nInputTokens - 1) - (long)pos > 0) {
+            const long remaining = (long)(nInputTokens - 1) - (long)pos;
+            const NnUint batchSize = (NnUint)std::min<long>(remaining, (long)args->nBatches);
+            inference.setBatchSize(batchSize);
+            inference.setPosition(pos);
+            for (NnUint i = 0u; i < batchSize; ++i) inference.setToken(i, (NnUint)inputTokens[pos + i]);
+            inference.forward();
+            accumulateWarmupPerf(inference.getLastPerf(), execUs, syncUs, bubbleUs, tokens, stageIndex, hasStage);
+            pos += batchSize;
+        }
+
+        int token = inputTokens[nInputTokens - 1];
+        inference.setBatchSize(1u);
+        tokenizer->resetDecoder();
+        Sampler warmupSampler(tokenizer->vocabSize, args->temperature, args->topp, args->seed);
+        for (; pos < steps; ++pos) {
+            inference.setPosition(pos);
+            inference.setToken(0u, (NnUint)token);
+            inference.forward();
+            accumulateWarmupPerf(inference.getLastPerf(), execUs, syncUs, bubbleUs, tokens, stageIndex, hasStage);
+            token = warmupSampler.sample(inference.logitsPipe);
+        }
+
+        result.scoreMs = warmupMaxStageNodeMs(execUs, syncUs, bubbleUs, tokens, warmupRatiosLabel(candidate.ratios));
+        result.ok = true;
+        printf("🔥 [warmup] workers=%u workerIndices=%s ratios=%s score_max_stage_node_ms_per_tok=%.3f\n",
+            (unsigned)nWorkers,
+            warmupWorkerIndicesString(candidate.workerIndices).c_str(),
+            warmupRatiosLabel(candidate.ratios),
+            result.scoreMs);
+        for (NnUint node = 0u; node < nNodes; ++node) {
+            if (tokens[node] == 0ull) continue;
+            const double ms = (double)(execUs[node] + syncUs[node] + bubbleUs[node]) / 1000.0 / (double)tokens[node];
+            printf("🔥 [warmup]   Stage %u Node %u per_tok_total=%.3f ms tok=%llu\n",
+                (unsigned)(hasStage[node] ? stageIndex[node] : 0xFFFFFFFFu),
+                (unsigned)node,
+                ms,
+                tokens[node]);
+        }
+        std::fflush(stdout);
+        finishGuard.finishNow();
+    } catch (const std::exception &e) {
+        result.ok = false;
+        result.error = e.what();
+        printf("🔥 [warmup] workers=%u workerIndices=%s ratios=%s failed: %s\n",
+            (unsigned)candidate.nWorkers,
+            warmupWorkerIndicesString(candidate.workerIndices).c_str(),
+            warmupRatiosLabel(candidate.ratios),
+            e.what());
+        std::fflush(stdout);
+    }
+    return result;
+}
+
+static WarmupSelection selectWarmupConfiguration(
+    AppCliArgs *args,
+    LlmHeader *header,
+    Tokenizer *tokenizer,
+    NnUint maxWorkers) {
+    std::vector<WarmupCandidate> candidates = buildWarmupCandidates(maxWorkers, header->nLayers, args);
+    if (candidates.empty()) throw std::runtime_error("--warmup has no candidate ratios");
+
+    const NnUint budget = std::max<NnUint>(1u, args->warmupBudget);
+    WarmupCandidateResult best;
+    printf("🔥 [warmup] enabled maxWorkers=%u steps=%u budget=%u candidates=%zu scoring=max Stage/Node Profile per-token total\n",
+        (unsigned)maxWorkers,
+        (unsigned)args->warmupSteps,
+        (unsigned)budget,
+        candidates.size());
+    for (NnUint i = 0u; i < (NnUint)candidates.size() && i < budget; ++i) {
+        WarmupCandidateResult r = probeWarmupCandidate(args, header, tokenizer, candidates[i]);
+        if (r.ok && (!best.ok || r.scoreMs < best.scoreMs)) {
+            best = r;
+        }
+        if (r.nWorkers > 0u && i + 1u < (NnUint)candidates.size() && i + 1u < budget) {
+            waitForWarmupWorkersToRelisten();
+        }
+    }
+    if (!best.ok) {
+        throw std::runtime_error("--warmup failed for all probed candidate ratios");
+    }
+    printf("🔥 [warmup] selected workers=%u workerIndices=%s nNodes=%u ratios=%s score_max_stage_node_ms_per_tok=%.3f\n",
+        (unsigned)best.nWorkers,
+        warmupWorkerIndicesString(best.workerIndices).c_str(),
+        (unsigned)(best.nWorkers + 1u),
+        warmupRatiosLabel(best.ratios),
+        best.scoreMs);
+    std::fflush(stdout);
+    WarmupSelection selection;
+    selection.nWorkers = best.nWorkers;
+    selection.workerIndices = best.workerIndices;
+    selection.ratios = best.ratios;
+    selection.scoreMs = best.scoreMs;
+    return selection;
+}
+
 void printPartitionPlanDebug(const NnUnevenPartitionPlan* plan) {
     printf("\n🔍 [DEBUG] Pipeline Partition Plan Verification:\n");
     printf("===================================================\n");
@@ -1072,7 +1625,7 @@ void printPartitionPlanDebug(const NnUnevenPartitionPlan* plan) {
     printf("===================================================\n\n");
 }
 
-static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr) {
+static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan) {
     std::vector<NnExecutorDevice> devices;
 
     if (args->gpuIndex >= 0) {
@@ -3347,6 +3900,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     LlmNet net;
     std::unique_ptr<NnUnevenPartitionPlan> planPtr;
     std::vector<float> ratios;
+    std::string warmupSelectedRatios;
+    NnUint warmupSelectedWorkers = args->nWorkers;
 
     // IMPORTANT: plan barrier affects graph construction (insertion of OP_PLAN_BARRIER/OP_PLAN_APPLY)
     // so we must enable it before building the LLM net.
@@ -3372,6 +3927,20 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         args->runtimeActiveSegEnabled,
         args->runtimeRedundantSegEnabled && !bubbleShadowKvEnabled(),
         args->runtimePrimarySkipLayersStr);
+
+    if (args->warmupEnabled) {
+        if (args->ratiosStr != nullptr) {
+            printf("🔥 [warmup] skipped: explicit --ratios=%s was provided\n", args->ratiosStr);
+        } else {
+            WarmupSelection selection = selectWarmupConfiguration(args, &header, &tokenizer, args->nWorkers);
+            warmupSelectedWorkers = selection.nWorkers;
+            warmupSelectedRatios = selection.ratios;
+            applyWarmupWorkerSubset(args, selection);
+            nNodes = args->nWorkers + 1u;
+            args->ratiosStr = warmupSelectedRatios.empty() ? nullptr : const_cast<char*>(warmupSelectedRatios.c_str());
+            if (warmupSelectedWorkers > 0u) waitForWarmupWorkersToRelisten();
+        }
+    }
 
     if(args->ratiosStr != nullptr){
         printf("nNodes=%d\n", nNodes);

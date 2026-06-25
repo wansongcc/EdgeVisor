@@ -31,6 +31,7 @@ public:
     bool interactive;
     NnFloatType syncType;
     NnUint nWorkers;
+    NnUint workerAllocCount;
     char **workerHosts;
     NnUint *workerPorts;
     float temperature;
@@ -47,6 +48,10 @@ public:
     int gpuSegmentTo;
 
     char *ratiosStr;
+    bool warmupEnabled; // Auto-select ratios before inference when --ratios is omitted
+    NnUint warmupSteps; // Probe generation steps per candidate
+    NnUint warmupBudget; // Maximum number of candidates to probe
+    char *warmupCandidatesStr; // Optional candidate override, separated by whitespace/semicolon
     char *kvRedundancyStr; // KV redundancy per node, format: "2" (all) or "2,3,2,3" (per-node)
     bool enablePlanBarrier; // Enable plan barrier for online migration
     bool enableStageFullWeights; // Enable stage full residency (full weights and buffers)

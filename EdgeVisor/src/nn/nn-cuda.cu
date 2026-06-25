@@ -2,12 +2,14 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 static std::string cudaErrorString(cudaError_t err, const char *expr) {
     std::ostringstream out;
@@ -18,6 +20,30 @@ static std::string cudaErrorString(cudaError_t err, const char *expr) {
 #define NN_CUDA_CHECK(expr) do { \
     cudaError_t _err = (expr); \
     if (_err != cudaSuccess) throw std::runtime_error(cudaErrorString(_err, #expr)); \
+} while (0)
+
+static std::string cublasErrorString(cublasStatus_t status, const char *expr) {
+    std::ostringstream out;
+    out << expr << " failed: ";
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS: out << "CUBLAS_STATUS_SUCCESS"; break;
+        case CUBLAS_STATUS_NOT_INITIALIZED: out << "CUBLAS_STATUS_NOT_INITIALIZED"; break;
+        case CUBLAS_STATUS_ALLOC_FAILED: out << "CUBLAS_STATUS_ALLOC_FAILED"; break;
+        case CUBLAS_STATUS_INVALID_VALUE: out << "CUBLAS_STATUS_INVALID_VALUE"; break;
+        case CUBLAS_STATUS_ARCH_MISMATCH: out << "CUBLAS_STATUS_ARCH_MISMATCH"; break;
+        case CUBLAS_STATUS_MAPPING_ERROR: out << "CUBLAS_STATUS_MAPPING_ERROR"; break;
+        case CUBLAS_STATUS_EXECUTION_FAILED: out << "CUBLAS_STATUS_EXECUTION_FAILED"; break;
+        case CUBLAS_STATUS_INTERNAL_ERROR: out << "CUBLAS_STATUS_INTERNAL_ERROR"; break;
+        case CUBLAS_STATUS_NOT_SUPPORTED: out << "CUBLAS_STATUS_NOT_SUPPORTED"; break;
+        case CUBLAS_STATUS_LICENSE_ERROR: out << "CUBLAS_STATUS_LICENSE_ERROR"; break;
+        default: out << "unknown(" << (int)status << ")"; break;
+    }
+    return out.str();
+}
+
+#define NN_CUBLAS_CHECK(expr) do { \
+    cublasStatus_t _status = (expr); \
+    if (_status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(cublasErrorString(_status, #expr)); \
 } while (0)
 
 static std::string sizeToString(const NnSize3D &s) {
@@ -71,6 +97,10 @@ static const NnTensorView *opTensorView(const NnOpConfig &op) {
         case OP_GELU: return &((const NnGeluOpCodeConfig *)op.config)->view;
         case OP_MUL: return &((const NnMulOpCodeConfig *)op.config)->view;
         case OP_SCALE: return &((const NnScaleOpCodeConfig *)op.config)->view;
+        case OP_INV_RMS: return &((const NnInvRmsOpConfig *)op.config)->view;
+        case OP_RMS_NORM: return &((const NnRmsNormOpConfig *)op.config)->view;
+        case OP_ROPE: return &((const NnRopeOpConfig *)op.config)->view;
+        case OP_SOFTMAX: return &((const NnSoftmaxOpCodeConfig *)op.config)->view;
         default: return nullptr;
     }
 }
@@ -94,7 +124,24 @@ __device__ static inline uint16_t cudaFloatToHalfBits(float x) {
     return __half_as_ushort(h);
 }
 
+__device__ static inline float cudaHalfBitsToFloat(uint16_t h) {
+    const int sign = (h & 0x8000u) ? -1 : 1;
+    const int exp = (h >> 10) & 0x1fu;
+    const int mant = h & 0x03ffu;
+    if (exp == 0) {
+        return sign * ldexpf((float)mant, -24);
+    }
+    if (exp == 31) {
+        return mant == 0 ? sign * 3.4028234663852886e38f : 0.0f;
+    }
+    return sign * ldexpf((float)(1024 + mant), exp - 25);
+}
+
 __device__ static inline NnByte *cudaRowBase(NnByte *base, NnPointerLayout layout, NnUint z, NnUint y) {
+    return base + z * layout.zStrideBytes + y * layout.batchStrideBytes + layout.byteOffset;
+}
+
+static inline NnByte *cudaHostRowBase(NnByte *base, const NnPointerLayout &layout, NnUint z, NnUint y) {
     return base + z * layout.zStrideBytes + y * layout.batchStrideBytes + layout.byteOffset;
 }
 
@@ -301,6 +348,323 @@ __global__ static void repeatZCopyQ80Kernel(
     *out = *src;
 }
 
+__global__ static void embeddingF32F32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const float *weight,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * output.logicalSize.x;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint x = (NnUint)(tid % output.logicalSize.x);
+    const NnUint y = (NnUint)(tid / output.logicalSize.x);
+    const float *tokenPtr = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
+    const NnUint token = (NnUint)tokenPtr[0];
+    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+    out[x] = weight[(NnSize)token * output.logicalSize.x + x];
+}
+
+__global__ static void invRmsF32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    float epsilon,
+    NnUint nColumns,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * nColumns;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint col = (NnUint)(tid % nColumns);
+    const NnUint y = (NnUint)(tid / nColumns);
+    const NnUint colSize = input.logicalSize.x / nColumns;
+    const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y) + (NnSize)col * colSize;
+    float ss = 0.0f;
+    for (NnUint i = 0u; i < colSize; ++i) ss += in[i] * in[i];
+    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+    out[col] = rsqrtf(ss / (float)colSize + epsilon);
+}
+
+__global__ static void rmsNormF32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const float *weight,
+    const float *invRms,
+    NnUint invRmsRowStride,
+    NnUint nColumns,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * output.logicalSize.x;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint x = (NnUint)(tid % output.logicalSize.x);
+    const NnUint y = (NnUint)(tid / output.logicalSize.x);
+    const NnUint colSize = output.logicalSize.x / nColumns;
+    const NnUint col = x / colSize;
+    const NnUint local = x - col * colSize;
+    const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
+    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+    out[x] = weight[local] * (invRms[(NnSize)y * invRmsRowStride + col] * in[x]);
+}
+
+__global__ static void ropeF32Kernel(
+    NnByte *inputBase,
+    NnPointerLayout input,
+    const float *positions,
+    const float *cache,
+    NnRopeOpConfig config,
+    NnTensorViewLayout view,
+    NnUint batchSize) {
+    const bool isQ = config.isQ == 1u;
+    const NnRopeSlice slice = config.slice;
+    if (config.type == ROPE_LLAMA || config.type == ROPE_LLAMA3_1) {
+        const NnUint pairCount = view.sizeX / 2u;
+        const NnSize total = (NnSize)batchSize * pairCount;
+        const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+        if (tid >= total) return;
+        const NnUint pair = (NnUint)(tid % pairCount);
+        const NnUint y = (NnUint)(tid / pairCount);
+        const NnUint pos = (NnUint)positions[y];
+        const NnUint shift = isQ ? slice.qShift : 0u;
+        const NnUint i = pair * 2u;
+        const float *posCache = cache + (NnSize)pos * slice.sliceDim + shift + view.offset;
+        float *x = (float *)cudaRowBase(inputBase, input, 0u, y);
+        const NnUint x0Index = view.offset + i;
+        const float fcr = posCache[i];
+        const float fci = posCache[i + 1u];
+        const float v0 = x[x0Index];
+        const float v1 = x[x0Index + 1u];
+        x[x0Index] = v0 * fcr - v1 * fci;
+        x[x0Index + 1u] = v0 * fci + v1 * fcr;
+        return;
+    }
+    if (config.type == ROPE_FALCON) {
+        const NnUint headDim = slice.headDim;
+        const NnUint nHeadsView = view.sizeX / headDim;
+        const NnUint half = headDim / 2u;
+        const NnSize total = (NnSize)batchSize * nHeadsView * half;
+        const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+        if (tid >= total) return;
+        const NnUint j = (NnUint)(tid % half);
+        NnSize t = tid / half;
+        const NnUint h = (NnUint)(t % nHeadsView);
+        const NnUint y = (NnUint)(t / nHeadsView);
+        const NnUint pos = (NnUint)positions[y];
+        const float *posCache = cache + (NnSize)pos * headDim;
+        float *x = (float *)cudaRowBase(inputBase, input, 0u, y);
+        const NnUint base = view.offset + h * headDim;
+        const float fcr = posCache[j];
+        const float fci = posCache[j + half];
+        const float v0 = x[base + j];
+        const float v1 = x[base + j + half];
+        x[base + j] = v0 * fcr - v1 * fci;
+        x[base + j + half] = v0 * fci + v1 * fcr;
+    }
+}
+
+__global__ static void shiftF32Kernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const float *indexes,
+    NnShiftOpCodeConfig config,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * input.logicalSize.x;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint x = (NnUint)(tid % input.logicalSize.x);
+    const NnUint y = (NnUint)(tid / input.logicalSize.x);
+    const NnUint row = (NnUint)indexes[y];
+    const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
+    float *outBase = (float *)(outputBase + output.byteOffset);
+    const NnSize dst = config.dstRowStride == 0u
+        ? (NnSize)row * input.logicalSize.x + x
+        : (NnSize)row * config.dstRowStride + config.dstColStart + x;
+    outBase[dst] = in[x];
+}
+
+__global__ static void softmaxF32Kernel(
+    NnByte *outputBase,
+    NnPointerLayout output,
+    NnTensorViewLayout view,
+    NnUint batchSize) {
+    __shared__ float scratch[256];
+    const NnUint row = blockIdx.x;
+    const NnUint y = row % batchSize;
+    const NnUint z = row / batchSize;
+    float *out = (float *)cudaRowBase(outputBase, output, z, y);
+    float maxv = -3.4028234663852886e38f;
+    for (NnUint i = threadIdx.x; i < view.sizeX; i += blockDim.x) {
+        const float v = out[view.offset + i * view.strideX];
+        maxv = maxv > v ? maxv : v;
+    }
+    scratch[threadIdx.x] = maxv;
+    __syncthreads();
+    for (NnUint stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            const float v = scratch[threadIdx.x + stride];
+            scratch[threadIdx.x] = scratch[threadIdx.x] > v ? scratch[threadIdx.x] : v;
+        }
+        __syncthreads();
+    }
+    maxv = scratch[0];
+    float sum = 0.0f;
+    for (NnUint i = threadIdx.x; i < view.sizeX; i += blockDim.x) {
+        const NnUint idx = view.offset + i * view.strideX;
+        const float v = expf(out[idx] - maxv);
+        out[idx] = v;
+        sum += v;
+    }
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (NnUint stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    sum = scratch[0];
+    for (NnUint i = threadIdx.x; i < view.sizeX; i += blockDim.x) {
+        const NnUint idx = view.offset + i * view.strideX;
+        out[idx] = out[idx] / sum;
+    }
+}
+
+__global__ static void softmaxF32SerialKernel(
+    NnByte *outputBase,
+    NnPointerLayout output,
+    NnTensorViewLayout view,
+    NnUint batchSize) {
+    const NnUint row = blockIdx.x;
+    const NnUint y = row % batchSize;
+    const NnUint z = row / batchSize;
+    float *out = (float *)cudaRowBase(outputBase, output, z, y);
+    float maxv = -3.4028234663852886e38f;
+    for (NnUint i = 0u; i < view.sizeX; ++i) {
+        const float v = out[view.offset + i * view.strideX];
+        maxv = maxv > v ? maxv : v;
+    }
+    float sum = 0.0f;
+    for (NnUint i = 0u; i < view.sizeX; ++i) {
+        const NnUint idx = view.offset + i * view.strideX;
+        const float v = expf(out[idx] - maxv);
+        out[idx] = v;
+        sum += v;
+    }
+    for (NnUint i = 0u; i < view.sizeX; ++i) {
+        const NnUint idx = view.offset + i * view.strideX;
+        out[idx] = out[idx] / sum;
+    }
+}
+
+__device__ static inline float q80q40BlockDot(const NnBlockQ80 *xb, const NnBlockQ40 *wb) {
+    int acc = 0;
+    for (NnUint k = 0u; k < Q40_BLOCK_SIZE / 2u; ++k) {
+        const int w0 = (int)(wb->qs[k] & 0x0fu) - 8;
+        const int w1 = (int)(wb->qs[k] >> 4) - 8;
+        const int x0 = (int)xb->qs[k];
+        const int x1 = (int)xb->qs[k + Q80_BLOCK_SIZE / 2u];
+        acc += w0 * x0 + w1 * x1;
+    }
+    return (float)acc * cudaHalfBitsToFloat(xb->d) * cudaHalfBitsToFloat(wb->d);
+}
+
+__global__ static void matmulQ80Q40SmallKKernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const NnBlockQ40 *weight,
+    const float *activeExpertIndexes,
+    NnUint activeExpertRowStride,
+    NnUint nActiveExperts,
+    NnUint nActiveExpertsOr1,
+    NnUint weightExperts,
+    NnUint weightBlocksPerRow,
+    NnUint weightRows,
+    NnUint view,
+    NnUint aOffsetBlocks,
+    NnUint cOffset,
+    NnUint aBlocks,
+    NnUint cLen,
+    NnUint inStartBlocks,
+    NnUint outStart,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)batchSize * nActiveExpertsOr1 * cLen;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint outLocal = (NnUint)(tid % cLen);
+    NnSize t = tid / cLen;
+    const NnUint e = (NnUint)(t % nActiveExpertsOr1);
+    const NnUint y = (NnUint)(t / nActiveExpertsOr1);
+    const NnUint activeExpert = nActiveExperts == 0u ? 0u : (NnUint)activeExpertIndexes[(NnSize)y * activeExpertRowStride + e];
+    if (activeExpert >= weightExperts) return;
+
+    const NnBlockQ80 *x = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, e, y) + aOffsetBlocks;
+    float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
+    const NnUint row = view == 0u ? outLocal : outStart + outLocal;
+    const NnUint inBlock = view == 2u ? inStartBlocks : 0u;
+    const NnBlockQ40 *w = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
+    float sum = 0.0f;
+    for (NnUint b = 0u; b < aBlocks; ++b) {
+        sum += q80q40BlockDot(x + b, w + b);
+    }
+    out[outLocal] = sum;
+}
+
+__global__ static void matmulQ80Q40LargeKKernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const NnBlockQ40 *weight,
+    const float *activeExpertIndexes,
+    NnUint activeExpertRowStride,
+    NnUint nActiveExperts,
+    NnUint nActiveExpertsOr1,
+    NnUint weightExperts,
+    NnUint weightBlocksPerRow,
+    NnUint weightRows,
+    NnUint view,
+    NnUint aOffsetBlocks,
+    NnUint cOffset,
+    NnUint aBlocks,
+    NnUint cLen,
+    NnUint inStartBlocks,
+    NnUint outStart,
+    NnUint batchSize) {
+    __shared__ float partial[256];
+    const NnSize oid = blockIdx.x;
+    const NnUint outLocal = (NnUint)(oid % cLen);
+    NnSize t = oid / cLen;
+    const NnUint e = (NnUint)(t % nActiveExpertsOr1);
+    const NnUint y = (NnUint)(t / nActiveExpertsOr1);
+    if (y >= batchSize) return;
+    const NnUint activeExpert = nActiveExperts == 0u ? 0u : (NnUint)activeExpertIndexes[(NnSize)y * activeExpertRowStride + e];
+    float sum = 0.0f;
+    if (activeExpert < weightExperts) {
+        const NnBlockQ80 *x = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, e, y) + aOffsetBlocks;
+        const NnUint row = view == 0u ? outLocal : outStart + outLocal;
+        const NnUint inBlock = view == 2u ? inStartBlocks : 0u;
+        const NnBlockQ40 *w = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
+        for (NnUint b = threadIdx.x; b < aBlocks; b += blockDim.x) {
+            sum += q80q40BlockDot(x + b, w + b);
+        }
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (NnUint stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u && activeExpert < weightExperts) {
+        float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
+        out[outLocal] = partial[0];
+    }
+}
+
 int nnCudaDeviceCount() {
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
@@ -481,7 +845,7 @@ NnCudaBuffer *NnCudaDeviceData::resolveBuffer(NnUint bufferIndex) {
 }
 
 NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan)
-    : gpuIndex(gpuIndex), stream(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), staging(), data() {
+    : gpuIndex(gpuIndex), stream(nullptr), blasHandle(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), staging(), data() {
     (void)this->netConfig;
     (void)this->netExecution;
     nnCudaPrintDeviceInfo(gpuIndex);
@@ -489,6 +853,10 @@ NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig
     cudaStream_t s = nullptr;
     NN_CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     stream = (void *)s;
+    cublasHandle_t h = nullptr;
+    NN_CUBLAS_CHECK(cublasCreate(&h));
+    NN_CUBLAS_CHECK(cublasSetStream(h, s));
+    blasHandle = (void *)h;
     if (nodeConfig != nullptr) {
         nodeConfig->partitionPlan = partitionPlan;
     }
@@ -499,6 +867,14 @@ NnCudaDevice::~NnCudaDevice() {
     if (stream != nullptr) {
         cudaSetDevice((int)gpuIndex);
         cudaStreamSynchronize((cudaStream_t)stream);
+    }
+    if (blasHandle != nullptr) {
+        cudaSetDevice((int)gpuIndex);
+        cublasDestroy((cublasHandle_t)blasHandle);
+        blasHandle = nullptr;
+    }
+    if (stream != nullptr) {
+        cudaSetDevice((int)gpuIndex);
         cudaStreamDestroy((cudaStream_t)stream);
         stream = nullptr;
     }
@@ -553,6 +929,48 @@ void NnCudaDevice::synchronize() {
     NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
 }
 
+static void validateCudaQ80Q40MatmulAtCreate(NnCudaDevice *device, const NnOpConfig &op) {
+    if (device == nullptr || op.code != OP_MATMUL || op.config == nullptr) return;
+    if (op.weightSize.floatType != F_Q40) return;
+    NnNetConfig *netConfig = device->getNetConfig();
+    NnNodeConfig *nodeConfig = device->getNodeConfig();
+    if (netConfig == nullptr || nodeConfig == nullptr) return;
+    NnPointerLayout in = resolvePointerLayout(netConfig, nodeConfig, device->getPartitionPlan(), &op.input);
+    NnPointerLayout out = resolvePointerLayout(netConfig, nodeConfig, device->getPartitionPlan(), &op.output);
+    if (in.logicalSize.floatType != F_Q80 || out.logicalSize.floatType != F_32) return;
+    const NnMatmulOpConfig *config = (const NnMatmulOpConfig *)op.config;
+    if ((config->aView.strideX != 0u && config->aView.strideX != 1u) ||
+        (config->cView.strideX != 0u && config->cView.strideX != 1u) ||
+        config->aView.sizeY != 0u ||
+        config->cView.sizeY != 0u) {
+        throw std::runtime_error("CUDA Q80xQ40 MATMUL supports only contiguous per-row A/C tensor views");
+    }
+    const NnTensorViewLayout aView = resolveTensorView(&config->aView, 0u, in.logicalSize.x, in.logicalSize.x);
+    const NnTensorViewLayout cView = resolveTensorView(&config->cView, 0u, out.logicalSize.x, out.logicalSize.x);
+    if ((op.weightSize.y % Q40_BLOCK_SIZE) != 0u ||
+        (aView.offset % Q80_BLOCK_SIZE) != 0u ||
+        (aView.sizeX % Q80_BLOCK_SIZE) != 0u ||
+        (config->inStart % Q40_BLOCK_SIZE) != 0u) {
+        throw std::runtime_error("CUDA Q80xQ40 MATMUL requires K, input offset, inStart and A slice to be 32-element block aligned");
+    }
+    if (config->view == 0u) {
+        if (aView.sizeX != op.weightSize.y || cView.sizeX != op.weightSize.x) {
+            throw std::runtime_error("CUDA Q80xQ40 MATMUL view=0 shape mismatch");
+        }
+    } else if (config->view == 1u) {
+        if (aView.sizeX != op.weightSize.y || config->outStart + cView.sizeX > op.weightSize.x) {
+            throw std::runtime_error("CUDA Q80xQ40 MATMUL view=1 shape mismatch");
+        }
+    } else if (config->view == 2u) {
+        if (config->inStart + aView.sizeX > op.weightSize.y ||
+            config->outStart + cView.sizeX > op.weightSize.x) {
+            throw std::runtime_error("CUDA Q80xQ40 MATMUL view=2 shape mismatch");
+        }
+    } else {
+        throw std::runtime_error("CUDA Q80xQ40 MATMUL unsupported view mode");
+    }
+}
+
 NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution)
     : device(device), segmentIndex(segmentIndex), segmentConfig(segmentConfig), netExecution(netExecution) {
     (void)this->netExecution;
@@ -564,12 +982,27 @@ NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentInd
         configBuffers.reserve(segmentConfig->nOps);
         for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
             const NnOpConfig &op = segmentConfig->ops[i];
+            validateCudaQ80Q40MatmulAtCreate(device, op);
             std::string weightName = std::string(op.name != nullptr ? op.name : "op") + ".weight";
             std::string configName = std::string(op.name != nullptr ? op.name : "op") + ".config";
             weightBuffers.emplace_back(new NnCudaBuffer(weightName.c_str(), op.weightSize.nBytes));
             configBuffers.emplace_back(new NnCudaBuffer(configName.c_str(), op.configSize));
             if (op.config != nullptr && op.configSize > 0u && device != nullptr) {
                 configBuffers.back()->write(op.config, 0u, op.configSize, device->getStream(), &device->staging);
+            }
+            if (op.code == OP_ROPE && op.config != nullptr && device != nullptr) {
+                const NnRopeOpConfig *ropeConfig = (const NnRopeOpConfig *)op.config;
+                if (ropeConfig->ropeCacheBufferIndex >= device->data.buffers.size()) {
+                    throw std::runtime_error("CUDA ROPE cache buffer index out of range");
+                }
+                std::vector<float> ropeCache(ropeConfig->slice.cacheSize.length, 0.0f);
+                fullfillRopeCache(ropeConfig, ropeCache.data());
+                device->data.resolveBuffer(ropeConfig->ropeCacheBufferIndex)->write(
+                    (const NnByte *)ropeCache.data(),
+                    0u,
+                    ropeConfig->slice.cacheSize.nBytes,
+                    device->getStream(),
+                    &device->staging);
             }
         }
         if (device != nullptr) {
@@ -628,19 +1061,35 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
         throw std::runtime_error("CUDA segment batchSize exceeds configured nBatches");
     }
 
-    for (NnUint i = 0u; i < netConfig->nPreSyncs; ++i) {
-        const NnPreSyncConfig &pre = netConfig->preSyncs[i];
-        NnCudaBuffer *pipe = device->data.resolvePipe(pre.pipeIndex);
+    std::vector<unsigned char> uploaded(netConfig->nPipes, 0u);
+    const auto uploadPipe = [&](NnUint pipeIndex) {
+        if (pipeIndex >= netConfig->nPipes) {
+            throw std::runtime_error("CUDA segment pipe index out of range during upload");
+        }
+        if (uploaded[pipeIndex] != 0u) return;
+        NnCudaBuffer *pipe = device->data.resolvePipe(pipeIndex);
         const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
-        pipe->write(netExecution->pipes[pre.pipeIndex], 0u, nBytes, device->getStream(), &device->staging);
+        pipe->write(netExecution->pipes[pipeIndex], 0u, nBytes, device->getStream(), &device->staging);
+        uploaded[pipeIndex] = 1u;
+    };
+
+    for (NnUint i = 0u; i < netConfig->nPreSyncs; ++i) {
+        uploadPipe(netConfig->preSyncs[i].pipeIndex);
     }
 
     for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
         const NnOpConfig &op = segmentConfig->ops[i];
-        if (op.input.source != SRC_PIPE) continue;
-        NnCudaBuffer *pipe = device->data.resolvePipe(op.input.pointerIndex);
-        const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
-        pipe->write(netExecution->pipes[op.input.pointerIndex], 0u, nBytes, device->getStream(), &device->staging);
+        if (op.input.source == SRC_PIPE) uploadPipe(op.input.pointerIndex);
+        if (op.code == OP_ROPE && op.config != nullptr) {
+            const NnRopeOpConfig *config = (const NnRopeOpConfig *)op.config;
+            uploadPipe(config->positionPipeIndex);
+        } else if (op.code == OP_MULTIHEAD_ATT && op.config != nullptr) {
+            const NnMultiHeadAttOpConfig *config = (const NnMultiHeadAttOpConfig *)op.config;
+            uploadPipe(config->positionPipeIndex);
+        } else if (op.code == OP_SHIFT && op.config != nullptr) {
+            const NnShiftOpCodeConfig *config = (const NnShiftOpCodeConfig *)op.config;
+            uploadPipe(config->indexPipeIndex);
+        }
     }
 }
 
@@ -676,6 +1125,296 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
     cudaStream_t stream = (cudaStream_t)device->getStream();
 
     switch (op.code) {
+        case OP_EMBEDDING: {
+            if (in.layout.logicalSize.floatType != F_32 ||
+                op.weightSize.floatType != F_32 ||
+                out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
+            if (total != 0u) {
+                embeddingF32F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (const float *)weightBuffers[opIndex]->data(),
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
+        case OP_INV_RMS: {
+            const NnInvRmsOpConfig *config = (const NnInvRmsOpConfig *)op.config;
+            if (config == nullptr) throw std::runtime_error("CUDA INV_RMS missing config");
+            if (in.layout.logicalSize.floatType != F_32 || out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            if (config->nColumns == 0u || (in.layout.logicalSize.x % config->nColumns) != 0u) {
+                throw std::runtime_error("CUDA INV_RMS invalid nColumns");
+            }
+            const NnSize total = (NnSize)batchSize * config->nColumns;
+            if (total != 0u) {
+                invRmsF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    config->epsilon,
+                    config->nColumns,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
+        case OP_RMS_NORM: {
+            const NnRmsNormOpConfig *config = (const NnRmsNormOpConfig *)op.config;
+            if (config == nullptr) throw std::runtime_error("CUDA RMS_NORM missing config");
+            if (in.layout.logicalSize.floatType != F_32 ||
+                op.weightSize.floatType != F_32 ||
+                out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            if (config->nColumns == 0u || (out.layout.logicalSize.x % config->nColumns) != 0u) {
+                throw std::runtime_error("CUDA RMS_NORM invalid nColumns");
+            }
+            NnCudaBuffer *invRmsBuf = device->data.resolveBuffer(config->invRmsBufferIndex);
+            const NnUint invRmsRowStride = nodeConfig->buffers[config->invRmsBufferIndex].size.x;
+            const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
+            if (total != 0u) {
+                rmsNormF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (const float *)weightBuffers[opIndex]->data(),
+                    (const float *)invRmsBuf->data(),
+                    invRmsRowStride,
+                    config->nColumns,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
+        case OP_MATMUL: {
+            const NnMatmulOpConfig *config = (const NnMatmulOpConfig *)op.config;
+            if (config == nullptr) throw std::runtime_error("CUDA MATMUL missing config");
+            if (in.layout.logicalSize.floatType == F_Q80 &&
+                op.weightSize.floatType == F_Q40 &&
+                out.layout.logicalSize.floatType == F_32) {
+                if ((config->aView.strideX != 0u && config->aView.strideX != 1u) ||
+                    (config->cView.strideX != 0u && config->cView.strideX != 1u) ||
+                    config->aView.sizeY != 0u ||
+                    config->cView.sizeY != 0u) {
+                    throw std::runtime_error("CUDA Q80xQ40 MATMUL supports only contiguous per-row A/C tensor views");
+                }
+                const NnTensorViewLayout aView = resolveTensorView(&config->aView, 0u, in.layout.logicalSize.x, in.layout.logicalSize.x);
+                const NnTensorViewLayout cView = resolveTensorView(&config->cView, 0u, out.layout.logicalSize.x, out.layout.logicalSize.x);
+                const NnUint aLen = (NnUint)aView.sizeX;
+                const NnUint cLen = (NnUint)cView.sizeX;
+                if (aLen == 0u || cLen == 0u) return;
+                if ((op.weightSize.y % Q40_BLOCK_SIZE) != 0u ||
+                    (aView.offset % Q80_BLOCK_SIZE) != 0u ||
+                    (aLen % Q80_BLOCK_SIZE) != 0u ||
+                    (config->inStart % Q40_BLOCK_SIZE) != 0u) {
+                    throw std::runtime_error("CUDA Q80xQ40 MATMUL requires K, input offset, inStart and A slice to be 32-element block aligned");
+                }
+                if (config->view == 0u) {
+                    if (aLen != op.weightSize.y || cLen != op.weightSize.x) {
+                        throw std::runtime_error("CUDA Q80xQ40 MATMUL view=0 shape mismatch");
+                    }
+                } else if (config->view == 1u) {
+                    if (aLen != op.weightSize.y || config->outStart + cLen > op.weightSize.x) {
+                        throw std::runtime_error("CUDA Q80xQ40 MATMUL view=1 shape mismatch");
+                    }
+                } else if (config->view == 2u) {
+                    if (config->inStart + aLen > op.weightSize.y ||
+                        config->outStart + cLen > op.weightSize.x) {
+                        throw std::runtime_error("CUDA Q80xQ40 MATMUL view=2 shape mismatch");
+                    }
+                } else {
+                    throw std::runtime_error("CUDA Q80xQ40 MATMUL unsupported view mode");
+                }
+                const NnUint nActiveExpertsOr1 = config->nActiveExperts == 0u ? 1u : config->nActiveExperts;
+                NnUint activeExpertRowStride = 0u;
+                const float *activeExpertIndexes = nullptr;
+                if (config->nActiveExperts != 0u) {
+                    NnCudaBuffer *idxBuf = device->data.resolveBuffer(config->activeExpertIndexesBufferIndex);
+                    activeExpertIndexes = (const float *)idxBuf->data();
+                    activeExpertRowStride = nodeConfig->buffers[config->activeExpertIndexesBufferIndex].size.x;
+                }
+                const NnUint weightBlocksPerRow = op.weightSize.y / Q40_BLOCK_SIZE;
+                const NnUint aBlocks = aLen / Q80_BLOCK_SIZE;
+                const NnUint aOffsetBlocks = (NnUint)aView.offset / Q80_BLOCK_SIZE;
+                const NnUint inStartBlocks = config->inStart / Q40_BLOCK_SIZE;
+                const NnSize totalOutputs = (NnSize)batchSize * nActiveExpertsOr1 * cLen;
+                if (aBlocks <= 4u) {
+                    matmulQ80Q40SmallKKernel<<<cudaBlocks(totalOutputs), 256, 0, stream>>>(
+                        (const NnByte *)in.buffer->data(), in.layout,
+                        (NnByte *)out.buffer->data(), out.layout,
+                        (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
+                        activeExpertIndexes,
+                        activeExpertRowStride,
+                        config->nActiveExperts,
+                        nActiveExpertsOr1,
+                        op.weightSize.z,
+                        weightBlocksPerRow,
+                        op.weightSize.x,
+                        config->view,
+                        aOffsetBlocks,
+                        (NnUint)cView.offset,
+                        aBlocks,
+                        cLen,
+                        inStartBlocks,
+                        config->outStart,
+                        batchSize);
+                    NN_CUDA_CHECK(cudaGetLastError());
+                } else {
+                    matmulQ80Q40LargeKKernel<<<(unsigned int)totalOutputs, 256, 0, stream>>>(
+                        (const NnByte *)in.buffer->data(), in.layout,
+                        (NnByte *)out.buffer->data(), out.layout,
+                        (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
+                        activeExpertIndexes,
+                        activeExpertRowStride,
+                        config->nActiveExperts,
+                        nActiveExpertsOr1,
+                        op.weightSize.z,
+                        weightBlocksPerRow,
+                        op.weightSize.x,
+                        config->view,
+                        aOffsetBlocks,
+                        (NnUint)cView.offset,
+                        aBlocks,
+                        cLen,
+                        inStartBlocks,
+                        config->outStart,
+                        batchSize);
+                    NN_CUDA_CHECK(cudaGetLastError());
+                }
+                return;
+            }
+            if (in.layout.logicalSize.floatType != F_32 ||
+                op.weightSize.floatType != F_32 ||
+                out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            if ((config->aView.strideX != 0u && config->aView.strideX != 1u) ||
+                (config->cView.strideX != 0u && config->cView.strideX != 1u) ||
+                config->aView.sizeY != 0u ||
+                config->cView.sizeY != 0u) {
+                throw std::runtime_error("CUDA MATMUL supports only contiguous per-row A/C tensor views");
+            }
+            const NnTensorViewLayout aView = resolveTensorView(&config->aView, 0u, in.layout.logicalSize.x, in.layout.logicalSize.x);
+            const NnTensorViewLayout cView = resolveTensorView(&config->cView, 0u, out.layout.logicalSize.x, out.layout.logicalSize.x);
+            const NnUint aLen = (NnUint)aView.sizeX;
+            const NnUint cLen = (NnUint)cView.sizeX;
+            if (aLen == 0u || cLen == 0u) return;
+            if (config->view == 0u) {
+                if (aLen != op.weightSize.y || cLen != op.weightSize.x) {
+                    throw std::runtime_error("CUDA MATMUL view=0 shape mismatch");
+                }
+            } else if (config->view == 1u) {
+                if (aLen != op.weightSize.y || config->outStart + cLen > op.weightSize.x) {
+                    throw std::runtime_error("CUDA MATMUL view=1 shape mismatch");
+                }
+            } else if (config->view == 2u) {
+                if (config->inStart + aLen > op.weightSize.y ||
+                    config->outStart + cLen > op.weightSize.x) {
+                    throw std::runtime_error("CUDA MATMUL view=2 shape mismatch");
+                }
+            } else {
+                throw std::runtime_error("CUDA MATMUL unsupported view mode");
+            }
+
+            cublasHandle_t handle = (cublasHandle_t)device->getBlasHandle();
+            if (handle == nullptr) throw std::runtime_error("CUDA MATMUL missing cuBLAS handle");
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            const NnUint nActiveExpertsOr1 = config->nActiveExperts == 0u ? 1u : config->nActiveExperts;
+            NnUint activeExpertRowStride = 0u;
+            std::vector<float> activeExpertIndexesHost;
+            if (config->nActiveExperts != 0u) {
+                NnCudaBuffer *idxBuf = device->data.resolveBuffer(config->activeExpertIndexesBufferIndex);
+                activeExpertRowStride = nodeConfig->buffers[config->activeExpertIndexesBufferIndex].size.x;
+                activeExpertIndexesHost.resize((NnSize)batchSize * activeExpertRowStride);
+                idxBuf->read(
+                    (NnByte *)activeExpertIndexesHost.data(),
+                    0u,
+                    getBytes(F_32, (NnSize)batchSize * activeExpertRowStride),
+                    device->getStream(),
+                    &device->staging);
+            }
+            const NnSize weightExpertFloats = (NnSize)op.weightSize.y * op.weightSize.x;
+            for (NnUint y = 0u; y < batchSize; ++y) {
+                for (NnUint e = 0u; e < nActiveExpertsOr1; ++e) {
+                    NnUint activeExpertIndex = 0u;
+                    if (config->nActiveExperts != 0u) {
+                        activeExpertIndex = (NnUint)activeExpertIndexesHost[(NnSize)y * activeExpertRowStride + e];
+                    }
+                    if (activeExpertIndex >= std::max(config->nExperts, 1u) || activeExpertIndex >= op.weightSize.z) {
+                        throw std::runtime_error("CUDA MATMUL active expert index out of range");
+                    }
+                    const float *x = (const float *)cudaHostRowBase((NnByte *)in.buffer->data(), in.layout, e, y) + aView.offset;
+                    float *c = (float *)cudaHostRowBase((NnByte *)out.buffer->data(), out.layout, e, y) + cView.offset;
+                    const float *wBase = (const float *)weightBuffers[opIndex]->data() + (NnSize)activeExpertIndex * weightExpertFloats;
+                    const float *w = nullptr;
+                    int lda = 0;
+                    int m = (int)aLen;
+                    int n = (int)cLen;
+                    if (config->view == 0u) {
+                        w = wBase;
+                        lda = (int)aLen;
+                    } else if (config->view == 1u) {
+                        w = wBase + (NnSize)config->outStart * op.weightSize.y;
+                        lda = (int)op.weightSize.y;
+                    } else {
+                        w = wBase + (NnSize)config->outStart * op.weightSize.y + config->inStart;
+                        lda = (int)op.weightSize.y;
+                    }
+                    NN_CUBLAS_CHECK(cublasSgemv(
+                        handle,
+                        CUBLAS_OP_T,
+                        m,
+                        n,
+                        &alpha,
+                        w,
+                        lda,
+                        x,
+                        1,
+                        &beta,
+                        c,
+                        1));
+                }
+            }
+            return;
+        }
+        case OP_ROPE: {
+            const NnRopeOpConfig *config = (const NnRopeOpConfig *)op.config;
+            if (config == nullptr) throw std::runtime_error("CUDA ROPE missing config");
+            if (in.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            const NnTensorViewLayout view = resolveOpView(op, in.layout.logicalSize, in.layout.logicalSize.x);
+            if ((view.sizeX % 2u) != 0u || view.strideX != 1u) {
+                throw std::runtime_error("CUDA ROPE requires contiguous even-width view");
+            }
+            if (config->type == ROPE_FALCON &&
+                (config->slice.headDim == 0u ||
+                 (view.offset % config->slice.headDim) != 0u ||
+                 (view.sizeX % config->slice.headDim) != 0u)) {
+                throw std::runtime_error("CUDA FALCON ROPE requires whole-head view");
+            }
+            NnCudaBuffer *positionPipe = device->data.resolvePipe(config->positionPipeIndex);
+            NnCudaBuffer *ropeCache = device->data.resolveBuffer(config->ropeCacheBufferIndex);
+            const NnSize total = config->type == ROPE_FALCON
+                ? (NnSize)batchSize * (view.sizeX / config->slice.headDim) * (config->slice.headDim / 2u)
+                : (NnSize)batchSize * (view.sizeX / 2u);
+            if (total != 0u) {
+                ropeF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (NnByte *)in.buffer->data(), in.layout,
+                    (const float *)positionPipe->data(),
+                    (const float *)ropeCache->data(),
+                    *config,
+                    view,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
         case OP_CAST: {
             if (in.layout.logicalSize.floatType == F_32 && out.layout.logicalSize.floatType == F_32) {
                 const NnTensorViewLayout view = resolveOpView(op, out.layout.logicalSize, out.layout.logicalSize.x);
@@ -811,6 +1550,47 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 repeatZCopyQ80Kernel<<<cudaBlocks(copyBlocks), 256, 0, stream>>>(
                     (NnByte *)out.buffer->data(), out.layout,
                     batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
+        case OP_SHIFT: {
+            const NnShiftOpCodeConfig *config = (const NnShiftOpCodeConfig *)op.config;
+            if (config == nullptr) throw std::runtime_error("CUDA SHIFT missing config");
+            if (in.layout.logicalSize.floatType != F_32 || out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            NnCudaBuffer *indexPipe = device->data.resolvePipe(config->indexPipeIndex);
+            const NnSize total = (NnSize)batchSize * in.layout.logicalSize.x;
+            if (total != 0u) {
+                shiftF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (const float *)indexPipe->data(),
+                    *config,
+                    batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
+        case OP_SOFTMAX: {
+            if (out.layout.logicalSize.floatType != F_32) {
+                throw std::runtime_error(unsupportedOpMessage(opIndex));
+            }
+            const NnTensorViewLayout view = resolveOpView(op, out.layout.logicalSize, out.layout.logicalSize.x);
+            const NnUint rows = out.layout.logicalSize.z * batchSize;
+            if (rows != 0u && view.sizeX != 0u) {
+                if (view.sizeX <= 32u) {
+                    softmaxF32SerialKernel<<<rows, 1, 0, stream>>>(
+                        (NnByte *)out.buffer->data(), out.layout,
+                        view,
+                        batchSize);
+                } else {
+                    softmaxF32Kernel<<<rows, 256, 0, stream>>>(
+                        (NnByte *)out.buffer->data(), out.layout,
+                        view,
+                        batchSize);
+                }
                 NN_CUDA_CHECK(cudaGetLastError());
             }
             return;

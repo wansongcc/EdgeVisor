@@ -63,6 +63,7 @@ class NnCudaDevice : public NnDevice {
 private:
     NnUint gpuIndex;
     void *stream;
+    void *blasHandle;
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
     NnNetExecution *netExecution;
@@ -82,6 +83,7 @@ public:
     NnUint getNodeIndex() const { return nodeConfig ? nodeConfig->nodeIndex : 0u; }
     NnUint getGpuIndex() const { return gpuIndex; }
     void *getStream() const { return stream; }
+    void *getBlasHandle() const { return blasHandle; }
     NnSize3D resolvePointerLogicalSize(const NnPointerConfig *config) const;
     NnNetConfig *getNetConfig() const { return netConfig; }
     NnNodeConfig *getNodeConfig() const { return nodeConfig; }

@@ -50,7 +50,7 @@ endif
 
 ifdef DLLAMA_CUDA
 	CXXFLAGS += -DDLLAMA_CUDA -I$(CUDA_HOME)/include
-	LIBS += -L$(CUDA_HOME)/lib64 -lcudart
+	LIBS += -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 	NVCCFLAGS += -std=c++11 -Isrc -DDLLAMA_CUDA
 	NVCCFLAGS += $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch))
 	DEPS += nn-cuda.o

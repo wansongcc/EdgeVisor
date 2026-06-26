@@ -1,5 +1,7 @@
 #include "nn-cuda.hpp"
+#include "nn-cpu.hpp"
 #include "nn-quants.hpp"
+#include "plan-command.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -113,6 +115,45 @@ static void expectQ80DequantNear(
     dequantizeQ80toF32(actual.data(), actualF32.data(), logicalElements, 1u, 0u);
     dequantizeQ80toF32(expected.data(), expectedF32.data(), logicalElements, 1u, 0u);
     expectF32Near(name, actualF32, expectedF32, maxAbsError);
+}
+
+static bool isPowerOfTwo(NnUint v) {
+    return v != 0u && (v & (v - 1u)) == 0u;
+}
+
+static void expectLaunchBlock(const char *name, NnUint value, NnUint maxValue) {
+    if (!isPowerOfTwo(value) || value < 32u || value > maxValue) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg), "%s invalid launch block size: value=%u max=%u", name, value, maxValue);
+        throw std::runtime_error(msg);
+    }
+}
+
+static void runCudaLaunchConfigTest(NnUint gpuIndex, NnCudaDevice &device) {
+    cudaDeviceProp prop{};
+    cudaError_t err = cudaGetDeviceProperties(&prop, (int)gpuIndex);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaGetDeviceProperties failed in launch config test: ") + cudaGetErrorString(err));
+    }
+    const NnCudaLaunchConfig &cfg = device.getLaunchConfig();
+    const int sm = prop.major * 10 + prop.minor;
+    if (cfg.computeCapabilityMajor != prop.major || cfg.computeCapabilityMinor != prop.minor || cfg.sm != sm) {
+        throw std::runtime_error("CUDA launch config compute capability mismatch");
+    }
+    if (cfg.maxThreadsPerBlock != (NnUint)prop.maxThreadsPerBlock || cfg.warpSize != (NnUint)prop.warpSize) {
+        throw std::runtime_error("CUDA launch config device property mismatch");
+    }
+    expectLaunchBlock("CUDA launch elementwise", cfg.elementwiseBlockSize, cfg.maxThreadsPerBlock);
+    expectLaunchBlock("CUDA launch reduction", cfg.reductionBlockSize, std::min<NnUint>(cfg.maxThreadsPerBlock, 256u));
+    expectLaunchBlock("CUDA launch attention", cfg.attentionBlockSize, std::min<NnUint>(cfg.maxThreadsPerBlock, 256u));
+    expectLaunchBlock("CUDA launch q80q40 small-K", cfg.q80q40SmallKBlockSize, std::min<NnUint>(cfg.maxThreadsPerBlock, 512u));
+    expectLaunchBlock("CUDA launch q80q40 large-K", cfg.q80q40LargeKBlockSize, std::min<NnUint>(cfg.maxThreadsPerBlock, 256u));
+    expectLaunchBlock("CUDA launch softmax", cfg.softmaxBlockSize, std::min<NnUint>(cfg.maxThreadsPerBlock, 256u));
+    expectLaunchBlock("CUDA launch moe gate", cfg.moeGateBlockSize, std::min<NnUint>(cfg.maxThreadsPerBlock, 256u));
+    if (cfg.q80q40SmallKMaxBlocks == 0u) {
+        throw std::runtime_error("CUDA launch config small-K threshold is zero");
+    }
+    std::printf("CUDA hardware launch config test: ok %s\n", device.launchConfigInfo().c_str());
 }
 
 static NnSize f32Index(const NnSize3D &size, NnUint z, NnUint y, NnUint x) {
@@ -1810,6 +1851,280 @@ static void runPr9Qwen3MoeChainTest(NnUint gpuIndex) {
     std::printf("CUDA PR9 Qwen3-MoE gate and expert chain tests: ok\n");
 }
 
+class InspectSync : public NnNodeSynchronizer {
+public:
+    NnNetExecution *execution;
+    NnSize3D pipeSize;
+    std::vector<float> expected;
+    bool inspected;
+    InspectSync(NnNetExecution *execution, const NnSize3D &pipeSize, const std::vector<float> &expected)
+        : execution(execution), pipeSize(pipeSize), expected(expected), inspected(false) {}
+    void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override {
+        (void)nThreads;
+        if (threadIndex != 0u || segmentIndex != 0u) return;
+        std::vector<float> got(expected.size(), 0.0f);
+        std::memcpy(got.data(), execution->pipes[1], pipeSize.nBytes);
+        expectF32Near("CUDA PR10 segment output visible before host sync", got, expected, 0.0f);
+        inspected = true;
+    }
+};
+
+static void initSplit(NnDimSplit &split, const std::vector<NnUint> &starts, const std::vector<NnUint> &lengths) {
+    split.starts = new NnUint[starts.size()];
+    split.lengths = new NnUint[lengths.size()];
+    for (size_t i = 0u; i < starts.size(); ++i) split.starts[i] = starts[i];
+    for (size_t i = 0u; i < lengths.size(); ++i) split.lengths[i] = lengths[i];
+}
+
+static void initTwoNodePlan(NnUnevenPartitionPlan &plan) {
+    plan.nNodes = 2u;
+    plan.nStages = 1u;
+    plan.stages = new NnStageConfig[1];
+    plan.stages[0].stageIndex = 0u;
+    plan.stages[0].startLayer = 0u;
+    plan.stages[0].endLayer = 1u;
+    plan.stages[0].nLayers = 1u;
+    plan.stages[0].rootNodeIndex = 0u;
+    plan.stages[0].nNodes = 2u;
+    plan.stages[0].nodeIndices = new NnUint[2]{0u, 1u};
+    initSplit(plan.headSplit, {0u, 2u}, {2u, 2u});
+    initSplit(plan.kvHeadSplit, {0u, 2u}, {2u, 2u});
+    initSplit(plan.headComputeSplit, {0u, 2u}, {2u, 2u});
+    initSplit(plan.kvHeadComputeSplit, {0u, 2u}, {2u, 2u});
+    initSplit(plan.vocabSplit, {0u, 8u}, {8u, 8u});
+    initSplit(plan.ffnSplit, {0u, 4u}, {4u, 4u});
+    initSplit(plan.dimSplit, {0u, 8u}, {8u, 8u});
+}
+
+static void runPr10StaticMixedExecutorTest(NnUint gpuIndex) {
+    const NnUint nBatches = 2u;
+    NnPipeConfig pipes[3];
+    pipes[0] = {(char *)"mixed_in", size2D(F_32, nBatches, 4u)};
+    pipes[1] = {(char *)"mixed_mid", size2D(F_32, nBatches, 4u)};
+    pipes[2] = {(char *)"mixed_out", size2D(F_32, nBatches, 4u)};
+
+    NnCastOpCodeConfig castCfg0{};
+    NnCastOpCodeConfig castCfg1{};
+    NnOpConfig ops0[1]{};
+    ops0[0].code = OP_CAST; ops0[0].name = (char *)"cuda_cast"; ops0[0].index = 0u;
+    ops0[0].input = pointerBatchConfig(SRC_PIPE, 0u); ops0[0].output = pointerBatchConfig(SRC_PIPE, 1u);
+    ops0[0].weightSize = size0(); ops0[0].config = (NnByte *)&castCfg0; ops0[0].configSize = sizeof(castCfg0);
+    NnSyncConfig sync0[1] = {{1u, SYNC_WITH_ROOT}};
+
+    NnOpConfig ops1[1]{};
+    ops1[0].code = OP_CAST; ops1[0].name = (char *)"cpu_cast"; ops1[0].index = 0u;
+    ops1[0].input = pointerBatchConfig(SRC_PIPE, 1u); ops1[0].output = pointerBatchConfig(SRC_PIPE, 2u);
+    ops1[0].weightSize = size0(); ops1[0].config = (NnByte *)&castCfg1; ops1[0].configSize = sizeof(castCfg1);
+
+    NnSegmentConfig segments[2];
+    segments[0].nOps = 1u; segments[0].ops = ops0; segments[0].nSyncs = 1u; segments[0].syncs = sync0;
+    segments[1].nOps = 1u; segments[1].ops = ops1; segments[1].nSyncs = 0u; segments[1].syncs = nullptr;
+
+    NnNetConfig netConfig{};
+    netConfig.nBatches = nBatches;
+    netConfig.nNodes = 2u;
+    netConfig.nPipes = 3u;
+    netConfig.pipes = pipes;
+    netConfig.nPreSyncs = 0u;
+    netConfig.preSyncs = nullptr;
+
+    NnNodeConfig nodeConfig{};
+    nodeConfig.nodeIndex = 0u;
+    nodeConfig.nBuffers = 0u;
+    nodeConfig.buffers = nullptr;
+    nodeConfig.nSegments = 2u;
+    nodeConfig.segments = segments;
+
+    NnNetExecution execution(1u, &netConfig);
+    execution.setBatchSize(nBatches);
+    std::vector<float> input = f32Pattern(pipes[0].size.length, 0.125f, -1.0f);
+    std::memcpy(execution.pipes[0], input.data(), pipes[0].size.nBytes);
+
+    InspectSync sync(&execution, pipes[1].size, input);
+    std::vector<NnExecutorDevice> devices;
+    devices.push_back(NnExecutorDevice(new NnCudaDevice(gpuIndex, &netConfig, &nodeConfig, &execution, nullptr), 0, 0));
+    devices.push_back(NnExecutorDevice(new NnCpuDevice(&netConfig, &nodeConfig, &execution, nullptr), -1, -1));
+    NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &sync, false);
+    executor.forward();
+
+    if (!sync.inspected) throw std::runtime_error("CUDA PR10 sync inspection did not run");
+    std::vector<float> got(input.size(), 0.0f);
+    std::memcpy(got.data(), execution.pipes[2], pipes[2].size.nBytes);
+    expectF32Near("CUDA PR10 CPU/CUDA mixed segment output", got, input, 0.0f);
+    std::printf("CUDA PR10 static mixed executor host-pipe semantics: ok\n");
+}
+
+static void runPr11PlanRefreshTest(NnUint gpuIndex) {
+    const NnUint nBatches = 1u;
+    NnPipeConfig pipes[3];
+    pipes[0] = {(char *)"pos", size2D(F_32, nBatches, 1u)};
+    pipes[1] = {(char *)"plan", size2D(F_32, nBatches, 8u)};
+    pipes[2] = {(char *)"dummy", size2D(F_32, nBatches, 8u)};
+
+    NnBufferConfig buffers[6];
+    buffers[0] = {(char *)"query", size2D(F_32, nBatches, 32u)};
+    buffers[1] = {(char *)"key", size2D(F_32, 4u, 32u)};
+    buffers[2] = {(char *)"value", size2D(F_32, 4u, 32u)};
+    buffers[3] = {(char *)"att", size1D(F_32, 64u)};
+    buffers[4] = {(char *)"mul", size2D(F_32, nBatches, 8u)};
+    buffers[5] = {(char *)"inv", size2D(F_32, nBatches, 4u)};
+
+    NnPlanBarrierOpCodeConfig barrierCfg{0u, 1u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 1u, 1u, PLAN_CMD_KIND_BOTH, 2u, 0u};
+    NnPlanApplyOpCodeConfig applyCfg{1u, 0u};
+    NnOpConfig planOps[2]{};
+    planOps[0].code = OP_PLAN_BARRIER; planOps[0].name = (char *)"plan_barrier"; planOps[0].index = 0u;
+    planOps[0].input = pointerBatchConfig(SRC_PIPE, 0u); planOps[0].output = pointerBatchConfig(SRC_PIPE, 1u);
+    planOps[0].weightSize = size0(); planOps[0].config = (NnByte *)&barrierCfg; planOps[0].configSize = sizeof(barrierCfg);
+    planOps[1].code = OP_PLAN_APPLY; planOps[1].name = (char *)"plan_apply"; planOps[1].index = 0u;
+    planOps[1].input = pointerBatchConfig(SRC_PIPE, 1u); planOps[1].output = pointerBatchConfig(SRC_PIPE, 1u);
+    planOps[1].weightSize = size0(); planOps[1].config = (NnByte *)&applyCfg; planOps[1].configSize = sizeof(applyCfg);
+
+    NnMultiHeadAttOpConfig mhaCfg{4u, 2u, 4u, 8u, 4u, 16u, 16u, 0u, 16u, 0u, 16u, 0u, 0u, 1u, 2u, 3u};
+    NnShiftOpCodeConfig shiftCfg{0u, 0u, 32u, 8u};
+    NnMatmulOpConfig rowCfg{}; rowCfg.view = 1u; rowCfg.outSliceTag = NN_SLICE_FFN; rowCfg.outStartUnit = 1u; rowCfg.cView = NnTensorView{0u, 0u, 1u, 0u, 1u};
+    NnMatmulOpConfig colCfg{}; colCfg.view = 2u; colCfg.inSliceTag = NN_SLICE_FFN; colCfg.inStartUnit = 1u; colCfg.aView = NnTensorView{0u, 0u, 1u, 0u, 1u};
+    NnMulOpCodeConfig mulCfg{4u, NnTensorView{0u, 0u, 4u, 0u, 1u}};
+    NnInvRmsOpConfig invCfg{1.0e-5f, 2u, NnTensorView{}};
+    NnRmsNormOpConfig rmsCfg{5u, 2u, NnTensorView{}};
+    NnOpConfig refreshOps[7]{};
+    refreshOps[0].code = OP_MULTIHEAD_ATT; refreshOps[0].name = (char *)"mha"; refreshOps[0].index = 0u;
+    refreshOps[0].input = pointerBatchedSliceConfigTagged(SRC_BUFFER, 0u, NN_SLICE_HEAD); refreshOps[0].output = pointerBatchedSliceConfigTagged(SRC_PIPE, 2u, NN_SLICE_HEAD);
+    refreshOps[0].weightSize = size0(); refreshOps[0].config = (NnByte *)&mhaCfg; refreshOps[0].configSize = sizeof(mhaCfg);
+    refreshOps[1].code = OP_SHIFT; refreshOps[1].name = (char *)"shift"; refreshOps[1].index = 0u;
+    refreshOps[1].input = pointerBatchConfig(SRC_PIPE, 2u); refreshOps[1].output = pointerRawConfig(SRC_BUFFER, 1u);
+    refreshOps[1].weightSize = size0(); refreshOps[1].config = (NnByte *)&shiftCfg; refreshOps[1].configSize = sizeof(shiftCfg);
+    refreshOps[2].code = OP_MATMUL; refreshOps[2].name = (char *)"row_mm"; refreshOps[2].index = 0u;
+    refreshOps[2].input = pointerBatchConfig(SRC_PIPE, 2u); refreshOps[2].output = pointerBatchConfig(SRC_PIPE, 2u);
+    refreshOps[2].weightSize = size2D(F_32, 8u, 8u); refreshOps[2].config = (NnByte *)&rowCfg; refreshOps[2].configSize = sizeof(rowCfg);
+    refreshOps[3].code = OP_MATMUL; refreshOps[3].name = (char *)"col_mm"; refreshOps[3].index = 0u;
+    refreshOps[3].input = pointerBatchConfig(SRC_PIPE, 2u); refreshOps[3].output = pointerBatchConfig(SRC_PIPE, 2u);
+    refreshOps[3].weightSize = size2D(F_32, 8u, 8u); refreshOps[3].config = (NnByte *)&colCfg; refreshOps[3].configSize = sizeof(colCfg);
+    refreshOps[4].code = OP_MUL; refreshOps[4].name = (char *)"mul"; refreshOps[4].index = 0u;
+    refreshOps[4].input = pointerBatchConfig(SRC_PIPE, 2u); refreshOps[4].output = pointerBatchConfig(SRC_PIPE, 2u);
+    refreshOps[4].weightSize = size0(); refreshOps[4].config = (NnByte *)&mulCfg; refreshOps[4].configSize = sizeof(mulCfg);
+    refreshOps[5].code = OP_INV_RMS; refreshOps[5].name = (char *)"inv"; refreshOps[5].index = 0u;
+    refreshOps[5].input = pointerBatchConfig(SRC_PIPE, 2u); refreshOps[5].output = pointerBatchConfig(SRC_BUFFER, 5u);
+    refreshOps[5].weightSize = size0(); refreshOps[5].config = (NnByte *)&invCfg; refreshOps[5].configSize = sizeof(invCfg);
+    refreshOps[6].code = OP_RMS_NORM; refreshOps[6].name = (char *)"rms"; refreshOps[6].index = 0u;
+    refreshOps[6].input = pointerBatchConfig(SRC_PIPE, 2u); refreshOps[6].output = pointerBatchConfig(SRC_PIPE, 2u);
+    refreshOps[6].weightSize = size1D(F_32, 4u); refreshOps[6].config = (NnByte *)&rmsCfg; refreshOps[6].configSize = sizeof(rmsCfg);
+
+    NnSegmentConfig segments[2];
+    segments[0].nOps = 2u; segments[0].ops = planOps; segments[0].nSyncs = 0u; segments[0].syncs = nullptr;
+    segments[1].nOps = 7u; segments[1].ops = refreshOps; segments[1].nSyncs = 0u; segments[1].syncs = nullptr;
+
+    NnNetConfig netConfig{};
+    netConfig.nBatches = nBatches; netConfig.nNodes = 2u; netConfig.nPipes = 3u; netConfig.pipes = pipes;
+    NnNodeConfig nodeConfig{};
+    nodeConfig.nodeIndex = 0u; nodeConfig.nBuffers = 6u; nodeConfig.buffers = buffers; nodeConfig.nSegments = 2u; nodeConfig.segments = segments;
+    NnUnevenPartitionPlan plan;
+    initTwoNodePlan(plan);
+    nodeConfig.partitionPlan = &plan;
+    NnNetExecution execution(1u, &netConfig);
+    execution.setBatchSize(nBatches);
+    ((float *)execution.pipes[0])[0] = 0.0f;
+
+    PlanCommand cmd = makeEmptyPlanCommand();
+    cmd.seq = 1001u;
+    cmd.mode = PLAN_CMD_MODE_NEXT_BARRIER;
+    cmd.stageIndex = 0u;
+    cmd.nMoves = 1u;
+    cmd.moves[0].fromNodeIndex = 0u;
+    cmd.moves[0].toNodeIndex = 1u;
+    cmd.moves[0].headMove = 1u;
+    cmd.moves[0].ffnMove = 2u;
+    cmd.moves[0].cmdKind = PLAN_CMD_KIND_BOTH;
+    planCommandCache().store(cmd);
+
+    NnCudaDevice device(gpuIndex, &netConfig, &nodeConfig, &execution, &plan);
+    std::unique_ptr<NnCudaDeviceSegment> planSegment((NnCudaDeviceSegment *)device.createSegment(0u));
+    std::unique_ptr<NnCudaDeviceSegment> refreshSegment((NnCudaDeviceSegment *)device.createSegment(1u));
+    planSegment->forward(0u, 1u, 0u, nBatches);
+    if (plan.headSplit.lengths[0] != 1u || plan.headSplit.lengths[1] != 3u ||
+        plan.ffnSplit.lengths[0] != 2u || plan.ffnSplit.lengths[1] != 6u) {
+        throw std::runtime_error("CUDA PR11 plan apply did not update head/ffn splits");
+    }
+    refreshSegment->refreshPointers();
+    if (mhaCfg.nHeads0 != 1u || mhaCfg.qSliceD0 != 8u || mhaCfg.kvDim0 != 16u ||
+        shiftCfg.dstColStart != 0u ||
+        rowCfg.outStart != 0u || rowCfg.cView.sizeX != 8u ||
+        colCfg.inStart != 0u || colCfg.aView.sizeX != 8u ||
+        mulCfg.view.offset != 0u || mulCfg.view.sizeX != 2u ||
+        invCfg.nColumns != 2u || rmsCfg.nColumns != 2u) {
+        throw std::runtime_error("CUDA PR11 refreshPointers did not update op configs as expected");
+    }
+    planCommandCache().clear();
+    std::printf("CUDA PR11 plan barrier/apply and refreshPointers tests: ok epoch=%u\n", device.getPlanEpoch());
+}
+
+static void runPr12CudaKvTransferTest(NnUint gpuIndex) {
+    const NnUint nBatches = 1u;
+    const NnUint seqLen = 4u;
+    const NnUint kvStride = 8u;
+    NnPipeConfig pipes[1];
+    pipes[0] = {(char *)"dummy", size2D(F_32, nBatches, 8u)};
+    NnBufferConfig buffers[4];
+    buffers[0] = {(char *)"query", size2D(F_32, nBatches, 8u)};
+    buffers[1] = {(char *)"key", size2D(F_32, seqLen, kvStride)};
+    buffers[2] = {(char *)"value", size2D(F_32, seqLen, kvStride)};
+    buffers[3] = {(char *)"att", size1D(F_32, 32u)};
+    NnMultiHeadAttOpConfig mhaCfg{1u, 1u, 1u, 4u, seqLen, 4u, 4u, 0u, 4u, 2u, kvStride, 0u, 0u, 1u, 2u, 3u};
+    NnOpConfig op{};
+    op.code = OP_MULTIHEAD_ATT; op.name = (char *)"mha_kv"; op.index = 7u;
+    op.input = pointerBatchConfig(SRC_PIPE, 0u); op.output = pointerBatchConfig(SRC_PIPE, 0u);
+    op.weightSize = size0(); op.config = (NnByte *)&mhaCfg; op.configSize = sizeof(mhaCfg);
+    NnSegmentConfig segment{};
+    segment.nOps = 1u; segment.ops = &op; segment.nSyncs = 0u; segment.syncs = nullptr;
+    NnNetConfig netConfig{};
+    netConfig.nBatches = nBatches; netConfig.nNodes = 1u; netConfig.nPipes = 1u; netConfig.pipes = pipes;
+    NnNodeConfig nodeConfig{};
+    nodeConfig.nodeIndex = 0u; nodeConfig.nBuffers = 4u; nodeConfig.buffers = buffers; nodeConfig.nSegments = 1u; nodeConfig.segments = &segment;
+    NnNetExecution execution(1u, &netConfig);
+    execution.setBatchSize(nBatches);
+    NnCudaDevice device(gpuIndex, &netConfig, &nodeConfig, &execution, nullptr);
+    std::unique_ptr<NnCudaDeviceSegment> cudaSegment((NnCudaDeviceSegment *)device.createSegment(0u));
+
+    std::vector<float> key = f32Pattern(buffers[1].size.length, 0.25f, 1.0f);
+    std::vector<float> val = f32Pattern(buffers[2].size.length, -0.125f, 2.0f);
+    device.writeBuffer(1u, (const NnByte *)key.data(), 0u, buffers[1].size.nBytes);
+    device.writeBuffer(2u, (const NnByte *)val.data(), 0u, buffers[2].size.nBytes);
+
+    std::vector<float> kRow;
+    std::vector<float> vRow;
+    if (!cudaSegment->exportLayerKvRow(7u, 2u, kvStride, kRow, vRow)) {
+        throw std::runtime_error("CUDA PR12 full KV export returned false");
+    }
+    std::vector<float> expectedK(kvStride, 0.0f), expectedV(kvStride, 0.0f);
+    for (NnUint i = 0u; i < 4u; ++i) {
+        expectedK[2u + i] = key[2u * kvStride + 2u + i];
+        expectedV[2u + i] = val[2u * kvStride + 2u + i];
+    }
+    expectF32Near("CUDA PR12 full KV export key", kRow, expectedK, 0.0f);
+    expectF32Near("CUDA PR12 full KV export value", vRow, expectedV, 0.0f);
+
+    std::vector<float> partK;
+    std::vector<float> partV;
+    if (!cudaSegment->exportLayerKvRow(7u, 2u, kvStride, partK, partV, 3u, 2u)) {
+        throw std::runtime_error("CUDA PR12 partial KV export returned false");
+    }
+    expectF32Near("CUDA PR12 partial KV export key", partK, std::vector<float>{key[2u * kvStride + 3u], key[2u * kvStride + 4u]}, 0.0f);
+    expectF32Near("CUDA PR12 partial KV export value", partV, std::vector<float>{val[2u * kvStride + 3u], val[2u * kvStride + 4u]}, 0.0f);
+
+    std::vector<float> newK{9.5f, 10.5f};
+    std::vector<float> newV{-9.5f, -10.5f};
+    if (!cudaSegment->applyTransferredKvRow(7u, 1u, newK, newV, 4u, 2u)) {
+        throw std::runtime_error("CUDA PR12 partial KV apply returned false");
+    }
+    std::vector<float> gotK(buffers[1].size.length, 0.0f), gotV(buffers[2].size.length, 0.0f);
+    device.readBuffer(1u, (NnByte *)gotK.data(), 0u, buffers[1].size.nBytes);
+    device.readBuffer(2u, (NnByte *)gotV.data(), 0u, buffers[2].size.nBytes);
+    key[1u * kvStride + 4u] = 9.5f; key[1u * kvStride + 5u] = 10.5f;
+    val[1u * kvStride + 4u] = -9.5f; val[1u * kvStride + 5u] = -10.5f;
+    expectF32Near("CUDA PR12 partial KV apply key", gotK, key, 0.0f);
+    expectF32Near("CUDA PR12 partial KV apply value", gotV, val, 0.0f);
+    std::printf("CUDA PR12 KV export/apply tests: ok\n");
+}
+
 int main(int argc, char **argv) {
     NnUint gpuIndex = 0u;
     for (int i = 1; i < argc; ++i) {
@@ -1833,6 +2148,7 @@ int main(int argc, char **argv) {
         NnNodeConfig nodeConfig{};
         NnCudaDevice device(gpuIndex, &netConfig, &nodeConfig, nullptr, nullptr);
         std::printf("CUDA device lifecycle: ok\n");
+        runCudaLaunchConfigTest(gpuIndex, device);
         runMemoryDataPathTest(gpuIndex);
         runPr4ElementwiseOpsTest(gpuIndex);
         runPr5EmbeddingNormRopeShiftSoftmaxTest(gpuIndex);
@@ -1840,6 +2156,9 @@ int main(int argc, char **argv) {
         runPr7Q80Q40MatmulTest(gpuIndex);
         runPr8MultiheadAttentionTest(gpuIndex);
         runPr9Qwen3MoeChainTest(gpuIndex);
+        runPr10StaticMixedExecutorTest(gpuIndex);
+        runPr11PlanRefreshTest(gpuIndex);
+        runPr12CudaKvTransferTest(gpuIndex);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "CUDA test failed: %s\n", e.what());
         return EXIT_FAILURE;

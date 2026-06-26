@@ -1,8 +1,11 @@
 #include "nn-cuda.hpp"
+#include "llm.hpp"
+#include "plan-command.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <cstdio>
@@ -119,6 +122,71 @@ static inline unsigned int cudaBlocks(NnSize n, unsigned int blockSize = 256u) {
     return (unsigned int)((n + blockSize - 1u) / blockSize);
 }
 
+static unsigned int cudaFloorPowerOfTwo(unsigned int v) {
+    if (v == 0u) return 0u;
+    unsigned int p = 1u;
+    while ((p << 1u) != 0u && (p << 1u) <= v) p <<= 1u;
+    return p;
+}
+
+static unsigned int cudaClampLaunchBlockSize(unsigned int requested, unsigned int deviceMax, unsigned int hardMax) {
+    unsigned int limit = std::min(deviceMax == 0u ? 1024u : deviceMax, hardMax == 0u ? 1024u : hardMax);
+    if (limit < 32u) limit = 32u;
+    unsigned int value = std::min(requested == 0u ? 32u : requested, limit);
+    value = cudaFloorPowerOfTwo(value);
+    if (value < 32u) value = 32u;
+    return value;
+}
+
+static NnCudaLaunchConfig buildCudaLaunchConfig(const cudaDeviceProp &prop) {
+    NnCudaLaunchConfig cfg{};
+    cfg.computeCapabilityMajor = prop.major;
+    cfg.computeCapabilityMinor = prop.minor;
+    cfg.sm = prop.major * 10 + prop.minor;
+    cfg.multiprocessorCount = (NnUint)std::max(prop.multiProcessorCount, 0);
+    cfg.maxThreadsPerBlock = (NnUint)std::max(prop.maxThreadsPerBlock, 0);
+    cfg.warpSize = (NnUint)std::max(prop.warpSize, 1);
+    cfg.integrated = prop.integrated != 0;
+
+    const unsigned int maxThreads = (unsigned int)std::max(prop.maxThreadsPerBlock, 32);
+    const bool preVolta = cfg.sm > 0 && cfg.sm < 70;
+    const bool ampereOrNewerDiscrete = cfg.sm >= 80 && !cfg.integrated;
+    const bool integratedOrLowPower = cfg.integrated;
+
+    const unsigned int elementwiseRequest = ampereOrNewerDiscrete ? 512u : (preVolta || integratedOrLowPower ? 128u : 256u);
+    const unsigned int reductionRequest = preVolta || integratedOrLowPower ? 128u : 256u;
+    const unsigned int attentionRequest = preVolta || integratedOrLowPower ? 128u : 256u;
+    const unsigned int moeGateRequest = integratedOrLowPower ? 64u : 128u;
+
+    cfg.elementwiseBlockSize = (NnUint)cudaClampLaunchBlockSize(elementwiseRequest, maxThreads, 1024u);
+    cfg.reductionBlockSize = (NnUint)cudaClampLaunchBlockSize(reductionRequest, maxThreads, 256u);
+    cfg.attentionBlockSize = (NnUint)cudaClampLaunchBlockSize(attentionRequest, maxThreads, 256u);
+    cfg.q80q40SmallKBlockSize = (NnUint)cudaClampLaunchBlockSize(elementwiseRequest, maxThreads, 512u);
+    cfg.q80q40LargeKBlockSize = cfg.reductionBlockSize;
+    cfg.softmaxBlockSize = cfg.reductionBlockSize;
+    cfg.moeGateBlockSize = (NnUint)cudaClampLaunchBlockSize(moeGateRequest, maxThreads, 256u);
+    cfg.q80q40SmallKMaxBlocks = (NnUint)(ampereOrNewerDiscrete ? 8u : 4u);
+    return cfg;
+}
+
+static std::string cudaLaunchConfigToString(const NnCudaLaunchConfig &cfg) {
+    std::ostringstream out;
+    out << "CUDA LaunchConfig: sm_" << cfg.sm
+        << " integrated=" << (cfg.integrated ? 1 : 0)
+        << " mp=" << cfg.multiprocessorCount
+        << " warp=" << cfg.warpSize
+        << " maxThreadsPerBlock=" << cfg.maxThreadsPerBlock
+        << " elementwise=" << cfg.elementwiseBlockSize
+        << " reduction=" << cfg.reductionBlockSize
+        << " attention=" << cfg.attentionBlockSize
+        << " q80q40SmallK=" << cfg.q80q40SmallKBlockSize
+        << " q80q40LargeK=" << cfg.q80q40LargeKBlockSize
+        << " softmax=" << cfg.softmaxBlockSize
+        << " moeGate=" << cfg.moeGateBlockSize
+        << " smallKMaxBlocks=" << cfg.q80q40SmallKMaxBlocks;
+    return out.str();
+}
+
 __device__ static inline uint16_t cudaFloatToHalfBits(float x) {
     __half h = __float2half(x);
     return __half_as_ushort(h);
@@ -143,6 +211,217 @@ __device__ static inline NnByte *cudaRowBase(NnByte *base, NnPointerLayout layou
 
 static inline NnByte *cudaHostRowBase(NnByte *base, const NnPointerLayout &layout, NnUint z, NnUint y) {
     return base + z * layout.zStrideBytes + y * layout.batchStrideBytes + layout.byteOffset;
+}
+
+static bool isCudaControlOp(NnOpCode code) {
+    return code == OP_PLAN_BARRIER || code == OP_PLAN_APPLY;
+}
+
+static const NnStageConfig *findStageForNodeCuda(const NnUnevenPartitionPlan *plan, NnUint nodeIndex) {
+    if (plan == nullptr || plan->stages == nullptr) return nullptr;
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        const NnStageConfig *st = &plan->stages[s];
+        for (NnUint i = 0u; i < st->nNodes; ++i) {
+            if (st->nodeIndices[i] == nodeIndex) return st;
+        }
+    }
+    return nullptr;
+}
+
+static bool cudaStageContains(const NnStageConfig *stage, NnUint node) {
+    if (stage == nullptr) return false;
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        if (stage->nodeIndices[i] == node) return true;
+    }
+    return false;
+}
+
+static int cudaStageRank(const NnStageConfig *stage, NnUint node) {
+    if (stage == nullptr) return -1;
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        if (stage->nodeIndices[i] == node) return (int)i;
+    }
+    return -1;
+}
+
+static bool cudaStageAdjacent(const NnStageConfig *stage, NnUint a, NnUint b) {
+    const int ra = cudaStageRank(stage, a);
+    const int rb = cudaStageRank(stage, b);
+    if (ra < 0 || rb < 0) return false;
+    const int d = (ra >= rb) ? (ra - rb) : (rb - ra);
+    return d == 1;
+}
+
+static void cudaRecomputeStarts(const NnStageConfig *stage, NnDimSplit &split) {
+    if (stage == nullptr || split.starts == nullptr || split.lengths == nullptr) return;
+    NnUint run = 0u;
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        split.starts[n] = run;
+        run += split.lengths[n];
+    }
+}
+
+static NnUint cudaGqaGroupSize(const NnUnevenPartitionPlan *plan, const NnStageConfig *stage) {
+    if (plan == nullptr || stage == nullptr || plan->headSplit.lengths == nullptr || plan->kvHeadSplit.lengths == nullptr) return 1u;
+    NnUint q = 0u;
+    NnUint kv = 0u;
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        q += plan->headSplit.lengths[n];
+        kv += plan->kvHeadSplit.lengths[n];
+    }
+    if (q != 0u && kv != 0u && (q % kv) == 0u) {
+        const NnUint g = q / kv;
+        return g == 0u ? 1u : g;
+    }
+    return 1u;
+}
+
+static bool cudaHasHeadDeltaForStage(const std::vector<int> &delta, const NnStageConfig *stage) {
+    if (stage == nullptr) return false;
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n < delta.size() && delta[n] != 0) return true;
+    }
+    return false;
+}
+
+static bool cudaValidateKvShadowCoverage(
+    const NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage,
+    const std::vector<int> &delta,
+    char *reason,
+    size_t reasonSize) {
+    auto setReason = [&](const char *value) {
+        if (reason != nullptr && reasonSize != 0u) std::snprintf(reason, reasonSize, "%s", value);
+    };
+    if (!getEnableStageFullWeights()) { setReason("kv_shadow_requires_stage_full_weights"); return false; }
+    if (!getEnableKvRedundancyDuringMigration()) { setReason("kv_shadow_redundancy_disabled"); return false; }
+    if (plan == nullptr || stage == nullptr ||
+        plan->kvHeadSplit.lengths == nullptr ||
+        plan->kvHeadComputeSplit.starts == nullptr ||
+        plan->kvHeadComputeSplit.lengths == nullptr) {
+        setReason("kv_shadow_split_missing");
+        return false;
+    }
+    NnUint newStart = 0u;
+    for (NnUint i = 0u; i < stage->nNodes; ++i) {
+        const NnUint n = stage->nodeIndices[i];
+        if (n >= delta.size()) { setReason("kv_shadow_delta_missing"); return false; }
+        const int newLenSigned = (int)plan->kvHeadSplit.lengths[n] + delta[n];
+        if (newLenSigned < 0) { setReason("kv_shadow_underflow"); return false; }
+        const NnUint newLen = (NnUint)newLenSigned;
+        const NnUint newEnd = newStart + newLen;
+        const NnUint shadowStart = plan->kvHeadComputeSplit.starts[n];
+        const NnUint shadowEnd = shadowStart + plan->kvHeadComputeSplit.lengths[n];
+        if (newStart < shadowStart || newEnd > shadowEnd) {
+            setReason("kv_shadow_coverage_miss");
+            return false;
+        }
+        newStart = newEnd;
+    }
+    setReason("");
+    return true;
+}
+
+static bool cudaApplyPlanDeltas(
+    NnCudaDevice *device,
+    NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage,
+    const std::vector<int> &deltaHeadOrKv,
+    const std::vector<int> &deltaFfn,
+    NnUint msgEpoch,
+    NnUint layerIndex,
+    NnUint pos) {
+    if (device == nullptr || plan == nullptr || stage == nullptr) return false;
+    const NnUint gqaGroup = cudaGqaGroupSize(plan, stage);
+    bool changed = false;
+
+    if (cudaHasHeadDeltaForStage(deltaHeadOrKv, stage)) {
+        if (gqaGroup > 1u && plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths) {
+            if (getEnableKvRedundancyDuringMigration() && !getAllowNoShadowHeadMigration()) {
+                char reason[96] = {0};
+                if (!cudaValidateKvShadowCoverage(plan, stage, deltaHeadOrKv, reason, sizeof(reason))) {
+                    std::printf("🧭 [plan][apply][cuda] node=%u stage=%u epoch=%u layer=%u pos=%u reject: %s\n",
+                        (unsigned)device->getNodeIndex(), (unsigned)stage->stageIndex, (unsigned)msgEpoch,
+                        (unsigned)layerIndex, (unsigned)pos, reason);
+                    std::fflush(stdout);
+                    return false;
+                }
+            }
+            for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                const NnUint n = stage->nodeIndices[i];
+                const int newLen = (int)plan->kvHeadSplit.lengths[n] + deltaHeadOrKv[n];
+                if (newLen < 0) return false;
+            }
+            for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                const NnUint n = stage->nodeIndices[i];
+                if (deltaHeadOrKv[n] == 0) continue;
+                plan->kvHeadSplit.lengths[n] = (NnUint)((int)plan->kvHeadSplit.lengths[n] + deltaHeadOrKv[n]);
+                changed = true;
+            }
+            if (changed) {
+                cudaRecomputeStarts(stage, plan->kvHeadSplit);
+                for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                    const NnUint n = stage->nodeIndices[i];
+                    plan->headSplit.starts[n] = plan->kvHeadSplit.starts[n] * gqaGroup;
+                    plan->headSplit.lengths[n] = plan->kvHeadSplit.lengths[n] * gqaGroup;
+                }
+            }
+        } else {
+            if (!plan->headSplit.starts || !plan->headSplit.lengths) return false;
+            for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                const NnUint n = stage->nodeIndices[i];
+                const int newLen = (int)plan->headSplit.lengths[n] + deltaHeadOrKv[n];
+                if (newLen < 0) return false;
+            }
+            for (NnUint i = 0u; i < stage->nNodes; ++i) {
+                const NnUint n = stage->nodeIndices[i];
+                if (deltaHeadOrKv[n] == 0) continue;
+                plan->headSplit.lengths[n] = (NnUint)((int)plan->headSplit.lengths[n] + deltaHeadOrKv[n]);
+                changed = true;
+            }
+            if (changed) cudaRecomputeStarts(stage, plan->headSplit);
+        }
+    }
+
+    if (!deltaFfn.empty()) {
+        if (!plan->ffnSplit.starts || !plan->ffnSplit.lengths) return false;
+        for (NnUint i = 0u; i < stage->nNodes; ++i) {
+            const NnUint n = stage->nodeIndices[i];
+            const int d = n < deltaFfn.size() ? deltaFfn[n] : 0;
+            const int newLen = (int)plan->ffnSplit.lengths[n] + d;
+            if (newLen < 0) return false;
+        }
+        bool ffnChanged = false;
+        for (NnUint i = 0u; i < stage->nNodes; ++i) {
+            const NnUint n = stage->nodeIndices[i];
+            const int d = n < deltaFfn.size() ? deltaFfn[n] : 0;
+            if (d == 0) continue;
+            plan->ffnSplit.lengths[n] = (NnUint)((int)plan->ffnSplit.lengths[n] + d);
+            ffnChanged = true;
+        }
+        if (ffnChanged) {
+            cudaRecomputeStarts(stage, plan->ffnSplit);
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        std::printf("🧭 [plan][apply][cuda] node=%u stage=%u epoch=%u layer=%u pos=%u applied qHeads=%u kvHeads=%u ffnDim=%u\n",
+            (unsigned)device->getNodeIndex(),
+            (unsigned)stage->stageIndex,
+            (unsigned)msgEpoch,
+            (unsigned)layerIndex,
+            (unsigned)pos,
+            (unsigned)(plan->headSplit.lengths ? plan->headSplit.lengths[device->getNodeIndex()] : 0u),
+            (unsigned)(plan->kvHeadSplit.lengths ? plan->kvHeadSplit.lengths[device->getNodeIndex()] : 0u),
+            (unsigned)(plan->ffnSplit.lengths ? plan->ffnSplit.lengths[device->getNodeIndex()] : 0u));
+        std::fflush(stdout);
+        device->setPlanEpoch(msgEpoch);
+    }
+    return changed;
 }
 
 __global__ static void castF32F32Kernel(
@@ -911,9 +1190,12 @@ std::string nnCudaDeviceInfo(NnUint gpuIndex) {
     std::ostringstream out;
     out << "CUDA Device[" << gpuIndex << "]: " << prop.name
         << " cc " << prop.major << "." << prop.minor
+        << " sm_" << (prop.major * 10 + prop.minor)
         << ", globalMem=" << (unsigned long long)(prop.totalGlobalMem / (1024ull * 1024ull)) << " MB"
         << ", multiProcessorCount=" << prop.multiProcessorCount
+        << ", warpSize=" << prop.warpSize
         << ", maxThreadsPerBlock=" << prop.maxThreadsPerBlock
+        << ", integrated=" << prop.integrated
         << ", driver=" << driverVersion
         << ", runtime=" << runtimeVersion;
     return out.str();
@@ -1063,11 +1345,16 @@ NnCudaBuffer *NnCudaDeviceData::resolveBuffer(NnUint bufferIndex) {
 }
 
 NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan)
-    : gpuIndex(gpuIndex), stream(nullptr), blasHandle(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), staging(), data() {
+    : gpuIndex(gpuIndex), stream(nullptr), blasHandle(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), launchConfig{}, staging(), data() {
     (void)this->netConfig;
     (void)this->netExecution;
-    nnCudaPrintDeviceInfo(gpuIndex);
     NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    cudaDeviceProp prop{};
+    NN_CUDA_CHECK(cudaGetDeviceProperties(&prop, (int)gpuIndex));
+    launchConfig = buildCudaLaunchConfig(prop);
+    nnCudaPrintDeviceInfo(gpuIndex);
+    std::printf("🔷 %s\n", launchConfigInfo().c_str());
+    std::fflush(stdout);
     cudaStream_t s = nullptr;
     NN_CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     stream = (void *)s;
@@ -1100,6 +1387,10 @@ NnCudaDevice::~NnCudaDevice() {
 
 NnUint NnCudaDevice::maxNThreads() {
     return 1u;
+}
+
+std::string NnCudaDevice::launchConfigInfo() const {
+    return cudaLaunchConfigToString(launchConfig);
 }
 
 NnDeviceSegment *NnCudaDevice::createSegment(NnUint segmentIndex) {
@@ -1341,6 +1632,13 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
     NnCudaPointerRef in = resolveCudaPointer(device, netConfig, nodeConfig, device->getPartitionPlan(), &op.input);
     NnCudaPointerRef out = resolveCudaPointer(device, netConfig, nodeConfig, device->getPartitionPlan(), &op.output);
     cudaStream_t stream = (cudaStream_t)device->getStream();
+    const NnCudaLaunchConfig &launch = device->getLaunchConfig();
+    const unsigned int elementwiseBlock = (unsigned int)launch.elementwiseBlockSize;
+    const unsigned int attentionBlock = (unsigned int)launch.attentionBlockSize;
+    const unsigned int q80q40SmallKBlock = (unsigned int)launch.q80q40SmallKBlockSize;
+    const unsigned int q80q40LargeKBlock = (unsigned int)launch.q80q40LargeKBlockSize;
+    const unsigned int softmaxBlock = (unsigned int)launch.softmaxBlockSize;
+    const unsigned int moeGateBlock = (unsigned int)launch.moeGateBlockSize;
 
     switch (op.code) {
         case OP_EMBEDDING: {
@@ -1353,7 +1651,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
             if (total == 0u) return;
             if (op.weightSize.floatType == F_32) {
-                embeddingF32F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                embeddingF32F32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)weightBuffers[opIndex]->data(),
@@ -1365,7 +1663,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 if ((op.weightSize.x % Q40_BLOCK_SIZE) != 0u) {
                     throw std::runtime_error("CUDA EMBEDDING Q40 requires block-aligned embedding width");
                 }
-                embeddingQ40F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                embeddingQ40F32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
@@ -1378,7 +1676,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 if ((op.weightSize.x % Q80_BLOCK_SIZE) != 0u) {
                     throw std::runtime_error("CUDA EMBEDDING Q80 requires block-aligned embedding width");
                 }
-                embeddingQ80F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                embeddingQ80F32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const NnBlockQ80 *)weightBuffers[opIndex]->data(),
@@ -1400,7 +1698,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnSize total = (NnSize)batchSize * config->nColumns;
             if (total != 0u) {
-                invRmsF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                invRmsF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     config->epsilon,
@@ -1425,7 +1723,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnUint invRmsRowStride = nodeConfig->buffers[config->invRmsBufferIndex].size.x;
             const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
             if (total != 0u) {
-                rmsNormF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                rmsNormF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)weightBuffers[opIndex]->data(),
@@ -1489,8 +1787,8 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 const NnUint aOffsetBlocks = (NnUint)aView.offset / Q80_BLOCK_SIZE;
                 const NnUint inStartBlocks = config->inStart / Q40_BLOCK_SIZE;
                 const NnSize totalOutputs = (NnSize)batchSize * nActiveExpertsOr1 * cLen;
-                if (aBlocks <= 4u) {
-                    matmulQ80Q40SmallKKernel<<<cudaBlocks(totalOutputs), 256, 0, stream>>>(
+                if (aBlocks <= launch.q80q40SmallKMaxBlocks) {
+                    matmulQ80Q40SmallKKernel<<<cudaBlocks(totalOutputs, q80q40SmallKBlock), q80q40SmallKBlock, 0, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
@@ -1511,7 +1809,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                         batchSize);
                     NN_CUDA_CHECK(cudaGetLastError());
                 } else {
-                    matmulQ80Q40LargeKKernel<<<(unsigned int)totalOutputs, 256, 0, stream>>>(
+                    matmulQ80Q40LargeKKernel<<<(unsigned int)totalOutputs, q80q40LargeKBlock, 0, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
@@ -1651,7 +1949,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 ? (NnSize)batchSize * (view.sizeX / config->slice.headDim) * (config->slice.headDim / 2u)
                 : (NnSize)batchSize * (view.sizeX / 2u);
             if (total != 0u) {
-                ropeF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                ropeF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (NnByte *)in.buffer->data(), in.layout,
                     (const float *)positionPipe->data(),
                     (const float *)ropeCache->data(),
@@ -1722,7 +2020,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             dim3 grid(config.nHeads0, batchSize, 1u);
             if (batchSize != 0u) {
-                multiheadAttScoreF32Kernel<<<grid, 256, 0, stream>>>(
+                multiheadAttScoreF32Kernel<<<grid, attentionBlock, 0, stream>>>(
                     (const float *)positionPipe->data(),
                     (const float *)queryBuffer->data(),
                     (const float *)keyCacheBuffer->data(),
@@ -1736,7 +2034,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                     config,
                     batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
-                multiheadAttValueF32Kernel<<<grid, 256, 0, stream>>>(
+                multiheadAttValueF32Kernel<<<grid, attentionBlock, 0, stream>>>(
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)positionPipe->data(),
                     (const float *)valueCacheBuffer->data(),
@@ -1752,7 +2050,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 const NnTensorViewLayout view = resolveOpView(op, out.layout.logicalSize, out.layout.logicalSize.x);
                 const NnSize total = (NnSize)out.layout.logicalSize.z * batchSize * view.sizeY * view.sizeX;
                 if (total != 0u) {
-                    castF32F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                    castF32F32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         view, batchSize);
@@ -1765,7 +2063,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 validateQ80View("CAST F32->Q80", view);
                 const NnSize totalBlocks = (NnSize)in.layout.logicalSize.z * batchSize * (view.sizeX / Q80_BLOCK_SIZE);
                 if (totalBlocks != 0u) {
-                    q80QuantizeKernel<<<cudaBlocks(totalBlocks), 256, 0, stream>>>(
+                    q80QuantizeKernel<<<cudaBlocks(totalBlocks, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         (NnUint)view.offset, (NnUint)view.sizeX, batchSize);
@@ -1779,7 +2077,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnTensorViewLayout view = resolveOpView(op, out.layout.logicalSize, out.layout.logicalSize.x);
             const NnSize total = (NnSize)out.layout.logicalSize.z * batchSize * view.sizeY * view.sizeX;
             if (total != 0u) {
-                siluKernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                siluKernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (NnByte *)out.buffer->data(), out.layout, view, batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
             }
@@ -1789,7 +2087,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnTensorViewLayout view = resolveOpView(op, out.layout.logicalSize, out.layout.logicalSize.x);
             const NnSize total = (NnSize)out.layout.logicalSize.z * batchSize * view.sizeY * view.sizeX;
             if (total != 0u) {
-                geluKernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                geluKernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (NnByte *)out.buffer->data(), out.layout, view, batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
             }
@@ -1803,7 +2101,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnUint multRowStride = nodeConfig->buffers[config->multiplierBufferIndex].size.x;
             const NnSize total = (NnSize)in.layout.logicalSize.z * batchSize * view.sizeY * view.sizeX;
             if (total != 0u) {
-                mulKernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                mulKernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)multBuf->data(), multRowStride,
@@ -1819,7 +2117,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             NnCudaBuffer *scaleBuf = device->data.resolveBuffer(config->scaleBufferIndex);
             const NnSize total = (NnSize)in.layout.logicalSize.z * batchSize * view.sizeY * view.sizeX;
             if (total != 0u) {
-                scaleKernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                scaleKernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)scaleBuf->data(),
@@ -1839,7 +2137,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
             if (total == 0u) return;
             if (in.layout.logicalSize.floatType == F_32) {
-                mergeAddF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                mergeAddF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     nSlices, batchSize);
@@ -1850,7 +2148,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 if ((out.layout.logicalSize.x % Q80_BLOCK_SIZE) != 0u) {
                     throw std::runtime_error("CUDA MERGE_ADD Q80 input requires block-aligned output width");
                 }
-                mergeAddQ80F32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                mergeAddQ80F32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     nSlices, batchSize);
@@ -1865,7 +2163,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnSize total = (NnSize)batchSize * out.layout.logicalSize.x;
             if (total != 0u) {
-                mergeSumF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                mergeSumF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     batchSize);
@@ -1882,7 +2180,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnSize quantBlocks = (NnSize)batchSize * (out.layout.logicalSize.x / Q80_BLOCK_SIZE);
             if (quantBlocks != 0u) {
-                q80QuantizeKernel<<<cudaBlocks(quantBlocks), 256, 0, stream>>>(
+                q80QuantizeKernel<<<cudaBlocks(quantBlocks, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     0u, out.layout.logicalSize.x,
@@ -1892,7 +2190,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnSize copyBlocks = (NnSize)(out.layout.logicalSize.z > 0u ? out.layout.logicalSize.z - 1u : 0u)
                 * batchSize * (out.layout.logicalSize.x / Q80_BLOCK_SIZE);
             if (copyBlocks != 0u) {
-                repeatZCopyQ80Kernel<<<cudaBlocks(copyBlocks), 256, 0, stream>>>(
+                repeatZCopyQ80Kernel<<<cudaBlocks(copyBlocks, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (NnByte *)out.buffer->data(), out.layout,
                     batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
@@ -1908,7 +2206,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             NnCudaBuffer *indexPipe = device->data.resolvePipe(config->indexPipeIndex);
             const NnSize total = (NnSize)batchSize * in.layout.logicalSize.x;
             if (total != 0u) {
-                shiftF32Kernel<<<cudaBlocks(total), 256, 0, stream>>>(
+                shiftF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)indexPipe->data(),
@@ -1931,7 +2229,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                         view,
                         batchSize);
                 } else {
-                    softmaxF32Kernel<<<rows, 256, 0, stream>>>(
+                    softmaxF32Kernel<<<rows, softmaxBlock, 0, stream>>>(
                         (NnByte *)out.buffer->data(), out.layout,
                         view,
                         batchSize);
@@ -1963,7 +2261,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             NnCudaBuffer *indexesBuf = device->data.resolveBuffer(config->indexesBufferIndex);
             if (batchSize != 0u) {
-                moeGateF32Kernel<<<cudaBlocks(batchSize), 256, 0, stream>>>(
+                moeGateF32Kernel<<<cudaBlocks(batchSize, moeGateBlock), moeGateBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (float *)indexesBuf->data(),
@@ -1973,6 +2271,171 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                     batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
             }
+            return;
+        }
+        case OP_PLAN_BARRIER: {
+            if (netExecution == nullptr || op.input.source != SRC_PIPE || op.output.source != SRC_PIPE) return;
+            const float *posPipe = (const float *)netExecution->pipes[op.input.pointerIndex];
+            float *planPipe = (float *)netExecution->pipes[op.output.pointerIndex];
+            if (posPipe == nullptr || planPipe == nullptr) return;
+            const NnUint layerIndex = op.index;
+            const NnUint pos = posPipe[0] >= 0.0f ? (NnUint)posPipe[0] : 0u;
+            const NnUnevenPartitionPlan *plan = device->getPartitionPlan();
+            const NnUint myNode = device->getNodeIndex();
+            const NnStageConfig *stage = findStageForNodeCuda(plan, myNode);
+            const PlanCommandSnapshot snap = planCommandCache().load();
+            const PlanCommand &pc = snap.cmd;
+            const bool hasPayload =
+                pc.cmdKind == PLAN_CMD_KIND_HEAD ||
+                pc.cmdKind == PLAN_CMD_KIND_FFN ||
+                pc.cmdKind == PLAN_CMD_KIND_BOTH ||
+                (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u);
+            const bool hasCmd =
+                isValidPlanCommandHeader(pc) &&
+                (pc.mode == PLAN_CMD_MODE_EXACT || pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) &&
+                hasPayload;
+            const bool stageOk = (pc.stageIndex == 0xFFFFFFFFu) || (stage != nullptr && stage->stageIndex == pc.stageIndex);
+            const bool isStageRoot = stageOk && stage != nullptr && stage->rootNodeIndex == myNode;
+
+            unsigned int emitEpoch = device->getPlanEpoch();
+            unsigned int cmd = 0u;
+            unsigned int fromNode = 0u;
+            unsigned int toNode = 0u;
+            unsigned int headMove = 0u;
+            unsigned int ffnMove = 0u;
+            bool trigger = false;
+            if (hasCmd && isStageRoot) {
+                const unsigned int lastEmitted = device->getLastPlanCmdSeqEmitted();
+                if (!(pc.seq != 0u && pc.seq <= lastEmitted)) {
+                    if (pc.mode == PLAN_CMD_MODE_EXACT) {
+                        const bool exactMatch = layerIndex == pc.triggerLayer && pos == pc.triggerPos;
+                        const bool missedExact =
+                            pc.triggerPos != 0xFFFFFFFFu &&
+                            pc.triggerLayer != 0xFFFFFFFFu &&
+                            (pos > pc.triggerPos || (pos == pc.triggerPos && layerIndex > pc.triggerLayer));
+                        trigger = exactMatch || missedExact;
+                    } else {
+                        trigger = true;
+                    }
+                }
+            }
+            if (trigger) {
+                emitEpoch += 1u;
+                if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u) {
+                    const PlanMove &m = pc.moves[0];
+                    cmd = m.cmdKind;
+                    fromNode = m.fromNodeIndex;
+                    toNode = m.toNodeIndex;
+                    headMove = m.headMove;
+                    ffnMove = m.ffnMove;
+                    if (cmd == 0u) {
+                        if (headMove != 0u && ffnMove != 0u) cmd = PLAN_CMD_KIND_BOTH;
+                        else if (headMove != 0u) cmd = PLAN_CMD_KIND_HEAD;
+                        else if (ffnMove != 0u) cmd = PLAN_CMD_KIND_FFN;
+                    }
+                } else if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 1u) {
+                    cmd = 4u;
+                    fromNode = pc.seq;
+                } else {
+                    cmd = pc.cmdKind;
+                    fromNode = pc.fromNodeIndex;
+                    toNode = pc.toNodeIndex;
+                    headMove = pc.nHeadsToMove;
+                    ffnMove = pc.nFfnToMove;
+                }
+                device->setLastPlanCmdSeqEmitted(pc.seq);
+                std::printf("🧭 [plan][emit][cuda] node=%u stage=%u layer=%u pos=%u epoch=%u cmd=%u headMove=%u ffnMove=%u from=%u to=%u seq=%u\n",
+                    (unsigned)myNode,
+                    (unsigned)(stage != nullptr ? stage->stageIndex : 0u),
+                    (unsigned)layerIndex,
+                    (unsigned)pos,
+                    (unsigned)emitEpoch,
+                    (unsigned)cmd,
+                    (unsigned)headMove,
+                    (unsigned)ffnMove,
+                    (unsigned)fromNode,
+                    (unsigned)toNode,
+                    (unsigned)pc.seq);
+                std::fflush(stdout);
+            }
+            for (NnUint b = 0u; b < batchSize; ++b) {
+                float *row = planPipe + b * 8u;
+                row[0] = (float)emitEpoch;
+                row[1] = (float)cmd;
+                row[2] = (float)fromNode;
+                row[3] = (float)toNode;
+                row[4] = (float)headMove;
+                row[5] = (float)layerIndex;
+                row[6] = (float)pos;
+                row[7] = (float)ffnMove;
+            }
+            if (op.output.pointerIndex < netConfig->nPipes) {
+                NnCudaBuffer *pipe = device->data.resolvePipe(op.output.pointerIndex);
+                const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
+                pipe->write((const NnByte *)planPipe, 0u, nBytes, stream, &device->staging);
+            }
+            return;
+        }
+        case OP_PLAN_APPLY: {
+            if (netExecution == nullptr || op.input.source != SRC_PIPE) return;
+            const float *in0 = (const float *)netExecution->pipes[op.input.pointerIndex];
+            if (in0 == nullptr) return;
+            const unsigned int curEpoch = device->getPlanEpoch();
+            const unsigned int msgEpoch = in0[0] >= 0.0f ? (unsigned int)in0[0] : 0u;
+            const unsigned int cmd = in0[1] >= 0.0f ? (unsigned int)in0[1] : 0u;
+            const unsigned int fromNode = in0[2] >= 0.0f ? (unsigned int)in0[2] : 0u;
+            const unsigned int toNode = in0[3] >= 0.0f ? (unsigned int)in0[3] : 0u;
+            const unsigned int headMove = in0[4] >= 0.0f ? (unsigned int)in0[4] : 0u;
+            const unsigned int layerIndex = in0[5] >= 0.0f ? (unsigned int)in0[5] : 0u;
+            const unsigned int pos = in0[6] >= 0.0f ? (unsigned int)in0[6] : 0u;
+            const unsigned int ffnMove = in0[7] >= 0.0f ? (unsigned int)in0[7] : 0u;
+            if (!(cmd == 1u || cmd == 2u || cmd == 3u || cmd == 4u) || msgEpoch <= curEpoch) return;
+            NnUnevenPartitionPlan *plan = const_cast<NnUnevenPartitionPlan *>(device->getPartitionPlan());
+            if (plan == nullptr || plan->nStages == 0u) return;
+            const NnPlanApplyOpCodeConfig *config = (const NnPlanApplyOpCodeConfig *)op.config;
+            const NnUint onlyStage = config != nullptr ? config->onlyStageIndex : 0u;
+            if (onlyStage >= plan->nStages) return;
+            const NnStageConfig *stage = findStageForNodeCuda(plan, device->getNodeIndex());
+            if (stage == nullptr || stage->stageIndex != onlyStage) return;
+
+            std::vector<int> deltaHeadOrKv(plan->nNodes, 0);
+            std::vector<int> deltaFfn(plan->nNodes, 0);
+            bool reject = false;
+            auto addMove = [&](NnUint f, NnUint t, NnUint h, NnUint ffn) {
+                if (!cudaStageContains(stage, f) || !cudaStageContains(stage, t) || f == t || !cudaStageAdjacent(stage, f, t)) {
+                    reject = true;
+                    return;
+                }
+                if (h != 0u) { deltaHeadOrKv[f] -= (int)h; deltaHeadOrKv[t] += (int)h; }
+                if (ffn != 0u) { deltaFfn[f] -= (int)ffn; deltaFfn[t] += (int)ffn; }
+            };
+            if (cmd == 4u) {
+                const PlanCommandSnapshot snap = planCommandCache().load();
+                const PlanCommand &pc = snap.cmd;
+                if (!isValidPlanCommandHeader(pc) || pc.seq != fromNode || !planCommandHasMoveList(pc)) {
+                    std::printf("🧭 [plan][apply][cuda] node=%u stage=%u epoch=%u reject: cmdlist missing/mismatch\n",
+                        (unsigned)device->getNodeIndex(), (unsigned)onlyStage, (unsigned)msgEpoch);
+                    std::fflush(stdout);
+                    return;
+                }
+                const uint32_t maxMovesAllowed = std::min<uint32_t>(DLLAMA_PLAN_CMD_MAX_MOVES, (uint32_t)(2u * stage->nNodes));
+                if (pc.nMoves > maxMovesAllowed) return;
+                for (uint32_t i = 0u; i < pc.nMoves; ++i) {
+                    const PlanMove &m = pc.moves[i];
+                    addMove(m.fromNodeIndex, m.toNodeIndex, m.headMove, m.ffnMove);
+                    if (reject) break;
+                }
+            } else {
+                addMove(fromNode, toNode, (cmd == 1u || cmd == 3u) ? headMove : 0u, (cmd == 2u || cmd == 3u) ? ffnMove : 0u);
+            }
+            if (reject) {
+                std::printf("🧭 [plan][apply][cuda] node=%u stage=%u epoch=%u layer=%u pos=%u reject: bad move\n",
+                    (unsigned)device->getNodeIndex(), (unsigned)onlyStage, (unsigned)msgEpoch,
+                    (unsigned)layerIndex, (unsigned)pos);
+                std::fflush(stdout);
+                return;
+            }
+            cudaApplyPlanDeltas(device, plan, stage, deltaHeadOrKv, deltaFfn, msgEpoch, layerIndex, pos);
             return;
         }
         default:
@@ -2008,13 +2471,275 @@ void NnCudaDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thread
 
 void NnCudaDeviceSegment::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
     if (device != nullptr) {
-        device->setPartitionPlan(plan);
+        if (device->getPartitionPlan() != plan) {
+            device->setPartitionPlan(plan);
+        }
         planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
     }
 }
 
 void NnCudaDeviceSegment::refreshPointers() {
-    if (device != nullptr) {
-        planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+    if (device == nullptr || segmentConfig == nullptr) return;
+    NnNetConfig *netConfig = device->getNetConfig();
+    NnNodeConfig *nodeConfig = device->getNodeConfig();
+    const NnUnevenPartitionPlan *plan = device->getPartitionPlan();
+    if (netConfig == nullptr || nodeConfig == nullptr) return;
+    if (nodeConfig->partitionPlan != plan) nodeConfig->partitionPlan = plan;
+    const NnUint nodeIndex = device->getNodeIndex();
+
+    auto getSplitStart = [&](NnSliceTag tag, NnUint *outStart) -> bool {
+        if (plan == nullptr || outStart == nullptr) return false;
+        switch (tag) {
+            case NN_SLICE_VOCAB:
+                if (plan->vocabSplit.starts) { *outStart = plan->vocabSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_FFN:
+                if (plan->ffnSplit.starts) { *outStart = plan->ffnSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_DIM:
+                if (plan->dimSplit.starts) { *outStart = plan->dimSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_HEAD:
+                if (plan->headSplit.starts) { *outStart = plan->headSplit.starts[nodeIndex]; return true; }
+                return false;
+            case NN_SLICE_KV_HEAD:
+                if (plan->kvHeadSplit.starts) { *outStart = plan->kvHeadSplit.starts[nodeIndex]; return true; }
+                return false;
+            default:
+                return false;
+        }
+    };
+
+    auto findRmsNormColSize = [&](NnUint fromOpIndex, const NnSize3D &inputSizeNow) -> NnUint {
+        for (NnUint j = fromOpIndex + 1u; j < segmentConfig->nOps && j < fromOpIndex + 8u; ++j) {
+            NnOpConfig *c = &segmentConfig->ops[j];
+            if (c->code != OP_RMS_NORM) continue;
+            if (c->weightSize.x == 0u) continue;
+            if (inputSizeNow.x % c->weightSize.x != 0u) continue;
+            return c->weightSize.x;
+        }
+        return 0u;
+    };
+
+    for (NnUint opIndex = 0u; opIndex < segmentConfig->nOps; ++opIndex) {
+        NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
+        if (isCudaControlOp(opConfig->code)) continue;
+
+        NnPointerLayout inLayout = resolvePointerLayout(netConfig, nodeConfig, plan, &opConfig->input);
+        NnPointerLayout outLayout = resolvePointerLayout(netConfig, nodeConfig, plan, &opConfig->output);
+        NnSize3D inputSize = inLayout.logicalSize;
+        NnSize3D outputSize = outLayout.logicalSize;
+        if (opConfig->code == OP_CAST &&
+            opConfig->output.type == PNTR_BATCHED_SLICE &&
+            inputSize.x != outputSize.x) {
+            outputSize = size3D(outputSize.floatType, outputSize.z, outputSize.y, inputSize.x);
+        }
+
+        if (plan != nullptr && opConfig->config != nullptr) {
+            if (opConfig->code == OP_MULTIHEAD_ATT) {
+                auto *cfg = (NnMultiHeadAttOpConfig *)opConfig->config;
+                const bool fullAttBuffer =
+                    opConfig->input.type == PNTR_BATCHED_SLICE ||
+                    opConfig->output.type == PNTR_BATCHED_SLICE;
+                if (plan->headSplit.starts && plan->headSplit.lengths) {
+                    cfg->nHeads0 = plan->headSplit.lengths[nodeIndex];
+                    cfg->qSliceD0 = cfg->nHeads0 * cfg->headDim;
+                    if (fullAttBuffer) {
+                        cfg->qStart = plan->headSplit.starts[nodeIndex] * cfg->headDim;
+                        cfg->qStride = cfg->nHeads * cfg->headDim;
+                    } else {
+                        cfg->qStart = 0u;
+                        cfg->qStride = cfg->qSliceD0;
+                    }
+                }
+                if (plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths) {
+                    const NnUint kvHeads0 = plan->kvHeadSplit.lengths[nodeIndex];
+                    cfg->kvDim0 = kvHeads0 * cfg->headDim;
+                    if (fullAttBuffer) {
+                        cfg->kvStart = plan->kvHeadSplit.starts[nodeIndex] * cfg->headDim;
+                        cfg->kvStride = cfg->nKvHeads * cfg->headDim;
+                    } else {
+                        cfg->kvStart = 0u;
+                        cfg->kvStride = cfg->kvDim0;
+                    }
+                }
+            } else if (opConfig->code == OP_SHIFT) {
+                auto *cfg = (NnShiftOpCodeConfig *)opConfig->config;
+                if (cfg->dstRowStride != 0u && cfg->dstColStartUnit != 0u &&
+                    plan->kvHeadSplit.starts && plan->kvHeadSplit.lengths) {
+                    cfg->dstColStart = plan->kvHeadSplit.starts[nodeIndex] * cfg->dstColStartUnit;
+                }
+            } else if (opConfig->code == OP_MATMUL) {
+                auto *cfg = (NnMatmulOpConfig *)opConfig->config;
+                if (cfg->view == 1u && cfg->outSliceTag != NN_SLICE_AUTO && cfg->outStartUnit != 0u) {
+                    NnUint st = 0u;
+                    if (getSplitStart(cfg->outSliceTag, &st)) {
+                        cfg->outStart = st * cfg->outStartUnit;
+                        if (cfg->outResidentStart != 0u && cfg->outStart >= cfg->outResidentStart) {
+                            cfg->outStart -= cfg->outResidentStart;
+                        }
+                    }
+                }
+                if (cfg->view == 2u && cfg->inSliceTag != NN_SLICE_AUTO && cfg->inStartUnit != 0u) {
+                    NnUint st = 0u;
+                    if (getSplitStart(cfg->inSliceTag, &st)) {
+                        cfg->inStart = st * cfg->inStartUnit;
+                        if (cfg->inResidentStart != 0u && cfg->inStart >= cfg->inResidentStart) {
+                            cfg->inStart -= cfg->inResidentStart;
+                        }
+                    }
+                }
+                if (cfg->aView.sizeX != 0u) cfg->aView.sizeX = inputSize.x;
+                if (cfg->cView.sizeX != 0u) cfg->cView.sizeX = outputSize.x;
+            } else if (opConfig->code == OP_MUL) {
+                auto *cfg = (NnMulOpCodeConfig *)opConfig->config;
+                if (plan->ffnSplit.starts && plan->ffnSplit.lengths && cfg->view.sizeX != 0u) {
+                    cfg->view.offset = plan->ffnSplit.starts[nodeIndex];
+                    cfg->view.sizeX = plan->ffnSplit.lengths[nodeIndex];
+                    cfg->view.strideX = 1u;
+                }
+            } else if (opConfig->code == OP_INV_RMS) {
+                auto *cfg = (NnInvRmsOpConfig *)opConfig->config;
+                const NnUint colSize = findRmsNormColSize(opIndex, inputSize);
+                if (colSize != 0u && inputSize.x % colSize == 0u) {
+                    const NnUint newCols = inputSize.x / colSize;
+                    if (outputSize.x >= newCols && newCols != 0u) cfg->nColumns = newCols;
+                }
+            } else if (opConfig->code == OP_RMS_NORM) {
+                auto *cfg = (NnRmsNormOpConfig *)opConfig->config;
+                const NnUint colSize = opConfig->weightSize.x;
+                if (colSize != 0u && inputSize.x % colSize == 0u) {
+                    const NnUint newCols = inputSize.x / colSize;
+                    if (newCols != 0u) cfg->nColumns = newCols;
+                }
+            } else if (opConfig->code == OP_ROPE) {
+                auto *cfg = (NnRopeOpConfig *)opConfig->config;
+                if (cfg->isQ == 1u) cfg->slice.qDim0 = inputSize.x;
+                else cfg->slice.kvDim0 = inputSize.x;
+            }
+        }
+
+        if (opConfig->config != nullptr && opConfig->configSize > 0u && opIndex < configBuffers.size()) {
+            configBuffers[opIndex]->write(opConfig->config, 0u, opConfig->configSize, device->getStream(), &device->staging);
+        }
     }
+
+    device->synchronize();
+    planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+}
+
+bool NnCudaDeviceSegment::exportLayerKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    NnUint kvDim,
+    std::vector<float> &kRow,
+    std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
+    const bool partial = rangeLen != 0u;
+    const NnUint outDim = partial ? rangeLen : kvDim;
+    kRow.assign(outDim, 0.0f);
+    vRow.assign(outDim, 0.0f);
+    if (device == nullptr || segmentConfig == nullptr || kvDim == 0u || outDim == 0u) return false;
+    if (partial && rangeStart + rangeLen > kvDim) return false;
+    NnNodeConfig *nodeConfig = device->getNodeConfig();
+    if (nodeConfig == nullptr) return false;
+
+    bool readAny = false;
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        const NnOpConfig &op = segmentConfig->ops[i];
+        if (op.code != OP_MULTIHEAD_ATT || op.index != layerIndex) continue;
+        const auto *cfg = (const NnMultiHeadAttOpConfig *)op.config;
+        if (cfg == nullptr) continue;
+
+        auto readOne = [&](NnUint bufIdx, std::vector<float> &dstRow, const char *tag) {
+            if (bufIdx >= nodeConfig->nBuffers) return;
+            const NnSize3D &bSize = nodeConfig->buffers[bufIdx].size;
+            if (bSize.floatType != F_32 || bSize.x == 0u || bSize.y == 0u) return;
+            if (position >= bSize.y) return;
+            const NnUint srcStart = partial ? rangeStart : cfg->kvStart;
+            const NnUint dstStart = partial ? 0u : cfg->kvStart;
+            const NnUint needLen = partial ? rangeLen : cfg->kvDim0;
+            if (srcStart >= bSize.x || dstStart >= dstRow.size() || needLen == 0u) return;
+            const NnUint readLen = std::min(needLen, std::min(bSize.x - srcStart, (NnUint)dstRow.size() - dstStart));
+            if (readLen == 0u) return;
+            const NnSize offset = ((NnSize)position * (NnSize)bSize.x + (NnSize)srcStart) * sizeof(float);
+            device->readBuffer(bufIdx, (NnByte *)(dstRow.data() + dstStart), offset, (NnSize)readLen * sizeof(float));
+            readAny = true;
+            std::printf("🧩 [kv-export-cuda] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
+                (unsigned)device->getNodeIndex(),
+                (unsigned)segmentIndex,
+                (unsigned)layerIndex,
+                (unsigned)position,
+                tag,
+                (unsigned)bufIdx,
+                (unsigned)srcStart,
+                (unsigned)(srcStart + readLen),
+                (unsigned)dstStart,
+                (unsigned)(dstStart + readLen),
+                partial ? 1u : 0u);
+            std::fflush(stdout);
+        };
+
+        readOne(cfg->keyCacheBufferIndex, kRow, "k");
+        readOne(cfg->valueCacheBufferIndex, vRow, "v");
+    }
+    return readAny;
+}
+
+bool NnCudaDeviceSegment::applyTransferredKvRow(
+    NnUint layerIndex,
+    NnUint position,
+    const std::vector<float> &kRow,
+    const std::vector<float> &vRow,
+    NnUint rangeStart,
+    NnUint rangeLen) {
+    if (device == nullptr || segmentConfig == nullptr) return false;
+    if (kRow.empty() || vRow.empty() || kRow.size() != vRow.size()) return false;
+    if (rangeLen != 0u && rangeLen != kRow.size()) return false;
+    NnNodeConfig *nodeConfig = device->getNodeConfig();
+    if (nodeConfig == nullptr) return false;
+
+    bool wroteAny = false;
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        const NnOpConfig &op = segmentConfig->ops[i];
+        if (op.code != OP_MULTIHEAD_ATT || op.index != layerIndex) continue;
+        const auto *cfg = (const NnMultiHeadAttOpConfig *)op.config;
+        if (cfg == nullptr) continue;
+
+        auto writeOne = [&](NnUint bufIdx, const std::vector<float> &srcRow, const char *tag) {
+            if (bufIdx >= nodeConfig->nBuffers) return;
+            const NnSize3D &bSize = nodeConfig->buffers[bufIdx].size;
+            if (bSize.floatType != F_32 || bSize.x == 0u || bSize.y == 0u) return;
+            if (position >= bSize.y) return;
+            const bool isPartial = rangeLen != 0u;
+            const NnUint dstStart = isPartial ? rangeStart : cfg->kvStart;
+            const NnUint srcStart = isPartial ? 0u : cfg->kvStart;
+            const NnUint needLen = isPartial ? rangeLen : cfg->kvDim0;
+            if (srcStart >= srcRow.size() || dstStart >= bSize.x || needLen == 0u) return;
+            const NnUint writeLen = std::min(needLen, std::min((NnUint)srcRow.size() - srcStart, bSize.x - dstStart));
+            if (writeLen == 0u) return;
+            const NnSize offset = ((NnSize)position * (NnSize)bSize.x + (NnSize)dstStart) * sizeof(float);
+            device->writeBuffer(bufIdx, (const NnByte *)(srcRow.data() + srcStart), offset, (NnSize)writeLen * sizeof(float));
+            wroteAny = true;
+            std::printf("🧩 [kv-write-cuda] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
+                (unsigned)device->getNodeIndex(),
+                (unsigned)segmentIndex,
+                (unsigned)layerIndex,
+                (unsigned)position,
+                tag,
+                (unsigned)bufIdx,
+                (unsigned)srcStart,
+                (unsigned)(srcStart + writeLen),
+                (unsigned)dstStart,
+                (unsigned)(dstStart + writeLen),
+                isPartial ? 1u : 0u);
+            std::fflush(stdout);
+        };
+
+        writeOne(cfg->keyCacheBufferIndex, kRow, "k");
+        writeOne(cfg->valueCacheBufferIndex, vRow, "v");
+    }
+    if (wroteAny) device->synchronize();
+    return wroteAny;
 }

@@ -2,7 +2,8 @@ CXX = g++
 CXXFLAGS = -std=c++11 -Werror -Wformat -Werror=format-security -Isrc
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
-CUDA_ARCHS ?= 75
+CUDA_ARCHS ?= auto
+CUDA_ARCHS_FALLBACK ?= 75
 
 # Auto-generate header dependencies for correct incremental builds.
 # Without this, changing headers can silently produce ABI mismatches (e.g., sizeof changes)
@@ -49,10 +50,22 @@ endif
 endif
 
 ifdef DLLAMA_CUDA
+CUDA_ARCHS_DETECTED := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/[^0-9.]//g; s/\.//g' | awk 'NF' | sort -u | tr '\n' ' ')
+ifneq ($(filter auto native,$(CUDA_ARCHS)),)
+ifneq ($(strip $(CUDA_ARCHS_DETECTED)),)
+CUDA_ARCHS_EFFECTIVE := $(strip $(CUDA_ARCHS_DETECTED))
+else
+CUDA_ARCHS_EFFECTIVE := $(CUDA_ARCHS_FALLBACK)
+$(warning CUDA_ARCHS=$(CUDA_ARCHS) requested but nvidia-smi did not report compute capability; falling back to $(CUDA_ARCHS_EFFECTIVE). Set CUDA_ARCHS manually for cross-compilation.)
+endif
+else
+CUDA_ARCHS_EFFECTIVE := $(CUDA_ARCHS)
+endif
+$(info CUDA_ARCHS=$(CUDA_ARCHS_EFFECTIVE) requested=$(CUDA_ARCHS))
 	CXXFLAGS += -DDLLAMA_CUDA -I$(CUDA_HOME)/include
 	LIBS += -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 	NVCCFLAGS += -std=c++11 -Isrc -DDLLAMA_CUDA
-	NVCCFLAGS += $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch))
+	NVCCFLAGS += $(foreach arch,$(CUDA_ARCHS_EFFECTIVE),-gencode arch=compute_$(arch),code=sm_$(arch))
 	DEPS += nn-cuda.o
 endif
 

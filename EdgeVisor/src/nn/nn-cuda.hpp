@@ -11,6 +11,24 @@ int nnCudaDeviceCount();
 std::string nnCudaDeviceInfo(NnUint gpuIndex);
 void nnCudaPrintDeviceInfo(NnUint gpuIndex);
 
+struct NnCudaLaunchConfig {
+    int computeCapabilityMajor;
+    int computeCapabilityMinor;
+    int sm;
+    NnUint multiprocessorCount;
+    NnUint maxThreadsPerBlock;
+    NnUint warpSize;
+    bool integrated;
+    NnUint elementwiseBlockSize;
+    NnUint reductionBlockSize;
+    NnUint attentionBlockSize;
+    NnUint q80q40SmallKBlockSize;
+    NnUint q80q40LargeKBlockSize;
+    NnUint softmaxBlockSize;
+    NnUint moeGateBlockSize;
+    NnUint q80q40SmallKMaxBlocks;
+};
+
 class NnCudaPinnedStaging {
 private:
     void *hostPointer;
@@ -69,6 +87,8 @@ private:
     NnNetExecution *netExecution;
     const NnUnevenPartitionPlan *partitionPlan;
     std::atomic_uint planEpoch{0u};
+    std::atomic_uint lastPlanCmdSeqEmitted{0u};
+    NnCudaLaunchConfig launchConfig;
 public:
     NnCudaPinnedStaging staging;
     NnCudaDeviceData data;
@@ -80,10 +100,14 @@ public:
     const NnUnevenPartitionPlan *getPartitionPlan() const { return partitionPlan; }
     unsigned int getPlanEpoch() const { return planEpoch.load(std::memory_order_acquire); }
     void setPlanEpoch(unsigned int e) { planEpoch.store(e, std::memory_order_release); }
+    unsigned int getLastPlanCmdSeqEmitted() const { return lastPlanCmdSeqEmitted.load(std::memory_order_acquire); }
+    void setLastPlanCmdSeqEmitted(unsigned int s) { lastPlanCmdSeqEmitted.store(s, std::memory_order_release); }
     NnUint getNodeIndex() const { return nodeConfig ? nodeConfig->nodeIndex : 0u; }
     NnUint getGpuIndex() const { return gpuIndex; }
     void *getStream() const { return stream; }
     void *getBlasHandle() const { return blasHandle; }
+    const NnCudaLaunchConfig &getLaunchConfig() const { return launchConfig; }
+    std::string launchConfigInfo() const;
     NnSize3D resolvePointerLogicalSize(const NnPointerConfig *config) const;
     NnNetConfig *getNetConfig() const { return netConfig; }
     NnNodeConfig *getNodeConfig() const { return nodeConfig; }
@@ -117,6 +141,21 @@ public:
     void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) override;
     void setPartitionPlan(const NnUnevenPartitionPlan *plan) override;
     void refreshPointers() override;
+    bool exportLayerKvRow(
+        NnUint layerIndex,
+        NnUint position,
+        NnUint kvDim,
+        std::vector<float> &kRow,
+        std::vector<float> &vRow,
+        NnUint rangeStart = 0u,
+        NnUint rangeLen = 0u) override;
+    bool applyTransferredKvRow(
+        NnUint layerIndex,
+        NnUint position,
+        const std::vector<float> &kRow,
+        const std::vector<float> &vRow,
+        NnUint rangeStart = 0u,
+        NnUint rangeLen = 0u) override;
     void readWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *out);
 };
 

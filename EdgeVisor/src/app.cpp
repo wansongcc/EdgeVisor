@@ -2731,10 +2731,18 @@ void RootLlmInference::collectProfilePackets() {
     rootPacket.stageIndex = getStageIndexForNode(plan, 0);
     rootPacket.execUs = executor != nullptr ? executor->getTotalTime(STEP_EXECUTE_OP) : 0u;
     rootPacket.syncUs = executor != nullptr ? executor->getTotalTime(STEP_SYNC_NODES) : 0u;
+    const NnExecutorSyncProfile rootSyncProfile = executor != nullptr ? executor->getLastSyncProfile() : NnExecutorSyncProfile{};
+    rootPacket.syncPpSendUs = (NnUint)std::min<unsigned long long>(rootSyncProfile.ppSendUs, (unsigned long long)UINT32_MAX);
+    rootPacket.syncPpRecvUs = (NnUint)std::min<unsigned long long>(rootSyncProfile.ppRecvUs, (unsigned long long)UINT32_MAX);
+    rootPacket.syncRootWaitUs = (NnUint)std::min<unsigned long long>(rootSyncProfile.rootWaitUs, (unsigned long long)UINT32_MAX);
+    rootPacket.syncLogitsUs = (NnUint)std::min<unsigned long long>(rootSyncProfile.logitsUs, (unsigned long long)UINT32_MAX);
+    rootPacket.syncOtherUs = (NnUint)std::min<unsigned long long>(rootSyncProfile.otherUs, (unsigned long long)UINT32_MAX);
     rootPacket.bubbleUs = (NnUint)std::min<unsigned long long>(lastBubbleShadowStats.elapsedUs, (unsigned long long)UINT32_MAX);
     rootPacket.bubbleSegments = lastBubbleShadowStats.segmentsVisited;
     rootPacket.bubbleOps = lastBubbleShadowStats.opStepsExecuted;
     rootPacket.bubbleSkippedSyncs = lastBubbleShadowStats.skippedSyncSteps;
+    rootPacket.bubbleDrainUs = lastBubbleShadowStats.drainUs;
+    rootPacket.bubbleCompleted = lastBubbleShadowStats.completed;
     lastPerf.push_back(rootPacket);
 
     if (network != nullptr && network->nSockets > 0) {
@@ -4437,10 +4445,18 @@ void runWorkerApp(AppCliArgs *args) {
                     p.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
                     p.execUs = executor.getTotalTime(STEP_EXECUTE_OP);
                     p.syncUs = executor.getTotalTime(STEP_SYNC_NODES);
+                    const NnExecutorSyncProfile syncProfile = executor.getLastSyncProfile();
+                    p.syncPpSendUs = (NnUint)std::min<unsigned long long>(syncProfile.ppSendUs, (unsigned long long)UINT32_MAX);
+                    p.syncPpRecvUs = (NnUint)std::min<unsigned long long>(syncProfile.ppRecvUs, (unsigned long long)UINT32_MAX);
+                    p.syncRootWaitUs = (NnUint)std::min<unsigned long long>(syncProfile.rootWaitUs, (unsigned long long)UINT32_MAX);
+                    p.syncLogitsUs = (NnUint)std::min<unsigned long long>(syncProfile.logitsUs, (unsigned long long)UINT32_MAX);
+                    p.syncOtherUs = (NnUint)std::min<unsigned long long>(syncProfile.otherUs, (unsigned long long)UINT32_MAX);
                     p.bubbleUs = (NnUint)std::min<unsigned long long>(bubbleStats.elapsedUs, (unsigned long long)UINT32_MAX);
                     p.bubbleSegments = bubbleStats.segmentsVisited;
                     p.bubbleOps = bubbleStats.opStepsExecuted;
                     p.bubbleSkippedSyncs = bubbleStats.skippedSyncSteps;
+                    p.bubbleDrainUs = bubbleStats.drainUs;
+                    p.bubbleCompleted = bubbleStats.completed;
                     network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
                 }
                 inference.maybeSendLastStageSampledToken(planPtr.get());

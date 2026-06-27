@@ -554,10 +554,17 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     struct NodePerfAgg {
         unsigned long long execUs = 0;
         unsigned long long syncUs = 0;
+        unsigned long long syncPpSendUs = 0;
+        unsigned long long syncPpRecvUs = 0;
+        unsigned long long syncRootWaitUs = 0;
+        unsigned long long syncLogitsUs = 0;
+        unsigned long long syncOtherUs = 0;
         unsigned long long bubbleUs = 0;
         unsigned long long bubbleSegments = 0;
         unsigned long long bubbleOps = 0;
         unsigned long long bubbleSkippedSyncs = 0;
+        unsigned long long bubbleDrainUs = 0;
+        unsigned long long bubbleCompleted = 0;
         unsigned long long forwardCount = 0;
         unsigned long long tokenCount = 0;
         NnUint stageIndex = 0;
@@ -611,10 +618,17 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 NodePerfAgg& a = perfAgg[p.nodeIndex];
                 a.execUs += p.execUs;
                 a.syncUs += p.syncUs;
+                a.syncPpSendUs += p.syncPpSendUs;
+                a.syncPpRecvUs += p.syncPpRecvUs;
+                a.syncRootWaitUs += p.syncRootWaitUs;
+                a.syncLogitsUs += p.syncLogitsUs;
+                a.syncOtherUs += p.syncOtherUs;
                 a.bubbleUs += p.bubbleUs;
                 a.bubbleSegments += p.bubbleSegments;
                 a.bubbleOps += p.bubbleOps;
                 a.bubbleSkippedSyncs += p.bubbleSkippedSyncs;
+                a.bubbleDrainUs += p.bubbleDrainUs;
+                a.bubbleCompleted += p.bubbleCompleted;
                 a.forwardCount += 1;
                 a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
                 a.stageIndex = p.stageIndex;
@@ -746,10 +760,17 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 NodePerfAgg& a = perfAgg[p.nodeIndex];
                 a.execUs += p.execUs;
                 a.syncUs += p.syncUs;
+                a.syncPpSendUs += p.syncPpSendUs;
+                a.syncPpRecvUs += p.syncPpRecvUs;
+                a.syncRootWaitUs += p.syncRootWaitUs;
+                a.syncLogitsUs += p.syncLogitsUs;
+                a.syncOtherUs += p.syncOtherUs;
                 a.bubbleUs += p.bubbleUs;
                 a.bubbleSegments += p.bubbleSegments;
                 a.bubbleOps += p.bubbleOps;
                 a.bubbleSkippedSyncs += p.bubbleSkippedSyncs;
+                a.bubbleDrainUs += p.bubbleDrainUs;
+                a.bubbleCompleted += p.bubbleCompleted;
                 a.forwardCount += 1;
                 a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
                 a.stageIndex = p.stageIndex;
@@ -957,6 +978,12 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             const double syncPerFwdMs = (double)a.syncUs / 1000.0 / (double)a.forwardCount;
             const double bubblePerFwdMs = (double)a.bubbleUs / 1000.0 / (double)a.forwardCount;
             const double totalPerFwdMs = execPerFwdMs + syncPerFwdMs + bubblePerFwdMs;
+            const double ppSendPerFwdMs = (double)a.syncPpSendUs / 1000.0 / (double)a.forwardCount;
+            const double ppRecvPerFwdMs = (double)a.syncPpRecvUs / 1000.0 / (double)a.forwardCount;
+            const double rootWaitPerFwdMs = (double)a.syncRootWaitUs / 1000.0 / (double)a.forwardCount;
+            const double logitsPerFwdMs = (double)a.syncLogitsUs / 1000.0 / (double)a.forwardCount;
+            const double otherSyncPerFwdMs = (double)a.syncOtherUs / 1000.0 / (double)a.forwardCount;
+            const double bubbleDrainPerFwdMs = (double)a.bubbleDrainUs / 1000.0 / (double)a.forwardCount;
 
             const double execPerTokMs = (double)a.execUs / 1000.0 / (double)a.tokenCount;
             const double syncPerTokMs = (double)a.syncUs / 1000.0 / (double)a.tokenCount;
@@ -978,6 +1005,16 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 (unsigned long long)a.bubbleOps,
                 (unsigned long long)a.forwardCount,
                 (unsigned long long)a.tokenCount);
+            printf("      sync/fwd: ppSend=%6.2f ppRecv=%6.2f rootWait=%6.2f logits=%6.2f other=%6.2f ms | bubbleDrain/fwd=%6.2f ms complete=%llu/%llu skippedSyncs=%llu\n",
+                ppSendPerFwdMs,
+                ppRecvPerFwdMs,
+                rootWaitPerFwdMs,
+                logitsPerFwdMs,
+                otherSyncPerFwdMs,
+                bubbleDrainPerFwdMs,
+                (unsigned long long)a.bubbleCompleted,
+                (unsigned long long)a.forwardCount,
+                (unsigned long long)a.bubbleSkippedSyncs);
         }
         printf("\n");
         printf("Hint: prompt eval uses batchSize>1, so per-token is usually the meaningful metric for rebalancing.\n");

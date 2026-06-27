@@ -209,10 +209,17 @@ typedef struct {
     NnUint stageIndex;
     NnUint execUs;
     NnUint syncUs;
+    NnUint syncPpSendUs;
+    NnUint syncPpRecvUs;
+    NnUint syncRootWaitUs;
+    NnUint syncLogitsUs;
+    NnUint syncOtherUs;
     NnUint bubbleUs;
     NnUint bubbleSegments;
     NnUint bubbleOps;
     NnUint bubbleSkippedSyncs;
+    NnUint bubbleDrainUs;
+    NnUint bubbleCompleted;
 } LlmPerfPacket;
 
 // Bootstrap settings sent from root to worker after socket connect and before

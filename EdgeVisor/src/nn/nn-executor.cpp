@@ -21,6 +21,11 @@ static constexpr NnByte SEG_ROLE_PRIMARY = 1;
 static constexpr NnByte SEG_ROLE_REDUNDANT = 2;
 static constexpr NnByte SEG_ROLE_SHADOW_KV = 3;
 static constexpr NnByte SEG_ROLE_SHIFTED_PP_START = 4;
+static constexpr NnByte SEG_SYNC_OTHER = 0;
+static constexpr NnByte SEG_SYNC_PP_SEND = 1;
+static constexpr NnByte SEG_SYNC_PP_RECV = 2;
+static constexpr NnByte SEG_SYNC_ROOT_WAIT = 3;
+static constexpr NnByte SEG_SYNC_LOGITS = 4;
 
 static inline bool nameHas(const char *name, const char *needle) {
     if (name == nullptr || needle == nullptr) return false;
@@ -101,6 +106,35 @@ static bool segmentHasOpName(const NnSegmentConfig *seg, const char *needle) {
         if (nameHas(seg->ops[i].name, needle)) return true;
     }
     return false;
+}
+
+static bool segmentHasSyncType(const NnSegmentConfig *seg, NnSyncType syncType) {
+    if (seg == nullptr || seg->syncs == nullptr) return false;
+    for (NnUint i = 0; i < seg->nSyncs; ++i) {
+        if (seg->syncs[i].syncType == syncType) return true;
+    }
+    return false;
+}
+
+static NnByte classifySegmentSyncProfileKind(const NnSegmentConfig *seg) {
+    if (segmentHasSyncType(seg, SYNC_PP_SEND)) return SEG_SYNC_PP_SEND;
+    if (segmentHasSyncType(seg, SYNC_PP_RECV)) return SEG_SYNC_PP_RECV;
+
+    const bool hasLogitsOp =
+        segmentHasOpName(seg, "final_cast_logits") ||
+        segmentHasOpName(seg, "final_matmul_logits");
+    if (hasLogitsOp &&
+        (segmentHasSyncType(seg, SYNC_NODE_SLICES_EXCEPT_ROOT) ||
+         segmentHasSyncType(seg, SYNC_NODE_SLICES_TO_STAGE_ROOT))) {
+        return SEG_SYNC_LOGITS;
+    }
+
+    if (seg != nullptr && seg->nOps == 0u &&
+        segmentHasSyncType(seg, SYNC_NODE_SLICES_EXCEPT_ROOT)) {
+        return SEG_SYNC_ROOT_WAIT;
+    }
+
+    return SEG_SYNC_OTHER;
 }
 
 static bool parseEnvBoolOr(const char *name, bool fallback) {
@@ -373,7 +407,7 @@ NnExecutorException::NnExecutorException(const std::string message)
 
 NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *devices, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark)
     : netExecution(netExecution), nodeConfig(nodeConfig), segments(nodeConfig->nSegments), steps(), segmentKinds(), segmentRuntimeRoles(), segmentLayerIndex(), segmentHasExecOps(), segmentEnabled(nullptr), threads(nullptr)
-    , bubbleShadowThread(), bubbleShadowMutex(), lastBubbleShadowStats{}, bubbleShadowAsyncRunning(false), bubbleShadowAsyncStarted(false), bubbleShadowStopRequested(false), bubbleShadowComplete(false), bubbleShadowCursor(0u), bubbleShadowDrainUs(0u), bubbleShadowStepIndices()
+    , bubbleShadowThread(), bubbleShadowMutex(), lastBubbleShadowStats{}, lastSyncProfile{}, bubbleShadowAsyncRunning(false), bubbleShadowAsyncStarted(false), bubbleShadowStopRequested(false), bubbleShadowComplete(false), bubbleShadowCursor(0u), bubbleShadowDrainUs(0u), bubbleShadowStepIndices(), segmentSyncProfileKinds()
 {
     NnUint maxNThreads = 0;
     for (NnExecutorDevice &d : *devices) {
@@ -401,11 +435,13 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     segmentRuntimeRoles.assign(nodeConfig->nSegments, SEG_ROLE_UNGUARDED);
     segmentLayerIndex.assign(nodeConfig->nSegments, -1);
     segmentHasExecOps.assign(nodeConfig->nSegments, 0u);
+    segmentSyncProfileKinds.assign(nodeConfig->nSegments, SEG_SYNC_OTHER);
     std::vector<int> segmentActiveLayers(nodeConfig->nSegments, -1);
     const std::unordered_set<NnUint> skipPrimaryLayers = parseLayerSetEnv("DLLAMA_RUNTIME_PRIMARY_SKIP_LAYERS");
     for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
         segmentKinds[s] = classifySegmentKind(nodeConfig->segments[s]);
         segmentRuntimeRoles[s] = classifySegmentRuntimeRole(&nodeConfig->segments[s], segmentKinds[s]);
+        segmentSyncProfileKinds[s] = classifySegmentSyncProfileKind(&nodeConfig->segments[s]);
         int activeLayer = -1;
         int redundantLayer = -1;
         int shadowKvLayer = -1;
@@ -514,6 +550,8 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.segmentLayerIndex = segmentLayerIndex.empty() ? nullptr : segmentLayerIndex.data();
     context.segmentHasExecOps = segmentHasExecOps.empty() ? nullptr : segmentHasExecOps.data();
     context.nSegments = (this->nodeConfig != nullptr) ? this->nodeConfig->nSegments : 0u;
+    context.syncProfile = &lastSyncProfile;
+    context.segmentSyncProfileKinds = segmentSyncProfileKinds.empty() ? nullptr : segmentSyncProfileKinds.data();
     context.owner = this;
     context.currentStepIndex.store(0u);
     context.doneThreadCount.store(0u);
@@ -633,6 +671,22 @@ static inline void *executorThreadHandler(void *arg) {
                 NnUint time = context->timer->elapsedMicroseconds();
                 context->totalTime[step->type] += time;
 
+                if (context->syncProfile != nullptr && context->segmentSyncProfileKinds != nullptr &&
+                    step->type == STEP_SYNC_NODES && step->segmentIndex < context->nSegments) {
+                    const NnByte syncKind = context->segmentSyncProfileKinds[step->segmentIndex];
+                    if (syncKind == SEG_SYNC_PP_SEND) {
+                        context->syncProfile->ppSendUs += (unsigned long long)time;
+                    } else if (syncKind == SEG_SYNC_PP_RECV) {
+                        context->syncProfile->ppRecvUs += (unsigned long long)time;
+                    } else if (syncKind == SEG_SYNC_ROOT_WAIT) {
+                        context->syncProfile->rootWaitUs += (unsigned long long)time;
+                    } else if (syncKind == SEG_SYNC_LOGITS) {
+                        context->syncProfile->logitsUs += (unsigned long long)time;
+                    } else {
+                        context->syncProfile->otherUs += (unsigned long long)time;
+                    }
+                }
+
                 // Per-layer compute profiling (ATTN/FFN only).
                 if (context->layerPerf != nullptr && context->segmentKinds != nullptr && step->type == STEP_EXECUTE_OP && step->opConfig != nullptr) {
                     const NnUint layerIndex = step->opConfig->index;
@@ -680,6 +734,8 @@ void NnExecutor::forward() {
 
     joinBubbleShadowAsync();
     resetBubbleShadowStateForForward();
+
+    lastSyncProfile.reset();
 
     if (context.timer != nullptr) {
         std::memset(context.totalTime, 0, sizeof(context.totalTime));
@@ -962,6 +1018,10 @@ void NnExecutor::joinBubbleShadowAsync() {
 NnBubbleShadowStats NnExecutor::getLastBubbleShadowStats() const {
     std::lock_guard<std::mutex> lock(bubbleShadowMutex);
     return lastBubbleShadowStats;
+}
+
+NnExecutorSyncProfile NnExecutor::getLastSyncProfile() const {
+    return lastSyncProfile;
 }
 
 void NnExecutor::refreshPointers() {

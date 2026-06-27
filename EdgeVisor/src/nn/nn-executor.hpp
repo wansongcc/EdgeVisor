@@ -95,6 +95,22 @@ enum NnExecutorStepType {
 
 #define N_STEP_TYPES STEP_SYNC_NODES + 1
 
+struct NnExecutorSyncProfile {
+    unsigned long long ppSendUs = 0ull;
+    unsigned long long ppRecvUs = 0ull;
+    unsigned long long rootWaitUs = 0ull;
+    unsigned long long logitsUs = 0ull;
+    unsigned long long otherUs = 0ull;
+
+    void reset() {
+        ppSendUs = 0ull;
+        ppRecvUs = 0ull;
+        rootWaitUs = 0ull;
+        logitsUs = 0ull;
+        otherUs = 0ull;
+    }
+};
+
 class NnExecutorDevice {
 public:
     std::unique_ptr<NnDevice> device;
@@ -131,6 +147,8 @@ typedef struct {
     const int *segmentLayerIndex;
     const NnByte *segmentHasExecOps;
     NnUint nSegments;
+    NnExecutorSyncProfile *syncProfile;
+    const NnByte *segmentSyncProfileKinds;
     NnExecutor *owner;
 } NnExecutorContext;
 
@@ -177,6 +195,7 @@ private:
     std::thread bubbleShadowThread;
     mutable std::mutex bubbleShadowMutex;
     NnBubbleShadowStats lastBubbleShadowStats;
+    NnExecutorSyncProfile lastSyncProfile;
     bool bubbleShadowAsyncRunning;
     bool bubbleShadowAsyncStarted;
     bool bubbleShadowStopRequested;
@@ -184,6 +203,7 @@ private:
     NnUint bubbleShadowCursor;
     NnUint bubbleShadowDrainUs;
     std::vector<NnUint> bubbleShadowStepIndices;
+    std::vector<NnByte> segmentSyncProfileKinds;
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
     NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning);
     bool isRedundantLayerActive(NnUint layerIndex) const;
@@ -200,6 +220,7 @@ public:
     void pauseBubbleShadowAsyncAfterSync();
     void drainBubbleShadowAsync();
     NnBubbleShadowStats getLastBubbleShadowStats() const;
+    NnExecutorSyncProfile getLastSyncProfile() const;
     // CPU-only today: update partition plan used for PNTR_BATCHED_SLICE resolution.
     void setPartitionPlan(const NnUnevenPartitionPlan *plan);
     // CPU-only today: re-resolve segment pointers after updating partition plan.

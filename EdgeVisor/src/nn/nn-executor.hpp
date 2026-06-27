@@ -186,6 +186,7 @@ private:
     std::vector<NnUint> bubbleShadowStepIndices;
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
     NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning);
+    bool isRedundantLayerActive(NnUint layerIndex) const;
     void resetBubbleShadowStateForForward();
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
@@ -210,6 +211,7 @@ public:
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
     void setRedundantLayerEnabled(NnUint layerIndex, bool enabled);
+    void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     bool exportLayerKvRow(
         NnUint layerIndex,
         NnUint position,

@@ -40,6 +40,7 @@ public:
     bool interactive;
     NnFloatType syncType;
     NnUint nWorkers;
+    NnUint workerAllocCount;
     char **workerHosts;
     NnUint *workerPorts;
     float temperature;
@@ -56,6 +57,10 @@ public:
     int gpuSegmentTo;
 
     char *ratiosStr;
+    bool warmupEnabled; // Auto-select ratios before inference when --ratios is omitted
+    NnUint warmupSteps; // Probe generation steps per candidate
+    NnUint warmupBudget; // Maximum number of candidates to probe
+    char *warmupCandidatesStr; // Optional candidate override, separated by whitespace/semicolon
     char *kvRedundancyStr; // KV redundancy per node, format: "2" (all) or "2,3,2,3" (per-node)
     bool enablePlanBarrier; // Enable plan barrier for online migration
     bool enableStageFullWeights; // Enable stage full residency (full weights and buffers)
@@ -333,6 +338,7 @@ private:
     LlmControlPacket controlPacket;
     bool profileEnabled = false;
     const NnUnevenPartitionPlan* plan = nullptr;
+    const RuntimeStageLayerPlan* runtimePlan = nullptr;
     std::vector<LlmPerfPacket> lastPerf;
     NnUint lastPlanCmdSeqSent = 0u;
     NnBubbleShadowStats lastBubbleShadowStats{};
@@ -384,6 +390,11 @@ private:
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     bool sendPendingLayerSwitchControlOnly();
+    void maybeEnableShiftedPpStartForSourceStage(
+        const std::vector<NnUint> &switchLayers,
+        NnUint sourceNodeIndex,
+        NnUint targetNodeIndex,
+        bool selfIsSource);
     void collectProfilePackets();
     bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
     bool replayHistoryForHeadMigrationRecompute(const PlanCommand &cmd, NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
@@ -403,6 +414,7 @@ public:
     void setToken(NnUint batchIndex, NnUint token);
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
+    void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     void forward();
     void finish();
 };

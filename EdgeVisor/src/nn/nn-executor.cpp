@@ -19,6 +19,8 @@ static constexpr NnByte SEG_KIND_FFN   = 2;
 static constexpr NnByte SEG_ROLE_UNGUARDED = 0;
 static constexpr NnByte SEG_ROLE_PRIMARY = 1;
 static constexpr NnByte SEG_ROLE_REDUNDANT = 2;
+static constexpr NnByte SEG_ROLE_SHADOW_KV = 3;
+static constexpr NnByte SEG_ROLE_SHIFTED_PP_START = 4;
 
 static inline bool nameHas(const char *name, const char *needle) {
     if (name == nullptr || needle == nullptr) return false;
@@ -56,17 +58,27 @@ static const char *segmentKindToString(NnByte kind) {
 static const char *segmentRoleToString(NnByte role) {
     if (role == SEG_ROLE_PRIMARY) return "primary";
     if (role == SEG_ROLE_REDUNDANT) return "redundant";
+    if (role == SEG_ROLE_SHADOW_KV) return "shadow-kv";
+    if (role == SEG_ROLE_SHIFTED_PP_START) return "shifted-pp-start";
     return "unguarded";
 }
 
-static void inferActiveAndRedundantLayer(const NnSegmentConfig *seg, int *activeLayer, int *redundantLayer) {
+static void inferActiveRedundantAndShadowKvLayer(const NnSegmentConfig *seg, int *activeLayer, int *redundantLayer, int *shadowKvLayer) {
     if (activeLayer != nullptr) *activeLayer = -1;
     if (redundantLayer != nullptr) *redundantLayer = -1;
+    if (shadowKvLayer != nullptr) *shadowKvLayer = -1;
     if (seg == nullptr || seg->ops == nullptr) return;
 
     for (NnUint i = 0; i < seg->nOps; ++i) {
         const NnOpConfig &op = seg->ops[i];
-        const bool isRedundant = nameHas(op.name, "runtime_redundant_");
+        const bool isShadowKv = nameHas(op.name, "runtime_shadow_kv_");
+        const bool isRedundant = !isShadowKv && nameHas(op.name, "runtime_redundant_");
+        if (isShadowKv) {
+            if (shadowKvLayer != nullptr && *shadowKvLayer < 0) {
+                *shadowKvLayer = (int)op.index;
+            }
+            continue;
+        }
         if (isRedundant) {
             if (redundantLayer != nullptr && *redundantLayer < 0) {
                 *redundantLayer = (int)op.index;
@@ -77,6 +89,10 @@ static void inferActiveAndRedundantLayer(const NnSegmentConfig *seg, int *active
             }
         }
     }
+}
+
+static void inferActiveAndRedundantLayer(const NnSegmentConfig *seg, int *activeLayer, int *redundantLayer) {
+    inferActiveRedundantAndShadowKvLayer(seg, activeLayer, redundantLayer, nullptr);
 }
 
 static bool segmentHasOpName(const NnSegmentConfig *seg, const char *needle) {
@@ -133,8 +149,15 @@ static NnByte classifySegmentRuntimeRole(const NnSegmentConfig *seg, NnByte segK
     if (seg == nullptr) return SEG_ROLE_UNGUARDED;
     int activeLayer = -1;
     int redundantLayer = -1;
-    inferActiveAndRedundantLayer(seg, &activeLayer, &redundantLayer);
+    int shadowKvLayer = -1;
+    inferActiveRedundantAndShadowKvLayer(seg, &activeLayer, &redundantLayer, &shadowKvLayer);
 
+    if (shadowKvLayer >= 0) {
+        return SEG_ROLE_SHADOW_KV;
+    }
+    if (segmentHasOpName(seg, "runtime_shifted_pp_start")) {
+        return SEG_ROLE_SHIFTED_PP_START;
+    }
     if (redundantLayer >= 0) {
         return SEG_ROLE_REDUNDANT;
     }
@@ -385,9 +408,16 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
         segmentRuntimeRoles[s] = classifySegmentRuntimeRole(&nodeConfig->segments[s], segmentKinds[s]);
         int activeLayer = -1;
         int redundantLayer = -1;
-        inferActiveAndRedundantLayer(&nodeConfig->segments[s], &activeLayer, &redundantLayer);
+        int shadowKvLayer = -1;
+        inferActiveRedundantAndShadowKvLayer(
+            &nodeConfig->segments[s],
+            &activeLayer,
+            &redundantLayer,
+            &shadowKvLayer);
         segmentActiveLayers[s] = activeLayer;
-        segmentLayerIndex[s] = (activeLayer >= 0) ? activeLayer : redundantLayer;
+        segmentLayerIndex[s] =
+            (activeLayer >= 0) ? activeLayer :
+            ((redundantLayer >= 0) ? redundantLayer : shadowKvLayer);
         segmentHasExecOps[s] = (nodeConfig->segments[s].nOps > 0) ? 1u : 0u;
     }
 
@@ -399,6 +429,8 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
         const bool enabled =
             (role == SEG_ROLE_PRIMARY) ? enablePrimaryByDefault :
             (role == SEG_ROLE_REDUNDANT) ? enableRedundantByDefault :
+            (role == SEG_ROLE_SHADOW_KV) ? false :
+            (role == SEG_ROLE_SHIFTED_PP_START) ? false :
             true;
         bool finalEnabled = enabled;
         if (role == SEG_ROLE_PRIMARY && segmentActiveLayers[s] >= 0 &&
@@ -465,7 +497,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     for (NnUint i = 0u; i < (NnUint)steps.size(); ++i) {
         const NnExecutorStep &step = steps[i];
         if (step.segmentIndex < segmentRuntimeRoles.size() &&
-            segmentRuntimeRoles[step.segmentIndex] == SEG_ROLE_REDUNDANT) {
+            segmentRuntimeRoles[step.segmentIndex] == SEG_ROLE_SHADOW_KV) {
             bubbleShadowStepIndices.push_back(i);
         }
     }
@@ -508,6 +540,7 @@ NnExecutor::~NnExecutor() {
 }
 
 void NnExecutor::loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) {
+    bool loaded = false;
     for (NnUint segmentIndex = 0; segmentIndex < nodeConfig->nSegments; segmentIndex++) {
         NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
         for (NnUint i = 0; i < segmentConfig->nOps; i++) {
@@ -515,11 +548,14 @@ void NnExecutor::loadWeight(const char *name, NnUint opIndex, NnSize offset, NnS
             if (opConfig->index == opIndex && std::strcmp(opConfig->name, name) == 0) {
                 NnDeviceSegment *segment = segments[segmentIndex].get();
                 assert(segment != nullptr);
+                // Shadow KV and takeover segments may share the same logical
+                // op name/layer, so every matching segment must receive weight.
                 segment->loadWeight(i, offset, nBytes, weight);
-                return;
+                loaded = true;
             }
         }
     }
+    if (loaded) return;
     throw std::invalid_argument(
         "Cannot locate op name='" + std::string(name) +
         "' index=" + std::to_string(opIndex) +
@@ -704,6 +740,21 @@ void NnExecutor::resetBubbleShadowStateForForward() {
     bubbleShadowDrainUs = 0u;
 }
 
+bool NnExecutor::isRedundantLayerActive(NnUint layerIndex) const {
+    if (segmentEnabled == nullptr || nodeConfig == nullptr) return false;
+    for (NnUint s = 0u; s < nodeConfig->nSegments; ++s) {
+        if (s >= segmentRuntimeRoles.size() || segmentRuntimeRoles[s] != SEG_ROLE_REDUNDANT) continue;
+        if (segmentEnabled[s].load(std::memory_order_relaxed) == 0u) continue;
+
+        const NnSegmentConfig *seg = &nodeConfig->segments[s];
+        int activeLayer = -1;
+        int redundantLayer = -1;
+        inferActiveAndRedundantLayer(seg, &activeLayer, &redundantLayer);
+        if (redundantLayer >= 0 && (NnUint)redundantLayer == layerIndex) return true;
+    }
+    return false;
+}
+
 NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning) {
     NnBubbleShadowStats stats{};
     if (!allowWhileRunning && context.isAlive.load()) {
@@ -762,7 +813,12 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, b
         }
 
         if (segmentIndex >= segmentRuntimeRoles.size()) continue;
-        if (segmentRuntimeRoles[segmentIndex] != SEG_ROLE_REDUNDANT) continue;
+        if (segmentRuntimeRoles[segmentIndex] != SEG_ROLE_SHADOW_KV) continue;
+        if (segmentIndex < segmentLayerIndex.size() &&
+            segmentLayerIndex[segmentIndex] >= 0 &&
+            isRedundantLayerActive((NnUint)segmentLayerIndex[segmentIndex])) {
+            continue;
+        }
 
         if (lastSegment != segmentIndex) {
             lastSegment = segmentIndex;
@@ -985,14 +1041,19 @@ void NnExecutor::setPrimaryLayerEnabled(NnUint layerIndex, bool enabled) {
     if (segmentEnabled == nullptr || nodeConfig == nullptr) return;
     NnUint matched = 0u;
     for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
-        if (s >= segmentRuntimeRoles.size() || segmentRuntimeRoles[s] != SEG_ROLE_PRIMARY) continue;
+        if (s >= segmentRuntimeRoles.size()) continue;
+        if (segmentRuntimeRoles[s] != SEG_ROLE_PRIMARY && segmentRuntimeRoles[s] != SEG_ROLE_SHIFTED_PP_START) continue;
         const NnSegmentConfig *seg = &nodeConfig->segments[s];
         int activeLayer = -1;
         int redundantLayer = -1;
         inferActiveAndRedundantLayer(seg, &activeLayer, &redundantLayer);
         if (activeLayer >= 0 && (NnUint)activeLayer == layerIndex) {
-            segmentEnabled[s].store(enabled ? 1u : 0u, std::memory_order_relaxed);
-            matched += 1u;
+            if (segmentRuntimeRoles[s] == SEG_ROLE_PRIMARY) {
+                segmentEnabled[s].store(enabled ? 1u : 0u, std::memory_order_relaxed);
+                matched += 1u;
+            } else if (!enabled) {
+                segmentEnabled[s].store(0u, std::memory_order_relaxed);
+            }
         }
     }
     std::printf("🛂 [layer-gate] node=%u role=primary layer=%u enabled=%u matchedSegs=%u\n",
@@ -1022,6 +1083,51 @@ void NnExecutor::setRedundantLayerEnabled(NnUint layerIndex, bool enabled) {
         (unsigned)layerIndex,
         enabled ? 1u : 0u,
         (unsigned)matched);
+    std::fflush(stdout);
+}
+
+void NnExecutor::setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled) {
+    if (segmentEnabled == nullptr || nodeConfig == nullptr) return;
+    NnUint shiftedMatched = 0u;
+    NnUint primaryAttMatched = 0u;
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        if (s >= segmentRuntimeRoles.size()) continue;
+        const NnSegmentConfig *seg = &nodeConfig->segments[s];
+        int activeLayer = -1;
+        int redundantLayer = -1;
+        inferActiveAndRedundantLayer(seg, &activeLayer, &redundantLayer);
+        if (activeLayer < 0 || (NnUint)activeLayer != layerIndex) continue;
+
+        const NnByte role = segmentRuntimeRoles[s];
+        if (role == SEG_ROLE_SHIFTED_PP_START) {
+            segmentEnabled[s].store(enabled ? 1u : 0u, std::memory_order_relaxed);
+            shiftedMatched += 1u;
+        }
+    }
+    if (shiftedMatched > 0u) {
+        for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+            if (s >= segmentRuntimeRoles.size()) continue;
+            const NnSegmentConfig *seg = &nodeConfig->segments[s];
+            int activeLayer = -1;
+            int redundantLayer = -1;
+            inferActiveAndRedundantLayer(seg, &activeLayer, &redundantLayer);
+            if (activeLayer < 0 || (NnUint)activeLayer != layerIndex) continue;
+
+            const NnByte role = segmentRuntimeRoles[s];
+            if (role == SEG_ROLE_PRIMARY && s < segmentKinds.size() && segmentKinds[s] == SEG_KIND_ATTN) {
+            // Shifted PP start reads from X pipe; primary attention reads from
+            // ZQ. They are mutually exclusive for the same layer.
+                segmentEnabled[s].store(enabled ? 0u : 1u, std::memory_order_relaxed);
+                primaryAttMatched += 1u;
+            }
+        }
+    }
+    std::printf("🛂 [layer-gate] node=%u role=shifted-pp-start layer=%u enabled=%u matchedSegs=%u primaryAttToggled=%u\n",
+        (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+        (unsigned)layerIndex,
+        enabled ? 1u : 0u,
+        (unsigned)shiftedMatched,
+        (unsigned)primaryAttMatched);
     std::fflush(stdout);
 }
 

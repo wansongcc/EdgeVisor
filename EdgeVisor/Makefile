@@ -36,7 +36,19 @@ ifdef WVLA
 endif
 
 ifdef DLLAMA_VULKAN
-	CGLSLC = glslc
+ifeq ($(OS),Windows_NT)
+	CGLSLC ?= glslc
+else
+	CGLSLC ?= $(shell command -v glslc 2>/dev/null || command -v glslangValidator 2>/dev/null)
+endif
+
+CGLSLC_NAME := $(notdir $(firstword $(CGLSLC)))
+
+ifeq ($(strip $(CGLSLC)),)
+$(error No GLSL compiler found. Please install glslc or glslang-tools, or pass CGLSLC=/path/to/glslc)
+endif
+
+$(info Vulkan shader compiler: $(CGLSLC_NAME) [$(CGLSLC)])
 
 ifeq ($(OS),Windows_NT)
 	LIBS += -L$(VK_SDK_PATH)\lib -lvulkan-1
@@ -116,14 +128,20 @@ nn-vulkan.o: src/nn/nn-vulkan.cpp
 nn-cuda.o: src/nn/nn-cuda.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-
 ifdef DLLAMA_VULKAN
 VULKAN_SHADER_SRCS := $(wildcard src/nn/vulkan/*.comp)
 VULKAN_SHADER_BINS := $(VULKAN_SHADER_SRCS:.comp=.spv)
 DEPS += $(VULKAN_SHADER_BINS)
 
+ifeq ($(CGLSLC_NAME),glslangValidator)
+GLSL_COMPILE = $(CGLSLC) -V --target-env vulkan1.2 -S comp -Isrc/nn/vulkan $< -o $@
+else
+GLSL_COMPILE = $(CGLSLC) -c --target-env=vulkan1.2 -Isrc/nn/vulkan $< -o $@
+endif
+
 %.spv: %.comp
-	$(CGLSLC) -c $< -o $@ --target-env=vulkan1.2
+	$(GLSL_COMPILE)
+
 nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o ${DEPS}
 	$(CXX) $(CXXFLAGS) src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
 endif
@@ -152,22 +170,26 @@ plan-controller.o: src/plan-controller.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o nn-cpu-ops.o tokenizer.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
 # --- (您的新测试目标) ---
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 
-# [TAB] <-- 这一行必须以 TAB 开始！
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
 worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}
-# [TAB]
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
+
 Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o ablation.o ${DEPS}
-# [TAB]
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
+
 pointer-swizzling-microbench: src/test/pointer_swizzling_microbench.cpp nn-quants.o nn-core.o nn-executor.o nn-cpu.o nn-cpu-ops.o llamafile-sgemm.o plan-command.o ablation.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
+
 dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
+
 dllama-api: src/dllama-api.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
+
 uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 

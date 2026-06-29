@@ -98,7 +98,7 @@ DEPS += io-profile.o
 .PHONY: clean dllama
 
 clean:
-	$(DELETE_CMD) *.o *.d dllama dllama-* socket-benchmark mmap-buffer-* *-test *.exe
+	$(DELETE_CMD) *.o *.d dllama dllama-* socket-benchmark mmap-buffer-* *-test *.exe src/nn/vulkan/*.spv
 
 # nn
 nn-quants.o: src/nn/nn-quants.cpp

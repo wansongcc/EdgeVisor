@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "nn/io-profile.hpp"
 #include "plan-controller.hpp"
 #include "dynamic/dynamic_layer.hpp"
 #include "dynamic/kv_collector.hpp"
@@ -245,6 +246,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.ratiosLen = 0u;
     p.primarySkipLayersLen = 0u;
     p.kvRedundancyLen = 0u;
+    p.ioProfileLogLen = 0u;
 
     if (args->modelPath != nullptr) {
         p.flags |= LLM_BOOTSTRAP_HAS_MODEL_PATH;
@@ -262,6 +264,10 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
         p.flags |= LLM_BOOTSTRAP_HAS_KV_REDUNDANCY;
         p.kvRedundancyLen = (NnUint)std::strlen(args->kvRedundancyStr) + 1u;
     }
+    if (args->ioProfileLogPath != nullptr && args->ioProfileLogPath[0] != '\0') {
+        p.flags |= LLM_BOOTSTRAP_HAS_IO_PROFILE_LOG;
+        p.ioProfileLogLen = (NnUint)std::strlen(args->ioProfileLogPath) + 1u;
+    }
     if (args->enableKvAggregate) {
         p.flags |= LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE;
     }
@@ -271,6 +277,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     if (p.ratiosLen > 0u) network->write(socketIndex, args->ratiosStr, p.ratiosLen);
     if (p.primarySkipLayersLen > 0u) network->write(socketIndex, args->runtimePrimarySkipLayersStr, p.primarySkipLayersLen);
     if (p.kvRedundancyLen > 0u) network->write(socketIndex, args->kvRedundancyStr, p.kvRedundancyLen);
+    if (p.ioProfileLogLen > 0u) network->write(socketIndex, args->ioProfileLogPath, p.ioProfileLogLen);
 }
 
 static LlmBootstrapPacket readBootstrapPacket(
@@ -278,7 +285,8 @@ static LlmBootstrapPacket readBootstrapPacket(
     std::string &modelPath,
     std::string &ratiosStr,
     std::string &primarySkipLayersStr,
-    std::string &kvRedundancyStr) {
+    std::string &kvRedundancyStr,
+    std::string &ioProfileLogPath) {
     LlmBootstrapPacket p;
     network->read(ROOT_SOCKET_INDEX, &p, sizeof(p));
     if (p.magic != LLM_BOOTSTRAP_MAGIC)
@@ -290,6 +298,7 @@ static LlmBootstrapPacket readBootstrapPacket(
     ratiosStr.clear();
     primarySkipLayersStr.clear();
     kvRedundancyStr.clear();
+    ioProfileLogPath.clear();
     if ((p.flags & LLM_BOOTSTRAP_HAS_MODEL_PATH) != 0u) {
         std::vector<char> buf(p.modelPathLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.modelPathLen);
@@ -309,6 +318,11 @@ static LlmBootstrapPacket readBootstrapPacket(
         std::vector<char> buf(p.kvRedundancyLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.kvRedundancyLen);
         kvRedundancyStr.assign(buf.data());
+    }
+    if ((p.flags & LLM_BOOTSTRAP_HAS_IO_PROFILE_LOG) != 0u) {
+        std::vector<char> buf(p.ioProfileLogLen);
+        network->read(ROOT_SOCKET_INDEX, buf.data(), p.ioProfileLogLen);
+        ioProfileLogPath.assign(buf.data());
     }
     return p;
 }
@@ -408,6 +422,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.fallbackPolicyStr = nullptr;
     args.ablationLogPath = nullptr;
     args.experimentId = nullptr;
+    args.ioProfileLogPath = std::getenv("DLLAMA_IO_PROFILE_LOG") != nullptr && std::getenv("DLLAMA_IO_PROFILE_LOG")[0] != '\0'
+        ? const_cast<char*>(std::getenv("DLLAMA_IO_PROFILE_LOG"))
+        : nullptr;
 
     {
         int envBoundaryLayers = -1;
@@ -737,6 +754,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.ablationLogPath = value;
         } else if (std::strcmp(name, "--experiment-id") == 0) {
             args.experimentId = value;
+        } else if (std::strcmp(name, "--io-profile-log") == 0) {
+            args.ioProfileLogPath = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -794,6 +813,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         args.enableStageFullWeights = true;
         std::printf("⚠️  [pp-migrate] --enable-pp-migration requires stage full weights; auto enabling --enable-stage-full-weights\n");
         std::fflush(stdout);
+    }
+    if (args.ioProfileLogPath != nullptr && args.ioProfileLogPath[0] != '\0') {
+        setenv("DLLAMA_IO_PROFILE_LOG", args.ioProfileLogPath, 1);
     }
     return args;
 }
@@ -4070,6 +4092,11 @@ void WorkerLlmInference::flushPendingKvAck() {
 }
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    if (args != nullptr && args->ioProfileLogPath != nullptr && args->ioProfileLogPath[0] != '\0') {
+        dllamaIoProbeConfigure(args->ioProfileLogPath);
+    } else {
+        dllamaIoProbeConfigureFromEnv();
+    }
     NnUint nNodes = args->nWorkers + 1;
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
     EdgeVisorAblationConfig ablationConfig = edgevisorAblationConfigFromSources(
@@ -4231,6 +4258,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         loadLlmNetWeight(args->modelPath, &net, &weightLoader);
     }
 
+    dllamaIoProbeSetNode(0u, getStageIndexForNode(planPtr.get(), 0u));
+
     RootLlmInference inference(&net, &execution, &executor, network, planPtr.get(), profileEnabled, args->enablePpMigration);
 
     // Step 1: seed PlanCommand cache from deprecated env hooks (fallback).
@@ -4274,6 +4303,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     handler(&context);
 
     inference.finish();
+    dllamaIoProbeFlush("root-inference");
 }
 
 void runWorkerApp(AppCliArgs *args) {
@@ -4286,7 +4316,14 @@ void runWorkerApp(AppCliArgs *args) {
         std::string bootRatios;
         std::string bootPrimarySkipLayers;
         std::string bootKvRedundancy;
-        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers, bootKvRedundancy);
+        std::string bootIoProfileLogPath;
+        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers, bootKvRedundancy, bootIoProfileLogPath);
+        if (!bootIoProfileLogPath.empty()) {
+            setenv("DLLAMA_IO_PROFILE_LOG", bootIoProfileLogPath.c_str(), 1);
+            dllamaIoProbeConfigure(bootIoProfileLogPath.c_str());
+        } else {
+            dllamaIoProbeConfigureFromEnv();
+        }
 
         const bool hasBootModel = !bootModelPath.empty();
         const bool hasBootRatios = !bootRatios.empty();
@@ -4372,6 +4409,8 @@ void runWorkerApp(AppCliArgs *args) {
                  createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, kvRedundancyPerNode)
              ));
         }
+
+        dllamaIoProbeSetNode(nodeConfig.nodeIndex, getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex));
 
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
@@ -4598,5 +4637,6 @@ void runWorkerApp(AppCliArgs *args) {
                 break;
             }
         }
+        dllamaIoProbeFlush("worker-session");
     }
 }

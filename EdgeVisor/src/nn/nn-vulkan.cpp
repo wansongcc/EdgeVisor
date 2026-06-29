@@ -1,4 +1,5 @@
 #include "nn-vulkan.hpp"
+#include "nn/io-profile.hpp"
 #include "ablation.hpp"
 #include "plan-command.hpp"
 #include "llm.hpp"
@@ -269,12 +270,16 @@ void NnVulkanStagingCopier::allocate(const NnSize size) {
 void NnVulkanStagingCopier::copy(NnByte *data, const NnSize size, const NnVulkanStagingCopierDirection direction) {
     assert(size == allocatedSize);
 
+    const bool ioProfile = dllamaIoProbeEnabled();
+    const std::uint64_t startUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     switch (direction) {
     case COPY_TO_DEVICE:
         std::memcpy(hostPointer, data, size);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - startUs, (std::uint64_t)size);
         break;
     case COPY_FROM_DEVICE:
         std::memcpy(data, hostPointer, size);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - startUs, (std::uint64_t)size);
         break;
     }
 }
@@ -299,6 +304,8 @@ void NnVulkanStagingCopier::addCopyCommand(vk::CommandBuffer& commandBuffer, vk:
 }
 
 void NnVulkanStagingCopier::executeCopyCommand(vk::Buffer& target, const NnSize offset, const NnSize size, const NnVulkanStagingCopierDirection direction) {
+    const bool ioProfile = dllamaIoProbeEnabled();
+    const std::uint64_t startUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     vk::CommandBufferAllocateInfo allocInfo(context->commandPool, vk::CommandBufferLevel::ePrimary, 1);
     const std::vector<vk::CommandBuffer> cmdBuffers = context->device.allocateCommandBuffers(allocInfo);
     vk::CommandBuffer commandBuffer = cmdBuffers.front();
@@ -313,6 +320,12 @@ void NnVulkanStagingCopier::executeCopyCommand(vk::Buffer& target, const NnSize 
 
     context->device.destroyFence(fence);
     context->device.freeCommandBuffers(context->commandPool, 1, &commandBuffer);
+    if (ioProfile) {
+        dllamaIoProbeRecordVulkanCopyCommand(
+            direction == COPY_TO_DEVICE ? DLLAMA_IO_PROBE_H2D : DLLAMA_IO_PROBE_D2H,
+            dllamaIoProbeNowUs() - startUs,
+            (std::uint64_t)size);
+    }
 }
 
 NnVulkanBuffer::NnVulkanBuffer(NnVulkanContext *context, NnVulkanStagingCopier *copier, const char *name, const NnSize bufferSize, const bool isSliceable, vk::BufferUsageFlags usageFlags, bool fastAccess) :
@@ -379,8 +392,13 @@ void NnVulkanBuffer::write(const NnByte *data, const NnSize offset, const NnSize
     assert(offset + size <= bufferSize);
 
     if (isHostVisible && hostPointer != nullptr) {
+        const bool ioProfile = dllamaIoProbeEnabled();
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         std::memcpy(&hostPointer[offset], data, size);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)size);
+        const std::uint64_t flushStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         context->device.flushMappedMemoryRanges({ { deviceMemory, offset, (vk::DeviceSize)size } });
+        if (ioProfile) dllamaIoProbeRecordVulkanFlush(dllamaIoProbeNowUs() - flushStartUs, (std::uint64_t)size);
         VULKAN_TRACE("Wrote %zu bytes to host visible buffer", size);
     } else {
         copier->allocate(size);
@@ -398,8 +416,13 @@ void NnVulkanBuffer::read(NnByte *data, const NnSize offset, const NnSize size) 
     assert(offset + size <= bufferSize);
 
     if (isHostVisible && hostPointer != nullptr) {
+        const bool ioProfile = dllamaIoProbeEnabled();
+        const std::uint64_t invalidateStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         context->device.invalidateMappedMemoryRanges({ {deviceMemory, offset, (vk::DeviceSize)size} });
+        if (ioProfile) dllamaIoProbeRecordVulkanInvalidate(dllamaIoProbeNowUs() - invalidateStartUs, (std::uint64_t)size);
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         std::memcpy(data, &hostPointer[offset], size);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)size);
 
         VULKAN_TRACE("Read %zu bytes from host visible buffer", size);
     } else {

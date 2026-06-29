@@ -11,6 +11,7 @@ typedef SSIZE_T ssize_t;
 #include <netdb.h>  // for getaddrinfo
 #endif
 #include "nn-network.hpp"
+#include "nn/io-profile.hpp"
 #include "nn-core.hpp"
 #include <cassert>
 #include <cstring>
@@ -520,11 +521,14 @@ static void printBytes(const char* prefix, const void* data, NnSize size) {
 
 void writeSocket(int socket, const void *data, NnSize size) {
     printBytes("DEBUG: writeSocket", data, size);
+    const bool ioProfile = dllamaIoProbeEnabled();
     unsigned int eagainSpins = 0u;
     while (size > 0) {
+        const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         ssize_t s = send(socket, (const char*)data, size, 0);
         if (s < 0) {
             if (isEagainError()) {
+                if (ioProfile) dllamaIoProbeRecordNetSendEagain();
                 backoffOnEagain(eagainSpins);
                 continue;
             }
@@ -532,6 +536,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
         } else if (s == 0) {
             throw NnTransferSocketException(0, "Socket closed");
         }
+        if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
         eagainSpins = 0u;
         size -= s;
         data = (const char*)data + s;
@@ -540,12 +545,15 @@ void writeSocket(int socket, const void *data, NnSize size) {
 
 static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned long maxAttempts) {
     // maxAttempts = 0 means infinite attempts
+    const bool ioProfile = dllamaIoProbeEnabled();
     NnSize s = size;
     unsigned int eagainSpins = 0u;
     while (s > 0) {
+        const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         ssize_t r = recv(socket, (char*)data, s, 0);
         if (r < 0) {
             if (isEagainError()) {
+                if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
                 backoffOnEagain(eagainSpins);
                 if (s == size && maxAttempts > 0) {
                     maxAttempts--;
@@ -559,6 +567,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
         } else if (r == 0) {
             throw NnTransferSocketException(0, "Socket closed");
         }
+        if (ioProfile) dllamaIoProbeRecordNetRecvSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
         printBytes("DEBUG: readSocket", data, r);
         eagainSpins = 0u;
         data = (char*)data + r;
@@ -1062,6 +1071,8 @@ void NnNetwork::printCommProfile(const char *label, const NnCommProfileStats &s,
 void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize size) {
     assert(socketIndex < nSockets);
 
+    const bool ioProfile = dllamaIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
     for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
@@ -1071,11 +1082,14 @@ void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize s
         recordCommSend(chunkSize);
     }
     sentBytes[socketIndex] += size;
+    if (ioProfile) dllamaIoProbeRecordNetWriteWall(dllamaIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
     assert(socketIndex < nSockets);
 
+    const bool ioProfile = dllamaIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
     for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
@@ -1085,6 +1099,7 @@ void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
         recordCommRecv(chunkSize);
     }
     recvBytes[socketIndex] += size;
+    if (ioProfile) dllamaIoProbeRecordNetReadWall(dllamaIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::writeAck(const NnUint socketIndex) {
@@ -1188,6 +1203,8 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     bool isWriting;
+    const bool ioProfile = dllamaIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     if (commProfileEnabled) commWriteManyCalls.fetch_add(1u, std::memory_order_relaxed);
     NnSize nBytes = 0;
     const unsigned long timeoutMs = getIoTimeoutMs();
@@ -1212,10 +1229,12 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 isWriting = true;
                 int socket = sockets[io->socketIndex];
                 ssize_t chunkSize = io->size > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : io->size;
+                const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
                 ssize_t s = send(socket, (const char*)io->data, chunkSize, 0);
                 if (s < 0) {
                     if (isEagainError()) {
                         recordCommSendEagain();
+                        if (ioProfile) dllamaIoProbeRecordNetSendEagain();
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
@@ -1223,6 +1242,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 } else if (s == 0) {
                     throw NnTransferSocketException(0, "Socket closed");
                 }
+                if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
                 recordCommSend((NnSize)s);
                 eagainSpins = 0u;
                 io->size -= s;
@@ -1230,6 +1250,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
             }
         }
     } while (isWriting);
+    if (ioProfile) dllamaIoProbeRecordNetWriteWall(dllamaIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::writeAll(const void *data, NnSize size) {
@@ -1245,6 +1266,8 @@ void NnNetwork::writeAll(const void *data, NnSize size) {
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     bool isReading;
+    const bool ioProfile = dllamaIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     if (commProfileEnabled) commReadManyCalls.fetch_add(1u, std::memory_order_relaxed);
     NnSize nBytes = 0;
     const unsigned long timeoutMs = getIoTimeoutMs();
@@ -1268,10 +1291,12 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
             if (io->size > 0) {
                 isReading = true;
                 int socket = sockets[io->socketIndex];
+                const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
                 ssize_t r = recv(socket, (char*)io->data, io->size, 0);
                 if (r < 0) {
                     if (isEagainError()) {
                         recordCommRecvEagain();
+                        if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
@@ -1279,6 +1304,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                 } else if (r == 0) {
                     throw NnTransferSocketException(0, "Socket closed");
                 }
+                if (ioProfile) dllamaIoProbeRecordNetRecvSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
                 recordCommRecv((NnSize)r);
                 eagainSpins = 0u;
                 io->size -= r;
@@ -1286,6 +1312,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
             }
         }
     } while (isReading);
+    if (ioProfile) dllamaIoProbeRecordNetReadWall(dllamaIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::getStats(NnSize *sentBytes, NnSize *recvBytes) {

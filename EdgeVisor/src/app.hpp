@@ -88,6 +88,7 @@ public:
     char *fallbackPolicyStr;
     char *ablationLogPath;
     char *experimentId;
+    char *ioProfileLogPath;
 
     // worker
     NnUint port;
@@ -253,6 +254,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV = 1u << 8,
     LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC = 1u << 9,
     LLM_BOOTSTRAP_LAST_STAGE_SAMPLING = 1u << 10,
+    LLM_BOOTSTRAP_HAS_IO_PROFILE_LOG = 1u << 11,
 };
 
 typedef struct {
@@ -274,6 +276,7 @@ typedef struct {
     NnUint ratiosLen;    // bytes including '\0' if present
     NnUint primarySkipLayersLen; // bytes including '\0' if present
     NnUint kvRedundancyLen; // bytes including '\0' if present
+    NnUint ioProfileLogLen; // bytes including '\0' if present
     NnUint bubbleShadowKvEnabled; // 0/1, compute runtime redundant segments after primary forward
     float samplerTemperature;
     float samplerTopP;
@@ -281,7 +284,7 @@ typedef struct {
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 12u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 13u;
 
 static constexpr NnUint LLM_SAMPLED_TOKEN_MAGIC = 0x4b545344u; // 'DSTK' little-endian
 static constexpr NnUint LLM_SAMPLED_TOKEN_VERSION = 1u;

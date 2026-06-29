@@ -93,6 +93,8 @@ else
     DELETE_CMD = rm -fv
 endif
 
+DEPS += io-profile.o
+
 .PHONY: clean dllama
 
 clean:
@@ -106,6 +108,8 @@ nn-core.o: src/nn/nn-core.cpp
 nn-executor.o: src/nn/nn-executor.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-network.o: src/nn/nn-network.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+io-profile.o: src/nn/io-profile.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-network-local.o: src/nn/nn-network-local.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -147,8 +151,8 @@ nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o ll
 endif
 
 ifdef DLLAMA_CUDA
-nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o
-	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
+nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o -o $@ $(LIBS)
 endif
 
 # llm

@@ -1,4 +1,5 @@
 #include "nn-cuda.hpp"
+#include "nn/io-profile.hpp"
 #include "llm.hpp"
 #include "plan-command.hpp"
 
@@ -1258,29 +1259,49 @@ void NnCudaBuffer::write(const NnByte *data, NnSize offset, NnSize nBytes, void 
     if (nBytes == 0u) return;
     if (data == nullptr) throw std::runtime_error("CUDA write received null host pointer for buffer " + name);
     validateRange("write", name, bufferSize, offset, nBytes);
+    const bool ioProfile = dllamaIoProbeEnabled();
     if (staging == nullptr) {
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync((NnByte *)devicePointer + offset, data, nBytes, cudaMemcpyHostToDevice, (cudaStream_t)stream));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
         return;
     }
     void *host = staging->ensure(nBytes);
+    const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     std::memcpy(host, data, nBytes);
+    if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)nBytes);
+    const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaMemcpyAsync((NnByte *)devicePointer + offset, host, nBytes, cudaMemcpyHostToDevice, (cudaStream_t)stream));
+    if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
+    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - syncStartUs);
 }
 
 void NnCudaBuffer::read(NnByte *data, NnSize offset, NnSize nBytes, void *stream, NnCudaPinnedStaging *staging) {
     if (nBytes == 0u) return;
     if (data == nullptr) throw std::runtime_error("CUDA read received null host pointer for buffer " + name);
     validateRange("read", name, bufferSize, offset, nBytes);
+    const bool ioProfile = dllamaIoProbeEnabled();
     if (staging == nullptr) {
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync(data, (NnByte *)devicePointer + offset, nBytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+        const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
+        if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
         return;
     }
     void *host = staging->ensure(nBytes);
+    const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaMemcpyAsync(host, (NnByte *)devicePointer + offset, nBytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream));
+    if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
+    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+    const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     std::memcpy(data, host, nBytes);
+    if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)nBytes);
 }
 
 void NnCudaBuffer::clear(void *stream) {

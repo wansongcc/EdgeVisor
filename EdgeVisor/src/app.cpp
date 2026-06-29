@@ -369,6 +369,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.steps = 0;
     args.benchmark = false;
     args.lastStageSampling = lastStageSamplingEnabled();
+    args.continuousBatching = false;
+    args.maxActiveSeqs = 1u;
+    args.decodeBatchSize = 1u;
+    args.ppMicrobatchSize = 1u;
+    args.ppInflight = 0u;
+    args.benchmarkConcurrentRequests = 1u;
     args.seed = (unsigned long long)time(nullptr);
     args.chatTemplateType = TEMPLATE_UNKNOWN;
     args.maxSeqLen = 0;
@@ -432,6 +438,17 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         char *name = argv[i];
 
         // Flags (no value)
+        if (std::strcmp(name, "--continuous-batching") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.continuousBatching = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.continuousBatching = true;
+                i += 1;
+            }
+            continue;
+        }
+
         if (std::strcmp(name, "--benchmark") == 0) {
             // Support both: "--benchmark" and "--benchmark 1|0".
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -656,6 +673,26 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.port = atoi(value);
         } else if (std::strcmp(name, "--nthreads") == 0) {
             args.nThreads = atoi(value);
+        } else if (std::strcmp(name, "--max-active-seqs") == 0) {
+            int x = std::atoi(value);
+            if (x < 1) x = 1;
+            args.maxActiveSeqs = (NnUint)x;
+        } else if (std::strcmp(name, "--decode-batch-size") == 0) {
+            int x = std::atoi(value);
+            if (x < 1) x = 1;
+            args.decodeBatchSize = (NnUint)x;
+        } else if (std::strcmp(name, "--pp-microbatch-size") == 0) {
+            int x = std::atoi(value);
+            if (x < 1) x = 1;
+            args.ppMicrobatchSize = (NnUint)x;
+        } else if (std::strcmp(name, "--pp-inflight") == 0) {
+            int x = std::atoi(value);
+            if (x < 1) x = 1;
+            args.ppInflight = (NnUint)x;
+        } else if (std::strcmp(name, "--benchmark-concurrent-requests") == 0) {
+            int x = std::atoi(value);
+            if (x < 1) x = 1;
+            args.benchmarkConcurrentRequests = (NnUint)x;
         } else if (std::strcmp(name, "--steps") == 0) {
             args.steps = atoi(value);
         } else if (std::strcmp(name, "--temperature") == 0) {
@@ -730,6 +767,24 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
     }
 #endif
+    if (args.continuousBatching) {
+        if (args.nWorkers > 0u && !args.lastStageSampling) {
+            args.lastStageSampling = true;
+            setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+            std::printf("[continuous-batching] auto enabling last-stage sampling for PP in-flight decode\n");
+            std::fflush(stdout);
+        }
+        if (args.ppMicrobatchSize != 1u) {
+            std::printf("⚠️  [continuous-batching] first implementation uses --pp-microbatch-size 1; overriding %u -> 1\n",
+                (unsigned)args.ppMicrobatchSize);
+            std::fflush(stdout);
+            args.ppMicrobatchSize = 1u;
+        }
+        if (args.decodeBatchSize < args.ppMicrobatchSize) args.decodeBatchSize = args.ppMicrobatchSize;
+        if (args.maxActiveSeqs < args.benchmarkConcurrentRequests) {
+            args.maxActiveSeqs = args.benchmarkConcurrentRequests;
+        }
+    }
     if (args.enablePpMigration && !args.enableKvAggregate) {
         args.enableKvAggregate = true;
         std::printf("⚠️  [pp-migrate] --enable-pp-migration requires KV aggregate; auto enabling --enable-kv-aggregate\n");
@@ -1462,8 +1517,8 @@ static WarmupCandidateResult probeWarmupCandidate(
         }
 
         LlmNet net = uneven
-            ? buildLlmNetUneven(header, nNodes, args->nBatches, planPtr.get())
-            : buildLlmNet(header, nNodes, args->nBatches);
+            ? buildLlmNetUneven(header, nNodes, args->nBatches, planPtr.get(), args->maxActiveSeqs)
+            : buildLlmNet(header, nNodes, args->nBatches, args->maxActiveSeqs);
         std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
         NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
         NnNetExecution execution(args->nThreads, &net.netConfig);
@@ -1848,6 +1903,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
     this->positionPipe = (float *)execution->pipes[net->positionPipeIndex];
+    this->slotPipe = (net->slotPipeIndex != (NnUint)-1) ? (float *)execution->pipes[net->slotPipeIndex] : nullptr;
     this->logitsPipe = (float *)execution->pipes[net->logitsPipeIndex];
     this->kvAggKPipe = (net->kvAggKPipeIndex != (NnUint)-1) ? (float *)execution->pipes[net->kvAggKPipeIndex] : nullptr;
     this->kvAggVPipe = (net->kvAggVPipeIndex != (NnUint)-1) ? (float *)execution->pipes[net->kvAggVPipeIndex] : nullptr;
@@ -1859,6 +1915,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->profileEnabled = profileEnabled;
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
     this->controlPacket.planCmdSeq = 0u;
+    this->batchMetadataDirty = false;
     this->lastPlanCmdSeqSent = 0u;
     this->lastBubbleShadowStats = {};
     this->asyncKvCollectLayer = -1;
@@ -1973,14 +2030,38 @@ void RootLlmInference::setPosition(NnUint position) {
     assert(position + execution->batchSize - 1 < header->seqLen);
 
     controlPacket.position = position;
-    for (NnUint i = 0; i < execution->batchSize; i++)
+    batchMetadataDirty = false;
+    for (NnUint i = 0; i < execution->batchSize; i++) {
         positionPipe[i] = (float)(position + i);
+        if (slotPipe != nullptr) slotPipe[i] = 0.0f;
+    }
+}
+
+void RootLlmInference::setPosition(NnUint batchIndex, NnUint position) {
+    assert(batchIndex < execution->batchSize);
+    assert(position < header->seqLen);
+    if (batchIndex == 0u) controlPacket.position = position;
+    positionPipe[batchIndex] = (float)position;
+    if (position != controlPacket.position + batchIndex) batchMetadataDirty = true;
+}
+
+void RootLlmInference::setSlot(NnUint batchIndex, NnUint slotId) {
+    assert(batchIndex < execution->batchSize);
+    if (slotPipe == nullptr) return;
+    slotPipe[batchIndex] = (float)slotId;
+    if (slotId != 0u) batchMetadataDirty = true;
+}
+
+void RootLlmInference::setBatchItem(NnUint batchIndex, NnUint token, NnUint position, NnUint slotId) {
+    setPosition(batchIndex, position);
+    setSlot(batchIndex, slotId);
+    setToken(batchIndex, token);
 }
 
 void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
     assert(batchIndex >= 0 && batchIndex < execution->batchSize);
     tokenPipe[batchIndex] = (float)token;
-    const NnUint pos = controlPacket.position + batchIndex;
+    const NnUint pos = (positionPipe != nullptr) ? (NnUint)positionPipe[batchIndex] : (controlPacket.position + batchIndex);
     if (header != nullptr && pos < header->seqLen) {
         if (tokenHistory.size() <= pos) {
             tokenHistory.resize((size_t)pos + 1u, -1);
@@ -2718,12 +2799,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     return true;
 }
 
-void RootLlmInference::collectProfilePackets() {
-    if (!profileEnabled) return;
-
-    lastPerf.clear();
-    lastPerf.reserve((network != nullptr ? network->nSockets : 0u) + 1u);
-
+LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
     LlmPerfPacket rootPacket{};
     rootPacket.position = controlPacket.position;
     rootPacket.batchSize = controlPacket.batchSize;
@@ -2743,21 +2819,31 @@ void RootLlmInference::collectProfilePackets() {
     rootPacket.bubbleSkippedSyncs = lastBubbleShadowStats.skippedSyncSteps;
     rootPacket.bubbleDrainUs = lastBubbleShadowStats.drainUs;
     rootPacket.bubbleCompleted = lastBubbleShadowStats.completed;
-    lastPerf.push_back(rootPacket);
+    return rootPacket;
+}
 
+void RootLlmInference::collectDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out) {
+    out.clear();
+    if (!profileEnabled) return;
+    out.reserve((network != nullptr ? network->nSockets : 0u) + 1u);
+    out.push_back(rootPacket);
     if (network != nullptr && network->nSockets > 0) {
         const NnUint nWorkers = network->nSockets;
-        const size_t base = lastPerf.size();
-        lastPerf.resize(base + nWorkers);
-
+        const size_t base = out.size();
+        out.resize(base + nWorkers);
         std::vector<NnSocketIo> ios(nWorkers);
         for (NnUint i = 0; i < nWorkers; ++i) {
             ios[i].socketIndex = i;
-            ios[i].data = &lastPerf[base + i];
+            ios[i].data = &out[base + i];
             ios[i].size = sizeof(LlmPerfPacket);
         }
         network->readMany(nWorkers, &ios[0]);
     }
+}
+
+void RootLlmInference::collectProfilePackets() {
+    if (!profileEnabled) return;
+    collectDeferredProfile(makeRootPerfPacket(), lastPerf);
 }
 
 bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens) {
@@ -3004,7 +3090,7 @@ bool RootLlmInference::recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUi
     return applyOk;
 }
 
-void RootLlmInference::forward() {
+void RootLlmInference::forward(bool collectProfile) {
     lastBubbleShadowStats = {};
     bool sendKvTransfer = false;
     bool sendLayerSwitch = false;
@@ -3084,6 +3170,7 @@ void RootLlmInference::forward() {
         }
         if (sendKvTransfer) out.flags |= LLM_CTRL_HAS_KV_TRANSFER;
         if (sendLayerSwitch) out.flags |= LLM_CTRL_HAS_LAYER_SWITCH;
+        if (batchMetadataDirty) out.flags |= LLM_CTRL_HAS_BATCH_META;
 
         logRootControlSend(out);
         network->writeAll(&out, sizeof(LlmControlPacket));
@@ -3122,6 +3209,16 @@ void RootLlmInference::forward() {
                 switchPkt.reserved2 = 0u;
                 network->writeAll(&switchPkt, sizeof(switchPkt));
             }
+        }
+        if ((out.flags & LLM_CTRL_HAS_BATCH_META) != 0u) {
+            LlmBatchMetadataHeader mh{};
+            mh.magic = LLM_BATCH_META_MAGIC;
+            mh.version = LLM_BATCH_META_VERSION;
+            mh.batchSize = controlPacket.batchSize;
+            mh.reserved = 0u;
+            network->writeAll(&mh, sizeof(mh));
+            network->writeAll(positionPipe, sizeof(float) * (size_t)controlPacket.batchSize);
+            network->writeAll(slotPipe, sizeof(float) * (size_t)controlPacket.batchSize);
         }
     }
 
@@ -3658,7 +3755,11 @@ void RootLlmInference::forward() {
         }
     }
 
-    collectProfilePackets();
+    if (collectProfile) {
+        collectProfilePackets();
+    } else {
+        lastPerf.clear();
+    }
 }
 
 void RootLlmInference::finish() {
@@ -3670,6 +3771,7 @@ void RootLlmInference::finish() {
         LlmControlPacket out = controlPacket;
         out.flags = controlPacket.flags & LLM_CTRL_PROFILE;
         out.flags &= ~LLM_CTRL_HAS_PLAN_CMD;
+        out.flags &= ~LLM_CTRL_HAS_BATCH_META;
         out.planCmdSeq = 0u;
         logRootControlSend(out);
         network->writeAll(&out, sizeof(LlmControlPacket));
@@ -3684,6 +3786,7 @@ WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *net
     this->logitsPipeIndex = logitsPipeIndex;
     this->lastStageSampler = lastStageSampler;
     this->positionPipe = (float *)execution->pipes[0];
+    this->slotPipe = (execution->nPipes > 1u) ? (float *)execution->pipes[1] : nullptr;
     this->logitsPipe = (logitsPipeIndex != (NnUint)-1) ? (float *)execution->pipes[logitsPipeIndex] : nullptr;
 }
 
@@ -3823,8 +3926,34 @@ bool WorkerLlmInference::tryReadControlPacket() {
     }
 
     printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);
-    for (NnUint i = 0; i < controlPacket.batchSize; i++)
-        positionPipe[i] = (float)(controlPacket.position + i);
+    bool gotBatchMeta = false;
+    if ((controlPacket.flags & LLM_CTRL_HAS_BATCH_META) != 0u) {
+        LlmBatchMetadataHeader mh{};
+        network->read(ROOT_SOCKET_INDEX, &mh, sizeof(mh));
+        if (mh.magic == LLM_BATCH_META_MAGIC && mh.version == LLM_BATCH_META_VERSION && mh.batchSize == controlPacket.batchSize) {
+            network->read(ROOT_SOCKET_INDEX, positionPipe, sizeof(float) * (size_t)controlPacket.batchSize);
+            if (slotPipe != nullptr) {
+                network->read(ROOT_SOCKET_INDEX, slotPipe, sizeof(float) * (size_t)controlPacket.batchSize);
+            } else {
+                std::vector<float> discard(controlPacket.batchSize);
+                network->read(ROOT_SOCKET_INDEX, discard.data(), sizeof(float) * discard.size());
+            }
+            gotBatchMeta = true;
+        } else {
+            std::printf("⚠️  [Worker] Bad batch metadata packet (magic=0x%08x version=%u batch=%u expected=%u)\n",
+                (unsigned)mh.magic,
+                (unsigned)mh.version,
+                (unsigned)mh.batchSize,
+                (unsigned)controlPacket.batchSize);
+            std::fflush(stdout);
+        }
+    }
+    if (!gotBatchMeta) {
+        for (NnUint i = 0; i < controlPacket.batchSize; i++) {
+            positionPipe[i] = (float)(controlPacket.position + i);
+            if (slotPipe != nullptr) slotPipe[i] = 0.0f;
+        }
+    }
     execution->setBatchSize(controlPacket.batchSize);
     return true;
 }
@@ -4034,7 +4163,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         ));
         
         // 使用 Uneven Builder (传入 planPtr)
-        net = buildLlmNetUneven(&header, nNodes, args->nBatches, planPtr.get());
+        net = buildLlmNetUneven(&header, nNodes, args->nBatches, planPtr.get(), args->maxActiveSeqs);
         
         if (args->info) {
             printf("⚖️  Uneven partitioning strategy enabled: %s\n", args->ratiosStr);
@@ -4042,7 +4171,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         }
     } else {
         printf("⚖️  Even partitioning strategy enabled: ");
-        net = buildLlmNet(&header, nNodes, args->nBatches);
+        net = buildLlmNet(&header, nNodes, args->nBatches, args->maxActiveSeqs);
     }
     
     std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);

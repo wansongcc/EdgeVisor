@@ -2466,6 +2466,7 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
     float *valueCache = (float *)context->buffers[config->valueCacheBufferIndex];
     float *att = (float *)context->buffers[config->attBufferIndex];
     const float *positions = (float *)context->pipes[config->positionPipeIndex];
+    const float *slots = (config->kvSlotStride != 0u) ? (float *)context->pipes[config->slotPipeIndex] : nullptr;
 
 #if DLLAMA_DEBUG_ATTN
     static std::atomic<NnUint> dbgPrinted{0u};
@@ -2505,6 +2506,10 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
         const NnUint qHeadStart = (config->headDim != 0u) ? (config->qStart / config->headDim) : 0u;
 
         const NnUint kvStride = config->kvStride == 0u ? config->kvDim0 : config->kvStride;
+        const NnUint slotId = (slots != nullptr) ? (NnUint)slots[batchIndex] : 0u;
+        const NnSize kvSlotBase = (config->kvSlotStride != 0u) ? (NnSize)slotId * (NnSize)config->kvSlotStride : 0u;
+        float *keyCacheBatch = keyCache + kvSlotBase;
+        float *valueCacheBatch = valueCache + kvSlotBase;
 
         // Debug: print K/V cache values per owned KV-head on this node.
         // Enable with: DLLAMA_DEBUG_KVCACHE_PER_HEAD=1
@@ -2628,7 +2633,7 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
 
         multiheadAtt_F32(y, q, 
             &att[batchIndex * config->nHeads0 * config->seqLen],
-            keyCache, valueCache, pos,
+            keyCacheBatch, valueCacheBatch, pos,
             config->nHeads, config->nHeads0,
             config->nKvHeads,
             config->kvDim0, config->kvStart, kvStride,
@@ -3120,6 +3125,7 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
 
     const NnShiftOpCodeConfig *config = (NnShiftOpCodeConfig *)context->opConfig;
     const float *indexes = (float *)context->pipes[config->indexPipeIndex];
+    const float *slots = (config->kvSlotStride != 0u) ? (float *)context->pipes[config->slotPipeIndex] : nullptr;
     const NnSize dimBytes = getBytes(F_32, context->inputSize.x);
     NnByte *output = context->output[0];
 
@@ -3145,10 +3151,13 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         const NnSize index = (NnSize)indexes[batchIndex];
+        const NnUint slotId = (slots != nullptr) ? (NnUint)slots[batchIndex] : 0u;
+        const NnSize slotBase = (config->kvSlotStride != 0u) ? (NnSize)slotId * (NnSize)config->kvSlotStride : 0u;
         if (config->dstRowStride == 0u) {
-            assert((index + 1) * context->inputSize.x <= context->outputSize.x);
+            const NnSize dstElem = slotBase + index * (NnSize)context->inputSize.x;
+            assert(dstElem + context->inputSize.x <= context->outputSize.x);
             copy_UNK(
-                &output[index * dimBytes],
+                &output[getBytes(F_32, dstElem)],
                 context->input[batchIndex],
                 dimBytes,
                 nThreads,
@@ -3156,11 +3165,11 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
         } else {
             const NnSize rowStrideBytes = getBytes(F_32, config->dstRowStride);
             const NnSize colStartBytes = getBytes(F_32, config->dstColStart);
-            const NnSize totalRows = context->outputSize.x / config->dstRowStride;
-            assert(index < totalRows);
+            const NnSize dstElem = slotBase + index * (NnSize)config->dstRowStride + (NnSize)config->dstColStart;
+            assert(dstElem + context->inputSize.x <= context->outputSize.x);
             assert(config->dstColStart + context->inputSize.x <= config->dstRowStride);
             copy_UNK(
-                &output[index * rowStrideBytes + colStartBytes],
+                &output[getBytes(F_32, slotBase) + index * rowStrideBytes + colStartBytes],
                 context->input[batchIndex],
                 dimBytes,
                 nThreads,
@@ -3195,7 +3204,7 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
                             const NnUint kvHeadStart = config->dstColStart / headDim;
                             const NnUint kvHeadLen = context->inputSize.x / headDim;
                             const NnUint dimsToPrint = (kvPerHeadDimsSel == 0u) ? headDim : std::min(headDim, kvPerHeadDimsSel);
-                            const float *row = (const float *)(output + index * rowStrideBytes);
+                            const float *row = (const float *)(output + getBytes(F_32, slotBase) + index * rowStrideBytes);
                             const char *kind = isShiftK() ? "K" : (isShiftV() ? "V" : "KV");
 
                             for (NnUint localKv = 0u; localKv < kvHeadLen; ++localKv) {

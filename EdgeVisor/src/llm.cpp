@@ -453,6 +453,10 @@ static const NnStageConfig* getStageForNode(const NnUnevenPartitionPlan *plan, N
 }
 
 LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
+    return buildLlmNet(h, nNodes, nBatches, 1u);
+}
+
+LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint maxActiveSeqs) {
     NnUint nExpertsOr1 = std::max(h->nExperts, 1u);
     NnUint nActiveExpertsOr1 = std::max(h->nActiveExperts, 1u);
     NnUint ffDim = h->hiddenDim;
@@ -461,11 +465,16 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
         ffDim = h->moeHiddenDim;
 
     LlmNet n;
+    n.maxActiveSeqs = std::max<NnUint>(1u, maxActiveSeqs);
     n.tokenEmbeddingSize = tokenEmbeddingResidentSize(h);
     n.rmsNormSize = size1D(F_32, h->dim);
     n.qkRmsNormSize = size1D(F_32, h->headDim);
     n.moeGateSize = size2D(F_32, h->dim, h->nExperts);
+    const NnUint kvSlotCount = n.maxActiveSeqs;
     NnKvCacheSlice kvCacheSlice = sliceKvCache(h->kvDim, h->seqLen, nNodes); //KVslice
+    const NnUint kvSlotStride = h->seqLen * kvCacheSlice.kvDim0;
+    kvCacheSlice.keySize = size2D(F_32, h->seqLen * kvSlotCount, kvCacheSlice.kvDim0);
+    kvCacheSlice.valueSize = size2D(F_32, h->seqLen * kvSlotCount, kvCacheSlice.kvDim0);
     NnMultiHeadAttSlice multiHeadAttSlice = sliceMultiHeadAtt(h->nHeads, h->seqLen, nNodes, nBatches);
 
     n.qSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->qDim);
@@ -508,6 +517,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     NnNetConfigBuilder netBuilder(nNodes, nBatches);
 
     n.positionPipeIndex = netBuilder.addPipe("POS", size2D(F_32, nBatches, 1));
+    n.slotPipeIndex = netBuilder.addPipe("SLT", size2D(F_32, nBatches, 1));
     n.tokenPipeIndex = netBuilder.addPipe("TOK", size2D(F_32, nBatches, 1));
     n.xPipeIndex = netBuilder.addPipe("X", size2D(F_32, nBatches, h->dim));
     n.logitsPipeIndex = netBuilder.addPipe("LG", size2D(F_32, nBatches, h->vocabSize));
@@ -526,6 +536,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     }
 
     netBuilder.addPreSync(n.positionPipeIndex);
+    netBuilder.addPreSync(n.slotPipeIndex);
 
     n.header = h;
     n.netConfig = netBuilder.build();
@@ -697,13 +708,13 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                 pointerBatchConfig(SRC_BUFFER, kTempBufferIndex),
                 pointerRawConfig(SRC_BUFFER, kBufferIndex),
                 size0(),
-                NnShiftOpCodeConfig{n.positionPipeIndex});
+                NnShiftOpCodeConfig{n.positionPipeIndex, 0u, 0u, 0u, n.slotPipeIndex, kvSlotStride});
             att.addOp(
                 OP_SHIFT, "block_shift_v", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, vTempBufferIndex),
                 pointerRawConfig(SRC_BUFFER, vBufferIndex),
                 size0(),
-                NnShiftOpCodeConfig{n.positionPipeIndex});
+                NnShiftOpCodeConfig{n.positionPipeIndex, 0u, 0u, 0u, n.slotPipeIndex, kvSlotStride});
             att.addOp(
                 OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex,
                 pointerBatchedSliceConfig(SRC_BUFFER, zBufferIndex),
@@ -714,7 +725,8 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                     h->nKvHeads, h->headDim, h->seqLen, n.qSlice.d0, kvCacheSlice.kvDim0,
                     0u, n.qSlice.d0,
                     0u, kvCacheSlice.kvDim0,
-                    n.positionPipeIndex, qBufferIndex, kBufferIndex, vBufferIndex, attBufferIndex});
+                    n.positionPipeIndex, qBufferIndex, kBufferIndex, vBufferIndex, attBufferIndex,
+                    n.slotPipeIndex, kvSlotStride});
             att.addOp(
                 OP_CAST, "block_cast_y2", layerIndex,
                 pointerBatchedSliceConfig(SRC_BUFFER, zBufferIndex),
@@ -1035,7 +1047,12 @@ static NnNodeConfig buildLlmNodeInternal(
     }
 
     // 2. 计算切分 (Slicing)
+    const NnUint kvSlotCount = (n != nullptr) ? std::max<NnUint>(1u, n->maxActiveSeqs) : 1u;
     NnKvCacheSliceUneven kvCacheSlice = sliceKvCacheUneven(h->seqLen, h->headDim, plan, nodeIndex);
+    const NnUint localKvSlotStride = h->seqLen * kvCacheSlice.kvLen;
+    const NnUint fullKvSlotStride = h->seqLen * h->kvDim;
+    kvCacheSlice.keySize = size2D(F_32, h->seqLen * kvSlotCount, kvCacheSlice.kvLen);
+    kvCacheSlice.valueSize = size2D(F_32, h->seqLen * kvSlotCount, kvCacheSlice.kvLen);
     NnMultiHeadAttSliceUneven multiHeadAttSlice = sliceMultiHeadAttUneven(nBatches, h->nHeads, h->seqLen, plan, nodeIndex);
     
     const NnDimSplit *residentHeadSplit = (stageFullWeights && plan->headComputeSplit.starts != nullptr)
@@ -1420,10 +1437,10 @@ static NnNodeConfig buildLlmNodeInternal(
     auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromXPipe, bool writeBackToXPipe) {
         const NnUint redundantKBufferIndex = nodeBuilder.addBuffer(
             "red_k",
-            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.keySize);
+            fullAttBuffers ? size2D(F_32, h->seqLen * kvSlotCount, h->kvDim) : kvCacheSlice.keySize);
         const NnUint redundantVBufferIndex = nodeBuilder.addBuffer(
             "red_v",
-            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.valueSize);
+            fullAttBuffers ? size2D(F_32, h->seqLen * kvSlotCount, h->kvDim) : kvCacheSlice.valueSize);
         if (layerKRegistry != nullptr && layerIndex < layerKRegistry->size()) {
             (*layerKRegistry)[layerIndex] = redundantKBufferIndex;
         }
@@ -1498,11 +1515,11 @@ static NnNodeConfig buildLlmNodeInternal(
             NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheKBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceK});
 
         const NnShiftOpCodeConfig redShiftKCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
-            : NnShiftOpCodeConfig{n->positionPipeIndex};
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
         const NnShiftOpCodeConfig redShiftVCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
-            : NnShiftOpCodeConfig{n->positionPipeIndex};
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
         redAtt.addOp(OP_SHIFT, "block_shift_k", layerIndex,
             kTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantKBufferIndex),
             size0(), redShiftKCfg);
@@ -1614,7 +1631,9 @@ static NnNodeConfig buildLlmNodeInternal(
                 qBufferIndex,
                 redundantKBufferIndex,
                 redundantVBufferIndex,
-                attBufferIndex});
+                attBufferIndex,
+                n->slotPipeIndex,
+                fullAttBuffers ? fullKvSlotStride : localKvSlotStride});
 
         if (mhaOutBufferIndex != mhaOutQBufferIndex) {
             takeoverAtt.addOp(OP_CAST, "block_cast_y2", layerIndex,
@@ -1789,10 +1808,10 @@ static NnNodeConfig buildLlmNodeInternal(
         // ... (这里的 K/V Buffer 是 Layer Local 的，需要 Slice 信息) ...
         const NnUint kBufferIndex = nodeBuilder.addBuffer(
             "k",
-            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.keySize);
+            fullAttBuffers ? size2D(F_32, h->seqLen * kvSlotCount, h->kvDim) : kvCacheSlice.keySize);
         const NnUint vBufferIndex = nodeBuilder.addBuffer(
             "v",
-            fullAttBuffers ? size2D(F_32, h->seqLen, h->kvDim) : kvCacheSlice.valueSize);
+            fullAttBuffers ? size2D(F_32, h->seqLen * kvSlotCount, h->kvDim) : kvCacheSlice.valueSize);
         if (layerKRegistry != nullptr && layerIndex < layerKRegistry->size()) {
             (*layerKRegistry)[layerIndex] = kBufferIndex;
         }
@@ -1880,11 +1899,11 @@ static NnNodeConfig buildLlmNodeInternal(
         att.addOp(OP_ROPE, "block_rope_k", layerIndex, kTempSlicePtr, kTempSlicePtr, size0(), NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheKBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceK});
 
         const NnShiftOpCodeConfig shiftKCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
-            : NnShiftOpCodeConfig{n->positionPipeIndex};
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
         const NnShiftOpCodeConfig shiftVCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim}
-            : NnShiftOpCodeConfig{n->positionPipeIndex};
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
         att.addOp(OP_SHIFT, "block_shift_k", layerIndex, kTempSlicePtr, pointerRawConfig(SRC_BUFFER, kBufferIndex), size0(), shiftKCfg);
         att.addOp(OP_SHIFT, "block_shift_v", layerIndex, vTempSlicePtr, pointerRawConfig(SRC_BUFFER, vBufferIndex), size0(), shiftVCfg);
 
@@ -1930,7 +1949,9 @@ static NnNodeConfig buildLlmNodeInternal(
                 qBufferIndex,
                 kBufferIndex,
                 vBufferIndex,
-                attBufferIndex});
+                attBufferIndex,
+                n->slotPipeIndex,
+                fullAttBuffers ? fullKvSlotStride : localKvSlotStride});
 
 #if DLLAMA_DEBUG_ATTN
         printf(" [Node %u DEBUG] MHA: nHeads=%u nHeads0=%u qStart=%u qSliceD0=%u kvStart=%u kvDim0=%u kvStride=%u%s\n",
@@ -2301,7 +2322,12 @@ static RuntimeStageLayerPlan buildRuntimeStageLayerPlanStatic(const NnUnevenPart
 }
 
 LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnUnevenPartitionPlan* plan) {
+    return buildLlmNetUneven(h, nNodes, nBatches, plan, 1u);
+}
+
+LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnUnevenPartitionPlan* plan, NnUint maxActiveSeqs) {
     LlmNet n;
+    n.maxActiveSeqs = std::max<NnUint>(1u, maxActiveSeqs);
     n.header = h;
     n.runtimeStageLayerPlan = buildRuntimeStageLayerPlanStatic(plan, h->nLayers);
 
@@ -2314,6 +2340,7 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
     // 2. Global Pipes
     NnNetConfigBuilder netBuilder(nNodes, nBatches);
     n.positionPipeIndex = netBuilder.addPipe("POS", size2D(F_32, nBatches, 1));
+    n.slotPipeIndex = netBuilder.addPipe("SLT", size2D(F_32, nBatches, 1));
     n.tokenPipeIndex = netBuilder.addPipe("TOK", size2D(F_32, nBatches, 1));
     n.xPipeIndex = netBuilder.addPipe("X", size2D(F_32, nBatches, h->dim));
     n.logitsPipeIndex = netBuilder.addPipe("LG", size2D(F_32, nBatches, h->vocabSize));
@@ -2329,6 +2356,7 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
     }
 
     netBuilder.addPreSync(n.positionPipeIndex);
+    netBuilder.addPreSync(n.slotPipeIndex);
     n.netConfig = netBuilder.build();
     n.nodeConfigs = new NnNodeConfig[nNodes];
     n.nodeLayerKBufferIndex.assign(nNodes, std::vector<NnUint>(h->nLayers, (NnUint)-1));

@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 #include <chrono>
+#include <memory>
 
 static void computeLogitsStats(const float* logits, NnUint vocabSize,
                               bool &hasNaN, bool &hasInf,
@@ -502,11 +503,286 @@ static std::string buildInferencePrompt(AppInferenceContext *context, const char
     return std::string(generated.content, generated.length);
 }
 
+
+struct ContinuousNodePerfAgg {
+    unsigned long long execUs = 0;
+    unsigned long long syncUs = 0;
+    unsigned long long syncPpSendUs = 0;
+    unsigned long long syncPpRecvUs = 0;
+    unsigned long long syncRootWaitUs = 0;
+    unsigned long long syncLogitsUs = 0;
+    unsigned long long syncOtherUs = 0;
+    unsigned long long bubbleUs = 0;
+    unsigned long long bubbleSegments = 0;
+    unsigned long long bubbleOps = 0;
+    unsigned long long bubbleSkippedSyncs = 0;
+    unsigned long long bubbleDrainUs = 0;
+    unsigned long long bubbleCompleted = 0;
+    unsigned long long forwardCount = 0;
+    unsigned long long tokenCount = 0;
+    NnUint stageIndex = 0;
+    bool hasStage = false;
+};
+
+static void addContinuousPerf(std::vector<ContinuousNodePerfAgg> &perfAgg, const std::vector<LlmPerfPacket> &perf) {
+    for (const LlmPerfPacket &p : perf) {
+        if (p.nodeIndex >= perfAgg.size()) continue;
+        ContinuousNodePerfAgg &a = perfAgg[p.nodeIndex];
+        a.execUs += p.execUs;
+        a.syncUs += p.syncUs;
+        a.syncPpSendUs += p.syncPpSendUs;
+        a.syncPpRecvUs += p.syncPpRecvUs;
+        a.syncRootWaitUs += p.syncRootWaitUs;
+        a.syncLogitsUs += p.syncLogitsUs;
+        a.syncOtherUs += p.syncOtherUs;
+        a.bubbleUs += p.bubbleUs;
+        a.bubbleSegments += p.bubbleSegments;
+        a.bubbleOps += p.bubbleOps;
+        a.bubbleSkippedSyncs += p.bubbleSkippedSyncs;
+        a.bubbleDrainUs += p.bubbleDrainUs;
+        a.bubbleCompleted += p.bubbleCompleted;
+        a.forwardCount += 1u;
+        a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
+        a.stageIndex = p.stageIndex;
+        a.hasStage = true;
+    }
+}
+
+static void printContinuousProfileSummary(const std::vector<ContinuousNodePerfAgg> &perfAgg) {
+    if (perfAgg.empty()) return;
+    printf("\n");
+    printf("[Continuous Stage/Node Profile Summary]\n");
+    for (NnUint node = 0; node < (NnUint)perfAgg.size(); ++node) {
+        const ContinuousNodePerfAgg &a = perfAgg[node];
+        if (a.forwardCount == 0u || a.tokenCount == 0u) continue;
+        const double execPerFwdMs = (double)a.execUs / 1000.0 / (double)a.forwardCount;
+        const double syncPerFwdMs = (double)a.syncUs / 1000.0 / (double)a.forwardCount;
+        const double bubblePerFwdMs = (double)a.bubbleUs / 1000.0 / (double)a.forwardCount;
+        const double totalPerFwdMs = execPerFwdMs + syncPerFwdMs + bubblePerFwdMs;
+        const double ppSendPerFwdMs = (double)a.syncPpSendUs / 1000.0 / (double)a.forwardCount;
+        const double ppRecvPerFwdMs = (double)a.syncPpRecvUs / 1000.0 / (double)a.forwardCount;
+        const double rootWaitPerFwdMs = (double)a.syncRootWaitUs / 1000.0 / (double)a.forwardCount;
+        const double logitsPerFwdMs = (double)a.syncLogitsUs / 1000.0 / (double)a.forwardCount;
+        const double otherSyncPerFwdMs = (double)a.syncOtherUs / 1000.0 / (double)a.forwardCount;
+        const double bubbleDrainPerFwdMs = (double)a.bubbleDrainUs / 1000.0 / (double)a.forwardCount;
+        const double execPerTokMs = (double)a.execUs / 1000.0 / (double)a.tokenCount;
+        const double syncPerTokMs = (double)a.syncUs / 1000.0 / (double)a.tokenCount;
+        const double bubblePerTokMs = (double)a.bubbleUs / 1000.0 / (double)a.tokenCount;
+        const double totalPerTokMs = execPerTokMs + syncPerTokMs + bubblePerTokMs;
+
+        printf("  Stage %u Node %u: per-fwd total=%6.2f ms (exec=%6.2f sync=%6.2f bubble=%6.2f) | per-tok total=%6.2f ms (exec=%6.2f sync=%6.2f bubble=%6.2f) | bubbleSeg=%llu bubbleOps=%llu fwd=%llu tok=%llu\n",
+            a.hasStage ? a.stageIndex : 0u,
+            node,
+            totalPerFwdMs,
+            execPerFwdMs,
+            syncPerFwdMs,
+            bubblePerFwdMs,
+            totalPerTokMs,
+            execPerTokMs,
+            syncPerTokMs,
+            bubblePerTokMs,
+            (unsigned long long)a.bubbleSegments,
+            (unsigned long long)a.bubbleOps,
+            (unsigned long long)a.forwardCount,
+            (unsigned long long)a.tokenCount);
+        printf("      sync/fwd: ppSend=%6.2f ppRecv=%6.2f rootWait=%6.2f logits=%6.2f other=%6.2f ms | bubbleDrain/fwd=%6.2f ms complete=%llu/%llu skippedSyncs=%llu\n",
+            ppSendPerFwdMs,
+            ppRecvPerFwdMs,
+            rootWaitPerFwdMs,
+            logitsPerFwdMs,
+            otherSyncPerFwdMs,
+            bubbleDrainPerFwdMs,
+            (unsigned long long)a.bubbleCompleted,
+            (unsigned long long)a.forwardCount,
+            (unsigned long long)a.bubbleSkippedSyncs);
+    }
+}
+
+static void inferenceRunContinuousBatching(AppInferenceContext *context, const char *prompt, NnUint steps) {
+    if (prompt == nullptr) throw std::runtime_error("Prompt is required");
+    if (steps == 0u) throw std::runtime_error("Number of steps is required");
+
+    TokenizerChatStops stops(context->tokenizer);
+    std::string effectivePrompt = buildInferencePrompt(context, prompt, &stops);
+    std::vector<int> inputTokensVec(effectivePrompt.size() + 3u);
+    int *inputTokens = inputTokensVec.data();
+    int nInputTokens = 0;
+    context->tokenizer->encode(const_cast<char*>(effectivePrompt.c_str()), inputTokens, &nInputTokens, true, true);
+
+    if (nInputTokens > (int)context->header->seqLen)
+        throw std::runtime_error("The number of prompt tokens is greater than the sequence length");
+    if ((NnUint)nInputTokens > steps)
+        throw std::runtime_error("The number of prompt tokens is greater than the number of steps");
+
+    const NnUint nNodes = context->args->nWorkers + 1u;
+    const NnUint reqCount = std::max<NnUint>(1u, std::min<NnUint>(context->args->benchmarkConcurrentRequests, context->args->maxActiveSeqs));
+    const NnUint maxPos = std::min<NnUint>(context->header->seqLen, steps);
+    const NnUnevenPartitionPlan *plan = context->inference->getPartitionPlan();
+    bool planSupportsRemoteSampling = false;
+    if (plan != nullptr && plan->nStages > 1u) {
+        const NnStageConfig &last = plan->stages[plan->nStages - 1u];
+        planSupportsRemoteSampling = last.rootNodeIndex != 0u;
+    }
+    const bool useRemoteSampling = context->args->lastStageSampling && context->network != nullptr && planSupportsRemoteSampling;
+    NnUint ppInflight = context->args->ppInflight != 0u ? context->args->ppInflight : nNodes;
+    if (ppInflight < 1u) ppInflight = 1u;
+    if (!useRemoteSampling) ppInflight = 1u;
+
+    if (context->network != nullptr && !useRemoteSampling) {
+        printf("[continuous-batching] remote last-stage sampling is unavailable; using ppInflight=1 to keep logits sampling correct.\n");
+    }
+
+    printf("%s\n", effectivePrompt.c_str());
+    printf("[continuous-batching] requests=%u maxActiveSeqs=%u decodeBatchSize=%u ppMicrobatchSize=1 ppInflight=%u\n",
+        (unsigned)reqCount,
+        (unsigned)context->args->maxActiveSeqs,
+        (unsigned)context->args->decodeBatchSize,
+        (unsigned)ppInflight);
+
+    std::vector<ContinuousNodePerfAgg> perfAgg;
+    if (context->args->benchmark) perfAgg.resize(nNodes);
+
+    const auto evalWallStart = std::chrono::steady_clock::now();
+    const NnUint prefillBatchLimit = std::max<NnUint>(1u, context->args->nBatches);
+    for (NnUint req = 0u; req < reqCount; ++req) {
+        NnUint pos = 0u;
+        for (;;) {
+            const long remainingTokens = (long)nInputTokens - 1L - (long)pos;
+            if (remainingTokens <= 0L) break;
+            const NnUint batchSize = std::min<NnUint>((NnUint)remainingTokens, prefillBatchLimit);
+            context->inference->setBatchSize(batchSize);
+            for (NnUint i = 0u; i < batchSize; ++i) {
+                context->inference->setBatchItem(i, (NnUint)inputTokens[pos + i], pos + i, req);
+            }
+            context->inference->forward();
+            if (context->args->benchmark) addContinuousPerf(perfAgg, context->inference->getLastPerf());
+            if (useRemoteSampling && batchSize == 1u) {
+                NnUint discard = 0u;
+                context->inference->tryReceiveLastStageSampledToken(discard, nullptr);
+            }
+            pos += batchSize;
+        }
+    }
+    const auto evalWallEnd = std::chrono::steady_clock::now();
+
+    struct RequestState {
+        NnUint slotId = 0u;
+        NnUint pos = 0u;
+        int token = 0;
+        bool finished = false;
+        NnUint generated = 0u;
+        EosDetector *eos = nullptr;
+    };
+    struct InflightWork {
+        NnUint reqIndex = 0u;
+        LlmPerfPacket rootPacket{};
+    };
+
+    std::vector<std::unique_ptr<EosDetector> > detectors;
+    std::vector<RequestState> requests(reqCount);
+    std::deque<NnUint> ready;
+    for (NnUint req = 0u; req < reqCount; ++req) {
+        detectors.emplace_back(new EosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength));
+        requests[req].slotId = req;
+        requests[req].pos = (NnUint)nInputTokens - 1u;
+        requests[req].token = inputTokens[nInputTokens - 1];
+        requests[req].eos = detectors.back().get();
+        ready.push_back(req);
+    }
+
+    std::deque<InflightWork> inflight;
+    NnUint predTokens = 0u;
+    const auto predWallStart = std::chrono::steady_clock::now();
+
+    auto dispatchOne = [&](NnUint reqIndex) {
+        RequestState &r = requests[reqIndex];
+        context->inference->setBatchSize(1u);
+        context->inference->setBatchItem(0u, (NnUint)r.token, r.pos, r.slotId);
+        context->inference->forward(false);
+        InflightWork w;
+        w.reqIndex = reqIndex;
+        w.rootPacket = context->inference->makeRootPerfPacket();
+        inflight.push_back(w);
+    };
+
+    auto drainOne = [&]() {
+        InflightWork w = inflight.front();
+        inflight.pop_front();
+        std::vector<LlmPerfPacket> perf;
+        context->inference->collectDeferredProfile(w.rootPacket, perf);
+        if (context->args->benchmark) addContinuousPerf(perfAgg, perf);
+
+        NnUint sampledToken = 0u;
+        bool haveRemoteToken = false;
+        if (useRemoteSampling) {
+            haveRemoteToken = context->inference->tryReceiveLastStageSampledToken(sampledToken, nullptr);
+        }
+        const int token = haveRemoteToken
+            ? (int)sampledToken
+            : context->sampler->sample(context->inference->logitsPipe);
+
+        RequestState &r = requests[w.reqIndex];
+        EosDetectorType eosType = r.eos != nullptr ? r.eos->append(token, nullptr) : NOT_EOS;
+        r.token = token;
+        r.pos += 1u;
+        r.generated += 1u;
+        predTokens += 1u;
+
+        if (eosType == EOS || r.pos >= maxPos) {
+            r.finished = true;
+        } else {
+            ready.push_back(w.reqIndex);
+        }
+    };
+
+    while (!ready.empty() || !inflight.empty()) {
+        while (!ready.empty() && inflight.size() < ppInflight) {
+            const NnUint reqIndex = ready.front();
+            ready.pop_front();
+            if (!requests[reqIndex].finished) dispatchOne(reqIndex);
+        }
+        if (!inflight.empty()) drainOne();
+    }
+
+    const auto predWallEnd = std::chrono::steady_clock::now();
+    const double evalWallMs = std::chrono::duration<double, std::milli>(evalWallEnd - evalWallStart).count();
+    const double predWallMs = std::chrono::duration<double, std::milli>(predWallEnd - predWallStart).count();
+    const NnUint evalTokens = ((NnUint)nInputTokens - 1u) * reqCount;
+
+    printf("\n");
+    printf("Continuous Evaluation\n");
+    printf("    nRequests: %u\n", (unsigned)reqCount);
+    printf("     nBatches: %u\n", (unsigned)context->args->nBatches);
+    printf("      nTokens: %u\n", (unsigned)evalTokens);
+    if (evalTokens > 0u && evalWallMs > 0.0) {
+        printf("     tokens/s: %3.2f (%3.2f ms/tok)\n", ((double)evalTokens * 1000.0) / evalWallMs, evalWallMs / (double)evalTokens);
+    } else {
+        printf("     tokens/s: n/a\n");
+    }
+    printf("Continuous Prediction (aggregate root wall-clock)\n");
+    printf("    nRequests: %u\n", (unsigned)reqCount);
+    printf("      nTokens: %u\n", (unsigned)predTokens);
+    if (predTokens > 0u && predWallMs > 0.0) {
+        printf("     tokens/s: %3.2f (%3.2f ms/tok)\n", ((double)predTokens * 1000.0) / predWallMs, predWallMs / (double)predTokens);
+    } else {
+        printf("     tokens/s: n/a\n");
+    }
+
+    if (context->args->benchmark) {
+        printContinuousProfileSummary(perfAgg);
+        printf("Hint: continuous prediction counts aggregate tokens across active request slots.\n");
+    }
+}
+
 static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, NnUint steps) {
     if (prompt == nullptr)
         throw std::runtime_error("Prompt is required");
     if (steps == 0)
         throw std::runtime_error("Number of steps is required");
+    if (context != nullptr && context->args != nullptr && context->args->continuousBatching) {
+        inferenceRunContinuousBatching(context, prompt, steps);
+        return;
+    }
 
     TokenizerChatStops stops(context->tokenizer);
     EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
@@ -1484,7 +1760,10 @@ int main(int argc, char **argv) {
     int returnCode = EXIT_SUCCESS;
     try {
         AppCliArgs args = AppCliArgs::parse(argc, argv, true);
-        if (std::strcmp(args.mode, "inference") == 0) {
+        if (args.help) {
+            printf("Usage: %s <inference|chat|perplexity|worker> [options]\n", argv[0]);
+            returnCode = EXIT_SUCCESS;
+        } else if (std::strcmp(args.mode, "inference") == 0) {
             printf("nNodes=%d\n", args.nWorkers);
             if (envFlagEnabled("DLLAMA_E2E_MATMUL_VIEW0_CHECK")) {
                 if (args.nWorkers != 0) {

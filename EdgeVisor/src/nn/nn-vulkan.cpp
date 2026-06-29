@@ -1147,6 +1147,7 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
         case OP_SHIFT: {
             const NnShiftOpCodeConfig *config = (NnShiftOpCodeConfig *)opConfig->config;
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->indexPipeIndex)});
+            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->slotPipeIndex)});
         } break;
         case OP_ROPE: {
             const NnRopeOpConfig *config = (NnRopeOpConfig *)opConfig->config;
@@ -1160,6 +1161,7 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->keyCacheBufferIndex)});
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->valueCacheBufferIndex)});
             a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->attBufferIndex)});
+            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->slotPipeIndex)});
         } break;
         case OP_MOE_GATE: {
             const NnMoeGateOpCodeConfig *config = (NnMoeGateOpCodeConfig *)opConfig->config;

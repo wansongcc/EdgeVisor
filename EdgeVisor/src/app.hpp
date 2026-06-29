@@ -48,6 +48,12 @@ public:
     NnUint steps;
     bool benchmark;
     bool lastStageSampling;
+    bool continuousBatching;
+    NnUint maxActiveSeqs;
+    NnUint decodeBatchSize;
+    NnUint ppMicrobatchSize;
+    NnUint ppInflight;
+    NnUint benchmarkConcurrentRequests;
     unsigned long long seed;
     ChatTemplateType chatTemplateType;
     NnUint maxSeqLen;
@@ -106,7 +112,18 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_HAS_LAYER_SWITCH = 1u << 3,
     LLM_CTRL_HAS_KV_EXPORT_REQUEST = 1u << 4,
     LLM_CTRL_CONTROL_ONLY = 1u << 5,
+    LLM_CTRL_HAS_BATCH_META = 1u << 6,
 };
+
+static constexpr NnUint LLM_BATCH_META_MAGIC = 0x4d54424du; // 'MBTM' little-endian
+static constexpr NnUint LLM_BATCH_META_VERSION = 1u;
+
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint batchSize;
+    NnUint reserved;
+} LlmBatchMetadataHeader;
 
 typedef struct {
     NnUint magic;          // 'KVTR'
@@ -336,6 +353,7 @@ public:
 private:
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
+    float *slotPipe = nullptr;
     float *kvAggKPipe = nullptr;
     float *kvAggVPipe = nullptr;
     LlmHeader *header;
@@ -393,6 +411,7 @@ private:
     NnUint nextKvExportRequestId = 1u;
     uint64_t lastMigrationStateTransferBytes = 0u;
     uint64_t lastMigrationExportedRows = 0u;
+    bool batchMetadataDirty = false;
     bool collectSourceStageKvTransfers(NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
@@ -418,11 +437,16 @@ public:
     RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled);
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
+    void setPosition(NnUint batchIndex, NnUint position);
+    void setSlot(NnUint batchIndex, NnUint slotId);
+    void setBatchItem(NnUint batchIndex, NnUint token, NnUint position, NnUint slotId);
     void setToken(NnUint batchIndex, NnUint token);
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
-    void forward();
+    void forward(bool collectProfile = true);
+    void collectDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out);
+    LlmPerfPacket makeRootPerfPacket() const;
     void finish();
 };
 
@@ -444,6 +468,7 @@ public:
     void maybeSendLastStageSampledToken(const NnUnevenPartitionPlan *plan);
 private:
     float *positionPipe;
+    float *slotPipe;
     float *logitsPipe;
     NnNetExecution *execution;
     NnNetwork *network;

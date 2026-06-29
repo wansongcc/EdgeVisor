@@ -23,21 +23,26 @@ layout(binding = 3) readonly uniform configBuffer {
     uint dstColStart;
     uint dstRowStride;
     uint dstColStartUnit;
+    uint slotPipeIndex;
+    uint kvSlotStride;
 };
 layout(binding = 4) readonly buffer indexBuffer { float indexes[]; };
+layout(binding = 5) readonly buffer slotBuffer { float slots[]; };
 
 void main() {
     const uint batchIndex = gl_WorkGroupID.y;
     const uint chunkIndex = gl_WorkGroupID.x;
 
     const uint index = uint(indexes[batchIndex]);
+    const uint slot = kvSlotStride == 0 ? 0 : uint(slots[batchIndex]);
+    const uint slotBase = kvSlotStride == 0 ? 0 : slot * kvSlotStride;
 
     const BatchInfo info = infos[batchIndex];
     const uint offset = chunkIndex * CHUNK_SIZE;
     const uint xOffset = info.inputOffset + offset;
     const uint rowStride = dstRowStride == 0 ? info.inputSizeX : dstRowStride;
     const uint colStart = dstRowStride == 0 ? 0 : dstColStart;
-    const uint yOffset = index * rowStride + colStart + offset;
+    const uint yOffset = slotBase + index * rowStride + colStart + offset;
 
     [[unroll]] for (uint i = 0; i < CHUNK_SIZE; i++) {
         y[yOffset + i] = x[xOffset + i];

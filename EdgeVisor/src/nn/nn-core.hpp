@@ -600,6 +600,8 @@ typedef struct {
     NnUint keyCacheBufferIndex;
     NnUint valueCacheBufferIndex;
     NnUint attBufferIndex;
+    NnUint slotPipeIndex;
+    NnUint kvSlotStride;
 } NnMultiHeadAttOpConfig;
 
 typedef struct {
@@ -648,6 +650,10 @@ typedef struct {
     // If dstColStartUnit!=0, refresh code may set dstColStart = kvHeadSplit.starts[node] * dstColStartUnit.
     // For KV cache this is typically headDim.
     NnUint dstColStartUnit;
+    // Optional: flattened request-slot stride in destination elements.
+    // When kvSlotStride!=0, effective row = slotId * kvSlotStride + index * rowStride.
+    NnUint slotPipeIndex;
+    NnUint kvSlotStride;
 } NnShiftOpCodeConfig;
 
 typedef struct {

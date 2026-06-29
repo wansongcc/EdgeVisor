@@ -823,6 +823,7 @@ __global__ static void shiftF32Kernel(
     NnByte *outputBase,
     NnPointerLayout output,
     const float *indexes,
+    const float *slots,
     NnShiftOpCodeConfig config,
     NnUint batchSize) {
     const NnSize total = (NnSize)batchSize * input.logicalSize.x;
@@ -831,11 +832,13 @@ __global__ static void shiftF32Kernel(
     const NnUint x = (NnUint)(tid % input.logicalSize.x);
     const NnUint y = (NnUint)(tid / input.logicalSize.x);
     const NnUint row = (NnUint)indexes[y];
+    const NnUint slotId = (config.kvSlotStride != 0u) ? (NnUint)slots[y] : 0u;
+    const NnSize slotBase = (config.kvSlotStride != 0u) ? (NnSize)slotId * (NnSize)config.kvSlotStride : 0u;
     const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y);
     float *outBase = (float *)(outputBase + output.byteOffset);
     const NnSize dst = config.dstRowStride == 0u
-        ? (NnSize)row * input.logicalSize.x + x
-        : (NnSize)row * config.dstRowStride + config.dstColStart + x;
+        ? slotBase + (NnSize)row * input.logicalSize.x + x
+        : slotBase + (NnSize)row * config.dstRowStride + config.dstColStart + x;
     outBase[dst] = in[x];
 }
 
@@ -977,6 +980,7 @@ __device__ static inline void cudaMhaOffsets(
 
 __global__ static void multiheadAttScoreF32Kernel(
     const float *positions,
+    const float *slots,
     const float *query,
     const float *keyCache,
     float *att,
@@ -986,6 +990,8 @@ __global__ static void multiheadAttScoreF32Kernel(
     const NnUint y = blockIdx.y;
     if (h >= config.nHeads0 || y >= batchSize) return;
     const NnUint pos = (NnUint)positions[y];
+    const NnUint slotId = (config.kvSlotStride != 0u) ? (NnUint)slots[y] : 0u;
+    const NnSize slotBase = (config.kvSlotStride != 0u) ? (NnSize)slotId * (NnSize)config.kvSlotStride : 0u;
     NnUint qOffset = 0u;
     NnUint kvOffset = 0u;
     NnUint attOffset = 0u;
@@ -993,7 +999,7 @@ __global__ static void multiheadAttScoreF32Kernel(
     const float invHeadDimRoot = rsqrtf((float)config.headDim);
     for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         float score = 0.0f;
-        const NnUint kOffset = p * config.kvStride + kvOffset;
+        const NnSize kOffset = slotBase + (NnSize)p * config.kvStride + kvOffset;
         for (NnUint i = 0u; i < config.headDim; ++i) {
             score += query[qOffset + i] * keyCache[kOffset + i];
         }
@@ -1032,6 +1038,7 @@ __global__ static void multiheadAttValueF32Kernel(
     NnByte *outputBase,
     NnPointerLayout output,
     const float *positions,
+    const float *slots,
     const float *valueCache,
     const float *att,
     NnMultiHeadAttOpConfig config,
@@ -1040,6 +1047,8 @@ __global__ static void multiheadAttValueF32Kernel(
     const NnUint y = blockIdx.y;
     if (h >= config.nHeads0 || y >= batchSize) return;
     const NnUint pos = (NnUint)positions[y];
+    const NnUint slotId = (config.kvSlotStride != 0u) ? (NnUint)slots[y] : 0u;
+    const NnSize slotBase = (config.kvSlotStride != 0u) ? (NnSize)slotId * (NnSize)config.kvSlotStride : 0u;
     NnUint qOffset = 0u;
     NnUint kvOffset = 0u;
     NnUint attOffset = 0u;
@@ -1050,7 +1059,7 @@ __global__ static void multiheadAttValueF32Kernel(
         float acc = 0.0f;
         const NnUint vOffset = kvOffset + i;
         for (NnUint p = 0u; p <= pos; ++p) {
-            acc += att[attOffset + p] * valueCache[p * config.kvStride + vOffset];
+            acc += att[attOffset + p] * valueCache[slotBase + (NnSize)p * config.kvStride + vOffset];
         }
         out[i] = acc;
     }
@@ -1595,9 +1604,11 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
         } else if (op.code == OP_MULTIHEAD_ATT && op.config != nullptr) {
             const NnMultiHeadAttOpConfig *config = (const NnMultiHeadAttOpConfig *)op.config;
             uploadPipe(config->positionPipeIndex);
+            if (config->kvSlotStride != 0u) uploadPipe(config->slotPipeIndex);
         } else if (op.code == OP_SHIFT && op.config != nullptr) {
             const NnShiftOpCodeConfig *config = (const NnShiftOpCodeConfig *)op.config;
             uploadPipe(config->indexPipeIndex);
+            if (config->kvSlotStride != 0u) uploadPipe(config->slotPipeIndex);
         }
     }
 }
@@ -2002,6 +2013,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 throw std::runtime_error("CUDA MULTIHEAD_ATT q-head range is not covered by local KV range");
             }
             NnCudaBuffer *positionPipe = device->data.resolvePipe(config.positionPipeIndex);
+            NnCudaBuffer *slotPipe = device->data.resolvePipe(config.slotPipeIndex);
             NnCudaBuffer *queryBuffer = device->data.resolveBuffer(config.queryBufferIndex);
             NnCudaBuffer *keyCacheBuffer = device->data.resolveBuffer(config.keyCacheBufferIndex);
             NnCudaBuffer *valueCacheBuffer = device->data.resolveBuffer(config.valueCacheBufferIndex);
@@ -2022,6 +2034,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             if (batchSize != 0u) {
                 multiheadAttScoreF32Kernel<<<grid, attentionBlock, 0, stream>>>(
                     (const float *)positionPipe->data(),
+                    (const float *)slotPipe->data(),
                     (const float *)queryBuffer->data(),
                     (const float *)keyCacheBuffer->data(),
                     (float *)attBuffer->data(),
@@ -2037,6 +2050,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 multiheadAttValueF32Kernel<<<grid, attentionBlock, 0, stream>>>(
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)positionPipe->data(),
+                    (const float *)slotPipe->data(),
                     (const float *)valueCacheBuffer->data(),
                     (const float *)attBuffer->data(),
                     config,
@@ -2204,12 +2218,14 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 throw std::runtime_error(unsupportedOpMessage(opIndex));
             }
             NnCudaBuffer *indexPipe = device->data.resolvePipe(config->indexPipeIndex);
+            NnCudaBuffer *slotPipe = device->data.resolvePipe(config->slotPipeIndex);
             const NnSize total = (NnSize)batchSize * in.layout.logicalSize.x;
             if (total != 0u) {
                 shiftF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)indexPipe->data(),
+                    (const float *)slotPipe->data(),
                     *config,
                     batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());

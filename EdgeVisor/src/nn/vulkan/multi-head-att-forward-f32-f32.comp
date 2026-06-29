@@ -35,12 +35,15 @@ layout(binding = 3) readonly uniform configBuffer {
     uint keyCacheBufferIndex;
     uint valueCacheBufferIndex;
     uint attBufferIndex;
+    uint slotPipeIndex;
+    uint kvSlotStride;
 };
 layout(binding = 4) readonly buffer positionsBuffer { float positions[]; };
 layout(binding = 5) readonly buffer queryBuffer { float query[]; };
 layout(binding = 6) readonly buffer keyCacheBuffer { float keyCache[]; };
 layout(binding = 7) readonly buffer valueCacheBuffer { float valueCache[]; };
 layout(binding = 8) buffer attBufferBuffer { float att[]; };
+layout(binding = 9) readonly buffer slotBuffer { float slots[]; };
 
 shared uint sharedPosition;
 shared float sharedMaxScore;
@@ -67,6 +70,8 @@ void main() {
 
     const BatchInfo info = infos[batchIndex];
     const uint position = sharedPosition;
+    const uint slot = kvSlotStride == 0 ? 0 : uint(slots[batchIndex]);
+    const uint slotBase = kvSlotStride == 0 ? 0 : slot * kvSlotStride;
 
     const uint attOffset = batchIndex * nHeads0 * seqLen + h * seqLen;
     const uint qOffset = batchIndex * qStride + qStart + h * headDim;
@@ -75,7 +80,7 @@ void main() {
 
     float ms = -1e10f;
     for (uint p = threadIndex; p <= position; p += N_THREADS) {
-        const uint kOffset = kvOffset + p * kvStride;
+        const uint kOffset = slotBase + kvOffset + p * kvStride;
 
         float score = 0.0f;
         for (uint i = 0; i < headDim; i++) {
@@ -127,7 +132,7 @@ void main() {
         const uint vOffset = kvOffset + i;
         for (uint p = 0; p <= position; p += 1) {
             const float a = att[attOffset + p];
-            const float v = valueCache[vOffset + p * kvStride];
+            const float v = valueCache[slotBase + vOffset + p * kvStride];
             sum += v * a;
         }
         y[yOffset + i] = sum * yScale;

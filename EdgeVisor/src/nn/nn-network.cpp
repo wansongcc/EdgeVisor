@@ -9,6 +9,7 @@ typedef SSIZE_T ssize_t;
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>  // for getaddrinfo
+#include <poll.h>
 #endif
 #include "nn-network.hpp"
 #include "nn/io-profile.hpp"
@@ -130,6 +131,64 @@ static inline unsigned int getIoEagainSleepUs() {
         inited.store(true, std::memory_order_release);
     }
     return cached.load(std::memory_order_acquire);
+}
+
+static inline bool getIoEagainPollEnabled() {
+    // Default ON: wait for fd readiness after EAGAIN instead of busy polling.
+    static std::atomic<bool> cached{true};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        bool v = true;
+        if (const char *p = std::getenv("DLLAMA_IO_EAGAIN_POLL")) {
+            v = !(std::strcmp(p, "0") == 0 ||
+                  std::strcmp(p, "false") == 0 ||
+                  std::strcmp(p, "False") == 0 ||
+                  std::strcmp(p, "off") == 0 ||
+                  std::strcmp(p, "OFF") == 0);
+        }
+        cached.store(v, std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
+static inline int remainingPollTimeoutMs(unsigned long timeoutMs, long long startMs, const char *what) {
+    if (timeoutMs == 0ul) return -1;
+    const long long elapsed = nowMsSteady() - startMs;
+    if (elapsed > (long long)timeoutMs) {
+        throw NnTransferSocketException(ETIMEDOUT, what);
+    }
+    const long long remaining = (long long)timeoutMs - elapsed;
+    return remaining > (long long)INT32_MAX ? INT32_MAX : (int)remaining;
+}
+
+static inline void waitSocketReadyAfterEagain(int socket, bool wantWrite, unsigned long timeoutMs, long long startMs) {
+    if (!getIoEagainPollEnabled()) return;
+#ifdef _WIN32
+    (void)socket;
+    (void)wantWrite;
+    (void)timeoutMs;
+    (void)startMs;
+#else
+    struct pollfd pfd;
+    pfd.fd = socket;
+    pfd.events = wantWrite ? POLLOUT : POLLIN;
+    pfd.revents = 0;
+    const char *timeoutMsg = wantWrite
+        ? "Socket write timeout while waiting for POLLOUT (DLLAMA_IO_TIMEOUT_MS)"
+        : "Socket read timeout while waiting for POLLIN (DLLAMA_IO_TIMEOUT_MS)";
+    const int timeout = remainingPollTimeoutMs(timeoutMs, startMs, timeoutMsg);
+    int rc;
+    do {
+        rc = poll(&pfd, 1, timeout);
+    } while (rc < 0 && errno == EINTR);
+    if (rc == 0) {
+        throw NnTransferSocketException(ETIMEDOUT, timeoutMsg);
+    }
+    if (rc < 0) {
+        throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
+    }
+#endif
 }
 
 static inline void backoffOnEagain(unsigned int &spinCount) {
@@ -522,6 +581,8 @@ static void printBytes(const char* prefix, const void* data, NnSize size) {
 void writeSocket(int socket, const void *data, NnSize size) {
     printBytes("DEBUG: writeSocket", data, size);
     const bool ioProfile = dllamaIoProbeEnabled();
+    const unsigned long timeoutMs = getIoTimeoutMs();
+    const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
     unsigned int eagainSpins = 0u;
     while (size > 0) {
         const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
@@ -529,6 +590,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
         if (s < 0) {
             if (isEagainError()) {
                 if (ioProfile) dllamaIoProbeRecordNetSendEagain();
+                waitSocketReadyAfterEagain(socket, true, timeoutMs, startMs);
                 backoffOnEagain(eagainSpins);
                 continue;
             }
@@ -546,6 +608,8 @@ void writeSocket(int socket, const void *data, NnSize size) {
 static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned long maxAttempts) {
     // maxAttempts = 0 means infinite attempts
     const bool ioProfile = dllamaIoProbeEnabled();
+    const unsigned long timeoutMs = getIoTimeoutMs();
+    const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
     NnSize s = size;
     unsigned int eagainSpins = 0u;
     while (s > 0) {
@@ -554,12 +618,15 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
         if (r < 0) {
             if (isEagainError()) {
                 if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
-                backoffOnEagain(eagainSpins);
                 if (s == size && maxAttempts > 0) {
                     maxAttempts--;
                     if (maxAttempts == 0) {
                         return false;
                     }
+                    backoffOnEagain(eagainSpins);
+                } else {
+                    waitSocketReadyAfterEagain(socket, false, timeoutMs, startMs);
+                    backoffOnEagain(eagainSpins);
                 }
                 continue;
             }
@@ -1235,6 +1302,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                     if (isEagainError()) {
                         recordCommSendEagain();
                         if (ioProfile) dllamaIoProbeRecordNetSendEagain();
+                        waitSocketReadyAfterEagain(socket, true, timeoutMs, startMs);
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
@@ -1297,6 +1365,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                     if (isEagainError()) {
                         recordCommRecvEagain();
                         if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
+                        waitSocketReadyAfterEagain(socket, false, timeoutMs, startMs);
                         backoffOnEagain(eagainSpins);
                         continue;
                     }

@@ -57,6 +57,8 @@ struct StageSnapshot {
     double previousAvgMs = 0.0;
     double stageTimeMs = 0.0;
     double boundaryCommMs = 0.0;
+    double leftBoundaryLayerMs = 0.0;
+    double rightBoundaryLayerMs = 0.0;
     double riskPenalty = 0.0;
     std::vector<NodeSnapshot> nodes;
 };

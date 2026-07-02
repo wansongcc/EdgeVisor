@@ -705,7 +705,9 @@ void PlanUdsController::run() {
                             {"nodeIndex", p.nodeIndex},
                             {"stageIndex", p.stageIndex},
                             {"execUs", p.execUs},
-                            {"syncUs", p.syncUs}
+                            {"syncUs", p.syncUs},
+                            {"leftBoundaryLayerUs", p.leftBoundaryLayerUs},
+                            {"rightBoundaryLayerUs", p.rightBoundaryLayerUs}
                         });
                     }
                 }

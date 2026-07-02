@@ -37,6 +37,7 @@ enum class ControllerState {
 
 struct NodeWindowStats {
     double totalMs = 0.0;
+    double computeMs = 0.0;
     double attnMs = 0.0;
     double ffnMs = 0.0;
     uint32_t samples = 0u;
@@ -44,7 +45,10 @@ struct NodeWindowStats {
 
 struct StageWindowStats {
     double stageTotalMs = 0.0;
+    double stageComputeMs = 0.0;
     double boundaryCommMs = 0.0;
+    double leftBoundaryLayerMs = 0.0;
+    double rightBoundaryLayerMs = 0.0;
     uint32_t samples = 0u;
     std::map<uint32_t, NodeWindowStats> nodes;
 };
@@ -255,6 +259,11 @@ static double packetTimeMs(const json &p) {
     return (execUs + syncUs + bubbleUs) / 1000.0;
 }
 
+static double packetComputeMs(const json &p) {
+    const double execUs = (double)p.value("execUs", 0u);
+    return execUs / 1000.0;
+}
+
 static double packetBoundaryCommMs(const json &p) {
     const double sendUs = (double)p.value("syncPpSendUs", 0u);
     const double recvUs = (double)p.value("syncPpRecvUs", 0u);
@@ -270,8 +279,12 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
     uint32_t samplePos = statusPos;
     bool havePacket = false;
     std::map<uint32_t, double> stageMaxMs;
+    std::map<uint32_t, double> stageComputeMaxMs;
     std::map<uint32_t, double> stageBoundaryMs;
+    std::map<uint32_t, double> stageLeftBoundaryMaxMs;
+    std::map<uint32_t, double> stageRightBoundaryMaxMs;
     std::map<uint32_t, std::map<uint32_t, double> > nodeMs;
+    std::map<uint32_t, std::map<uint32_t, double> > nodeComputeMs;
 
     for (size_t i = 0u; i < arr.size(); ++i) {
         const json &p = arr.at(i);
@@ -282,16 +295,29 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
         const uint32_t stageIndex = p.value("stageIndex", 0u);
         samplePos = p.value("position", samplePos);
         const double ms = packetTimeMs(p);
-        if (ms <= 0.0) continue;
+        const double computeMs = packetComputeMs(p);
+        if (ms <= 0.0 && computeMs <= 0.0) continue;
         havePacket = true;
         if (stageMaxMs.find(stageIndex) == stageMaxMs.end() || ms > stageMaxMs[stageIndex]) {
             stageMaxMs[stageIndex] = ms;
+        }
+        if (stageComputeMaxMs.find(stageIndex) == stageComputeMaxMs.end() || computeMs > stageComputeMaxMs[stageIndex]) {
+            stageComputeMaxMs[stageIndex] = computeMs;
         }
         const double commMs = packetBoundaryCommMs(p);
         if (stageBoundaryMs.find(stageIndex) == stageBoundaryMs.end() || commMs > stageBoundaryMs[stageIndex]) {
             stageBoundaryMs[stageIndex] = commMs;
         }
+        const double leftBoundaryMs = (double)p.value("leftBoundaryLayerUs", 0u) / 1000.0;
+        const double rightBoundaryMs = (double)p.value("rightBoundaryLayerUs", 0u) / 1000.0;
+        if (stageLeftBoundaryMaxMs.find(stageIndex) == stageLeftBoundaryMaxMs.end() || leftBoundaryMs > stageLeftBoundaryMaxMs[stageIndex]) {
+            stageLeftBoundaryMaxMs[stageIndex] = leftBoundaryMs;
+        }
+        if (stageRightBoundaryMaxMs.find(stageIndex) == stageRightBoundaryMaxMs.end() || rightBoundaryMs > stageRightBoundaryMaxMs[stageIndex]) {
+            stageRightBoundaryMaxMs[stageIndex] = rightBoundaryMs;
+        }
         nodeMs[stageIndex][nodeIndex] = ms;
+        nodeComputeMs[stageIndex][nodeIndex] = computeMs;
     }
 
     if (!havePacket || stageMaxMs.empty()) return false;
@@ -311,15 +337,20 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
     for (std::map<uint32_t, double>::const_iterator it = stageMaxMs.begin(); it != stageMaxMs.end(); ++it) {
         const uint32_t stageIndex = it->first;
         const double stageMs = it->second;
+        const double stageComputeMs = stageComputeMaxMs[stageIndex];
         tokenTpot += stageMs;
         StageWindowStats &st = rt.window.stages[stageIndex];
         st.stageTotalMs += stageMs;
+        st.stageComputeMs += stageComputeMs;
         st.boundaryCommMs += stageBoundaryMs[stageIndex];
+        st.leftBoundaryLayerMs += stageLeftBoundaryMaxMs[stageIndex];
+        st.rightBoundaryLayerMs += stageRightBoundaryMaxMs[stageIndex];
         st.samples += 1u;
         const std::map<uint32_t, double> &nodes = nodeMs[stageIndex];
         for (std::map<uint32_t, double>::const_iterator nit = nodes.begin(); nit != nodes.end(); ++nit) {
             NodeWindowStats &nw = st.nodes[nit->first];
             nw.totalMs += nit->second;
+            nw.computeMs += nodeComputeMs[stageIndex][nit->first];
             nw.samples += 1u;
         }
     }
@@ -336,11 +367,15 @@ static void finalizeWindow(WindowSummary &w) {
         StageWindowStats &st = it->second;
         if (st.samples == 0u) continue;
         st.stageTotalMs /= (double)st.samples;
+        st.stageComputeMs /= (double)st.samples;
         st.boundaryCommMs /= (double)st.samples;
+        st.leftBoundaryLayerMs /= (double)st.samples;
+        st.rightBoundaryLayerMs /= (double)st.samples;
         for (std::map<uint32_t, NodeWindowStats>::iterator nit = st.nodes.begin(); nit != st.nodes.end(); ++nit) {
             NodeWindowStats &nw = nit->second;
             if (nw.samples == 0u) continue;
             nw.totalMs /= (double)nw.samples;
+            nw.computeMs /= (double)nw.samples;
             nw.attnMs = nw.attnMs > 0.0 ? nw.attnMs / (double)nw.samples : 0.0;
             nw.ffnMs = nw.ffnMs > 0.0 ? nw.ffnMs / (double)nw.samples : 0.0;
         }
@@ -420,8 +455,10 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
         std::map<uint32_t, StageWindowStats>::const_iterator wit = window.stages.find(stage.stageIndex);
         if (wit != window.stages.end()) {
             const StageWindowStats &ws = wit->second;
-            stage.stageTimeMs = ws.stageTotalMs;
+            stage.stageTimeMs = ws.stageComputeMs > 0.0 ? ws.stageComputeMs : ws.stageTotalMs;
             stage.boundaryCommMs = ws.boundaryCommMs;
+            stage.leftBoundaryLayerMs = ws.leftBoundaryLayerMs;
+            stage.rightBoundaryLayerMs = ws.rightBoundaryLayerMs;
         }
 
         StageEwma &ewma = rt.ewmaByStage[stage.stageIndex];
@@ -448,7 +485,7 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
             if (wit != window.stages.end()) {
                 std::map<uint32_t, NodeWindowStats>::const_iterator nit = wit->second.nodes.find(nodeIndex);
                 if (nit != wit->second.nodes.end()) {
-                    node.timeMs = nit->second.totalMs;
+                    node.timeMs = nit->second.computeMs > 0.0 ? nit->second.computeMs : nit->second.totalMs;
                     node.attnMs = nit->second.attnMs;
                     node.ffnMs = nit->second.ffnMs;
                 }

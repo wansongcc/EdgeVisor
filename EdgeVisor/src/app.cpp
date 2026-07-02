@@ -1825,6 +1825,29 @@ static bool stageContainsNodeLocal(const NnStageConfig *stage, NnUint nodeIndex)
     return false;
 }
 
+static NnUint layerComputeUsFromExecution(const NnNetExecution *execution, NnUint layerIndex) {
+    if (execution == nullptr || execution->layerPerf == nullptr) return 0u;
+    const NnNetExecution::LayerPerfState *lp = execution->layerPerf;
+    if (layerIndex >= lp->nLayers) return 0u;
+    const unsigned long long total = lp->attnUs[layerIndex] + lp->ffnUs[layerIndex];
+    return (NnUint)std::min<unsigned long long>(total, (unsigned long long)UINT32_MAX);
+}
+
+static void fillBoundaryLayerPerfPacket(
+    LlmPerfPacket &packet,
+    const NnUnevenPartitionPlan *plan,
+    NnUint nodeIndex,
+    const NnNetExecution *execution) {
+    const NnStageConfig *stage = findStageForNodeLocal(plan, nodeIndex);
+    if (stage == nullptr || stage->nLayers == 0u) return;
+    const NnUint leftLayer = stage->startLayer;
+    const NnUint rightLayer = stage->endLayer > stage->startLayer
+        ? (stage->endLayer - 1u)
+        : (stage->startLayer + stage->nLayers - 1u);
+    packet.leftBoundaryLayerUs = layerComputeUsFromExecution(execution, leftLayer);
+    packet.rightBoundaryLayerUs = layerComputeUsFromExecution(execution, rightLayer);
+}
+
 static bool areNodesInSameStageLocal(const NnUnevenPartitionPlan *plan, NnUint nodeA, NnUint nodeB) {
     if (plan == nullptr) return nodeA == nodeB;
     const NnStageConfig *stageA = findStageForNodeLocal(plan, nodeA);
@@ -3083,6 +3106,7 @@ LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
     rootPacket.bubbleSkippedSyncs = lastBubbleShadowStats.skippedSyncSteps;
     rootPacket.bubbleDrainUs = lastBubbleShadowStats.drainUs;
     rootPacket.bubbleCompleted = lastBubbleShadowStats.completed;
+    fillBoundaryLayerPerfPacket(rootPacket, plan, 0u, execution);
     return rootPacket;
 }
 
@@ -4846,6 +4870,7 @@ void runWorkerApp(AppCliArgs *args) {
                         p.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
                         p.execUs = 0u;
                         p.syncUs = 0u;
+                        fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                         network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
                     }
                     isFirstAttempt = true;
@@ -4880,6 +4905,7 @@ void runWorkerApp(AppCliArgs *args) {
                     p.bubbleSkippedSyncs = bubbleStats.skippedSyncSteps;
                     p.bubbleDrainUs = bubbleStats.drainUs;
                     p.bubbleCompleted = bubbleStats.completed;
+                    fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                     network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
                 }
                 inference.maybeSendLastStageSampledToken(planPtr.get());

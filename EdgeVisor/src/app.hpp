@@ -238,6 +238,8 @@ typedef struct {
     NnUint bubbleSkippedSyncs;
     NnUint bubbleDrainUs;
     NnUint bubbleCompleted;
+    NnUint leftBoundaryLayerUs;
+    NnUint rightBoundaryLayerUs;
 } LlmPerfPacket;
 
 // Bootstrap settings sent from root to worker after socket connect and before

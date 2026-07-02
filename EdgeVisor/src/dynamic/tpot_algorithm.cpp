@@ -71,6 +71,16 @@ static double migrationCostPerToken(double costMs, int expectedRemainingTokens) 
     return costMs / (double)denom;
 }
 
+static double ppBoundaryDeltaOutMs(const StageSnapshot &source, const StageSnapshot &target, const SchedulerConfig &cfg) {
+    double measured = 0.0;
+    if (target.stageIndex > source.stageIndex) {
+        measured = source.rightBoundaryLayerMs;
+    } else {
+        measured = source.leftBoundaryLayerMs;
+    }
+    return measured > 0.0 ? measured : ppDeltaOutMs(source, cfg);
+}
+
 Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double currentTpotMs, const SchedulerConfig &cfg) {
     if (stages.size() < 2u) return makeRejected(CandidateKind::PP_MOVE, "need at least two stages");
 
@@ -94,7 +104,7 @@ Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double curre
             if (!target.hasFullWeights) continue;
 
             const double gain =
-                ppDeltaOutMs(source, cfg) -
+                ppBoundaryDeltaOutMs(source, target, cfg) -
                 ppDeltaInMs(target, cfg) -
                 target.boundaryCommMs -
                 migCost -

@@ -180,7 +180,7 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
 dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.hpp %.h, $^) -o $@ $(LIBS)
 
 # --- (您的新测试目标) ---
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 

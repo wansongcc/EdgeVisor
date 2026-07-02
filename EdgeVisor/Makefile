@@ -166,6 +166,10 @@ ablation.o: src/ablation.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 dynamic-layer.o: src/dynamic/dynamic_layer.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+tpot-algorithm.o: src/dynamic/tpot_algorithm.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+dynamic-tpot.o: src/dynamic/dynamic_tpot.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 kv-collector.o: src/dynamic/kv_collector.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 plan-command.o: src/plan-command.cpp
@@ -175,11 +179,14 @@ plan-controller.o: src/plan-controller.cpp
 tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o nn-cpu-ops.o tokenizer.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
+dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
 # --- (您的新测试目标) ---
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
-worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}
+worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o ablation.o ${DEPS}
@@ -188,13 +195,13 @@ Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-netwo
 pointer-swizzling-microbench: src/test/pointer_swizzling_microbench.cpp nn-quants.o nn-core.o nn-executor.o nn-cpu.o nn-cpu-ops.o llamafile-sgemm.o plan-command.o ablation.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}
+dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-dllama-api: src/dllama-api.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o kv-collector.o ${DEPS}
+dllama-api: src/dllama-api.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o kv-collector.o ${DEPS}
+uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 # Include auto-generated dependency files (created by -MMD).

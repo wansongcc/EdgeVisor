@@ -684,6 +684,9 @@ void PlanUdsController::run() {
                     pp["enabled"] = inference_->isPpMigrationEnabled();
                     pp["layerCount"] = inference_->getMigrationLayerCount();
                     pp["layerListPinnedByEnv"] = inference_->isMigrationLayerListPinnedByEnv();
+                    pp["ackSeen"] = inference_->hasMigrationAck();
+                    pp["ackPos"] = inference_->getMigrationAckPos();
+                    pp["ackLayer"] = inference_->getMigrationAckLayer();
                     json layers = json::array();
                     for (NnUint layer : inference_->getMigrationLayers()) {
                         layers.push_back(layer);

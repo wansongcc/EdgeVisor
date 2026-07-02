@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include "nn-executor.hpp"
 #include "nn-cpu.hpp"
@@ -159,6 +160,101 @@ static bool isBubbleShadowKvEnabledForExecutor() {
 
 static bool isBubbleShadowKvAsyncEnabledForExecutor() {
     return isBubbleShadowKvEnabledForExecutor() && parseEnvBoolOr("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", true);
+}
+
+static long parseEnvLongOr(const char *name, long fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    char *end = nullptr;
+    const long out = std::strtol(v, &end, 10);
+    if (end == v) return fallback;
+    return out;
+}
+
+static NnByte parseSegmentKindNameOrAny(const char *v) {
+    if (v == nullptr || v[0] == '\0' || std::strcmp(v, "any") == 0) return 255u;
+    if (std::strcmp(v, "attn") == 0) return SEG_KIND_ATTN;
+    if (std::strcmp(v, "ffn") == 0) return SEG_KIND_FFN;
+    if (std::strcmp(v, "other") == 0) return SEG_KIND_OTHER;
+    return 255u;
+}
+
+static NnByte parseSegmentRoleNameOrAny(const char *v) {
+    if (v == nullptr || v[0] == '\0' || std::strcmp(v, "any") == 0) return 255u;
+    if (std::strcmp(v, "primary") == 0) return SEG_ROLE_PRIMARY;
+    if (std::strcmp(v, "redundant") == 0) return SEG_ROLE_REDUNDANT;
+    if (std::strcmp(v, "shadow-kv") == 0) return SEG_ROLE_SHADOW_KV;
+    if (std::strcmp(v, "shifted-pp-start") == 0) return SEG_ROLE_SHIFTED_PP_START;
+    if (std::strcmp(v, "unguarded") == 0) return SEG_ROLE_UNGUARDED;
+    return 255u;
+}
+
+struct TestComputeDelayConfig {
+    bool enabled = false;
+    bool decodeOnly = true;
+    long node = -1;
+    long layer = -1;
+    long minPos = -1;
+    long afterDecodeTokens = -1;
+    long delayUs = 0;
+    NnByte kind = 255u;
+    NnByte role = 255u;
+};
+
+static const TestComputeDelayConfig &testComputeDelayConfig() {
+    static const TestComputeDelayConfig cfg = []() {
+        TestComputeDelayConfig c;
+        c.delayUs = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_US", 0);
+        c.enabled = c.delayUs > 0;
+        c.decodeOnly = parseEnvBoolOr("DLLAMA_TEST_COMPUTE_DELAY_DECODE_ONLY", true);
+        c.node = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_NODE", -1);
+        c.layer = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_LAYER", -1);
+        c.minPos = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_MIN_POS", -1);
+        c.afterDecodeTokens = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS", -1);
+        c.kind = parseSegmentKindNameOrAny(std::getenv("DLLAMA_TEST_COMPUTE_DELAY_KIND"));
+        c.role = parseSegmentRoleNameOrAny(std::getenv("DLLAMA_TEST_COMPUTE_DELAY_ROLE"));
+        return c;
+    }();
+    return cfg;
+}
+
+static bool testComputeDelayDecodeWindowReady(const TestComputeDelayConfig &cfg, const NnExecutorContext *context) {
+    static std::atomic<bool> sawPrefillBatch(false);
+    static std::atomic<long> decodeStartPos(-1);
+    if (context == nullptr) return false;
+    if (!cfg.decodeOnly) return true;
+    if (context->batchSize > 1u) {
+        sawPrefillBatch.store(true, std::memory_order_relaxed);
+        return false;
+    }
+    if (context->batchSize != 1u) return false;
+    if (cfg.afterDecodeTokens < 0) return true;
+    if (!sawPrefillBatch.load(std::memory_order_relaxed)) return false;
+
+    long start = decodeStartPos.load(std::memory_order_relaxed);
+    if (start < 0) {
+        long expected = -1;
+        decodeStartPos.compare_exchange_strong(expected, (long)context->position, std::memory_order_relaxed);
+        start = decodeStartPos.load(std::memory_order_relaxed);
+    }
+    return (long)context->position >= start + cfg.afterDecodeTokens;
+}
+
+static bool shouldInjectTestComputeDelay(const NnExecutorStep *step, const NnExecutorThread *thread, const NnExecutorContext *context) {
+    const TestComputeDelayConfig &cfg = testComputeDelayConfig();
+    if (!cfg.enabled || step == nullptr || thread == nullptr || context == nullptr) return false;
+    if (step->type != STEP_EXECUTE_OP || step->arg0 != 0u) return false;
+    if (!testComputeDelayDecodeWindowReady(cfg, context)) return false;
+    if (cfg.minPos >= 0 && (long)context->position < cfg.minPos) return false;
+    if (cfg.node >= 0 && (long)context->nodeIndex != cfg.node) return false;
+    if (step->segmentIndex >= context->nSegments) return false;
+    if (context->segmentLayerIndex == nullptr || context->segmentKinds == nullptr || context->segmentRuntimeRoles == nullptr) return false;
+
+    const int layer = context->segmentLayerIndex[step->segmentIndex];
+    if (cfg.layer >= 0 && layer != (int)cfg.layer) return false;
+    if (cfg.kind != 255u && context->segmentKinds[step->segmentIndex] != cfg.kind) return false;
+    if (cfg.role != 255u && context->segmentRuntimeRoles[step->segmentIndex] != cfg.role) return false;
+    return true;
 }
 
 static std::unordered_set<NnUint> parseLayerSetEnv(const char *name) {
@@ -368,6 +464,7 @@ NnNetExecution::NnNetExecution(NnUint nThreads, NnNetConfig *netConfig) {
     this->nBatches = netConfig->nBatches;
     this->nPipes = netConfig->nPipes;
     this->batchSize = 0; // This value must be overwritten before calling forward
+    this->position = 0;
 
     pipes = new NnByte *[netConfig->nPipes];
     for (NnUint pipeIndex = 0; pipeIndex < netConfig->nPipes; pipeIndex++) {
@@ -393,6 +490,10 @@ NnNetExecution::~NnNetExecution() {
 void NnNetExecution::setBatchSize(NnUint batchSize) {
     assert(batchSize <= nBatches);
     this->batchSize = batchSize;
+}
+
+void NnNetExecution::setPosition(NnUint position) {
+    this->position = position;
 }
 
 NnExecutorDevice::NnExecutorDevice(NnDevice *device, int segmentFrom, int segmentTo) {
@@ -550,6 +651,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.segmentLayerIndex = segmentLayerIndex.empty() ? nullptr : segmentLayerIndex.data();
     context.segmentHasExecOps = segmentHasExecOps.empty() ? nullptr : segmentHasExecOps.data();
     context.nSegments = (this->nodeConfig != nullptr) ? this->nodeConfig->nSegments : 0u;
+    context.nodeIndex = (this->nodeConfig != nullptr) ? this->nodeConfig->nodeIndex : 0u;
     context.syncProfile = &lastSyncProfile;
     context.segmentSyncProfileKinds = segmentSyncProfileKinds.empty() ? nullptr : segmentSyncProfileKinds.data();
     context.owner = this;
@@ -557,6 +659,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.doneThreadCount.store(0u);
     context.isAlive.store(false);
     context.batchSize = 0u;
+    context.position = 0u;
     if (benchmark)
         context.timer = new Timer();
     else
@@ -628,6 +731,11 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
         if (!enabled) {
             return;
         }
+    }
+
+    if (shouldInjectTestComputeDelay(step, thread, context)) {
+        const long delayUs = testComputeDelayConfig().delayUs;
+        std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
     }
 
     if (isThread0 && context != nullptr && context->owner != nullptr) {
@@ -731,6 +839,7 @@ void NnExecutor::forward() {
     context.currentStepIndex.exchange(0);
     context.doneThreadCount.exchange(0);
     context.batchSize = netExecution->batchSize;
+    context.position = netExecution->position;
 
     joinBubbleShadowAsync();
     resetBubbleShadowStateForForward();

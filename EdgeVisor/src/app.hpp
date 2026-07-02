@@ -418,6 +418,7 @@ private:
     bool collectSourceStageKvTransfers(NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
+    void resetPendingKvMigrationState(const char *reason);
     bool sendPendingLayerSwitchControlOnly();
     void maybeEnableShiftedPpStartForSourceStage(
         const std::vector<NnUint> &switchLayers,

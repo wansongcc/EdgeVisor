@@ -2,6 +2,7 @@
 #include "nn/io-profile.hpp"
 #include "plan-controller.hpp"
 #include "dynamic/dynamic_layer.hpp"
+#include "dynamic/dynamic_tpot.hpp"
 #include "dynamic/kv_collector.hpp"
 #include <cassert>
 #include <cstring>
@@ -218,7 +219,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.magic = LLM_BOOTSTRAP_MAGIC;
     p.version = LLM_BOOTSTRAP_VERSION;
     p.flags = 0u;
-    p.benchmarkEnabled = args->benchmark ? 1u : 0u;
+    p.benchmarkEnabled = (args->benchmark || envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false)) ? 1u : 0u;
     p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
     p.enableStageFullWeights = args->enableStageFullWeights ? 1u : 0u;
     p.enableKvRedundancyDuringMigration = args->enableKvRedundancyDuringMigration ? 1u : 0u;
@@ -2051,6 +2052,7 @@ void RootLlmInference::setPosition(NnUint position) {
     assert(position >= 0);
     assert(position + execution->batchSize - 1 < header->seqLen);
 
+    execution->setPosition(position);
     controlPacket.position = position;
     batchMetadataDirty = false;
     for (NnUint i = 0; i < execution->batchSize; i++) {
@@ -2062,7 +2064,10 @@ void RootLlmInference::setPosition(NnUint position) {
 void RootLlmInference::setPosition(NnUint batchIndex, NnUint position) {
     assert(batchIndex < execution->batchSize);
     assert(position < header->seqLen);
-    if (batchIndex == 0u) controlPacket.position = position;
+    if (batchIndex == 0u) {
+        execution->setPosition(position);
+        controlPacket.position = position;
+    }
     positionPipe[batchIndex] = (float)position;
     if (position != controlPacket.position + batchIndex) batchMetadataDirty = true;
 }
@@ -2250,6 +2255,87 @@ bool RootLlmInference::submitBoundaryKvTransfer(NnUint layerIndex, NnUint positi
     return submitBoundaryKvTransferDetailed(layerIndex, position, kRow, vRow) == KV_TRANSFER_SUBMIT_OK;
 }
 
+
+void RootLlmInference::resetPendingKvMigrationState(const char *reason) {
+    {
+        std::lock_guard<std::mutex> lk(kvTransferMutex);
+        pendingKvTransfers.clear();
+        waitingKvAck = false;
+        waitingKvAckExpectedCount = 0u;
+        waitingKvAckLayers.clear();
+        waitingKvAckReceivedCount = 0u;
+        waitingKvAckReceivedLayers.clear();
+        waitingKvAckNodes.clear();
+        waitingKvAckNodeExpected.clear();
+        waitingKvAckNodeReceived.clear();
+        pendingLayerSwitchLayers.clear();
+    }
+    if (reason != nullptr && reason[0] != '\0') {
+        std::printf("WARN [kv-migrate] abort pending migration: %s\n", reason);
+        std::fflush(stdout);
+    }
+}
+
+static bool isLikelyPerfPacketPrefix(
+    NnUint position,
+    NnUint batchSize,
+    NnUint nodeIndex,
+    NnUint stageIndex,
+    NnUint expectedNode,
+    const LlmHeader *header,
+    const NnUnevenPartitionPlan *plan) {
+    if (batchSize == 0u || batchSize > 1024u) return false;
+    if (nodeIndex != expectedNode) return false;
+    if (header != nullptr && header->seqLen > 0u && position >= header->seqLen) return false;
+    if (plan != nullptr && plan->nStages > 0u && stageIndex >= plan->nStages) return false;
+    return true;
+}
+
+static bool isLikelyPerfPrefixFromExportHeader(
+    const LlmKvExportResponseHeader &resp,
+    NnUint expectedNode,
+    const LlmHeader *header,
+    const NnUnevenPartitionPlan *plan) {
+    return isLikelyPerfPacketPrefix(
+        resp.magic,
+        resp.version,
+        resp.requestId,
+        resp.fromNodeIndex,
+        expectedNode,
+        header,
+        plan);
+}
+
+static bool isLikelyPerfPrefixFromAckHeader(
+    const LlmKvAckBatchHeader &ack,
+    NnUint expectedNode,
+    const LlmHeader *header,
+    const NnUnevenPartitionPlan *plan) {
+    return isLikelyPerfPacketPrefix(
+        ack.magic,
+        ack.version,
+        ack.count,
+        ack.reserved,
+        expectedNode,
+        header,
+        plan);
+}
+
+static void drainPerfPacketTailAfterPrefix(
+    NnNetwork *network,
+    NnUint socketIndex,
+    NnSize prefixBytes,
+    const char *waitKind,
+    NnUint node) {
+    if (network == nullptr || prefixBytes >= sizeof(LlmPerfPacket)) return;
+    std::vector<char> discard((size_t)(sizeof(LlmPerfPacket) - prefixBytes));
+    network->read(socketIndex, discard.data(), (NnSize)discard.size());
+    std::printf("WARN [kv-migrate] drained stray profile packet before %s from node=%u\n",
+        waitKind != nullptr ? waitKind : "control response",
+        (unsigned)node);
+    std::fflush(stdout);
+}
+
 bool RootLlmInference::collectSourceStageKvTransfers(
     NnUint endPos,
     NnUint *exportedRows,
@@ -2360,32 +2446,70 @@ bool RootLlmInference::collectSourceStageKvTransfers(
 
             LlmKvExportResponseHeader resp{};
             network->read((NnUint)socketIndex, &resp, sizeof(resp));
+            for (int skippedPerf = 0;
+                 skippedPerf < 4 &&
+                 (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
+                  resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
+                  resp.requestId != requestId ||
+                  resp.fromNodeIndex != node) &&
+                 isLikelyPerfPrefixFromExportHeader(resp, node, header, plan);
+                 ++skippedPerf) {
+                drainPerfPacketTailAfterPrefix(network, (NnUint)socketIndex, sizeof(resp), "kv export response", node);
+                network->read((NnUint)socketIndex, &resp, sizeof(resp));
+            }
             if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
                 resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
                 resp.requestId != requestId ||
                 resp.fromNodeIndex != node) {
-                std::printf("⚠️  [kv-export-response] bad header from node=%u magic=0x%08x version=%u request=%u rows=%u\n",
+                std::printf("⚠️  [kv-export-response] bad header from node=%u magic=0x%08x version=%u request=%u rows=%u; abort migration\n",
                     (unsigned)node,
                     (unsigned)resp.magic,
                     (unsigned)resp.version,
                     (unsigned)resp.requestId,
                     (unsigned)resp.rowCount);
                 std::fflush(stdout);
-                continue;
+                return false;
+            }
+            const uint64_t maxResponseRows = (uint64_t)migrationLayers.size() * ((uint64_t)endPos + 1ull);
+            if ((uint64_t)resp.rowCount > maxResponseRows) {
+                std::printf("⚠️  [kv-export-response] excessive rows from node=%u rows=%u max=%llu; abort migration\n",
+                    (unsigned)node,
+                    (unsigned)resp.rowCount,
+                    (unsigned long long)maxResponseRows);
+                std::fflush(stdout);
+                return false;
             }
             rxBytes += sizeof(resp);
+            bool remoteOk = true;
             for (NnUint i = 0u; i < resp.rowCount; ++i) {
                 LlmKvTransferHeader hdr{};
                 network->read((NnUint)socketIndex, &hdr, sizeof(hdr));
-                if (hdr.magic != LLM_KV_TRANSFER_MAGIC ||
-                    hdr.version != LLM_KV_TRANSFER_VERSION ||
-                    hdr.kvDim != kvDim ||
+                const bool headerMagicOk =
+                    hdr.magic == LLM_KV_TRANSFER_MAGIC &&
+                    hdr.version == LLM_KV_TRANSFER_VERSION;
+                if (!headerMagicOk) {
+                    std::printf("⚠️  [kv-export-response] bad row header from node=%u row=%u magic=0x%08x version=%u; abort migration\n",
+                        (unsigned)node,
+                        (unsigned)i,
+                        (unsigned)hdr.magic,
+                        (unsigned)hdr.version);
+                    std::fflush(stdout);
+                    return false;
+                }
+                if (hdr.kvDim != kvDim ||
                     hdr.rangeLen != 0u ||
                     hdr.fromNodeIndex != node) {
-                    if (hdr.kvDim > 0u) {
-                        std::vector<float> discard((size_t)hdr.kvDim * 2u);
-                        network->read((NnUint)socketIndex, discard.data(), discard.size() * sizeof(float));
-                    }
+                    std::printf("⚠️  [kv-export-response] invalid row from node=%u row=%u kvDim=%u rangeLen=%u from=%u; abort after drain\n",
+                        (unsigned)node,
+                        (unsigned)i,
+                        (unsigned)hdr.kvDim,
+                        (unsigned)hdr.rangeLen,
+                        (unsigned)hdr.fromNodeIndex);
+                    std::fflush(stdout);
+                    if (hdr.kvDim == 0u || hdr.kvDim > kvDim) return false;
+                    std::vector<float> discard((size_t)hdr.kvDim * 2u);
+                    network->read((NnUint)socketIndex, discard.data(), discard.size() * sizeof(float));
+                    remoteOk = false;
                     continue;
                 }
                 std::vector<float> kRow(kvDim);
@@ -2394,6 +2518,7 @@ bool RootLlmInference::collectSourceStageKvTransfers(
                 network->read((NnUint)socketIndex, vRow.data(), vRow.size() * sizeof(float));
                 mergeRow(node, hdr.layerIndex, hdr.position, kRow, vRow);
             }
+            if (!remoteOk) return false;
             std::printf("🧩 [kv-export-response] requestId=%u sourceNode=%u rowCount=%u exportedRows=%u\n",
                 (unsigned)requestId,
                 (unsigned)node,
@@ -2484,6 +2609,7 @@ bool RootLlmInference::collectHeadKvTransfers(
 
     uint64_t rxBytes = 0u;
     NnUint exported = 0u;
+    bool remoteOk = true;
 
     if (fromNode == 0u) {
         for (NnUint layer : layers) {
@@ -2544,6 +2670,17 @@ bool RootLlmInference::collectHeadKvTransfers(
 
         LlmKvExportResponseHeader resp{};
         network->read((NnUint)socketIndex, &resp, sizeof(resp));
+        for (int skippedPerf = 0;
+             skippedPerf < 4 &&
+             (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
+              resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
+              resp.requestId != requestId ||
+              resp.fromNodeIndex != fromNode) &&
+             isLikelyPerfPrefixFromExportHeader(resp, fromNode, header, plan);
+             ++skippedPerf) {
+            drainPerfPacketTailAfterPrefix(network, (NnUint)socketIndex, sizeof(resp), "head kv export response", fromNode);
+            network->read((NnUint)socketIndex, &resp, sizeof(resp));
+        }
         if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
             resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
             resp.requestId != requestId ||
@@ -2554,6 +2691,15 @@ bool RootLlmInference::collectHeadKvTransfers(
                 (unsigned)resp.version,
                 (unsigned)resp.requestId,
                 (unsigned)resp.rowCount);
+            std::fflush(stdout);
+            return false;
+        }
+        const uint64_t maxResponseRows = (uint64_t)layers.size() * ((uint64_t)endPos + 1ull);
+        if ((uint64_t)resp.rowCount > maxResponseRows) {
+            std::printf("⚠️  [head-kv-export-response] excessive rows from node=%u rows=%u max=%llu; abort migration\n",
+                (unsigned)fromNode,
+                (unsigned)resp.rowCount,
+                (unsigned long long)maxResponseRows);
             std::fflush(stdout);
             return false;
         }
@@ -2568,11 +2714,28 @@ bool RootLlmInference::collectHeadKvTransfers(
                 hdr.rangeStart == rangeStart &&
                 hdr.rangeLen == rangeLen &&
                 hdr.fromNodeIndex == fromNode;
+            if (hdr.magic != LLM_KV_TRANSFER_MAGIC || hdr.version != LLM_KV_TRANSFER_VERSION) {
+                std::printf("⚠️  [head-kv-export-response] bad row header from node=%u row=%u magic=0x%08x version=%u; abort migration\n",
+                    (unsigned)fromNode,
+                    (unsigned)i,
+                    (unsigned)hdr.magic,
+                    (unsigned)hdr.version);
+                std::fflush(stdout);
+                return false;
+            }
             if (!okHeader) {
-                if (hdr.kvDim > 0u) {
-                    std::vector<float> discard((size_t)hdr.kvDim * 2u);
-                    network->read((NnUint)socketIndex, discard.data(), discard.size() * sizeof(float));
-                }
+                std::printf("⚠️  [head-kv-export-response] invalid row from node=%u row=%u kvDim=%u range=[%u,%u) from=%u; abort after drain\n",
+                    (unsigned)fromNode,
+                    (unsigned)i,
+                    (unsigned)hdr.kvDim,
+                    (unsigned)hdr.rangeStart,
+                    (unsigned)(hdr.rangeStart + hdr.rangeLen),
+                    (unsigned)hdr.fromNodeIndex);
+                std::fflush(stdout);
+                if (hdr.kvDim == 0u || hdr.kvDim > header->kvDim) return false;
+                std::vector<float> discard((size_t)hdr.kvDim * 2u);
+                network->read((NnUint)socketIndex, discard.data(), discard.size() * sizeof(float));
+                remoteOk = false;
                 continue;
             }
             PartialRow row;
@@ -2587,6 +2750,8 @@ bool RootLlmInference::collectHeadKvTransfers(
             rxBytes += (uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)rangeLen * sizeof(float) * 2ull;
         }
     }
+
+    if (!remoteOk) return false;
 
     NnUint queued = 0u;
     for (const PartialRow &row : rows) {
@@ -2617,156 +2782,233 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
     if (targetTransferBytes != nullptr) *targetTransferBytes = 0u;
     if (network == nullptr) return false;
 
-    bool sentAny = false;
+    static constexpr unsigned long KV_ACK_READ_MAX_ATTEMPTS = 20000ul;
+
     uint64_t bytes = 0u;
-    for (int guard = 0; guard < 10000; ++guard) {
-        bool sendKvTransfer = false;
-        std::vector<PendingKvTransferItem> kvTransfers;
-        {
-            std::lock_guard<std::mutex> lk(kvTransferMutex);
-            if (!pendingKvTransfers.empty() && !waitingKvAck) {
-                sendKvTransfer = true;
-                kvTransfers = pendingKvTransfers;
-                pendingKvTransfers.clear();
-                waitingKvAck = true;
-                waitingKvAckExpectedCount = (NnUint)kvTransfers.size();
-                waitingKvAckLayers.clear();
-                waitingKvAckReceivedCount = 0u;
-                waitingKvAckReceivedLayers.clear();
-                waitingKvAckNodes.clear();
-                waitingKvAckNodeExpected.clear();
-                waitingKvAckNodeReceived.clear();
-                for (const auto &it : kvTransfers) {
-                    appendUniqueLayer(waitingKvAckLayers, it.header.layerIndex);
-                    const NnUint targetNode = it.header.targetNodeIndex;
-                    if (targetNode == 0u) continue;
-                    auto itNode = std::find(waitingKvAckNodes.begin(), waitingKvAckNodes.end(), targetNode);
-                    if (itNode == waitingKvAckNodes.end()) {
-                        waitingKvAckNodes.push_back(targetNode);
-                        waitingKvAckNodeExpected.push_back(1u);
-                        waitingKvAckNodeReceived.push_back(0u);
-                    } else {
-                        const size_t idx = (size_t)(itNode - waitingKvAckNodes.begin());
-                        waitingKvAckNodeExpected[idx] += 1u;
-                    }
-                }
-                std::sort(waitingKvAckLayers.begin(), waitingKvAckLayers.end());
+    std::vector<PendingKvTransferItem> kvTransfers;
+    {
+        std::lock_guard<std::mutex> lk(kvTransferMutex);
+        if (pendingKvTransfers.empty() || waitingKvAck) return false;
+
+        kvTransfers = pendingKvTransfers;
+        pendingKvTransfers.clear();
+        waitingKvAck = true;
+        waitingKvAckExpectedCount = (NnUint)kvTransfers.size();
+        waitingKvAckLayers.clear();
+        waitingKvAckReceivedCount = 0u;
+        waitingKvAckReceivedLayers.clear();
+        waitingKvAckNodes.clear();
+        waitingKvAckNodeExpected.clear();
+        waitingKvAckNodeReceived.clear();
+        for (const auto &it : kvTransfers) {
+            appendUniqueLayer(waitingKvAckLayers, it.header.layerIndex);
+            const NnUint targetNode = it.header.targetNodeIndex;
+            if (targetNode == 0u) continue;
+            auto itNode = std::find(waitingKvAckNodes.begin(), waitingKvAckNodes.end(), targetNode);
+            if (itNode == waitingKvAckNodes.end()) {
+                waitingKvAckNodes.push_back(targetNode);
+                waitingKvAckNodeExpected.push_back(1u);
+                waitingKvAckNodeReceived.push_back(0u);
+            } else {
+                const size_t idx = (size_t)(itNode - waitingKvAckNodes.begin());
+                waitingKvAckNodeExpected[idx] += 1u;
             }
         }
+        std::sort(waitingKvAckLayers.begin(), waitingKvAckLayers.end());
+    }
 
-        if (sendKvTransfer) {
-            LlmControlPacket out = controlPacket;
-            out.flags = LLM_CTRL_HAS_KV_TRANSFER | LLM_CTRL_CONTROL_ONLY;
-            out.batchSize = 1u;
-            out.planCmdSeq = 0u;
-            logRootControlSend(out);
-            network->writeAll(&out, sizeof(LlmControlPacket));
+    auto fail = [&](const char *reason) -> bool {
+        resetPendingKvMigrationState(reason);
+        if (targetTransferBytes != nullptr) *targetTransferBytes = bytes;
+        return false;
+    };
 
-            LlmKvTransferBatchHeader bh{};
-            bh.magic = LLM_KV_TRANSFER_BATCH_MAGIC;
-            bh.version = LLM_KV_TRANSFER_BATCH_VERSION;
-            bh.count = (NnUint)kvTransfers.size();
-            bh.reserved = 0u;
-            network->writeAll(&bh, sizeof(bh));
-            bytes += (uint64_t)network->nSockets * ((uint64_t)sizeof(LlmControlPacket) + (uint64_t)sizeof(bh));
-            for (const auto &it : kvTransfers) {
-                network->writeAll(&it.header, sizeof(LlmKvTransferHeader));
-                network->writeAll(it.kRow.data(), it.kRow.size() * sizeof(float));
-                network->writeAll(it.vRow.data(), it.vRow.size() * sizeof(float));
-                bytes += (uint64_t)network->nSockets *
-                    ((uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)it.kRow.size() * sizeof(float) + (uint64_t)it.vRow.size() * sizeof(float));
-            }
-            sentAny = true;
+    std::map<NnUint, std::vector<const PendingKvTransferItem *>> transfersByTarget;
+    for (const auto &it : kvTransfers) {
+        if (it.header.targetNodeIndex == 0u) continue;
+        transfersByTarget[it.header.targetNodeIndex].push_back(&it);
+    }
+    if (transfersByTarget.empty()) {
+        return fail("no remote target nodes for kv transfer");
+    }
+
+    LlmControlPacket out = controlPacket;
+    out.flags = LLM_CTRL_HAS_KV_TRANSFER | LLM_CTRL_CONTROL_ONLY;
+    out.batchSize = 1u;
+    out.planCmdSeq = 0u;
+
+    for (const auto &entry : transfersByTarget) {
+        const NnUint targetNode = entry.first;
+        const int socketIndex = network->getSocketIndexForNode(targetNode, 0u);
+        if (socketIndex < 0) {
+            std::printf("⚠️  [kv-migrate] missing socket for target node=%u; abort migration\n",
+                (unsigned)targetNode);
+            std::fflush(stdout);
+            return fail("missing target socket");
         }
 
-        if (!waitingKvAck) break;
+        logRootControlSend(out);
+        network->write((NnUint)socketIndex, &out, sizeof(LlmControlPacket));
 
-        const NnStageConfig *targetStage = findStageForNodeLocal(plan, nextStageRootNode);
-        NnUint validAckCountInc = 0u;
-        std::vector<NnUint> ackedLayersInc;
-        std::vector<NnUint> nodeAckInc(waitingKvAckNodes.size(), 0u);
-        NnUint ackPos = 0u;
-        bool ackPosSet = false;
+        LlmKvTransferBatchHeader bh{};
+        bh.magic = LLM_KV_TRANSFER_BATCH_MAGIC;
+        bh.version = LLM_KV_TRANSFER_BATCH_VERSION;
+        bh.count = (NnUint)entry.second.size();
+        bh.reserved = 0u;
+        network->write((NnUint)socketIndex, &bh, sizeof(bh));
+        bytes += (uint64_t)sizeof(LlmControlPacket) + (uint64_t)sizeof(bh);
 
-        for (size_t ni = 0u; ni < waitingKvAckNodes.size(); ++ni) {
-            if (ni >= waitingKvAckNodeExpected.size() || ni >= waitingKvAckNodeReceived.size()) continue;
-            if (waitingKvAckNodeReceived[ni] >= waitingKvAckNodeExpected[ni]) continue;
-            const NnUint ackNode = waitingKvAckNodes[ni];
-            const int socketIndex = network->getSocketIndexForNode(ackNode, 0u);
-            if (socketIndex < 0) continue;
+        for (const PendingKvTransferItem *item : entry.second) {
+            const PendingKvTransferItem &it = *item;
+            network->write((NnUint)socketIndex, &it.header, sizeof(LlmKvTransferHeader));
+            network->write((NnUint)socketIndex, it.kRow.data(), it.kRow.size() * sizeof(float));
+            network->write((NnUint)socketIndex, it.vRow.data(), it.vRow.size() * sizeof(float));
+            bytes += (uint64_t)sizeof(LlmKvTransferHeader) +
+                (uint64_t)it.kRow.size() * sizeof(float) +
+                (uint64_t)it.vRow.size() * sizeof(float);
+        }
+    }
 
-            LlmKvAckBatchHeader abh{};
-            network->read((NnUint)socketIndex, &abh, sizeof(abh));
-            if (abh.magic != LLM_KV_ACK_BATCH_MAGIC || abh.version != LLM_KV_ACK_BATCH_VERSION) {
-                std::printf("⚠️  [kv-migrate] unexpected packet on ack socket node=%u (magic=0x%08x ver=%u), skip\n",
+    const NnStageConfig *targetStage = findStageForNodeLocal(plan, nextStageRootNode);
+    NnUint validAckCountInc = 0u;
+    std::vector<NnUint> ackedLayersInc;
+    std::vector<NnUint> nodeAckInc(waitingKvAckNodes.size(), 0u);
+    NnUint ackPos = 0u;
+    bool ackPosSet = false;
+
+    for (size_t ni = 0u; ni < waitingKvAckNodes.size(); ++ni) {
+        if (ni >= waitingKvAckNodeExpected.size() || ni >= waitingKvAckNodeReceived.size()) continue;
+        if (waitingKvAckNodeReceived[ni] >= waitingKvAckNodeExpected[ni]) continue;
+        const NnUint ackNode = waitingKvAckNodes[ni];
+        const int socketIndex = network->getSocketIndexForNode(ackNode, 0u);
+        if (socketIndex < 0) {
+            std::printf("⚠️  [kv-migrate] missing socket for ack node=%u; abort migration\n",
+                (unsigned)ackNode);
+            std::fflush(stdout);
+            return fail("missing ack socket");
+        }
+
+        LlmKvAckBatchHeader abh{};
+        bool haveAckHeader = false;
+        for (int skippedPerf = 0; skippedPerf < 4; ++skippedPerf) {
+            if (!network->tryReadWithMaxAttempts((NnUint)socketIndex, &abh, sizeof(abh), KV_ACK_READ_MAX_ATTEMPTS)) {
+                std::printf("⚠️  [kv-migrate] timeout waiting ack batch from node=%u attempts=%lu; abort migration\n",
                     (unsigned)ackNode,
-                    (unsigned)abh.magic,
-                    (unsigned)abh.version);
+                    KV_ACK_READ_MAX_ATTEMPTS);
                 std::fflush(stdout);
-                continue;
+                return fail("timeout waiting kv ack batch");
             }
-
-            for (NnUint i = 0u; i < abh.count; ++i) {
-                LlmKvAckPacket ack{};
-                network->read((NnUint)socketIndex, &ack, sizeof(ack));
-                if (ack.magic != LLM_KV_ACK_MAGIC || ack.version != LLM_KV_ACK_VERSION) continue;
-                if (ack.toNodeIndex != 0u) continue;
-                if (ack.fromNodeIndex != ackNode) continue;
-                if (targetStage != nullptr) {
-                    if (!stageContainsNodeLocal(targetStage, ack.fromNodeIndex)) continue;
-                } else {
-                    if (ack.fromNodeIndex != nextStageRootNode) continue;
-                }
-                validAckCountInc += 1u;
-                nodeAckInc[ni] += 1u;
-                appendUniqueLayer(ackedLayersInc, ack.layerIndex);
-                if (!ackPosSet) {
-                    ackPos = ack.position;
-                    ackPosSet = true;
-                }
-                std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
-                    (unsigned)ack.layerIndex,
-                    (unsigned)ack.position,
-                    (unsigned)ack.fromNodeIndex);
+            if (abh.magic == LLM_KV_ACK_BATCH_MAGIC && abh.version == LLM_KV_ACK_BATCH_VERSION) {
+                haveAckHeader = true;
+                break;
             }
+            if (!isLikelyPerfPrefixFromAckHeader(abh, ackNode, header, plan)) break;
+            drainPerfPacketTailAfterPrefix(network, (NnUint)socketIndex, sizeof(abh), "kv ack batch", ackNode);
+        }
+        if (!haveAckHeader) {
+            std::printf("⚠️  [kv-migrate] bad ack batch from node=%u magic=0x%08x ver=%u count=%u; abort migration\n",
+                (unsigned)ackNode,
+                (unsigned)abh.magic,
+                (unsigned)abh.version,
+                (unsigned)abh.count);
+            std::fflush(stdout);
+            return fail("bad kv ack batch header");
         }
 
-        if (validAckCountInc > 0u) {
-            std::sort(ackedLayersInc.begin(), ackedLayersInc.end());
-            std::lock_guard<std::mutex> lk(kvTransferMutex);
-            waitingKvAckReceivedCount += validAckCountInc;
-            for (size_t ni = 0u; ni < nodeAckInc.size() && ni < waitingKvAckNodeReceived.size(); ++ni) {
-                waitingKvAckNodeReceived[ni] += nodeAckInc[ni];
-            }
-            for (NnUint layer : ackedLayersInc) {
-                appendUniqueLayer(waitingKvAckReceivedLayers, layer);
-            }
-            std::sort(waitingKvAckReceivedLayers.begin(), waitingKvAckReceivedLayers.end());
-
-            const bool layersMatched = !waitingKvAckLayers.empty() && waitingKvAckReceivedLayers == waitingKvAckLayers;
-            const bool rowsMatched = (waitingKvAckExpectedCount == 0u) || (waitingKvAckReceivedCount >= waitingKvAckExpectedCount);
-            if (layersMatched && rowsMatched) {
-                waitingKvAck = false;
-                waitingKvAckExpectedCount = 0u;
-                waitingKvAckReceivedCount = 0u;
-                waitingKvAckNodes.clear();
-                waitingKvAckNodeExpected.clear();
-                waitingKvAckNodeReceived.clear();
-                pendingLayerSwitchLayers = waitingKvAckReceivedLayers;
-                waitingKvAckReceivedLayers.clear();
-                migrationAckSeen = true;
-                migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
-                migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
-                std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
-                    (unsigned)pendingLayerSwitchLayers.size());
-                std::fflush(stdout);
-            }
+        const NnUint remainingForNode = waitingKvAckNodeExpected[ni] - waitingKvAckNodeReceived[ni];
+        if (abh.count == 0u || abh.count > remainingForNode) {
+            std::printf("⚠️  [kv-migrate] invalid ack count from node=%u count=%u remaining=%u; abort migration\n",
+                (unsigned)ackNode,
+                (unsigned)abh.count,
+                (unsigned)remainingForNode);
+            std::fflush(stdout);
+            return fail("invalid kv ack count");
         }
-        if (!waitingKvAck) break;
+
+        for (NnUint i = 0u; i < abh.count; ++i) {
+            LlmKvAckPacket ack{};
+            network->read((NnUint)socketIndex, &ack, sizeof(ack));
+            const bool ackOk =
+                ack.magic == LLM_KV_ACK_MAGIC &&
+                ack.version == LLM_KV_ACK_VERSION &&
+                ack.toNodeIndex == 0u &&
+                ack.fromNodeIndex == ackNode;
+            if (!ackOk) {
+                std::printf("⚠️  [kv-migrate] bad ack packet from node=%u idx=%u magic=0x%08x ver=%u from=%u to=%u; abort migration\n",
+                    (unsigned)ackNode,
+                    (unsigned)i,
+                    (unsigned)ack.magic,
+                    (unsigned)ack.version,
+                    (unsigned)ack.fromNodeIndex,
+                    (unsigned)ack.toNodeIndex);
+                std::fflush(stdout);
+                return fail("bad kv ack packet");
+            }
+            if (targetStage != nullptr) {
+                if (!stageContainsNodeLocal(targetStage, ack.fromNodeIndex)) {
+                    std::printf("⚠️  [kv-migrate] ack from node=%u outside target stage; abort migration\n",
+                        (unsigned)ack.fromNodeIndex);
+                    std::fflush(stdout);
+                    return fail("ack outside target stage");
+                }
+            } else if (ack.fromNodeIndex != nextStageRootNode) {
+                std::printf("⚠️  [kv-migrate] ack from node=%u expected root=%u; abort migration\n",
+                    (unsigned)ack.fromNodeIndex,
+                    (unsigned)nextStageRootNode);
+                std::fflush(stdout);
+                return fail("ack from unexpected node");
+            }
+            validAckCountInc += 1u;
+            nodeAckInc[ni] += 1u;
+            appendUniqueLayer(ackedLayersInc, ack.layerIndex);
+            if (!ackPosSet) {
+                ackPos = ack.position;
+                ackPosSet = true;
+            }
+            std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
+                (unsigned)ack.layerIndex,
+                (unsigned)ack.position,
+                (unsigned)ack.fromNodeIndex);
+        }
+    }
+
+    std::sort(ackedLayersInc.begin(), ackedLayersInc.end());
+    {
+        std::lock_guard<std::mutex> lk(kvTransferMutex);
+        waitingKvAckReceivedCount += validAckCountInc;
+        for (size_t ni = 0u; ni < nodeAckInc.size() && ni < waitingKvAckNodeReceived.size(); ++ni) {
+            waitingKvAckNodeReceived[ni] += nodeAckInc[ni];
+        }
+        for (NnUint layer : ackedLayersInc) {
+            appendUniqueLayer(waitingKvAckReceivedLayers, layer);
+        }
+        std::sort(waitingKvAckReceivedLayers.begin(), waitingKvAckReceivedLayers.end());
+
+        const bool layersMatched = !waitingKvAckLayers.empty() && waitingKvAckReceivedLayers == waitingKvAckLayers;
+        const bool rowsMatched = (waitingKvAckExpectedCount == 0u) || (waitingKvAckReceivedCount >= waitingKvAckExpectedCount);
+        if (layersMatched && rowsMatched) {
+            waitingKvAck = false;
+            waitingKvAckExpectedCount = 0u;
+            waitingKvAckReceivedCount = 0u;
+            waitingKvAckNodes.clear();
+            waitingKvAckNodeExpected.clear();
+            waitingKvAckNodeReceived.clear();
+            pendingLayerSwitchLayers = waitingKvAckReceivedLayers;
+            waitingKvAckReceivedLayers.clear();
+            migrationAckSeen = true;
+            migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
+            migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
+            std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
+                (unsigned)pendingLayerSwitchLayers.size());
+            std::fflush(stdout);
+        }
     }
 
     if (targetTransferBytes != nullptr) *targetTransferBytes = bytes;
-    return sentAny && !waitingKvAck;
+    if (waitingKvAck) {
+        return fail("kv ack incomplete");
+    }
+    return true;
 }
 
 bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
@@ -2895,6 +3137,7 @@ bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double 
     const NnUint replayBatch = 1u;
     for (NnUint pos = 0u; pos <= endPos; ++pos) {
         execution->setBatchSize(replayBatch);
+        execution->setPosition(pos);
         controlPacket.batchSize = replayBatch;
         controlPacket.position = pos;
         positionPipe[0] = (float)pos;
@@ -2913,6 +3156,7 @@ bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double 
     auto t1 = std::chrono::steady_clock::now();
 
     execution->setBatchSize(savedBatchSize);
+    execution->setPosition(savedPosition);
     controlPacket.batchSize = savedBatchSize;
     controlPacket.position = savedPosition;
     for (NnUint i = 0u; i < savedBatchSize; ++i) {
@@ -3285,6 +3529,7 @@ void RootLlmInference::forward(bool collectProfile) {
     }
     executor->forward();
     lastBubbleShadowStats = maybeRunBubbleShadowKv(executor, "root", 0u, controlPacket.position, controlPacket.batchSize);
+    bool profileCollectedBeforeRecovery = false;
 
     if (network != nullptr && waitingKvAck) {
         const NnStageConfig *targetStage = findStageForNodeLocal(plan, nextStageRootNode);
@@ -3627,6 +3872,10 @@ void RootLlmInference::forward(bool collectProfile) {
     if (!migrationBatchSubmitted && asyncKvCollectPos >= 0 &&
         controlPacket.position == (NnUint)asyncKvCollectPos &&
         !migrationLayers.empty() && executor != nullptr && header != nullptr) {
+        if (collectProfile && !profileCollectedBeforeRecovery) {
+            collectProfilePackets();
+            profileCollectedBeforeRecovery = true;
+        }
         const NnUint endPos = std::min((NnUint)asyncKvCollectPos, (header->seqLen > 0u) ? (header->seqLen - 1u) : 0u);
         const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
         auto tStall0 = std::chrono::steady_clock::now();
@@ -3778,7 +4027,9 @@ void RootLlmInference::forward(bool collectProfile) {
     }
 
     if (collectProfile) {
-        collectProfilePackets();
+        if (!profileCollectedBeforeRecovery) {
+            collectProfilePackets();
+        }
     } else {
         lastPerf.clear();
     }
@@ -3977,6 +4228,7 @@ bool WorkerLlmInference::tryReadControlPacket() {
         }
     }
     execution->setBatchSize(controlPacket.batchSize);
+    execution->setPosition(controlPacket.position);
     return true;
 }
 
@@ -4217,7 +4469,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::unique_ptr<NnNetwork> networkPtr(nullptr);
     NnNetwork *network = nullptr;
 
-    const bool profileEnabled = args->benchmark;
+    const bool dynamicTpotEnabled = envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false);
+    const bool profileEnabled = args->benchmark || dynamicTpotEnabled;
     const bool layerProfileEnabled = profileEnabled && envFlagEnabledDefault("DLLAMA_LAYER_PROF_ENABLE", false);
 
     if (nNodes == 1) {
@@ -4274,12 +4527,14 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         planCtrl = PlanUdsController::start(std::string(planSock), &inference);
     }
 
-    // Step 5: internal dynamic scheduler (queries UDS layer_prof and issues set_plan).
+    // Step 5: internal dynamic schedulers (query UDS and issue migration commands).
     std::unique_ptr<DynamicLayerController> dynCtrl;
+    std::unique_ptr<DynamicTpotController> tpotCtrl;
     std::unique_ptr<RootKvCollector> kvCollector;
     kvCollector = RootKvCollector::start(&inference);
     if (planSock != nullptr && planSock[0] != '\0') {
         dynCtrl = DynamicLayerController::start(std::string(planSock), &inference);
+        tpotCtrl = DynamicTpotController::start(std::string(planSock), &inference);
     }
 
     if (network != nullptr) {

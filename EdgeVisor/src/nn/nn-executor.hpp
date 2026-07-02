@@ -64,6 +64,7 @@ public:
     NnUint nPipes;
     NnByte **pipes;
     NnUint batchSize;
+    NnUint position;
     NnUint nBatches;
 
     // Optional per-layer profiling state shared between executor and synchronizer.
@@ -74,6 +75,7 @@ public:
     NnNetExecution(NnUint nThreads, NnNetConfig *netConfig);
     ~NnNetExecution();
     void setBatchSize(NnUint batchSize);
+    void setPosition(NnUint position);
 };
 
 // Per-layer CPU compute timing (microseconds), filled by executor and consumed by synchronizer.
@@ -136,6 +138,7 @@ typedef struct {
     std::atomic_uint doneThreadCount;
     std::atomic_bool isAlive;
     NnUint batchSize;
+    NnUint position;
     Timer *timer;
     NnUint totalTime[N_STEP_TYPES];
 
@@ -147,6 +150,7 @@ typedef struct {
     const int *segmentLayerIndex;
     const NnByte *segmentHasExecOps;
     NnUint nSegments;
+    NnUint nodeIndex;
     NnExecutorSyncProfile *syncProfile;
     const NnByte *segmentSyncProfileKinds;
     NnExecutor *owner;

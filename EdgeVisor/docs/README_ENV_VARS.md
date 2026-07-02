@@ -195,6 +195,24 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
   - 默认按“next stage”初始化。
   - 实际在线迁移路由由 UDS `set_pp_migration` 的 `fromNodeIndex` / `toNodeIndex` 动态决定并覆盖默认值。
 
+### 1.5 单请求 TPOT 在线调度器
+
+- `DLLAMA_DYNAMIC_TPOT_ENABLE`（严格布尔：`1` 启用）
+  - 默认：关闭
+  - 作用：在 root 进程内启动异步 TPOT 调度线程，低频读取 UDS `status` / `perf`，并通过既有 `set_plan` / `set_pp_migration` 下发单请求 decode 迁移。
+  - 依赖：`DLLAMA_PLAN_CTRL_SOCKET`、`--enable-plan-barrier`；PP 候选还需要 `--enable-pp-migration`。
+  - 备注：调度日志写入文件，不写 stdout。关闭该变量后行为与现有版本一致。
+
+- `DLLAMA_TPOT_WINDOW_TOKENS`（整数，默认 `16`）
+- `DLLAMA_TPOT_COOLDOWN_TOKENS`（整数，默认 `32`）
+- `DLLAMA_TPOT_ROLLBACK_WINDOW`（整数，默认 `16`）
+- `DLLAMA_TPOT_MIN_PP_GAIN_MS`（浮点，默认 `5`）
+- `DLLAMA_TPOT_MIN_TP_GAIN_MS`（浮点，默认 `2`）
+- `DLLAMA_TPOT_LOAD_PENALTY_BETA`（浮点，默认 `0.08`）
+- `DLLAMA_TPOT_LOG`（字符串，默认 `/tmp/dllama_tpot_scheduler.log`）
+  - 作用：控制 TPOT 调度窗口、冷却、回滚阈值、PP/TP 最小收益和结构化日志路径。
+  - 日志行前缀：`tpot_sched seq=... state=... best=... gain_ms=... steady_tpot=... overshoot_pct=...`。
+
 ### 1.6 分布式：Root 同步环境变量到 Workers
 
 - `DLLAMA_SYNC_ENV_VARS`（逗号分隔列表）

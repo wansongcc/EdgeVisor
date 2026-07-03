@@ -116,6 +116,7 @@ public:
     void writeAckWithPayload(const NnUint socketIndex, const void *payload, const NnSize payloadSize);
     void readAckWithPayload(const NnUint socketIndex, void *payload, const NnSize payloadSize);
     bool tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts);
+    bool tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts);
     void writeMany(NnUint n, NnSocketIo *ios);
     void writeAll(const void *data, NnSize size);
     void readMany(NnUint n, NnSocketIo *ios);

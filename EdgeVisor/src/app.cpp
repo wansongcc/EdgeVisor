@@ -3052,6 +3052,7 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
             waitingKvAckNodeExpected.clear();
             waitingKvAckNodeReceived.clear();
             pendingLayerSwitchLayers = waitingKvAckReceivedLayers;
+            waitingKvAckLayers.clear();
             waitingKvAckReceivedLayers.clear();
             migrationAckSeen = true;
             migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
@@ -3605,6 +3606,14 @@ void RootLlmInference::forward(bool collectProfile) {
             const int socketIndex = network->getSocketIndexForNode(ackNode, 0u);
             if (socketIndex < 0) continue;
 
+            LlmKvAckBatchHeader peek{};
+            if (!network->tryPeekWithMaxAttempts((NnUint)socketIndex, &peek, sizeof(peek), 1ul)) continue;
+            if (peek.magic != LLM_KV_ACK_BATCH_MAGIC && peek.magic != LLM_KV_ACK_MAGIC) {
+                // The same socket also carries profile packets. Do not consume
+                // non-ACK data here; collectProfilePackets() will read it later.
+                continue;
+            }
+
             LlmKvAckBatchHeader abh{};
             if (!network->tryReadWithMaxAttempts((NnUint)socketIndex, &abh, sizeof(abh), 1ul)) continue;
             if (abh.magic != LLM_KV_ACK_BATCH_MAGIC || abh.version != LLM_KV_ACK_BATCH_VERSION) {
@@ -3613,7 +3622,7 @@ void RootLlmInference::forward(bool collectProfile) {
                     std::printf("⚠️  [kv-migrate] discarded stray unbatched ack on node=%u; check all nodes use the same dllama binary\n",
                         (unsigned)ackNode);
                 } else {
-                    std::printf("⚠️  [kv-migrate] unexpected packet on ack socket node=%u (magic=0x%08x ver=%u), skip\n",
+                    std::printf("⚠️  [kv-migrate] unexpected ack-framed packet on node=%u (magic=0x%08x ver=%u), skip\n",
                         (unsigned)ackNode,
                         (unsigned)abh.magic,
                         (unsigned)abh.version);
@@ -3669,6 +3678,7 @@ void RootLlmInference::forward(bool collectProfile) {
                 waitingKvAckNodeExpected.clear();
                 waitingKvAckNodeReceived.clear();
                 pendingLayerSwitchLayers = waitingKvAckReceivedLayers;
+                waitingKvAckLayers.clear();
                 waitingKvAckReceivedLayers.clear();
                 migrationAckSeen = true;
                 migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;

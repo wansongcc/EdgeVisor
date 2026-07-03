@@ -643,6 +643,41 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
     return true;
 }
 
+static inline bool tryPeekSocket(int socket, void *data, NnSize size, unsigned long maxAttempts) {
+    // maxAttempts = 0 means infinite attempts. MSG_PEEK is intentionally
+    // non-consuming; only return true when the complete prefix is available.
+    const unsigned long timeoutMs = getIoTimeoutMs();
+    const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
+    unsigned int eagainSpins = 0u;
+    while (true) {
+        ssize_t r = recv(socket, (char*)data, size, MSG_PEEK);
+        if (r < 0) {
+            if (isEagainError()) {
+                if (maxAttempts > 0) {
+                    maxAttempts--;
+                    if (maxAttempts == 0) return false;
+                    backoffOnEagain(eagainSpins);
+                } else {
+                    waitSocketReadyAfterEagain(socket, false, timeoutMs, startMs);
+                    backoffOnEagain(eagainSpins);
+                }
+                continue;
+            }
+            throw NnTransferSocketException(0, "Error peeking from socket");
+        } else if (r == 0) {
+            throw NnTransferSocketException(0, "Socket closed");
+        }
+        if ((NnSize)r >= size) return true;
+        if (maxAttempts > 0) {
+            maxAttempts--;
+            if (maxAttempts == 0) return false;
+        } else {
+            waitSocketReadyAfterEagain(socket, false, timeoutMs, startMs);
+        }
+        backoffOnEagain(eagainSpins);
+    }
+}
+
 void readSocket(int socket, void *data, NnSize size) {
     if (!tryReadSocket(socket, data, size, 0)) {
         throw std::runtime_error("Error reading from socket");
@@ -1266,6 +1301,11 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
         return true;
     }
     return false;
+}
+
+bool NnNetwork::tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts) {
+    assert(socketIndex >= 0 && socketIndex < nSockets);
+    return tryPeekSocket(sockets[socketIndex], data, size, maxAttempts);
 }
 
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {

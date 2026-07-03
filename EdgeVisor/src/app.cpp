@@ -21,6 +21,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <chrono>
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
@@ -131,6 +132,33 @@ static bool parseEnvInt(const char *name, int &out) {
     if (end == v) return false;
     out = (int)x;
     return true;
+}
+
+static int kvAckWaitTimeoutMs() {
+    int timeoutMs = 0;
+    if (parseEnvInt("DLLAMA_KV_ACK_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
+    if (parseEnvInt("DLLAMA_IO_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
+    return 5000;
+}
+
+static bool tryReadKvAckWithDeadline(NnNetwork *network, NnUint socketIndex, void *data, NnSize size, int timeoutMs) {
+    if (network == nullptr) return false;
+    if (timeoutMs <= 0) {
+        return network->tryReadWithMaxAttempts(socketIndex, data, size, 0ul);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    do {
+        if (network->tryReadWithMaxAttempts(socketIndex, data, size, 1000ul)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+static void drainStrayKvAckRemainder(NnNetwork *network, NnUint socketIndex) {
+    if (network == nullptr) return;
+    if (sizeof(LlmKvAckPacket) <= sizeof(LlmKvAckBatchHeader)) return;
+    char rest[sizeof(LlmKvAckPacket) - sizeof(LlmKvAckBatchHeader)];
+    network->read(socketIndex, rest, sizeof(rest));
 }
 
 static std::vector<NnUint> parseLayerListEnv(const char *name) {
@@ -2805,7 +2833,7 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
     if (targetTransferBytes != nullptr) *targetTransferBytes = 0u;
     if (network == nullptr) return false;
 
-    static constexpr unsigned long KV_ACK_READ_MAX_ATTEMPTS = 20000ul;
+    const int ackTimeoutMs = kvAckWaitTimeoutMs();
 
     uint64_t bytes = 0u;
     std::vector<PendingKvTransferItem> kvTransfers;
@@ -2914,16 +2942,23 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
         LlmKvAckBatchHeader abh{};
         bool haveAckHeader = false;
         for (int skippedPerf = 0; skippedPerf < 4; ++skippedPerf) {
-            if (!network->tryReadWithMaxAttempts((NnUint)socketIndex, &abh, sizeof(abh), KV_ACK_READ_MAX_ATTEMPTS)) {
-                std::printf("⚠️  [kv-migrate] timeout waiting ack batch from node=%u attempts=%lu; abort migration\n",
+            if (!tryReadKvAckWithDeadline(network, (NnUint)socketIndex, &abh, sizeof(abh), ackTimeoutMs)) {
+                std::printf("⚠️  [kv-migrate] timeout waiting ack batch from node=%u timeoutMs=%d; abort migration\n",
                     (unsigned)ackNode,
-                    KV_ACK_READ_MAX_ATTEMPTS);
+                    ackTimeoutMs);
                 std::fflush(stdout);
                 return fail("timeout waiting kv ack batch");
             }
             if (abh.magic == LLM_KV_ACK_BATCH_MAGIC && abh.version == LLM_KV_ACK_BATCH_VERSION) {
                 haveAckHeader = true;
                 break;
+            }
+            if (abh.magic == LLM_KV_ACK_MAGIC && abh.version == LLM_KV_ACK_VERSION) {
+                drainStrayKvAckRemainder(network, (NnUint)socketIndex);
+                std::printf("⚠️  [kv-migrate] discarded stray unbatched ack while waiting batch from node=%u; check all nodes use the same dllama binary\n",
+                    (unsigned)ackNode);
+                std::fflush(stdout);
+                continue;
             }
             if (!isLikelyPerfPrefixFromAckHeader(abh, ackNode, header, plan)) break;
             drainPerfPacketTailAfterPrefix(network, (NnUint)socketIndex, sizeof(abh), "kv ack batch", ackNode);
@@ -3573,10 +3608,16 @@ void RootLlmInference::forward(bool collectProfile) {
             LlmKvAckBatchHeader abh{};
             if (!network->tryReadWithMaxAttempts((NnUint)socketIndex, &abh, sizeof(abh), 1ul)) continue;
             if (abh.magic != LLM_KV_ACK_BATCH_MAGIC || abh.version != LLM_KV_ACK_BATCH_VERSION) {
-                std::printf("⚠️  [kv-migrate] unexpected packet on ack socket node=%u (magic=0x%08x ver=%u), skip\n",
-                    (unsigned)ackNode,
-                    (unsigned)abh.magic,
-                    (unsigned)abh.version);
+                if (abh.magic == LLM_KV_ACK_MAGIC && abh.version == LLM_KV_ACK_VERSION) {
+                    drainStrayKvAckRemainder(network, (NnUint)socketIndex);
+                    std::printf("⚠️  [kv-migrate] discarded stray unbatched ack on node=%u; check all nodes use the same dllama binary\n",
+                        (unsigned)ackNode);
+                } else {
+                    std::printf("⚠️  [kv-migrate] unexpected packet on ack socket node=%u (magic=0x%08x ver=%u), skip\n",
+                        (unsigned)ackNode,
+                        (unsigned)abh.magic,
+                        (unsigned)abh.version);
+                }
                 std::fflush(stdout);
                 continue;
             }
@@ -4364,6 +4405,10 @@ void WorkerLlmInference::flushPendingKvAck() {
     for (const auto &ack : pendingKvAcks) {
         network->write(ROOT_SOCKET_INDEX, &ack, sizeof(ack));
     }
+    std::printf("🔁 [kv-migrate] ack batch sent node=%u count=%u\n",
+        (unsigned)localNodeIndex,
+        (unsigned)abh.count);
+    std::fflush(stdout);
     pendingKvAcks.clear();
 }
 

@@ -13,15 +13,25 @@
 
 ### 1.1 启用 UDS Server
 
-Plan UDS Controller 仅在设置环境变量后启动：
+当前推荐用 root 启动参数启用 UDS：
 
-- `DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
+```bash
+--plan-ctrl-socket /tmp/dllama_plan.sock
+```
 
-Root 进程启动后会监听该 Unix Domain Socket。
+兼容写法仍然可用：
+
+```bash
+export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
+```
+
+Root 进程启动后会监听该 Unix Domain Socket。自动 TPOT 调度使用同一个 UDS；如果启动时加入 `--enable-dynamic-tpot` 且没有指定 socket，代码会默认使用 `/tmp/dllama_plan.sock`。
 
 ### 1.2 启用推理侧 plan barrier（决定“是否真的会迁移”）
 
-**必须**在启动推理（root 和 workers）时启用 `--enable-plan-barrier`，否则推理图里不会插入 `OP_PLAN_BARRIER/OP_PLAN_APPLY`，即使 `set_plan` 返回 `ok:true` 也不会真正 emit/apply。
+手动 UDS `set_plan` 必须启用 `--enable-plan-barrier`，否则推理图里不会插入 `OP_PLAN_BARRIER/OP_PLAN_APPLY`，即使 `set_plan` 返回 `ok:true` 也不会真正 emit/apply。
+
+自动 TPOT 场景推荐使用 `--enable-dynamic-tpot`，它会自动开启 `--enable-plan-barrier`。
 
 > workers 侧是否启用由 root bootstrap 下发；无需额外在 worker 进程传同样参数（但允许）。
 
@@ -256,17 +266,25 @@ Plan 指令写入一个共享的 PlanCommand cache。
 
 ### 5.1 启动推理（示例）
 
-- 在 root 进程环境中设置：
+手动 UDS 迁移：
 
 ```bash
-export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
+./dllama inference \
+  <model/prompt/workers/ratios args> \
+  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --enable-plan-barrier
 ```
 
-- 启动 inference 时加入：
+自动 TPOT 迁移：
 
 ```bash
-./dllama inference ... --enable-plan-barrier ...
+./dllama inference \
+  <model/prompt/workers/ratios args> \
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan.sock
 ```
+
+`--enable-dynamic-tpot` 会自动开启 `--enable-plan-barrier` 和 `--enable-pp-migration`，并设置 PP KV ACK timeout 与 collector 默认行为。
 
 ### 5.2 查询状态/耗时
 
@@ -306,7 +324,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock watch_layer_prof \
 检查：
 
 1. `status.enablePlanBarrier` 是否为 `true`
-2. inference 启动命令是否包含 `--enable-plan-barrier`
+2. 手动 UDS 模式下 inference 启动命令是否包含 `--enable-plan-barrier`；自动调度模式下是否包含 `--enable-dynamic-tpot`
 3. 是否连接了 workers 并进入实际推理循环（需要 forward 跑起来才会触发 barrier/apply）
 
 ### Q2: 有 `🧭 [plan][emit]`，但出现 `🧭 [plan][apply] reject: ...`

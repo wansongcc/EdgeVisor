@@ -135,7 +135,7 @@ SOCK=/tmp/dllama_gpu_patch_plan.sock
 MODEL3=/home/cc/dllama/distributed-llama/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
 TOK=/home/cc/dllama/distributed-llama/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
 
-DLLAMA_PLAN_CTRL_SOCKET="$SOCK" ./dllama inference \
+./dllama inference \
   --prompt "Hi" \
   --steps 16 \
   --model "$MODEL3" \
@@ -146,6 +146,7 @@ DLLAMA_PLAN_CTRL_SOCKET="$SOCK" ./dllama inference \
   --gpu-index 0 \
   --workers "127.0.0.1:19101" "127.0.0.1:19102" \
   --ratios "2:3:3" \
+  --plan-ctrl-socket "$SOCK" \
   --enable-plan-barrier \
   --enable-kv-redundancy-during-migration 1 \
   --kv-redundancy 2
@@ -214,6 +215,19 @@ Meaning:
 
 PP layer migration uses GPU KV row export/apply to transfer the history rows for the
 migrated boundary layer, then switches layer ownership after ack.
+
+Manual UDS mode uses `--plan-ctrl-socket ... --enable-plan-barrier --enable-pp-migration`.
+Current automatic TPOT mode can be enabled directly on root:
+
+```bash
+./dllama inference ... \
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --runtime-redundant-boundary-layers 1
+```
+
+`--enable-dynamic-tpot` automatically enables plan barrier, PP migration, KV aggregate,
+stage full weights, PP KV ACK timeout, and disables collector re-submit by default.
 
 Convenience script:
 

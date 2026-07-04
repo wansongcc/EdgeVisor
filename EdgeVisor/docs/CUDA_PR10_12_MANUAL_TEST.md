@@ -1,5 +1,8 @@
 # CUDA PR10–PR12 手工验收指南
 
+> Status: 本文件是 CUDA PR10/PR12 历史手动测试记录，保留当时命令不重写。当前动态迁移入口以 `README_ENV_VARS.md`、`README_DYNAMIC_UDS.md` 和 `HOW_TO_ONLINE_MIGRATION.md` 为准。
+
+
 本文档用于手工验证 CUDA 后端 PR10、PR11、PR12 的实现效果。它覆盖本地 CPU/CUDA 回归、CUDA 算子与 runtime 单测、Compute Sanitizer、单 GPU 模型语义、三 GPU 静态 TP/PP/TP+PP、动态 Head/FFN 重分片、PP KV 迁移、runtime redundant segment 和 Bubble Shadow KV。
 
 原则：

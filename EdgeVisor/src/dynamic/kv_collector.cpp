@@ -19,6 +19,19 @@ static int kvcParseEnvInt(const char *name, int defaultValue) {
     return (int)x;
 }
 
+static bool kvcEnvFlagEnabledDefault(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    if (std::strcmp(value, "0") == 0 ||
+        std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "False") == 0 ||
+        std::strcmp(value, "off") == 0 ||
+        std::strcmp(value, "OFF") == 0) {
+        return false;
+    }
+    return true;
+}
+
 std::unique_ptr<RootKvCollector> RootKvCollector::start(RootLlmInference *inference) {
 #ifdef _WIN32
     (void)inference;
@@ -58,6 +71,7 @@ void RootKvCollector::run() {
     int collectPos = -1;
 
     const int pollMs = std::max(1, kvcParseEnvInt("DLLAMA_ASYNC_KV_COLLECT_POLL_MS", 20));
+    const bool submitTransfer = kvcEnvFlagEnabledDefault("DLLAMA_ASYNC_KV_COLLECT_SUBMIT", false);
     NnUint kvDim = 0u;
     NnUint seqLen = 0u;
     bool collectorReady = false;
@@ -127,18 +141,22 @@ void RootKvCollector::run() {
 
                     const bool kOk = dumpOne(kPath, packet.kRow);
                     const bool vOk = dumpOne(vPath, packet.vRow);
-                    const RootLlmInference::KvTransferSubmitStatus submitStatus =
-                        inference_->submitBoundaryKvTransferDetailed((NnUint)collectLayer, (NnUint)collectPos, packet.kRow, packet.vRow);
-                    const bool enqueued = (submitStatus == RootLlmInference::KV_TRANSFER_SUBMIT_OK);
-                    std::fprintf(stderr, "[kv-collector] layer=%d pos=%d row dumped k=%s(%s) v=%s(%s) drained=%d\n",
+                    RootLlmInference::KvTransferSubmitStatus submitStatus = RootLlmInference::KV_TRANSFER_SUBMIT_OK;
+                    bool enqueued = false;
+                    if (submitTransfer) {
+                        submitStatus = inference_->submitBoundaryKvTransferDetailed((NnUint)collectLayer, (NnUint)collectPos, packet.kRow, packet.vRow);
+                        enqueued = (submitStatus == RootLlmInference::KV_TRANSFER_SUBMIT_OK);
+                    }
+                    std::fprintf(stderr, "[kv-collector] layer=%d pos=%d row dumped k=%s(%s) v=%s(%s) drained=%d submit=%s\n",
                         collectLayer,
                         collectPos,
                         kPath,
                         kOk ? "ok" : "fail",
                         vPath,
                         vOk ? "ok" : "fail",
-                        drained);
-                    if (!enqueued) {
+                        drained,
+                        submitTransfer ? (enqueued ? "queued" : "failed") : "off");
+                    if (submitTransfer && !enqueued) {
                         const char *reason = "unknown";
                         switch (submitStatus) {
                             case RootLlmInference::KV_TRANSFER_SUBMIT_NO_NETWORK: reason = "no-network"; break;

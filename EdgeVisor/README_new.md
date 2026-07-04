@@ -228,16 +228,30 @@ stageWeights*tpStage0*tpStage1*...
 - OP_PLAN_BARRIER：在某层某个 token 位置命中触发条件后，在 stage 内广播一条“计划消息”（epoch + 迁移参数）
 - OP_PLAN_APPLY：各节点收到消息后更新分片 plan，并 bump epoch；之后 forward 会 refresh pointers
 
-### 4.1 启用迁移功能（必须）
+### 4.1 当前推荐入口
 
-在 root 运行 inference/chat/api 时，通过命令行参数启用：
+自动单请求 TPOT 在线迁移：
 
-- `--enable-plan-barrier`
-- `--enable-stage-full-weights`（推荐，迁移/冗余更容易正确）
+```bash
+./dllama inference ... \
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --runtime-redundant-boundary-layers 1
+```
 
-### 4.2 启用 UDS 控制器（推荐）
+`--enable-dynamic-tpot` 会自动开启 `--enable-plan-barrier`、`--enable-pp-migration`、KV aggregate、stage full weights，并设置 PP KV ACK timeout 与 collector 默认行为。
 
-让 root 启动 UDS 监听，外部通过 UNIX domain socket 下发 PlanCommand：
+手动 UDS 迁移：
+
+```bash
+./dllama inference ... \
+  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --enable-plan-barrier
+```
+
+### 4.2 启用 UDS 控制器（兼容环境变量）
+
+仍可用环境变量启动 UDS：
 
 ```bash
 export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
@@ -310,7 +324,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
 
 ### 4.7 如何确认迁移已发生
 
-运行时会打印类似日志（只要启用了 `--enable-plan-barrier`，并且命中触发点）：
+手动 UDS 迁移命中触发点时会打印类似日志（自动 TPOT 也会通过同一路径下发命令）：
 
 - barrier 侧：
   - 🧭 [plan][emit] ...
@@ -346,8 +360,8 @@ DLLAMA_VULKAN=1 make -j dllama
 ### 6.1 UDS socket 不存在 / ping 失败
 
 - 确认 root 进程设置了：
-  - 启动命令包含 `--enable-plan-barrier`
-  - DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
+  - 手动 UDS：`--plan-ctrl-socket /tmp/dllama_plan.sock --enable-plan-barrier`
+  - 自动 TPOT：`--enable-dynamic-tpot --plan-ctrl-socket /tmp/dllama_plan.sock`
 - 如 socket 被旧进程占用：
 
 ```bash
@@ -405,8 +419,6 @@ export DLLAMA_SYNC_ENV_VARS="kvcache_debug,kvcache_debug_limit"
 终端 B（root）：
 
 ```bash
-export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
-
 ./dllama inference \
   --prompt "The capital of France is" \
   --steps 128 \
@@ -415,11 +427,21 @@ export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
   --buffer-float-type q80 \
   --nthreads 4 \
   --max-seq-len 2048 \
+  --plan-ctrl-socket /tmp/dllama_plan.sock \
   --enable-plan-barrier \
   --enable-stage-full-weights \
   --enable-kv-redundancy-during-migration 1 \
   --workers 127.0.0.1:9999 \
   --ratios 1:1
+```
+
+
+自动 TPOT 场景可把上面的手动开关替换为：
+
+```bash
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --runtime-redundant-boundary-layers 1
 ```
 
 终端 C（下发迁移）：

@@ -2,7 +2,7 @@
 
 本文说明如何在 `dllama` 推理过程中，通过 **UDS（Unix Domain Socket）控制器**下发一次性迁移命令，并验证迁移已经生效。
 
-> 适用范围：当前实现主要面向 **CPU 路线**的 online repartition 实验（plan barrier/apply 是 CPU-only hook）。
+> 适用范围：本文主要说明手动 UDS 迁移。TP `set_plan` 依赖 plan barrier/apply；PP layer 迁移使用 `set_pp_migration` + KV export/transfer/ack/switch。自动单请求 TPOT 调度请优先使用 `--enable-dynamic-tpot`，参数清单见 [README_ENV_VARS.md](README_ENV_VARS.md)。
 
 ---
 
@@ -30,15 +30,24 @@
 ## 2. 开启与启动
 
 ### 2.1 必要开关
-#### 作为环境变量开关在启动时开启
 
-- `DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
-  - 设置后 root 进程会启动 UDS 控制器线程。
-  - 进程启动后会在 stderr 打印：`[plan-uds] listening on /tmp/dllama_plan.sock`。
+当前推荐把 UDS socket 写在 root 启动参数中：
 
+```bash
+--plan-ctrl-socket /tmp/dllama_plan.sock
+```
+
+兼容环境变量仍可用：
+
+```bash
+export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
+```
+
+手动 UDS `set_plan` 还需要 `--enable-plan-barrier`。自动 TPOT 调度使用 `--enable-dynamic-tpot`，会自动补齐 plan barrier、PP migration、socket timeout 和 collector 默认行为。
 
 UDS 控制器协议说明与客户端示例见：
-- [docs/README_ENV_VARS.md](README_ENV_VARS.md)
+- [README_ENV_VARS.md](README_ENV_VARS.md)
+- [README_DYNAMIC_UDS.md](README_DYNAMIC_UDS.md)
 - 客户端脚本：[examples/plan-uds-client.py](../examples/plan-uds-client.py)
 
 kv冗余计算
@@ -69,7 +78,8 @@ cd /workspace/dllama/distributed-llama
 下面示例用仓库自带模型（可换成你的模型）。关键点是：
 - `--workers 127.0.0.1:9999` 让 root 连接本地 worker；
 - `--ratios 1:1` 形成 stage 内 2 节点（示例）；
-- 开启 `DLLAMA_ENABLE_PLAN_BARRIER` + `DLLAMA_PLAN_CTRL_SOCKET`。
+- 手动迁移：开启 `--enable-plan-barrier` + `--plan-ctrl-socket`。
+- 自动 TPOT 迁移：开启 `--enable-dynamic-tpot` + `--plan-ctrl-socket`。
 
 ```bash
 cd /workspace/dllama/distributed-llama
@@ -80,7 +90,8 @@ cd /workspace/dllama/distributed-llama
   --model /workspace/dllama/distributed-llama/models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
   --tokenizer /workspace/dllama/distributed-llama/models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
-  --enable-plan-barrier \ #启用在线迁移
+  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --enable-plan-barrier \
   --kv-redundancy 2 \
   --nthreads 2 \
   --max-seq-len 2048 \
@@ -145,6 +156,33 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
 - 对照迁移前后某个固定点的 slice/pointer/kv 范围变化
 - ps：seq同上，注意递增
 
+
+### 3.4 自动 TPOT 下发 PP/TP 迁移
+
+如果目标是在线自动迁移，不需要手工运行 `set_plan`/`set_pp_migration`。root 加入：
+
+```bash
+./dllama inference ... \
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --runtime-redundant-boundary-layers 1
+```
+
+纯 PP 测试时可关闭 TP 候选：
+
+```bash
+export DLLAMA_TPOT_MIN_TP_GAIN_MS=1000000
+export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
+```
+
+迁移成功的关键日志：
+
+```text
+[kv-migrate] ack batch complete layers=1 -> switch ownership
+[layer-gate] node=0 role=primary layer=... enabled=0
+[worker-switch] node=1 activate redundant layer=...
+```
+
 ---
 
 ## 4. 如何验证“迁移起效了”
@@ -206,8 +244,8 @@ DLLAMA_DEBUG_ONLINE_CHANGE=1 make -j dllama
 ### 5.1 socket 文件没有出现 / `ping` 连接失败
 
 - 确认 root 进程设置了：
-  - 启动命令包含 `--enable-plan-barrier`
-  - `DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
+  - 手动 UDS：`--plan-ctrl-socket /tmp/dllama_plan.sock --enable-plan-barrier`
+  - 自动 TPOT：`--enable-dynamic-tpot --plan-ctrl-socket /tmp/dllama_plan.sock`
 - root stderr 应该打印：`[plan-uds] listening on ...`
 - 若提示 bind 失败：删除旧 socket：`rm -f /tmp/dllama_plan.sock`
 

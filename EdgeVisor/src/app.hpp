@@ -74,6 +74,8 @@ public:
     bool allowNoShadowHeadMigration; // Allow head migration when runtime will recover KV state
     bool enableKvAggregate; // Build KV aggregate pipes (KC/VC)
     bool enablePpMigration; // Enable PP layer migration control path
+    bool enableDynamicTpot; // Enable root-side online TPOT scheduler
+    char *planCtrlSocketPath; // UDS path used by plan controller and dynamic TPOT scheduler
     NnUint runtimeRedundantBoundaryLayers; // Runtime redundant boundary span in layers
     bool runtimeActiveSegEnabled; // Default gate for primary segments
     bool runtimeRedundantSegEnabled; // Default gate for redundant segments

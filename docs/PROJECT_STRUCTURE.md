@@ -12,3 +12,15 @@ This project keeps the original `EdgeVisor` engine layout intact for build compa
 - `maintenance/`: historical patch scripts and debug helpers.
 
 Top-level `run_*.sh` files are compatibility wrappers. Update scripts under `scripts/`; wrappers should remain thin.
+
+## Documentation Entry Points
+
+Current migration/env documentation lives under `EdgeVisor/docs/`:
+
+- `EdgeVisor/docs/README_ENV_VARS.md`: canonical runtime env and CLI switch reference.
+- `EdgeVisor/docs/README_DYNAMIC_UDS.md`: manual UDS JSON protocol.
+- `EdgeVisor/docs/HOW_TO_ONLINE_MIGRATION.md`: manual and automatic online migration workflow.
+- `EdgeVisor/docs/UNEVEN_TP_PP_CONFIG.md`: ratios and PP/TP startup configuration.
+- `EdgeVisor/docs/DOCUMENT_STATUS.md`: docs that are current, historical, or candidates for deletion.
+
+`EdgeVisor/README.md` is mostly the upstream Distributed Llama README and is retained for compatibility; do not treat it as the authoritative EdgeVisor migration guide.

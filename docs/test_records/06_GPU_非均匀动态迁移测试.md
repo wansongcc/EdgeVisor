@@ -1,5 +1,8 @@
 # 06 GPU 非均匀动态迁移测试
 
+> Status: 本文件是历史验收记录，保留当时的命令与输出不重写。当前手动 UDS 推荐使用 `--plan-ctrl-socket <path> --enable-plan-barrier`；自动 TPOT 推荐使用 `--enable-dynamic-tpot --plan-ctrl-socket <path>`。
+
+
 - 测试日志目录：`/home/cc/yhbian/B01_Copy_API_Refactor/runtime_logs/benchmark_docs_20260531_071456/06_gpu_uneven_dynamic`
 - 项目根目录：`/home/cc/yhbian/B01_Copy_API_Refactor`
 - 本次测试参数：已加入 `--benchmark`

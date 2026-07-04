@@ -63,6 +63,13 @@ static bool envFlagEnabledDefault(const char *name, bool fallback) {
     return true;
 }
 
+static void setEnvIfUnsetOrEmpty(const char *name, const char *value) {
+    const char *current = std::getenv(name);
+    if (current == nullptr || current[0] == '\0') {
+        setenv(name, value, 1);
+    }
+}
+
 static bool bubbleShadowKvEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV", false);
 }
@@ -437,6 +444,10 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.allowNoShadowHeadMigration = false;
     args.enableKvAggregate = false;
     args.enablePpMigration = false;
+    args.enableDynamicTpot = envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false);
+    args.planCtrlSocketPath = std::getenv("DLLAMA_PLAN_CTRL_SOCKET") != nullptr && std::getenv("DLLAMA_PLAN_CTRL_SOCKET")[0] != '\0'
+        ? const_cast<char*>(std::getenv("DLLAMA_PLAN_CTRL_SOCKET"))
+        : nullptr;
     args.runtimeRedundantBoundaryLayers = 1u;
     args.runtimeActiveSegEnabled = true;
     args.runtimeRedundantSegEnabled = false;
@@ -583,6 +594,17 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 i += 2;
             } else {
                 args.enablePpMigration = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (std::strcmp(name, "--enable-dynamic-tpot") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.enableDynamicTpot = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.enableDynamicTpot = true;
                 i += 1;
             }
             continue;
@@ -785,6 +807,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.experimentId = value;
         } else if (std::strcmp(name, "--io-profile-log") == 0) {
             args.ioProfileLogPath = value;
+        } else if (std::strcmp(name, "--plan-ctrl-socket") == 0) {
+            args.planCtrlSocketPath = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -815,6 +839,35 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
     }
 #endif
+    if (args.enableDynamicTpot) {
+        if (args.planCtrlSocketPath == nullptr || args.planCtrlSocketPath[0] == '\0') {
+            args.planCtrlSocketPath = (char *)"/tmp/dllama_plan.sock";
+            std::printf("⚠️  [tpot-auto] --enable-dynamic-tpot requires a plan UDS; using --plan-ctrl-socket %s\n",
+                args.planCtrlSocketPath);
+            std::fflush(stdout);
+        }
+        if (!args.enablePlanBarrier) {
+            args.enablePlanBarrier = true;
+            std::printf("⚠️  [tpot-auto] --enable-dynamic-tpot requires --enable-plan-barrier; auto enabling\n");
+            std::fflush(stdout);
+        }
+        if (!args.enablePpMigration) {
+            args.enablePpMigration = true;
+            std::printf("⚠️  [tpot-auto] --enable-dynamic-tpot requires --enable-pp-migration; auto enabling\n");
+            std::fflush(stdout);
+        }
+        setenv("DLLAMA_DYNAMIC_TPOT_ENABLE", "1", 1);
+        setenv("DLLAMA_PLAN_CTRL_SOCKET", args.planCtrlSocketPath, 1);
+        setEnvIfUnsetOrEmpty("DLLAMA_KV_ACK_TIMEOUT_MS", "180000");
+        setEnvIfUnsetOrEmpty("DLLAMA_IO_TIMEOUT_MS", "180000");
+        setEnvIfUnsetOrEmpty("DLLAMA_ASYNC_KV_COLLECT_SUBMIT", "0");
+    } else {
+        setenv("DLLAMA_DYNAMIC_TPOT_ENABLE", "0", 1);
+        if (args.planCtrlSocketPath != nullptr && args.planCtrlSocketPath[0] != '\0') {
+            setenv("DLLAMA_PLAN_CTRL_SOCKET", args.planCtrlSocketPath, 1);
+        }
+    }
+
     if (args.continuousBatching) {
         if (args.nWorkers > 0u && !args.lastStageSampling) {
             args.lastStageSampling = true;
@@ -4548,7 +4601,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::unique_ptr<NnNetwork> networkPtr(nullptr);
     NnNetwork *network = nullptr;
 
-    const bool dynamicTpotEnabled = envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false);
+    const bool dynamicTpotEnabled = args->enableDynamicTpot;
     const bool profileEnabled = args->benchmark || dynamicTpotEnabled;
     const bool layerProfileEnabled = profileEnabled && envFlagEnabledDefault("DLLAMA_LAYER_PROF_ENABLE", false);
 
@@ -4599,9 +4652,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     // enablePlanBarrier was already applied before net construction.
 
-    // Step 4: external controller (UDS). Enabled by setting DLLAMA_PLAN_CTRL_SOCKET.
+    // Step 4: external controller (UDS). Enabled by --plan-ctrl-socket or DLLAMA_PLAN_CTRL_SOCKET.
     std::unique_ptr<PlanUdsController> planCtrl;
-    const char *planSock = std::getenv("DLLAMA_PLAN_CTRL_SOCKET");
+    const char *planSock = args->planCtrlSocketPath;
+    if (planSock == nullptr || planSock[0] == '\0') {
+        planSock = std::getenv("DLLAMA_PLAN_CTRL_SOCKET");
+    }
     if (planSock != nullptr && planSock[0] != '\0') {
         planCtrl = PlanUdsController::start(std::string(planSock), &inference);
     }

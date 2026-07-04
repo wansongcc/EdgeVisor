@@ -79,8 +79,7 @@ Validation entry points:
 - `scripts/cuda_static_semantics.sh`: build + CUDA unit tests, optional single
   GPU model run, optional static TP/PP/TP+PP root runs using `EDGEVISOR_WORKERS`.
 - `scripts/cuda_dynamic_semantics.sh`: build + CUDA PR11/PR12 unit coverage,
-  optional dynamic model run with `--enable-plan-barrier`, PP migration, and
-  Bubble Shadow KV flags.
+  optional dynamic model run. Manual UDS mode uses `--plan-ctrl-socket ... --enable-plan-barrier --enable-pp-migration`; automatic TPOT mode uses `--enable-dynamic-tpot --plan-ctrl-socket ...` and auto-enables PP migration dependencies.
 - `scripts/cuda_full_regression.sh`: CPU L0, CUDA unit tests, optional
   Compute Sanitizer and model-level gates.
 

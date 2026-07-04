@@ -95,3 +95,17 @@ http://10.0.0.1:9999/v1/models
 ```
 
 8. When the API server is running, you can open the web chat in your browser, open [llama-ui.js.org](https://llama-ui.js.org/), go to the settings and set the base URL to: `http://10.0.0.1:9999`. Press the "save" button and start chatting!
+
+## Online Migration Notes
+
+The basic commands above do not enable dynamic migration. Current migration
+parameters are documented in:
+
+- [README_ENV_VARS.md](README_ENV_VARS.md)
+- [HOW_TO_ONLINE_MIGRATION.md](HOW_TO_ONLINE_MIGRATION.md)
+- [UNEVEN_TP_PP_CONFIG.md](UNEVEN_TP_PP_CONFIG.md)
+
+For automatic root-side TPOT scheduling, add
+`--enable-dynamic-tpot --plan-ctrl-socket <path>` to root inference. For PP layer
+migration, also configure a PP layout with redundant boundary weights, for
+example `--runtime-redundant-boundary-layers 1`.

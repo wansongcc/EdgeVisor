@@ -104,114 +104,171 @@ export DLLAMA_POISON_CHECK_LIMIT=50
   - 数据布局（v1）：`Header(DLPS)` + `NnLayerPerfMsg[nLayers][nStageNodes]`。
   - 示例：`DLLAMA_LAYER_PROF_PATH=/tmp/layerprof.bin ./dllama inference ...`
 
-### 1.4 在线迁移 / 计划屏障（测试钩子）
+### 1.4 在线迁移 / 计划屏障 / PP layer 迁移
 
-完整使用与验证流程见：[docs/HOW_TO_ONLINE_MIGRATION.md](HOW_TO_ONLINE_MIGRATION.md)
+完整使用与验证流程见：[HOW_TO_ONLINE_MIGRATION.md](HOW_TO_ONLINE_MIGRATION.md)。UDS 协议细节见：[README_DYNAMIC_UDS.md](README_DYNAMIC_UDS.md)。
+
+#### 推荐入口（当前版本）
+
+- `--enable-dynamic-tpot`（命令行参数）
+  - 默认：关闭
+  - 作用：启用 root 侧单请求 decode TPOT 在线调度器，并自动补齐当前自动迁移必须条件。
+  - 自动设置/打开：
+    - `DLLAMA_DYNAMIC_TPOT_ENABLE=1`
+    - `DLLAMA_PLAN_CTRL_SOCKET=<socket>`（若未指定 socket，默认 `/tmp/dllama_plan.sock`）
+    - `DLLAMA_KV_ACK_TIMEOUT_MS=180000`（仅当未设置时）
+    - `DLLAMA_IO_TIMEOUT_MS=180000`（仅当未设置时）
+    - `DLLAMA_ASYNC_KV_COLLECT_SUBMIT=0`（仅当未设置时）
+    - `--enable-plan-barrier`
+    - `--enable-pp-migration`
+  - 备注：`--enable-pp-migration` 会继续自动打开 `--enable-kv-aggregate` 和 `--enable-stage-full-weights`。
+
+- `--plan-ctrl-socket <path>`（命令行参数）
+  - 默认：未设置；若与 `--enable-dynamic-tpot` 一起使用且未显式提供，则使用 `/tmp/dllama_plan.sock`。
+  - 作用：指定 root 内部 UDS 控制器路径，替代直接设置 `DLLAMA_PLAN_CTRL_SOCKET`。
+  - 示例：`--plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock`
+
+当前推荐 root 启动片段：
+
+```bash
+./dllama inference ... \
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --runtime-redundant-boundary-layers 1 \
+  --io-profile-log /tmp/dllama-io.log
+```
+
+#### 手动 UDS / 兼容入口
 
 - `--enable-plan-barrier`（命令行参数）
-  - 默认：关闭
-  - 作用：启用“每层一个 plan barrier + plan apply”的 CPU-only 测试钩子，用于 online repartition 实验。
-  - 备注：该开关会由 Root 通过 bootstrap 同步到 Workers。
+  - 默认：关闭；`--enable-dynamic-tpot` 会自动开启。
+  - 作用：启用每层 plan barrier/apply，用于 TP `set_plan` 和在线迁移命令生效。
+  - 备注：该开关由 root 通过 bootstrap 同步到 workers。
 
 - `DLLAMA_PLAN_CTRL_SOCKET`（字符串：UDS 路径）
-  - 默认：未设置（不启动控制器）
-  - 作用：在 root 进程内启动 UDS 控制器线程，供外部监控/规划进程下发 `PlanCommand`（推荐方式）。
-  - 示例：
-    - `export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
-    - `./dllama inference --enable-plan-barrier ...`
+  - 默认：未设置（不启动控制器）；可由 `--plan-ctrl-socket` 替代。
+  - 作用：在 root 进程内启动 UDS 控制器线程，供外部监控/规划进程下发 `PlanCommand`。
+  - 示例：`export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
 
 UDS 协议为“单行 JSON 请求 → 单行 JSON 响应”（每次连接只处理 1 条请求）。支持的 `op`：`ping` / `status` / `perf` / `set_plan` / `set_pp_migration` / `clear`。
 
 示例（使用仓库自带客户端 [examples/plan-uds-client.py](../examples/plan-uds-client.py)）：
 
 ```bash
-# 1) 启动 root 推理时开启：
-export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
-./dllama inference --enable-plan-barrier ...
-
-# 2) 基本连通性
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock ping
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
 
-# 3) 下发一次性“下一次 barrier 触发”的迁移命令（推荐真实运行方式）
+# TP stage 内迁移：下一次 barrier 触发
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
   --seq 1 --mode next_barrier --stage 0 --from 0 --to 1 --kind 3 --heads 1 --ffn 256
 
-# 4) 调试用：精确触发（到达指定 position + layer 才触发）
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
-  --seq 2 --mode exact --stage 0 --from 0 --to 1 --kind 3 --heads 1 --ffn 256 \
-  --trigger-pos 64 --trigger-layer 10
-
-# 5) PP layer 迁移控制（global root 下发到对应 stage root 路由）
+# PP layer 迁移：global root 下发到对应 stage root 路由
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
-  --seq 3 --mode exact --from 0 --to 1 --layer-count 2 --trigger-pos 64
+  --seq 3 --mode exact --from 0 --to 1 --layer-count 1 --trigger-pos 64
 ```
-
-- `DLLAMA_HARD_MIGRATE_POS`（整数）
-- `DLLAMA_HARD_MIGRATE_LAYER`（整数）
-- `DLLAMA_HARD_MIGRATE_KIND`（整数；`1=headSplit` `2=ffnSplit` `3=both`）
-- `DLLAMA_HARD_MIGRATE_HEAD_MOVE`（整数）
-- `DLLAMA_HARD_MIGRATE_FFN_MOVE`（整数）
-  - 状态：**Deprecated（兼容兜底）**
-  - 作用：不再直接驱动 barrier 的“静态触发器”。当检测到这些变量时，root 会在启动时**自动生成一条 `PlanCommand(mode=exact)`** 并打印 deprecate warning；外部 UDS 下发命令优先。
 
 - `--enable-kv-redundancy-during-migration`（命令行参数）
   - 默认：开启（`1`）
-  - 作用：当启用 plan barrier/migration 时，控制 migration 期间是否保留 KV redundancy（用于“无额外通信”的实验）。
-  - 用法：
-    - 开启：`--enable-kv-redundancy-during-migration` 或 `--enable-kv-redundancy-during-migration 1`
-    - 关闭：`--enable-kv-redundancy-during-migration 0`
+  - 作用：当启用 plan barrier/migration 时，控制 migration 期间是否保留 KV redundancy。
+  - 用法：`--enable-kv-redundancy-during-migration` / `--enable-kv-redundancy-during-migration 1` / `--enable-kv-redundancy-during-migration 0`
   - 备注：该开关由 root 通过 bootstrap 同步到 workers。
 
 - `--enable-pp-migration`（命令行参数）
-  - 默认：关闭
-  - 作用：启用 PP layer 迁移控制路径（自动消费 UDS `set_pp_migration` 命令并执行 KV transfer/ack/switch）。
-  - 备注：该开关依赖 KV aggregate；若未显式开启 `--enable-kv-aggregate`，程序会自动开启。
+  - 默认：关闭；`--enable-dynamic-tpot` 会自动开启。
+  - 作用：启用 PP layer 迁移控制路径，自动消费 UDS `set_pp_migration` 命令并执行 KV export/transfer/ack/switch。
+  - 自动依赖：若未显式开启，程序会自动开启 `--enable-kv-aggregate` 和 `--enable-stage-full-weights`。
+
+- `--runtime-redundant-boundary-layers <n>`（命令行参数）
+  - 默认：`1`
+  - 作用：为 PP boundary 周围保留可激活的 redundant layer 权重/segment。纯 PP 自动迁移通常至少需要 `1`。
 
 - `set_pp_migration.layerCount`（UDS 字段）
   - 默认：`1`
-  - 作用：控制 PP 迁移时按边界向内扩展的层数（迁移数量由控制器动态下发）。
-  - 示例：
-    - `python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration --seq 3 --mode exact --from 0 --to 1 --layer-count 2 --trigger-pos 64`
+  - 作用：控制 PP 迁移时按边界向内扩展的层数。当前自动调度 v1 每次最多迁移 1 层。
 
 - `DLLAMA_MIGRATION_LAYER_LIST`（逗号分隔整数列表）
   - 默认：未设置
   - 作用：指定在线迁移要批量处理的 layer 列表（transfer/ack/switch 按该列表批量执行）。
-  - 优先级：高于 UDS `set_pp_migration.layerCount`（设置列表后，控制器下发 count 不会覆盖该固定列表）。
-  - 示例：
-    - `export DLLAMA_MIGRATION_LAYER_LIST=13,12,11,10`
-    - `export DLLAMA_PP_MIGRATION_POS=31`
-    - `./dllama inference ...`
+  - 优先级：高于 UDS `set_pp_migration.layerCount`。
+  - 状态：调试/手动复现用；自动调度不建议设置。
 
 - `DLLAMA_PP_MIGRATION_POS`（整数）
   - 默认：未设置
-  - 作用：为 PP layer 迁移设置固定触发位置（root 到达该 pos 时触发历史 KV 批量迁移）。
-  - 备注：该变量仅控制触发位置；迁移路由（from/to stage root）可由 UDS `set_pp_migration` 动态下发覆盖。
-  - 示例：
-    - `export DLLAMA_PP_MIGRATION_POS=31`
-    - `./dllama inference ...`
+  - 作用：为 PP layer 迁移设置固定触发位置。
+  - 状态：legacy/debug；自动调度由 UDS `triggerPos` 或 runtime 决策控制，不建议常规使用。
 
-- 迁移方向说明
-  - 默认按“next stage”初始化。
-  - 实际在线迁移路由由 UDS `set_pp_migration` 的 `fromNodeIndex` / `toNodeIndex` 动态决定并覆盖默认值。
+- `DLLAMA_HARD_MIGRATE_POS` / `DLLAMA_HARD_MIGRATE_LAYER` / `DLLAMA_HARD_MIGRATE_KIND` / `DLLAMA_HARD_MIGRATE_HEAD_MOVE` / `DLLAMA_HARD_MIGRATE_FFN_MOVE`
+  - 状态：Deprecated（兼容兜底）
+  - 作用：启动时自动生成一条 `PlanCommand(mode=exact)`。新测试请使用 UDS 或 `--enable-dynamic-tpot`。
 
 ### 1.5 单请求 TPOT 在线调度器
 
 - `DLLAMA_DYNAMIC_TPOT_ENABLE`（严格布尔：`1` 启用）
-  - 默认：关闭
+  - 默认：关闭；推荐用 `--enable-dynamic-tpot` 替代。
   - 作用：在 root 进程内启动异步 TPOT 调度线程，低频读取 UDS `status` / `perf`，并通过既有 `set_plan` / `set_pp_migration` 下发单请求 decode 迁移。
-  - 依赖：`DLLAMA_PLAN_CTRL_SOCKET`、`--enable-plan-barrier`；PP 候选还需要 `--enable-pp-migration`。
-  - 备注：调度日志写入文件，不写 stdout。关闭该变量后行为与现有版本一致。
+  - 必要依赖：plan UDS、plan barrier；PP 候选需要 PP migration。使用 `--enable-dynamic-tpot` 时这些依赖会自动补齐。
+
+- `DLLAMA_TPOT_LOG`（字符串，默认 `/tmp/dllama_tpot_scheduler.log`）
+  - 作用：调度器结构化日志路径。日志行前缀：`tpot_sched seq=... state=... best=... gain_ms=... steady_tpot=... overshoot_pct=...`。
 
 - `DLLAMA_TPOT_WINDOW_TOKENS`（整数，默认 `16`）
+- `DLLAMA_TPOT_MIN_SAMPLES`（整数，默认 `8`）
 - `DLLAMA_TPOT_COOLDOWN_TOKENS`（整数，默认 `32`）
 - `DLLAMA_TPOT_ROLLBACK_WINDOW`（整数，默认 `16`）
+- `DLLAMA_TPOT_EWMA_ALPHA`（浮点，默认 `0.2`）
+  - 作用：控制观察窗口、最少样本、迁移冷却、回滚观察窗口和 EWMA 平滑。
+
 - `DLLAMA_TPOT_MIN_PP_GAIN_MS`（浮点，默认 `5`）
 - `DLLAMA_TPOT_MIN_TP_GAIN_MS`（浮点，默认 `2`）
+- `DLLAMA_TPOT_PP_RISK_MARGIN_MS`（浮点，默认 `0`）
+- `DLLAMA_TPOT_TP_RISK_MARGIN_MS`（浮点，默认 `0`）
+- `DLLAMA_TPOT_PP_MIGRATION_COST_MS`（浮点，默认 `0`）
+- `DLLAMA_TPOT_TP_MIGRATION_COST_MS`（浮点，默认 `0`）
+  - 作用：控制候选迁移是否值得执行。纯 PP 测试时可用很大的 TP 阈值关闭 TP 候选。
+
 - `DLLAMA_TPOT_LOAD_PENALTY_BETA`（浮点，默认 `0.08`）
-- `DLLAMA_TPOT_LOG`（字符串，默认 `/tmp/dllama_tpot_scheduler.log`）
-  - 作用：控制 TPOT 调度窗口、冷却、回滚阈值、PP/TP 最小收益和结构化日志路径。
-  - 日志行前缀：`tpot_sched seq=... state=... best=... gain_ms=... steady_tpot=... overshoot_pct=...`。
+- `DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS`（整数，默认 `128`）
+- `DLLAMA_TPOT_MAX_PP_LAYER_MOVE`（整数，默认 `1`）
+- `DLLAMA_TPOT_MAX_HEAD_MOVE`（整数，默认 `1`）
+- `DLLAMA_TPOT_MAX_FFN_MOVE`（整数，默认 `256`）
+  - 作用：PP cost model、迁移成本摊销和单次迁移粒度。
+
+- `DLLAMA_TPOT_POLL_MS`（整数，默认 `200`）
+- `DLLAMA_TPOT_UDS_TIMEOUT_MS`（整数，默认 `2000`）
+  - 作用：自动调度线程轮询 UDS 的频率和 timeout。
+
+纯 PP 自动迁移测试常用调参：
+
+```bash
+export DLLAMA_TPOT_LOG=/tmp/dllama_tpot_pp_auto.log
+export DLLAMA_TPOT_WINDOW_TOKENS=6
+export DLLAMA_TPOT_MIN_SAMPLES=6
+export DLLAMA_TPOT_COOLDOWN_TOKENS=8
+export DLLAMA_TPOT_ROLLBACK_WINDOW=8
+export DLLAMA_TPOT_MIN_PP_GAIN_MS=1
+export DLLAMA_TPOT_PP_RISK_MARGIN_MS=0
+export DLLAMA_TPOT_PP_MIGRATION_COST_MS=0
+export DLLAMA_TPOT_MIN_TP_GAIN_MS=1000000
+export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
+```
+
+### 1.5.1 KV/网络稳定性与 collector
+
+- `DLLAMA_KV_ACK_TIMEOUT_MS`（整数 ms，默认：未设置；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `180000`）
+  - 作用：PP KV transfer 后等待 target ACK batch 的墙钟超时。优先级高于 `DLLAMA_IO_TIMEOUT_MS`。
+
+- `DLLAMA_IO_TIMEOUT_MS`（整数 ms，默认 `0`：legacy 无限等待；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `180000`）
+  - 作用：socket read/write/poll timeout。
+
+- `DLLAMA_ASYNC_KV_COLLECT_SUBMIT`（布尔，默认 `0`；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `0`）
+  - 作用：控制 `RootKvCollector` dump 到 `/tmp/dllama_async_layer*_pos*_root_{k,v}.bin` 后是否再次提交 KV transfer。
+  - 说明：当前 PP real-transfer 已经批量转移 `[0,pos]` 历史 KV，collector 默认只 dump，不再重复 submit，避免迁移后残留 `waiting previous ack`。
+
+- `DLLAMA_ASYNC_KV_COLLECT_POLL_MS`（整数，默认 `20`）
+  - 作用：root KV collector 后台线程轮询间隔。
+
+- `DLLAMA_ASYNC_KV_COLLECT_LAYER`（整数，默认：当前 stage 的右边界 layer）
+  - 作用：构建 KV aggregate pipe 时指定 collector 观测的 layer。通常无需手动设置。
 
 ### 1.6 分布式：Root 同步环境变量到 Workers
 

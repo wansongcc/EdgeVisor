@@ -1,5 +1,8 @@
 # Bubble Shadow KV 3 GPU PP 对照测试记录
 
+> Status: 本文件是历史实验记录，保留当时的命令与输出不重写。当前自动 PP/TPOT 入口为 `--enable-dynamic-tpot --plan-ctrl-socket <path> --runtime-redundant-boundary-layers 1`，它会自动开启 PP migration 依赖项。
+
+
 ## 测试目的
 
 验证 `exp/bubble-shadow-kv` 分支中 Bubble Shadow KV 调度优化是否能在真实 3 GPU PP 场景下，把冗余 KV 相关计算更多放入 pipeline bubble / sync wait 窗口，减少对主路径的拖慢。

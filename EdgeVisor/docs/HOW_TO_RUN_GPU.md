@@ -37,3 +37,18 @@ Notes for NVIDIA Jetson:
 ./dllama worker    ... --nthreads 1 --gpu-index 0 
 ./dllama-api       ... --nthreads 1 --gpu-index 0 
 ```
+
+## Online Migration Notes
+
+GPU/Jetson online migration uses the same root/worker commands plus the current
+runtime switches documented in:
+
+- [README_ENV_VARS.md](README_ENV_VARS.md) for the full environment variable and
+  CLI switch reference.
+- [HOW_TO_ONLINE_MIGRATION.md](HOW_TO_ONLINE_MIGRATION.md) for manual UDS and
+  automatic TPOT migration workflows.
+
+For automatic PP/TPOT scheduling, start root inference with
+`--enable-dynamic-tpot --plan-ctrl-socket <path>` and add
+`--runtime-redundant-boundary-layers 1` when PP layer migration needs redundant
+boundary weights.

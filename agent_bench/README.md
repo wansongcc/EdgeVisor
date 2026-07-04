@@ -19,11 +19,10 @@ Backends currently implemented:
 
 EdgeVisor dynamic support:
 
-- The EdgeVisor backend sets `DLLAMA_PLAN_CTRL_SOCKET`.
-- It starts root inference with `--enable-plan-barrier`.
-- During the configured generation it sends `set_plan` over UDS.
-- The trace records UDS ping, set_plan response, status polling, and whether
-  EdgeVisor logs contain plan emit/apply markers.
+- Manual UDS migration mode starts root inference with `--plan-ctrl-socket <path>` and `--enable-plan-barrier`, then sends `set_plan` over UDS during the configured generation.
+- Automatic TPOT mode should start root inference with `--enable-dynamic-tpot --plan-ctrl-socket <path>`; this auto-enables plan barrier, PP migration, KV aggregate, stage full weights, ACK timeout, and collector no-resubmit defaults.
+- `DLLAMA_PLAN_CTRL_SOCKET` remains a compatibility fallback, but new backend code should prefer the CLI argument so traces capture the actual root command.
+- The trace records UDS ping, set_plan/set_pp_migration responses, status polling, and whether EdgeVisor logs contain plan emit/apply or PP `ack batch complete -> switch ownership` markers.
 
 Example:
 

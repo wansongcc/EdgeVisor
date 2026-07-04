@@ -41,7 +41,10 @@
 |------|------|----------|--------|
 | `--ratios` | TP/PP 工作量分配比例 | `"1:1*2:3"` | 均匀分配 |
 | `--kv-redundancy` | 每个节点的 KV 冗余头数量 | `"2"` 或 `"2,3,2,3"` | `2` |
-| `--enable-plan-barrier` | 启用在线迁移屏障 | `1` 或 `0` | `0` |
+| `--enable-plan-barrier` | 启用手动 UDS 在线迁移屏障 | `1` 或 `0` | `0` |
+| `--plan-ctrl-socket` | 指定 UDS 控制器 socket | `/tmp/dllama_plan.sock` | 未设置 |
+| `--enable-pp-migration` | 启用 PP layer 迁移路径 | `1` 或 `0` | `0` |
+| `--enable-dynamic-tpot` | 启用 root 自动 TPOT 在线调度 | `1` 或 `0` | `0` |
 
 ---
 
@@ -218,13 +221,9 @@ KV 冗余用于在线迁移时保持计算连续性。每个节点可以存储�
 - Stage 0 内 2 节点等比例 1:1
 - Stage 1 内 2 节点非均匀 2:3
 
-### 示例 4：启用在线迁移
+### 示例 4：手动 UDS 在线迁移
 
 ```bash
-# 设置 UDS 控制器 socket
-export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
-
-# 启动推理
 ./dllama inference \
   --prompt "The capital of France is" \
   --steps 128 \
@@ -232,6 +231,7 @@ export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
   --tokenizer models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
   --nthreads 8 \
+  --plan-ctrl-socket /tmp/dllama_plan.sock \
   --enable-plan-barrier \
   --enable-stage-full-weights \
   --enable-kv-redundancy-during-migration 1 \
@@ -247,6 +247,25 @@ export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
 python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
   --seq 1 --mode next_barrier --stage 0 --from 0 --to 1 --kind 3 --heads 1 --ffn 256
 ```
+
+### 示例 5：自动 TPOT PP 在线迁移
+
+```bash
+./dllama inference \
+  --prompt "introduce yourself" \
+  --steps 256 \
+  --model models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m \
+  --tokenizer models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t \
+  --buffer-float-type q80 \
+  --nthreads 1 \
+  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --enable-dynamic-tpot \
+  --runtime-redundant-boundary-layers 1 \
+  --workers 127.0.0.1:9999 127.0.0.1:9998 127.0.0.1:9997 \
+  --ratios '1@10*1@10*1@6*1@6'
+```
+
+`--enable-dynamic-tpot` 会自动开启 plan barrier、PP migration、KV aggregate、stage full weights、ACK timeout 和 collector 默认行为。
 
 ---
 

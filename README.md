@@ -104,6 +104,17 @@ bash run_semantic_gpu_dynamic_heads.sh
 bash run_gpu_pp_migration.sh
 ```
 
+Current root-side automatic TPOT migration entry:
+
+```bash
+./dllama inference ... \
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --runtime-redundant-boundary-layers 1
+```
+
+`--enable-dynamic-tpot` auto-enables plan barrier, PP migration, KV aggregate, stage full weights, PP KV ACK timeout, and collector no-resubmit defaults.
+
 A two-stage GPU smoke configuration with Stage 0 on GPU0 and Stage 1 using TP on GPU1/GPU2 can use:
 
 ```bash
@@ -276,6 +287,17 @@ bash run_gpu_pp_static.sh
 bash run_semantic_gpu_dynamic_heads.sh
 bash run_gpu_pp_migration.sh
 ```
+
+当前 root 侧自动 TPOT 迁移入口：
+
+```bash
+./dllama inference ... \
+  --enable-dynamic-tpot \
+  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --runtime-redundant-boundary-layers 1
+```
+
+`--enable-dynamic-tpot` 会自动开启 plan barrier、PP migration、KV aggregate、stage full weights、PP KV ACK timeout，以及 collector 默认不重复提交。
 
 两阶段 GPU smoke 示例：Stage 0 使用 GPU0，Stage 1 使用 GPU1/GPU2 做 TP，可使用：
 

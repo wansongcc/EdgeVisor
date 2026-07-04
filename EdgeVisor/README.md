@@ -2,6 +2,8 @@
 
 # Distributed Llama
 
+> Status: this file is mostly the upstream Distributed Llama README kept for compatibility. For current EdgeVisor GPU/PP/TP/automatic migration usage, prefer the top-level `../README.md`, `README_new.md`, `GPU_BASED_USAGE.md`, and `docs/README_ENV_VARS.md`.
+
 [![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/b4rtaz/distributed-llama/.github%2Fworkflows%2Fmain.yml?style=flat-square)](https://github.com/b4rtaz/distributed-llama/actions) [![License: MIT](https://img.shields.io/github/license/mashape/apistatus.svg?style=flat-square)](/LICENSE) [![Discord](https://discordapp.com/api/guilds/1245814812353495070/widget.png?style=shield)](https://n4no.com/projects/distributedLlama/discord.php)
 
 Connect home devices into a powerful cluster to accelerate LLM inference. More devices mean faster performance, leveraging tensor parallelism and high-speed synchronization over Ethernet.
@@ -14,7 +16,7 @@ Supports Linux, macOS, and Windows. Optimized for ARM and x86_64 AVX2 CPUs.
 - [🧠 How to Run on GPU](./docs/HOW_TO_RUN_GPU.md)
 - [🧷 Environment Variable Switches](./docs/README_ENV_VARS.md)
 - [🧭 Online Migration (PlanCommand + UDS)](./docs/HOW_TO_ONLINE_MIGRATION.md)
-- [⚖️ Uneven TP/PP Startup Configuration](./doc/UNEVEN_TP_PP_CONFIG.md)
+- [⚖️ Uneven TP/PP Startup Configuration](./docs/UNEVEN_TP_PP_CONFIG.md)
 
 **News**
 - 16 Sep 2025 - Qwen 3 MoE models are now supported on Vulkan.

@@ -87,6 +87,9 @@ struct PendingAction {
     bool active = false;
     tpot::Candidate candidate;
     double beforeTpotMs = 0.0;
+    uint32_t beforeSamples = 0u;
+    uint32_t beforePosBegin = 0u;
+    uint32_t beforePosEnd = 0u;
     uint32_t startPos = 0u;
 };
 
@@ -596,12 +599,48 @@ static std::string metricsString(const SchedulerMetrics &m, uint32_t currentPos)
     return oss.str();
 }
 
+static double tpotDeltaPct(double beforeMs, double afterMs) {
+    if (beforeMs <= 0.0) return 0.0;
+    return ((afterMs - beforeMs) / beforeMs) * 100.0;
+}
+
 static void logDecision(
     ControllerRuntime &rt,
     const WindowSummary &window,
     const tpot::Candidate &best,
     bool issued,
-    const char *extra) {
+    const char *extra,
+    const PendingAction *comparison = nullptr,
+    uint32_t verifyElapsedTokens = 0u) {
+    const PendingAction *cmp = comparison;
+    const bool hasCompare = (cmp != nullptr) || rt.pending.active;
+    double beforeTpotMs = window.tpotMs;
+    uint32_t beforeSamples = window.samples;
+    uint32_t beforePosBegin = window.posBegin;
+    uint32_t beforePosEnd = window.posEnd;
+    uint32_t compareStartPos = window.posEnd;
+    if (cmp != nullptr) {
+        beforeTpotMs = cmp->beforeTpotMs;
+        beforeSamples = cmp->beforeSamples;
+        beforePosBegin = cmp->beforePosBegin;
+        beforePosEnd = cmp->beforePosEnd;
+        compareStartPos = cmp->startPos;
+    } else if (rt.pending.active) {
+        beforeTpotMs = rt.pending.beforeTpotMs;
+        beforeSamples = rt.pending.beforeSamples;
+        beforePosBegin = rt.pending.beforePosBegin;
+        beforePosEnd = rt.pending.beforePosEnd;
+        compareStartPos = rt.pending.startPos;
+    }
+
+    const double afterTpotMs = window.tpotMs;
+    const double deltaMs = hasCompare ? (afterTpotMs - beforeTpotMs) : 0.0;
+    const double improveMs = hasCompare ? (beforeTpotMs - afterTpotMs) : 0.0;
+    const double deltaPct = hasCompare ? tpotDeltaPct(beforeTpotMs, afterTpotMs) : 0.0;
+    const double improvePct = -deltaPct;
+    const bool improved = hasCompare && deltaMs < 0.0;
+    const bool degraded = hasCompare && beforeTpotMs > 0.0 && afterTpotMs > beforeTpotMs * 1.05;
+
     std::ostringstream oss;
     oss << "tpot_sched seq=" << rt.decisionSeq
         << " state=" << stateName(rt.state)
@@ -616,8 +655,23 @@ static void logDecision(
         << " layer=" << best.layerIndex
         << " head_move=" << best.headMove
         << " ffn_move=" << best.ffnMove
-        << " tpot_before=" << (rt.pending.active ? rt.pending.beforeTpotMs : window.tpotMs)
-        << " tpot_after=" << window.tpotMs
+        << " tpot_before=" << beforeTpotMs
+        << " tpot_after=" << afterTpotMs
+        << " tpot_delta_ms=" << deltaMs
+        << " tpot_delta_pct=" << deltaPct
+        << " tpot_improve_ms=" << improveMs
+        << " tpot_improve_pct=" << improvePct
+        << " tpot_compare=" << (hasCompare ? 1 : 0)
+        << " tpot_improved=" << (improved ? 1 : 0)
+        << " tpot_degraded=" << (degraded ? 1 : 0)
+        << " pre_samples=" << beforeSamples
+        << " pre_pos_begin=" << beforePosBegin
+        << " pre_pos_end=" << beforePosEnd
+        << " post_samples=" << window.samples
+        << " post_pos_begin=" << window.posBegin
+        << " post_pos_end=" << window.posEnd
+        << " verify_start_pos=" << compareStartPos
+        << " verify_elapsed_tokens=" << verifyElapsedTokens
         << " settled=" << (rt.metrics.settled ? 1 : 0)
         << " migrations=" << rt.metrics.migrationCount
         << " rollbacks=" << rt.metrics.rollbackCount
@@ -739,7 +793,7 @@ void DynamicTpotController::run() {
             const char *note = "";
 
             if (rt.pending.active) {
-                const tpot::Candidate pendingForLog = rt.pending.candidate;
+                const PendingAction pendingForLog = rt.pending;
                 bool verifyIssued = false;
                 const uint32_t elapsed = window.posEnd >= rt.pending.startPos ? window.posEnd - rt.pending.startPos : 0u;
                 if (elapsed >= (uint32_t)rt.cfg.rollbackWindow) {
@@ -778,7 +832,7 @@ void DynamicTpotController::run() {
                 } else {
                     note = "verify_wait";
                 }
-                logDecision(rt, window, pendingForLog, verifyIssued, note);
+                logDecision(rt, window, pendingForLog.candidate, verifyIssued, note, &pendingForLog, elapsed);
                 std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
                 continue;
             }
@@ -801,6 +855,9 @@ void DynamicTpotController::run() {
                     rt.pending.active = true;
                     rt.pending.candidate = best;
                     rt.pending.beforeTpotMs = window.tpotMs;
+                    rt.pending.beforeSamples = window.samples;
+                    rt.pending.beforePosBegin = window.posBegin;
+                    rt.pending.beforePosEnd = window.posEnd;
                     rt.pending.startPos = window.posEnd;
                     rt.cooldownUntilPos = window.posEnd + (uint32_t)rt.cfg.cooldownTokens;
                     rt.state = ControllerState::VERIFY;

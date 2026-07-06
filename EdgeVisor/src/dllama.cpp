@@ -21,6 +21,16 @@
 #include <sstream>
 #include <chrono>
 #include <memory>
+#include <map>
+
+static void appendMigrationTpotLog(const std::string &line) {
+    const char *path = std::getenv("DLLAMA_TPOT_LOG");
+    if (path == nullptr || path[0] == '\0') return;
+    std::ofstream f(path, std::ios::app);
+    if (!f) return;
+    f << line << "\n";
+}
+
 
 static void computeLogitsStats(const float* logits, NnUint vocabSize,
                               bool &hasNaN, bool &hasInf,
@@ -850,11 +860,33 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         unsigned long long execUs = 0;
         unsigned long long syncUs = 0;
         unsigned long long bubbleUs = 0;
+        NnUint stageIndex = 0u;
+        bool hasStage = false;
         bool hasValue = false;
     };
     struct TokenPerfSample {
         NnUint pos = 0u;
         std::vector<TokenNodePerf> nodePerf;
+    };
+    struct MigrationTpotSummary {
+        bool ready = false;
+        NnUint anchorLayer = 0u;
+        NnUint anchorPos = 0u;
+        NnUint windowTokens = 0u;
+        NnUint beforeStart = 0u;
+        NnUint beforeEnd = 0u;
+        NnUint afterStart = 0u;
+        NnUint afterEnd = 0u;
+        double beforeTpotMs = 0.0;
+        double afterTpotMs = 0.0;
+        double tpotDeltaMs = 0.0;
+        double tpotImprovePct = 0.0;
+        double beforeComputeTpotMs = 0.0;
+        double afterComputeTpotMs = 0.0;
+        double computeDeltaMs = 0.0;
+        double computeImprovePct = 0.0;
+        unsigned long long beforeSamples = 0ull;
+        unsigned long long afterSamples = 0ull;
     };
     const NnUint nNodes = (context->args->nWorkers + 1);
     std::vector<NodePerfAgg> perfAgg;
@@ -864,6 +896,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     NnUint migrationPivotPos = 0u;
     NnUint migrationPivotLayer = 0u;
     const NnUint migrationWindowTokens = 20u;
+    MigrationTpotSummary migrationTpotSummary;
     if (context->args->benchmark) {
         perfAgg.resize(nNodes);
     }
@@ -1061,6 +1094,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 sample.nodePerf[p.nodeIndex].execUs = p.execUs;
                 sample.nodePerf[p.nodeIndex].syncUs = p.syncUs;
                 sample.nodePerf[p.nodeIndex].bubbleUs = p.bubbleUs;
+                sample.nodePerf[p.nodeIndex].stageIndex = p.stageIndex;
+                sample.nodePerf[p.nodeIndex].hasStage = true;
                 sample.nodePerf[p.nodeIndex].hasValue = true;
             }
             predPerfHistory.push_back(std::move(sample));
@@ -1099,8 +1134,41 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 const NnUint afterStart = migrationPivotPos + 1u;
                 const NnUint afterEnd = migrationPivotPos + 1u + migrationWindowTokens;
 
+                struct TpotWindowAgg {
+                    double totalMs = 0.0;
+                    double computeMs = 0.0;
+                    unsigned long long count = 0;
+                };
+                auto accumulateStageTpot = [](const TokenPerfSample &s, TpotWindowAgg &dst) {
+                    std::map<NnUint, double> stageTotalMaxMs;
+                    std::map<NnUint, double> stageComputeMaxMs;
+                    for (const TokenNodePerf &np : s.nodePerf) {
+                        if (!np.hasValue || !np.hasStage) continue;
+                        const double execMs = (double)np.execUs / 1000.0;
+                        const double totalMs = (double)(np.execUs + np.syncUs + np.bubbleUs) / 1000.0;
+                        std::map<NnUint, double>::iterator tit = stageTotalMaxMs.find(np.stageIndex);
+                        if (tit == stageTotalMaxMs.end() || totalMs > tit->second) stageTotalMaxMs[np.stageIndex] = totalMs;
+                        std::map<NnUint, double>::iterator cit = stageComputeMaxMs.find(np.stageIndex);
+                        if (cit == stageComputeMaxMs.end() || execMs > cit->second) stageComputeMaxMs[np.stageIndex] = execMs;
+                    }
+                    if (stageTotalMaxMs.empty()) return;
+                    double tokenTotalMs = 0.0;
+                    for (std::map<NnUint, double>::const_iterator it = stageTotalMaxMs.begin(); it != stageTotalMaxMs.end(); ++it) {
+                        tokenTotalMs += it->second;
+                    }
+                    double tokenComputeMs = 0.0;
+                    for (std::map<NnUint, double>::const_iterator it = stageComputeMaxMs.begin(); it != stageComputeMaxMs.end(); ++it) {
+                        tokenComputeMs += it->second;
+                    }
+                    dst.totalMs += tokenTotalMs;
+                    dst.computeMs += tokenComputeMs;
+                    dst.count += 1ull;
+                };
+
                 std::vector<WindowAgg> beforeAgg(nNodes);
                 std::vector<WindowAgg> afterAgg(nNodes);
+                TpotWindowAgg beforeTpot;
+                TpotWindowAgg afterTpot;
                 for (const TokenPerfSample &s : predPerfHistory) {
                     const bool inBefore = (s.pos >= beforeStart && s.pos < beforeEnd);
                     const bool inAfter = (s.pos >= afterStart && s.pos < afterEnd);
@@ -1112,8 +1180,11 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                         WindowAgg &dst = inBefore ? beforeAgg[node] : afterAgg[node];
                         dst.execUs += np.execUs;
                         dst.syncUs += np.syncUs;
+                        dst.bubbleUs += np.bubbleUs;
                         dst.count += 1ull;
                     }
+                    if (inBefore) accumulateStageTpot(s, beforeTpot);
+                    if (inAfter) accumulateStageTpot(s, afterTpot);
                 }
 
                 bool ready = true;
@@ -1124,14 +1195,78 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                     }
                 }
 
+                if (beforeTpot.count < migrationWindowTokens || afterTpot.count < migrationWindowTokens) {
+                    ready = false;
+                }
+
                 if (ready) {
-                    std::printf("\n⏱️  [Migration 20-token Avg] anchor(layer=%u pos=%u) before=[%u,%u) after=[%u,%u)\n",
+                    const double beforeTpotMs = beforeTpot.totalMs / (double)beforeTpot.count;
+                    const double afterTpotMs = afterTpot.totalMs / (double)afterTpot.count;
+                    const double beforeComputeTpotMs = beforeTpot.computeMs / (double)beforeTpot.count;
+                    const double afterComputeTpotMs = afterTpot.computeMs / (double)afterTpot.count;
+                    const double tpotDeltaMs = afterTpotMs - beforeTpotMs;
+                    const double tpotImprovePct = beforeTpotMs > 0.0 ? ((beforeTpotMs - afterTpotMs) / beforeTpotMs) * 100.0 : 0.0;
+                    const double computeDeltaMs = afterComputeTpotMs - beforeComputeTpotMs;
+                    const double computeImprovePct = beforeComputeTpotMs > 0.0 ? ((beforeComputeTpotMs - afterComputeTpotMs) / beforeComputeTpotMs) * 100.0 : 0.0;
+
+                    std::printf("\n⏱️  [Migration TPOT %u-token Avg] anchor(layer=%u pos=%u) before=[%u,%u) after=[%u,%u)\n",
+                        (unsigned)migrationWindowTokens,
                         (unsigned)migrationPivotLayer,
                         (unsigned)migrationPivotPos,
                         (unsigned)beforeStart,
                         (unsigned)beforeEnd,
                         (unsigned)afterStart,
                         (unsigned)afterEnd);
+                    std::printf("  • TPOT(stage-sum): before=%6.2f ms after=%6.2f ms delta=%+6.2f ms improve=%+6.2f%% | compute-only before=%6.2f ms after=%6.2f ms delta=%+6.2f ms improve=%+6.2f%% | samples=%llu/%llu\n",
+                        beforeTpotMs,
+                        afterTpotMs,
+                        tpotDeltaMs,
+                        tpotImprovePct,
+                        beforeComputeTpotMs,
+                        afterComputeTpotMs,
+                        computeDeltaMs,
+                        computeImprovePct,
+                        beforeTpot.count,
+                        afterTpot.count);
+                    migrationTpotSummary.ready = true;
+                    migrationTpotSummary.anchorLayer = migrationPivotLayer;
+                    migrationTpotSummary.anchorPos = migrationPivotPos;
+                    migrationTpotSummary.windowTokens = migrationWindowTokens;
+                    migrationTpotSummary.beforeStart = beforeStart;
+                    migrationTpotSummary.beforeEnd = beforeEnd;
+                    migrationTpotSummary.afterStart = afterStart;
+                    migrationTpotSummary.afterEnd = afterEnd;
+                    migrationTpotSummary.beforeTpotMs = beforeTpotMs;
+                    migrationTpotSummary.afterTpotMs = afterTpotMs;
+                    migrationTpotSummary.tpotDeltaMs = tpotDeltaMs;
+                    migrationTpotSummary.tpotImprovePct = tpotImprovePct;
+                    migrationTpotSummary.beforeComputeTpotMs = beforeComputeTpotMs;
+                    migrationTpotSummary.afterComputeTpotMs = afterComputeTpotMs;
+                    migrationTpotSummary.computeDeltaMs = computeDeltaMs;
+                    migrationTpotSummary.computeImprovePct = computeImprovePct;
+                    migrationTpotSummary.beforeSamples = beforeTpot.count;
+                    migrationTpotSummary.afterSamples = afterTpot.count;
+                    {
+                        std::ostringstream migLog;
+                        migLog << "migrate_tpot anchor_layer=" << migrationPivotLayer
+                               << " anchor_pos=" << migrationPivotPos
+                               << " window_tokens=" << migrationWindowTokens
+                               << " before_pos_begin=" << beforeStart
+                               << " before_pos_end=" << beforeEnd
+                               << " after_pos_begin=" << afterStart
+                               << " after_pos_end=" << afterEnd
+                               << " before_tpot_ms=" << beforeTpotMs
+                               << " after_tpot_ms=" << afterTpotMs
+                               << " tpot_delta_ms=" << tpotDeltaMs
+                               << " tpot_improve_pct=" << tpotImprovePct
+                               << " before_compute_tpot_ms=" << beforeComputeTpotMs
+                               << " after_compute_tpot_ms=" << afterComputeTpotMs
+                               << " compute_tpot_delta_ms=" << computeDeltaMs
+                               << " compute_tpot_improve_pct=" << computeImprovePct
+                               << " before_samples=" << beforeTpot.count
+                               << " after_samples=" << afterTpot.count;
+                        appendMigrationTpotLog(migLog.str());
+                    }
                     for (NnUint node = 0; node < nNodes; ++node) {
                         const double bExecMs = (double)beforeAgg[node].execUs / 1000.0 / (double)beforeAgg[node].count;
                         const double bSyncMs = (double)beforeAgg[node].syncUs / 1000.0 / (double)beforeAgg[node].count;
@@ -1295,14 +1430,39 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         printf("\n");
         printf("Hint: prompt eval uses batchSize>1, so per-token is usually the meaningful metric for rebalancing.\n");
 
-        if (migrationPivotKnown && !migrationWindowReported) {
+        if (migrationTpotSummary.ready) {
+            std::printf("\n");
+            std::printf("⏱️  [Migration TPOT Summary]\n");
+            std::printf("  anchor layer=%u pos=%u window=%u tokens before=[%u,%u) after=[%u,%u) samples=%llu/%llu\n",
+                (unsigned)migrationTpotSummary.anchorLayer,
+                (unsigned)migrationTpotSummary.anchorPos,
+                (unsigned)migrationTpotSummary.windowTokens,
+                (unsigned)migrationTpotSummary.beforeStart,
+                (unsigned)migrationTpotSummary.beforeEnd,
+                (unsigned)migrationTpotSummary.afterStart,
+                (unsigned)migrationTpotSummary.afterEnd,
+                migrationTpotSummary.beforeSamples,
+                migrationTpotSummary.afterSamples);
+            std::printf("  TPOT(stage-sum): before=%6.2f ms after=%6.2f ms delta=%+6.2f ms improve=%+6.2f%%\n",
+                migrationTpotSummary.beforeTpotMs,
+                migrationTpotSummary.afterTpotMs,
+                migrationTpotSummary.tpotDeltaMs,
+                migrationTpotSummary.tpotImprovePct);
+            std::printf("  compute-only:    before=%6.2f ms after=%6.2f ms delta=%+6.2f ms improve=%+6.2f%%\n",
+                migrationTpotSummary.beforeComputeTpotMs,
+                migrationTpotSummary.afterComputeTpotMs,
+                migrationTpotSummary.computeDeltaMs,
+                migrationTpotSummary.computeImprovePct);
+        } else if (migrationPivotKnown) {
             const NnUint beforeStart = (migrationPivotPos >= migrationWindowTokens)
                 ? (migrationPivotPos - migrationWindowTokens)
                 : 0u;
             const NnUint beforeEnd = migrationPivotPos;
             const NnUint afterStart = migrationPivotPos + 1u;
             const NnUint afterEnd = migrationPivotPos + 1u + migrationWindowTokens;
-            std::printf("[migrate-prof] insufficient tokens for full window: anchor(layer=%u pos=%u) need before=[%u,%u) after=[%u,%u)\n",
+            std::printf("\n");
+            std::printf("⏱️  [Migration TPOT Summary]\n");
+            std::printf("  insufficient tokens for full window: anchor(layer=%u pos=%u) need before=[%u,%u) after=[%u,%u)\n",
                 (unsigned)migrationPivotLayer,
                 (unsigned)migrationPivotPos,
                 (unsigned)beforeStart,

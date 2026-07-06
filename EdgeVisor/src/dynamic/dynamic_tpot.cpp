@@ -281,6 +281,7 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
 
     uint32_t samplePos = statusPos;
     bool havePacket = false;
+    bool isEvalSample = false;
     std::map<uint32_t, double> stageMaxMs;
     std::map<uint32_t, double> stageComputeMaxMs;
     std::map<uint32_t, double> stageBoundaryMs;
@@ -294,6 +295,7 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
         if (!p.is_object()) continue;
         const uint32_t batchSize = p.value("batchSize", 0u);
         if (batchSize == 0u) continue;
+        if (batchSize > 1u) isEvalSample = true;
         const uint32_t nodeIndex = p.value("nodeIndex", 0u);
         const uint32_t stageIndex = p.value("stageIndex", 0u);
         samplePos = p.value("position", samplePos);
@@ -321,6 +323,14 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
         }
         nodeMs[stageIndex][nodeIndex] = ms;
         nodeComputeMs[stageIndex][nodeIndex] = computeMs;
+    }
+
+    // Eval phase uses batchSize>1 and has fundamentally different TPOT
+    // characteristics; skip these samples so the scheduler window contains
+    // only comparable pred-phase (batchSize=1) tokens.
+    if (isEvalSample) {
+        rt.lastObservedPos = samplePos;
+        return false;
     }
 
     if (!havePacket || stageMaxMs.empty()) return false;

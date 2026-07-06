@@ -896,6 +896,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     NnUint migrationPivotPos = 0u;
     NnUint migrationPivotLayer = 0u;
     const NnUint migrationWindowTokens = 20u;
+    const NnUint predPhaseStartPos = (NnUint)(nInputTokens - 1);
     MigrationTpotSummary migrationTpotSummary;
     if (context->args->benchmark) {
         perfAgg.resize(nNodes);
@@ -1130,6 +1131,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 const NnUint beforeStart = (migrationPivotPos >= migrationWindowTokens)
                     ? (migrationPivotPos - migrationWindowTokens)
                     : 0u;
+                // Clip before window to pred-phase tokens only (eval tokens have different batching).
+                const NnUint effectiveBeforeStart = std::max(beforeStart, predPhaseStartPos);
                 const NnUint beforeEnd = migrationPivotPos;
                 const NnUint afterStart = migrationPivotPos + 1u;
                 const NnUint afterEnd = migrationPivotPos + 1u + migrationWindowTokens;
@@ -1170,7 +1173,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 TpotWindowAgg beforeTpot;
                 TpotWindowAgg afterTpot;
                 for (const TokenPerfSample &s : predPerfHistory) {
-                    const bool inBefore = (s.pos >= beforeStart && s.pos < beforeEnd);
+                    const bool inBefore = (s.pos >= effectiveBeforeStart && s.pos < beforeEnd);
                     const bool inAfter = (s.pos >= afterStart && s.pos < afterEnd);
                     if (!inBefore && !inAfter) continue;
                     for (NnUint node = 0; node < nNodes; ++node) {
@@ -1187,15 +1190,16 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                     if (inAfter) accumulateStageTpot(s, afterTpot);
                 }
 
+                static const NnUint kMinWindowTokens = 5u;
                 bool ready = true;
                 for (NnUint node = 0; node < nNodes; ++node) {
-                    if (beforeAgg[node].count < migrationWindowTokens || afterAgg[node].count < migrationWindowTokens) {
+                    if (beforeAgg[node].count < kMinWindowTokens || afterAgg[node].count < kMinWindowTokens) {
                         ready = false;
                         break;
                     }
                 }
 
-                if (beforeTpot.count < migrationWindowTokens || afterTpot.count < migrationWindowTokens) {
+                if (beforeTpot.count < kMinWindowTokens || afterTpot.count < kMinWindowTokens) {
                     ready = false;
                 }
 
@@ -1213,7 +1217,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                         (unsigned)migrationWindowTokens,
                         (unsigned)migrationPivotLayer,
                         (unsigned)migrationPivotPos,
-                        (unsigned)beforeStart,
+                        (unsigned)effectiveBeforeStart,
                         (unsigned)beforeEnd,
                         (unsigned)afterStart,
                         (unsigned)afterEnd);
@@ -1232,7 +1236,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                     migrationTpotSummary.anchorLayer = migrationPivotLayer;
                     migrationTpotSummary.anchorPos = migrationPivotPos;
                     migrationTpotSummary.windowTokens = migrationWindowTokens;
-                    migrationTpotSummary.beforeStart = beforeStart;
+                    migrationTpotSummary.beforeStart = effectiveBeforeStart;
                     migrationTpotSummary.beforeEnd = beforeEnd;
                     migrationTpotSummary.afterStart = afterStart;
                     migrationTpotSummary.afterEnd = afterEnd;
@@ -1251,7 +1255,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                         migLog << "migrate_tpot anchor_layer=" << migrationPivotLayer
                                << " anchor_pos=" << migrationPivotPos
                                << " window_tokens=" << migrationWindowTokens
-                               << " before_pos_begin=" << beforeStart
+                               << " before_pos_begin=" << effectiveBeforeStart
                                << " before_pos_end=" << beforeEnd
                                << " after_pos_begin=" << afterStart
                                << " after_pos_end=" << afterEnd

@@ -1821,19 +1821,21 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(
             buffer->read((NnByte *)(dstRow.data() + dstStart), offset, nBytes);
             readAny = true;
 
-            std::printf("🧩 [kv-export-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
-                (unsigned)(data ? data->getNodeIndex() : 0u),
-                (unsigned)segmentIndex,
-                (unsigned)layerIndex,
-                (unsigned)position,
-                tag,
-                (unsigned)bufIdx,
-                (unsigned)srcStart,
-                (unsigned)(srcStart + readLen),
-                (unsigned)dstStart,
-                (unsigned)(dstStart + readLen),
-                partial ? 1u : 0u);
-            std::fflush(stdout);
+            if (envFlagEnabled("DLLAMA_MIGRATION_VERBOSE_LOG")) {
+                std::printf("🧩 [kv-export-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
+                    (unsigned)(data ? data->getNodeIndex() : 0u),
+                    (unsigned)segmentIndex,
+                    (unsigned)layerIndex,
+                    (unsigned)position,
+                    tag,
+                    (unsigned)bufIdx,
+                    (unsigned)srcStart,
+                    (unsigned)(srcStart + readLen),
+                    (unsigned)dstStart,
+                    (unsigned)(dstStart + readLen),
+                    partial ? 1u : 0u);
+                std::fflush(stdout);
+            }
         };
 
         readOne(cfg->keyCacheBufferIndex, kRow, "k");
@@ -1884,19 +1886,21 @@ bool NnVulkanDeviceSegment::applyTransferredKvRow(
             buffer->write((const NnByte *)(srcRow.data() + srcStart), offset, nBytes);
             wroteAny = true;
 
-            std::printf("🧩 [kv-write-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
-                (unsigned)(data ? data->getNodeIndex() : 0u),
-                (unsigned)segmentIndex,
-                (unsigned)layerIndex,
-                (unsigned)position,
-                tag,
-                (unsigned)bufIdx,
-                (unsigned)srcStart,
-                (unsigned)(srcStart + writeLen),
-                (unsigned)dstStart,
-                (unsigned)(dstStart + writeLen),
-                partial ? 1u : 0u);
-            std::fflush(stdout);
+            if (envFlagEnabled("DLLAMA_MIGRATION_VERBOSE_LOG")) {
+                std::printf("🧩 [kv-write-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
+                    (unsigned)(data ? data->getNodeIndex() : 0u),
+                    (unsigned)segmentIndex,
+                    (unsigned)layerIndex,
+                    (unsigned)position,
+                    tag,
+                    (unsigned)bufIdx,
+                    (unsigned)srcStart,
+                    (unsigned)(srcStart + writeLen),
+                    (unsigned)dstStart,
+                    (unsigned)(dstStart + writeLen),
+                    partial ? 1u : 0u);
+                std::fflush(stdout);
+            }
         };
 
         writeOne(cfg->keyCacheBufferIndex, kRow, "k");

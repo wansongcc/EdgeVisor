@@ -28,6 +28,11 @@ static constexpr NnByte SEG_SYNC_PP_RECV = 2;
 static constexpr NnByte SEG_SYNC_ROOT_WAIT = 3;
 static constexpr NnByte SEG_SYNC_LOGITS = 4;
 
+static bool migrationVerboseLogEnabled() {
+    const char *value = std::getenv("DLLAMA_MIGRATION_VERBOSE_LOG");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 && std::strcmp(value, "False") != 0 && std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
 static inline bool nameHas(const char *name, const char *needle) {
     if (name == nullptr || needle == nullptr) return false;
     return std::strstr(name, needle) != nullptr;
@@ -1361,18 +1366,19 @@ bool NnExecutor::exportLayerKvRow(
                 std::memcpy(dstRow.data() + dstStart, src, (size_t)readLen * sizeof(float));
                 seen.insert(bufIdx);
                 readAny = true;
-
-                std::printf("🧩 [kv-export] node=%u seg=%u layer=%u pos=%u buf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
-                    (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
-                    (unsigned)s,
-                    (unsigned)layerIndex,
-                    (unsigned)position,
-                    (unsigned)bufIdx,
-                    (unsigned)srcStart,
-                    (unsigned)(srcStart + readLen),
-                    (unsigned)dstStart,
-                    (unsigned)(dstStart + readLen),
-                    partial ? 1u : 0u);
+                if (migrationVerboseLogEnabled()) {
+                    std::printf("🧩 [kv-export] node=%u seg=%u layer=%u pos=%u buf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
+                        (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+                        (unsigned)s,
+                        (unsigned)layerIndex,
+                        (unsigned)position,
+                        (unsigned)bufIdx,
+                        (unsigned)srcStart,
+                        (unsigned)(srcStart + readLen),
+                        (unsigned)dstStart,
+                        (unsigned)(dstStart + readLen),
+                        partial ? 1u : 0u);
+                }
             };
 
             readOne(cfg->keyCacheBufferIndex, kRow, readK);
@@ -1450,21 +1456,22 @@ bool NnExecutor::applyTransferredKvRow(
                 std::memcpy(dst, srcRow.data() + srcStart, (size_t)writeLen * sizeof(float));
                 written.insert(bufIdx);
                 wroteAny = true;
-
-                std::printf("🧩 [kv-write] node=%u seg=%u layer=%u pos=%u %sBuf=%u bufX=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
-                    (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
-                    (unsigned)s,
-                    (unsigned)layerIndex,
-                    (unsigned)position,
-                    tag,
-                    (unsigned)bufIdx,
-                    (unsigned)bSize.x,
-                    (unsigned)srcStart,
-                    (unsigned)(srcStart + writeLen),
-                    (unsigned)dstStart,
-                    (unsigned)(dstStart + writeLen),
-                    partial ? 1u : 0u);
-                std::fflush(stdout);
+                if (migrationVerboseLogEnabled()) {
+                    std::printf("🧩 [kv-write] node=%u seg=%u layer=%u pos=%u %sBuf=%u bufX=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
+                        (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+                        (unsigned)s,
+                        (unsigned)layerIndex,
+                        (unsigned)position,
+                        tag,
+                        (unsigned)bufIdx,
+                        (unsigned)bSize.x,
+                        (unsigned)srcStart,
+                        (unsigned)(srcStart + writeLen),
+                        (unsigned)dstStart,
+                        (unsigned)(dstStart + writeLen),
+                        partial ? 1u : 0u);
+                    std::fflush(stdout);
+                }
             };
 
             writeOne(cfg->keyCacheBufferIndex, kRow, writtenK, "k");

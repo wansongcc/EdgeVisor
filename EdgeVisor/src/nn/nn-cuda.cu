@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -2759,19 +2760,21 @@ bool NnCudaDeviceSegment::applyTransferredKvRow(
             const NnSize offset = ((NnSize)position * (NnSize)bSize.x + (NnSize)dstStart) * sizeof(float);
             device->writeBuffer(bufIdx, (const NnByte *)(srcRow.data() + srcStart), offset, (NnSize)writeLen * sizeof(float));
             wroteAny = true;
-            std::printf("🧩 [kv-write-cuda] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
-                (unsigned)device->getNodeIndex(),
-                (unsigned)segmentIndex,
-                (unsigned)layerIndex,
-                (unsigned)position,
-                tag,
-                (unsigned)bufIdx,
-                (unsigned)srcStart,
-                (unsigned)(srcStart + writeLen),
-                (unsigned)dstStart,
-                (unsigned)(dstStart + writeLen),
-                isPartial ? 1u : 0u);
-            std::fflush(stdout);
+            if (std::getenv("DLLAMA_MIGRATION_VERBOSE_LOG") != nullptr && std::strcmp(std::getenv("DLLAMA_MIGRATION_VERBOSE_LOG"), "0") != 0) {
+                std::printf("🧩 [kv-write-cuda] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
+                    (unsigned)device->getNodeIndex(),
+                    (unsigned)segmentIndex,
+                    (unsigned)layerIndex,
+                    (unsigned)position,
+                    tag,
+                    (unsigned)bufIdx,
+                    (unsigned)srcStart,
+                    (unsigned)(srcStart + writeLen),
+                    (unsigned)dstStart,
+                    (unsigned)(dstStart + writeLen),
+                    isPartial ? 1u : 0u);
+                std::fflush(stdout);
+            }
         };
 
         writeOne(cfg->keyCacheBufferIndex, kRow, "k");

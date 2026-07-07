@@ -203,39 +203,34 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 
 ### 1.5 单请求 TPOT 在线调度器
 
-- `DLLAMA_DYNAMIC_TPOT_ENABLE`（严格布尔：`1` 启用）
-  - 默认：关闭；推荐用 `--enable-dynamic-tpot` 替代。
-  - 作用：在 root 进程内启动异步 TPOT 调度线程，低频读取 UDS `status` / `perf`，并通过既有 `set_plan` / `set_pp_migration` 下发单请求 decode 迁移。
-  - 必要依赖：plan UDS、plan barrier；PP 候选需要 PP migration。使用 `--enable-dynamic-tpot` 时这些依赖会自动补齐。
+自动 TPOT 调度器由 `--enable-dynamic-tpot` 或 `DLLAMA_DYNAMIC_TPOT_ENABLE=1` 启用。它会在 root 侧异步读取 UDS `status` / `perf`，并通过 `set_plan` / `set_pp_migration` 下发单请求 decode 迁移。
 
-- `DLLAMA_TPOT_LOG`（字符串，默认 `/tmp/dllama_tpot_scheduler.log`）
-  - 作用：调度器结构化日志路径。日志行前缀：`tpot_sched seq=... state=... best=... gain_ms=... steady_tpot=... overshoot_pct=...`。
-
-- `DLLAMA_TPOT_WINDOW_TOKENS`（整数，默认 `16`）
-- `DLLAMA_TPOT_MIN_SAMPLES`（整数，默认 `8`）
-- `DLLAMA_TPOT_COOLDOWN_TOKENS`（整数，默认 `32`）
-- `DLLAMA_TPOT_ROLLBACK_WINDOW`（整数，默认 `16`）
-- `DLLAMA_TPOT_EWMA_ALPHA`（浮点，默认 `0.2`）
-  - 作用：控制观察窗口、最少样本、迁移冷却、回滚观察窗口和 EWMA 平滑。
-
-- `DLLAMA_TPOT_MIN_PP_GAIN_MS`（浮点，默认 `5`）
-- `DLLAMA_TPOT_MIN_TP_GAIN_MS`（浮点，默认 `2`）
-- `DLLAMA_TPOT_PP_RISK_MARGIN_MS`（浮点，默认 `0`）
-- `DLLAMA_TPOT_TP_RISK_MARGIN_MS`（浮点，默认 `0`）
-- `DLLAMA_TPOT_PP_MIGRATION_COST_MS`（浮点，默认 `0`）
-- `DLLAMA_TPOT_TP_MIGRATION_COST_MS`（浮点，默认 `0`）
-  - 作用：控制候选迁移是否值得执行。纯 PP 测试时可用很大的 TP 阈值关闭 TP 候选。
-
-- `DLLAMA_TPOT_LOAD_PENALTY_BETA`（浮点，默认 `0.08`）
-- `DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS`（整数，默认 `128`）
-- `DLLAMA_TPOT_MAX_PP_LAYER_MOVE`（整数，默认 `1`）
-- `DLLAMA_TPOT_MAX_HEAD_MOVE`（整数，默认 `1`）
-- `DLLAMA_TPOT_MAX_FFN_MOVE`（整数，默认 `256`）
-  - 作用：PP cost model、迁移成本摊销和单次迁移粒度。
-
-- `DLLAMA_TPOT_POLL_MS`（整数，默认 `200`）
-- `DLLAMA_TPOT_UDS_TIMEOUT_MS`（整数，默认 `2000`）
-  - 作用：自动调度线程轮询 UDS 的频率和 timeout。
+| 参数 | 类型 | 默认值 | 作用 | 调大后的效果 |
+| --- | --- | --- | --- | --- |
+| `--enable-dynamic-tpot` | CLI 开关 | 关闭 | 启用 root 侧自动 TPOT 调度，并自动补齐 plan barrier、PP migration 等依赖 | 不适用 |
+| `--plan-ctrl-socket <path>` | CLI 参数 | 未设置 | 指定自动调度器和 plan controller 使用的 UDS 路径 | 不适用 |
+| `--enable-pp-migration` | CLI 开关 | 自动模式会开启 | 启用 PP layer 迁移执行路径 | 不适用 |
+| `DLLAMA_DYNAMIC_TPOT_ENABLE` | 布尔 | `0` | 直接启用/关闭自动 TPOT 调度器 | 不适用 |
+| `DLLAMA_TPOT_LOG` | 路径 | `/tmp/dllama_tpot_scheduler.log` | 调度器结构化日志，包含 `gain_ms`、`threshold_ms`、`note` 等 | 不影响策略 |
+| `DLLAMA_TPOT_WINDOW_TOKENS` | 整数 | `16` | 每次决策累计的 decode token 窗口 | 决策更稳但更慢 |
+| `DLLAMA_TPOT_MIN_SAMPLES` | 整数 | `8` | 形成一次有效决策窗口所需最少样本 | 降低低样本误判 |
+| `DLLAMA_TPOT_COOLDOWN_TOKENS` | 整数 | `32` | 一次迁移后禁止再次迁移的 token 数 | 减少连续迁移 |
+| `DLLAMA_TPOT_ROLLBACK_WINDOW` | 整数 | `16` | 迁移后观察多少 token 再判断是否回滚 | 回滚判断更稳但反馈更慢 |
+| `DLLAMA_TPOT_EWMA_ALPHA` | 浮点 | `0.2` | stage 性能 EWMA 平滑系数，范围 `(0,1]` | 较小值更平滑、更不敏感 |
+| `DLLAMA_TPOT_MIN_PP_GAIN_MS` | 浮点 ms | `5` | PP 迁移最小收益门槛 | 更少触发 PP 迁移 |
+| `DLLAMA_TPOT_MIN_TP_GAIN_MS` | 浮点 ms | `2` | TP head/FFN 迁移最小收益门槛 | 更少触发 TP 迁移 |
+| `DLLAMA_TPOT_PP_RISK_MARGIN_MS` | 浮点 ms | `0` | PP 候选额外风险余量，会从收益中扣除 | 要求 PP 收益更确定 |
+| `DLLAMA_TPOT_TP_RISK_MARGIN_MS` | 浮点 ms | `0` | TP 候选额外风险余量，会从收益中扣除 | 要求 TP 收益更确定 |
+| `DLLAMA_TPOT_PP_MIGRATION_COST_MS` | 浮点 ms | `0` | PP 迁移成本模型输入 | 避免小收益 PP 迁移 |
+| `DLLAMA_TPOT_TP_MIGRATION_COST_MS` | 浮点 ms | `0` | TP 迁移成本模型输入 | 避免小收益 TP 迁移 |
+| `DLLAMA_TPOT_LOAD_PENALTY_BETA` | 浮点 | `0.08` | 负载惩罚系数 | 更偏向保守分配 |
+| `DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS` | 整数 | `128` | 预期剩余 token，用于摊销迁移成本 | 越小越保守 |
+| `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` | 整数 | `1` | 单次 PP 最多迁移 layer 数 | 更大时单次迁移幅度更大 |
+| `DLLAMA_TPOT_MAX_HEAD_MOVE` | 整数 | `1` | 单次 TP head 迁移数量 | 更大时单次迁移幅度更大 |
+| `DLLAMA_TPOT_MAX_FFN_MOVE` | 整数 | `256` | 单次 TP FFN 维度迁移数量 | 更大时单次迁移幅度更大 |
+| `DLLAMA_TPOT_POLL_MS` | 整数 ms | `200` | 自动调度线程轮询 UDS 的间隔 | 降低调度频率 |
+| `DLLAMA_TPOT_UDS_TIMEOUT_MS` | 整数 ms | `2000` | 自动调度 UDS 请求超时 | 只影响异常等待 |
+| `DLLAMA_MIGRATION_VERBOSE_LOG` | 布尔 | `0` | 打开 KV export/write/merge/ack 的逐 row 详细日志 | 不影响策略，只增加日志 |
 
 纯 PP 自动迁移测试常用调参：
 

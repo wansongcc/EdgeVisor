@@ -2481,12 +2481,14 @@ bool RootLlmInference::collectSourceStageKvTransfers(
         slot.sources += 1u;
         exported += 1u;
         rxBytes += (uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)kRow.size() * sizeof(float) + (uint64_t)vRow.size() * sizeof(float);
-        std::printf("🧩 [kv-export-merge] sourceNode=%u layer=%u pos=%u kvDim=%u\n",
-            (unsigned)sourceNode,
-            (unsigned)layer,
-            (unsigned)pos,
-            (unsigned)kvDim);
-        std::fflush(stdout);
+        if (envFlagEnabledDefault("DLLAMA_MIGRATION_VERBOSE_LOG", false)) {
+            std::printf("🧩 [kv-export-merge] sourceNode=%u layer=%u pos=%u kvDim=%u\n",
+                (unsigned)sourceNode,
+                (unsigned)layer,
+                (unsigned)pos,
+                (unsigned)kvDim);
+            std::fflush(stdout);
+        }
     };
 
     bool requestedRemote = false;
@@ -3076,10 +3078,12 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
                 ackPos = ack.position;
                 ackPosSet = true;
             }
-            std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
-                (unsigned)ack.layerIndex,
-                (unsigned)ack.position,
-                (unsigned)ack.fromNodeIndex);
+            if (envFlagEnabledDefault("DLLAMA_MIGRATION_VERBOSE_LOG", false)) {
+                std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
+                    (unsigned)ack.layerIndex,
+                    (unsigned)ack.position,
+                    (unsigned)ack.fromNodeIndex);
+            }
         }
     }
 
@@ -3702,10 +3706,12 @@ void RootLlmInference::forward(bool collectProfile) {
                     ackPos = ack.position;
                     ackPosSet = true;
                 }
+            if (envFlagEnabledDefault("DLLAMA_MIGRATION_VERBOSE_LOG", false)) {
                 std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
                     (unsigned)ack.layerIndex,
                     (unsigned)ack.position,
                     (unsigned)ack.fromNodeIndex);
+            }
             }
         }
 

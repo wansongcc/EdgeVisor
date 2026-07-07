@@ -4718,6 +4718,9 @@ void runWorkerApp(AppCliArgs *args) {
         const bool hasBootModel = !bootModelPath.empty();
         const bool hasBootRatios = !bootRatios.empty();
         const bool useLocalLoading = hasBootModel && hasBootRatios;
+        const char *workerModelPath = (args->modelPath != nullptr && args->modelPath[0] != '\0')
+            ? args->modelPath
+            : bootModelPath.c_str();
         NnUint samplerVocabSize = 0u;
         const NnUint bootMaxSeqLen = boot.maxSeqLen;
         const NnFloatType bootSyncType = (NnFloatType)boot.syncType;
@@ -4781,7 +4784,7 @@ void runWorkerApp(AppCliArgs *args) {
         
            if (useLocalLoading) {
                // Worker 需要重新加载 Header 和 Plan 以确定加载逻辑和切分
-               LlmHeader header = loadLlmHeader((char*)bootModelPath.c_str(), bootMaxSeqLen, bootSyncType);
+               LlmHeader header = loadLlmHeader((char*)workerModelPath, bootMaxSeqLen, bootSyncType);
              samplerVocabSize = header.vocabSize;
              
              // [兼容性修复] 自动切换 Q80
@@ -4815,10 +4818,10 @@ void runWorkerApp(AppCliArgs *args) {
 
         if (useLocalLoading) {
             // [Local Loading Mode]
-            printf("🚀 Worker %d: Local Loading Mode from %s\n", nodeConfig.nodeIndex, bootModelPath.c_str());
+            printf("🚀 Worker %d: Local Loading Mode from %s\n", nodeConfig.nodeIndex, workerModelPath);
             
             // Reload header for temporary network construction
-            LlmHeader header = loadLlmHeader((char*)bootModelPath.c_str(), bootMaxSeqLen, bootSyncType);
+            LlmHeader header = loadLlmHeader((char*)workerModelPath, bootMaxSeqLen, bootSyncType);
             
             // Build temporary Net for loading context
             // 这里我们需要构建一个临时的 LlmNet 结构，因为 loader 需要 net 指针
@@ -4829,7 +4832,7 @@ void runWorkerApp(AppCliArgs *args) {
             NnLocalWeightLoader localLoader(&executor, nodeConfig.nodeIndex);
             
             // 使用新版 5 参数加载函数
-            loadLlmNetWeightUneven((char*)bootModelPath.c_str(), &tempNet, &localLoader, planPtr.get(), nodeConfig.nodeIndex);
+            loadLlmNetWeightUneven((char*)workerModelPath, &tempNet, &localLoader, planPtr.get(), nodeConfig.nodeIndex);
 
             releaseLlmNet(&tempNet);
             printf("✅ Worker %d: Weights loaded locally.\n", nodeConfig.nodeIndex);

@@ -120,6 +120,8 @@ def main() -> int:
         action="store_true",
         help="Opt in to experimental online KV/head migration; disabled by default for agentic success runs.",
     )
+    parser.add_argument("--model", type=Path, default=None, help="Override the model path for EdgeVisor/Dllama backends.")
+    parser.add_argument("--tokenizer", type=Path, default=None, help="Override the tokenizer path for EdgeVisor/Dllama backends.")
     parser.add_argument("--ctx", type=int, default=2048)
     args = parser.parse_args()
 
@@ -144,6 +146,10 @@ def main() -> int:
             "virtual_topology": virtual_topology,
             "last_stage_sampling": args.edge_last_stage_sampling,
         }
+        if args.model is not None:
+            backend_kwargs["model_path"] = args.model
+        if args.tokenizer is not None:
+            backend_kwargs["tokenizer_path"] = args.tokenizer
     elif args.backend == "dllama":
         backend_kwargs = {
             "cuda_visible": args.cuda_visible,
@@ -152,6 +158,10 @@ def main() -> int:
             "ratios": args.dllama_ratios,
             "worker_gpus": parse_gpu_list(args.dllama_worker_gpus),
         }
+        if args.model is not None:
+            backend_kwargs["model_path"] = args.model
+        if args.tokenizer is not None:
+            backend_kwargs["tokenizer_path"] = args.tokenizer
     elif args.backend == "edgevisor_exo":
         backend_kwargs = {
             "cuda_visible": args.cuda_visible,
@@ -210,6 +220,10 @@ def main() -> int:
             "extra_env": extra_env,
             "last_stage_sampling": args.edge_last_stage_sampling,
         }
+        if args.model is not None:
+            backend_kwargs["model_path"] = args.model
+        if args.tokenizer is not None:
+            backend_kwargs["tokenizer_path"] = args.tokenizer
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)
     print(json.dumps({"out_dir": str(out_dir), "trace": trace}, indent=2, ensure_ascii=False))

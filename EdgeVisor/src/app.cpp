@@ -22,6 +22,13 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <fstream>
+#include <array>
+#include <cerrno>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
@@ -91,6 +98,179 @@ static bool lastStageSamplingPlanSupported(const NnUnevenPartitionPlan *plan) {
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
     const NnStageConfig &last = plan->stages[plan->nStages - 1u];
     return last.nNodes > 0u && last.rootNodeIndex < plan->nNodes;
+}
+
+struct PpWeightMaterializationResult {
+    bool ok = true;
+    uint64_t bytes = 0u;
+    double elapsedMs = 0.0;
+    std::string reason;
+};
+
+static bool sendAllBytes(int fd, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = ::send(fd, data + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        sent += (size_t)n;
+    }
+    return true;
+}
+
+static bool readWeightChunk(std::ifstream &in, std::vector<char> &buf, size_t want, const std::string &path) {
+    if (want == 0) return true;
+    if (!in.good()) {
+        in.clear();
+        in.close();
+        in.open(path.c_str(), std::ios::binary);
+        if (!in.is_open()) return false;
+    }
+    in.read(buf.data(), (std::streamsize)want);
+    const std::streamsize got = in.gcount();
+    if (got == (std::streamsize)want) return true;
+    if (got < 0) return false;
+    in.clear();
+    in.seekg(0, std::ios::beg);
+    size_t offset = (size_t)std::max<std::streamsize>(0, got);
+    while (offset < want && in.good()) {
+        in.read(buf.data() + offset, (std::streamsize)(want - offset));
+        const std::streamsize extra = in.gcount();
+        if (extra <= 0) break;
+        offset += (size_t)extra;
+    }
+    return offset == want;
+}
+
+static PpWeightMaterializationResult materializePpMigrationWeights(const EdgeVisorAblationConfig &cfg) {
+    PpWeightMaterializationResult result;
+    if (cfg.weightMaterializationMode == WeightMaterializationMode::NONE ||
+        cfg.weightMaterializationBytes == 0u) {
+        result.reason = "weight_materialization_none";
+        return result;
+    }
+    if (cfg.weightMaterializationPath.empty()) {
+        result.ok = false;
+        result.reason = "weight_materialization_missing_path";
+        return result;
+    }
+
+    constexpr size_t kChunk = 1u << 20;
+    std::vector<char> buf(kChunk);
+    std::ifstream in(cfg.weightMaterializationPath.c_str(), std::ios::binary);
+    if (!in.is_open()) {
+        result.ok = false;
+        result.reason = "weight_materialization_open_failed";
+        return result;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t done = 0u;
+    if (cfg.weightMaterializationMode == WeightMaterializationMode::LOCAL_LOAD) {
+        while (done < cfg.weightMaterializationBytes) {
+            const size_t want = (size_t)std::min<uint64_t>(kChunk, cfg.weightMaterializationBytes - done);
+            if (!readWeightChunk(in, buf, want, cfg.weightMaterializationPath)) {
+                result.ok = false;
+                result.reason = "weight_local_load_read_failed";
+                break;
+            }
+            done += want;
+        }
+        if (result.ok) result.reason = "weight_local_load";
+    } else if (cfg.weightMaterializationMode == WeightMaterializationMode::TCP_TRANSFER) {
+        int serverFd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (serverFd < 0) {
+            result.ok = false;
+            result.reason = "weight_tcp_server_socket_failed";
+        } else {
+            int one = 1;
+            ::setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = 0;
+            if (::bind(serverFd, (sockaddr *)&addr, sizeof(addr)) != 0 || ::listen(serverFd, 1) != 0) {
+                result.ok = false;
+                result.reason = "weight_tcp_server_bind_failed";
+                ::close(serverFd);
+                serverFd = -1;
+            }
+        }
+        uint16_t port = 0;
+        if (result.ok) {
+            sockaddr_in bound{};
+            socklen_t len = sizeof(bound);
+            if (::getsockname(serverFd, (sockaddr *)&bound, &len) != 0) {
+                result.ok = false;
+                result.reason = "weight_tcp_server_port_failed";
+            } else {
+                port = ntohs(bound.sin_port);
+            }
+        }
+        std::thread receiver;
+        if (result.ok) {
+            int clientFd = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (clientFd < 0) {
+                result.ok = false;
+                result.reason = "weight_tcp_client_socket_failed";
+            } else {
+                sockaddr_in dst{};
+                dst.sin_family = AF_INET;
+                dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                dst.sin_port = htons(port);
+                if (::connect(clientFd, (sockaddr *)&dst, sizeof(dst)) != 0) {
+                    result.ok = false;
+                    result.reason = "weight_tcp_client_connect_failed";
+                } else {
+                    receiver = std::thread([serverFd]() {
+                        int client = ::accept(serverFd, nullptr, nullptr);
+                        if (client >= 0) {
+                            std::array<char, 65536> recvBuf{};
+                            while (true) {
+                                ssize_t n = ::recv(client, recvBuf.data(), recvBuf.size(), 0);
+                                if (n < 0 && errno == EINTR) continue;
+                                if (n <= 0) break;
+                            }
+                            ::close(client);
+                        }
+                        ::close(serverFd);
+                    });
+                    const double bytesPerSecond = std::max(0.001, cfg.weightMaterializationBandwidthMbps) * 1000.0 * 1000.0;
+                    const auto sendStart = std::chrono::steady_clock::now();
+                    while (done < cfg.weightMaterializationBytes) {
+                        const size_t want = (size_t)std::min<uint64_t>(kChunk, cfg.weightMaterializationBytes - done);
+                        if (!readWeightChunk(in, buf, want, cfg.weightMaterializationPath) ||
+                            !sendAllBytes(clientFd, buf.data(), want)) {
+                            result.ok = false;
+                            result.reason = "weight_tcp_transfer_failed";
+                            break;
+                        }
+                        done += want;
+                        const double expectedMs = ((double)done / bytesPerSecond) * 1000.0;
+                        const double elapsedMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - sendStart).count();
+                        if (expectedMs > elapsedMs) {
+                            std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(expectedMs - elapsedMs));
+                        }
+                    }
+                    if (result.ok) result.reason = "weight_tcp_transfer";
+                }
+                ::shutdown(clientFd, SHUT_RDWR);
+                ::close(clientFd);
+            }
+            if (receiver.joinable()) receiver.join();
+            else ::close(serverFd);
+        } else if (serverFd >= 0) {
+            ::close(serverFd);
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    result.bytes = done;
+    result.elapsedMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return result;
 }
 
 static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name) {
@@ -3332,7 +3512,9 @@ void RootLlmInference::emitPpMigrationRecoverEvent(
     bool applySuccess,
     uint64_t stateTransferBytes,
     uint64_t recomputeTokensOrLayers,
+    uint64_t materializedBytes,
     double statePrepareMs,
+    double bindMs,
     double recoverMs,
     double stallMs,
     const std::string &fallbackReason) {
@@ -3347,10 +3529,12 @@ void RootLlmInference::emitPpMigrationRecoverEvent(
     ev.toNode = nextStageRootNode;
     ev.selectedPolicy = std::string("shadow_") + toString(ablationCfg.shadowKvMode);
     ev.tStatePrepareMs = statePrepareMs;
+    ev.tBindMs = bindMs;
     ev.tRecoverMs = recoverMs;
     ev.stallTimeMs = stallMs;
     ev.stateTransferBytes = stateTransferBytes;
     ev.recomputeTokensOrLayers = recomputeTokensOrLayers;
+    ev.materializedBytes = materializedBytes;
     ev.bindingUpdateCount = (uint64_t)migrationLayers.size();
     ev.physicalDeviceGroup = "pp_route";
     ev.logicalGroup = "pp_stage_boundary";
@@ -4016,7 +4200,9 @@ void RootLlmInference::forward(bool collectProfile) {
         bool applyOk = false;
         uint64_t stateBytes = 0u;
         uint64_t recomputeUnits = 0u;
+        uint64_t materializedBytes = 0u;
         double statePrepareMs = 0.0;
+        double bindMs = 0.0;
         double recoverMs = 0.0;
         std::string fallbackReason;
         const NnStageConfig *fromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
@@ -4112,20 +4298,34 @@ void RootLlmInference::forward(bool collectProfile) {
             migrationBatchSubmitted = applyOk;
         }
 
+        if (applyOk) {
+            PpWeightMaterializationResult weight = materializePpMigrationWeights(ablationCfg);
+            materializedBytes = weight.bytes;
+            bindMs = weight.elapsedMs;
+            if (!weight.reason.empty() && weight.reason != "weight_materialization_none") {
+                fallbackReason += "+" + weight.reason;
+            }
+            if (!weight.ok) {
+                applyOk = false;
+                migrationBatchSubmitted = false;
+            }
+        }
         auto tStall1 = std::chrono::steady_clock::now();
         const double stallMs = std::chrono::duration<double, std::milli>(tStall1 - tStall0).count();
-        emitPpMigrationRecoverEvent(applyOk, stateBytes, recomputeUnits, statePrepareMs, recoverMs, stallMs, fallbackReason);
+        emitPpMigrationRecoverEvent(applyOk, stateBytes, recomputeUnits, materializedBytes, statePrepareMs, bindMs, recoverMs, stallMs, fallbackReason);
         if (applyOk) {
             migrationAckSeen = true;
             migrationAckPos = (int)endPos;
             migrationAckLayer = !migrationLayers.empty() ? (int)migrationLayers.back() : migrationAckLayer;
         }
-        std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu layers=%u posRange=[0,%u]\n",
+        std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu materializedBytes=%llu weightMs=%.3f layers=%u posRange=[0,%u]\n",
             toString(ablationCfg.shadowKvMode),
             applyOk ? "ok" : "fail",
             stallMs,
             (unsigned long long)stateBytes,
             (unsigned long long)recomputeUnits,
+            (unsigned long long)materializedBytes,
+            bindMs,
             (unsigned)migrationLayers.size(),
             (unsigned)endPos);
         std::fflush(stdout);

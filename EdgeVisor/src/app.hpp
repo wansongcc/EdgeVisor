@@ -437,7 +437,9 @@ private:
         bool applySuccess,
         uint64_t stateTransferBytes,
         uint64_t recomputeTokensOrLayers,
+        uint64_t materializedBytes,
         double statePrepareMs,
+        double bindMs,
         double recoverMs,
         double stallMs,
         const std::string &fallbackReason);

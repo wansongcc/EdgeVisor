@@ -72,13 +72,17 @@ class TcpRateProxy:
         rate_bytes_per_s: float,
         log_path: Path,
         start_throttled: bool = True,
+        throttle_ttl_s: float = 0.0,
     ):
         self.listen_port = int(listen_port)
         self.target_port = int(target_port)
         self.rate_bytes_per_s = float(rate_bytes_per_s)
         self.log_path = log_path
+        self.throttle_ttl_s = max(0.0, float(throttle_ttl_s))
         self._stop = threading.Event()
         self._throttle = threading.Event()
+        self._timer_lock = threading.Lock()
+        self._throttle_timer: Optional[threading.Timer] = None
         if start_throttled:
             self._throttle.set()
         self._server: Optional[socket.socket] = None
@@ -97,15 +101,40 @@ class TcpRateProxy:
         self._threads.append(thread)
         self._log(
             f"listen=127.0.0.1:{self.listen_port} target=127.0.0.1:{self.target_port} "
-            f"rate_bytes_per_s={self.rate_bytes_per_s:.3f} throttled={self._throttle.is_set()}"
+            f"rate_bytes_per_s={self.rate_bytes_per_s:.3f} throttled={self._throttle.is_set()} "
+            f"throttle_ttl_s={self.throttle_ttl_s:.3f}"
         )
+        if self._throttle.is_set():
+            self._arm_throttle_timer(self.throttle_ttl_s)
 
-    def activate(self) -> None:
+    def activate(self, ttl_s: Optional[float] = None) -> None:
         self._throttle.set()
-        self._log("throttle_activated")
+        ttl = self.throttle_ttl_s if ttl_s is None else max(0.0, float(ttl_s))
+        self._log(f"throttle_activated ttl_s={ttl:.3f}")
+        self._arm_throttle_timer(ttl)
+
+    def clear(self, reason: str = "manual") -> None:
+        self._throttle.clear()
+        self._log(f"throttle_cleared reason={reason}")
+
+    def _arm_throttle_timer(self, ttl_s: float) -> None:
+        with self._timer_lock:
+            if self._throttle_timer is not None:
+                self._throttle_timer.cancel()
+                self._throttle_timer = None
+            if ttl_s <= 0.0:
+                return
+            timer = threading.Timer(ttl_s, self.clear, kwargs={"reason": "ttl_expired"})
+            timer.daemon = True
+            timer.start()
+            self._throttle_timer = timer
 
     def stop(self) -> None:
         self._stop.set()
+        with self._timer_lock:
+            if self._throttle_timer is not None:
+                self._throttle_timer.cancel()
+                self._throttle_timer = None
         if self._server is not None:
             try:
                 self._server.close()
@@ -730,6 +759,7 @@ class EdgeVisorBackend(Backend):
         worker_actual_ports = [port_base + 100 + i + 1 for i in range(len(self.worker_gpus))]
         proxies: List[TcpRateProxy] = []
         proxied_nodes = self._network_proxy_nodes()
+        throttle_ttl_s = float((self.ablation_config or {}).get("network_proxy_throttle_ttl_s", 0.0) or 0.0)
         for idx, (listen_port, target_port) in enumerate(zip(worker_ports, worker_actual_ports)):
             node_id = idx + 1
             if proxied_nodes is not None and node_id not in proxied_nodes:
@@ -741,6 +771,7 @@ class EdgeVisorBackend(Backend):
                 rate_bytes_per_s=proxy_rate,
                 log_path=out_dir / f"{prefix}_proxy_node{idx + 1}.log",
                 start_throttled=bool((self.ablation_config or {}).get("network_proxy_start_throttled", True)),
+                throttle_ttl_s=throttle_ttl_s,
             )
             proxy.start()
             proxies.append(proxy)
@@ -980,6 +1011,8 @@ class EdgeVisorBackend(Backend):
                 worker_cmd = [
                     str(self.dllama_path),
                     "worker",
+                    "--backend",
+                    "cuda",
                     "--port",
                     str(worker_actual_ports[idx]),
                     "--nthreads",
@@ -996,6 +1029,8 @@ class EdgeVisorBackend(Backend):
             root_cmd = [
                 str(self.dllama_path),
                 "inference",
+                "--backend",
+                "cuda",
                 "--prompt",
                 prompt,
                 "--steps",
@@ -1048,12 +1083,9 @@ class EdgeVisorBackend(Backend):
             start = time.perf_counter()
             root_proc = popen_log(root_cmd, logs["root"], self.engine_dir, env)
             procs.append(root_proc)
-            if not bool((self.ablation_config or {}).get("network_proxy_start_throttled", True)):
-                for proxy in proxies:
-                    proxy.activate()
 
             if socket_path:
-                dynamic_events.extend(self._drive_dynamic_plan(socket_path, root_proc, dynamic_plan or {}, ablation_log_path))
+                dynamic_events.extend(self._drive_dynamic_plan(socket_path, root_proc, dynamic_plan or {}, ablation_log_path, proxies=proxies))
 
             try:
                 rc = root_proc.wait(timeout=self.timeout_s)
@@ -1105,6 +1137,7 @@ class EdgeVisorBackend(Backend):
         root_proc: subprocess.Popen[Any],
         dynamic_plan: Dict[str, Any],
         ablation_log_path: Optional[Path] = None,
+        proxies: Optional[List[TcpRateProxy]] = None,
     ) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
         deadline = time.time() + float(dynamic_plan.get("ready_timeout_s", 30.0))
@@ -1152,6 +1185,7 @@ class EdgeVisorBackend(Backend):
                         command_plan,
                         command_index=idx,
                         ablation_log_path=ablation_log_path,
+                        proxies=proxies,
                     )
                 )
             return events
@@ -1176,6 +1210,7 @@ class EdgeVisorBackend(Backend):
                 dynamic_plan,
                 command_index=0,
                 ablation_log_path=ablation_log_path,
+                proxies=proxies,
             )
         )
         return events
@@ -1188,6 +1223,7 @@ class EdgeVisorBackend(Backend):
         *,
         command_index: int = 0,
         ablation_log_path: Optional[Path] = None,
+        proxies: Optional[List[TcpRateProxy]] = None,
     ) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
         delay_s = float(dynamic_plan.get("delay_s", 0.5))
@@ -1237,6 +1273,20 @@ class EdgeVisorBackend(Backend):
             cmd["triggerPos"] = dynamic_plan["trigger_pos"]
         if "trigger_layer" in dynamic_plan:
             cmd["triggerLayer"] = dynamic_plan["trigger_layer"]
+        throttle_ttl_s = float((self.ablation_config or {}).get("network_proxy_throttle_ttl_s", 0.0) or 0.0)
+        if proxies and not bool((self.ablation_config or {}).get("network_proxy_start_throttled", True)):
+            for proxy in proxies:
+                proxy.activate(throttle_ttl_s)
+            events.append(
+                {
+                    "event": "network_proxy_throttle_activated",
+                    "command_index": command_index,
+                    "proxy_count": len(proxies),
+                    "ttl_s": throttle_ttl_s,
+                    "trigger_pos": cmd.get("triggerPos", ""),
+                    "trigger_layer": cmd.get("triggerLayer", ""),
+                }
+            )
         plan_op = str(dynamic_plan.get("plan_op", "set_plan"))
         if plan_op == "set_pp_migration":
             cmd.update(
@@ -1635,6 +1685,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         virtual_topology: Optional[Dict[str, Any]] = None,
         extra_env: Optional[Dict[str, str]] = None,
         last_stage_sampling: bool = False,
+        model_path: Path = EDGE_MODEL,
+        tokenizer_path: Path = EDGE_TOKENIZER,
     ):
         config = dict(ablation_config or {})
         runtime_boundary_layers = max(0, int(config.get("runtime_redundant_boundary_layers", 0) or 0))
@@ -1659,6 +1711,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             virtual_topology=virtual_topology,
             extra_root_args=extra_root_args,
             extra_env=extra_env,
+            model_path=model_path,
+            tokenizer_path=tokenizer_path,
             enable_benchmark=bool(config.get("enable_benchmark", False)),
             last_stage_sampling=bool(last_stage_sampling or config.get("last_stage_sampling", False)),
         )
@@ -1784,6 +1838,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
                 worker_cmd = [
                     str(self.dllama_path),
                     "worker",
+                    "--backend",
+                    "cuda",
                     "--port",
                     str(worker_ports[idx]),
                     "--nthreads",
@@ -1800,6 +1856,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
 
             root_cmd = [
                 str(self.api_path),
+                "--backend",
+                "cuda",
                 "--port",
                 str(self.api_port),
                 "--model",
@@ -1850,9 +1908,6 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             procs.append(root_proc)
             self.api_port = int(self.api_port)
             self._wait_api_ready(root_proc)
-            if not bool((self.ablation_config or {}).get("network_proxy_start_throttled", True)):
-                for proxy in proxies:
-                    proxy.activate()
             self._session_started_at_ms = (time.perf_counter() - started) * 1000.0
             self._persistent_procs = procs
             self._persistent_worker_cmds = worker_cmds
@@ -1928,6 +1983,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
                     root_proc,
                     dynamic_plan or {},
                     self._persistent_ablation_log_path,
+                    proxies=self._persistent_proxies,
                 )
 
             plan_thread = threading.Thread(target=drive_plan, daemon=True)

@@ -31,6 +31,22 @@ static bool parseBoolValue(const std::string &value, bool &out) {
     return false;
 }
 
+static uint64_t parseUint64Value(const std::string &value, uint64_t fallback) {
+    if (value.empty()) return fallback;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str() || (end != nullptr && *end != '\0')) return fallback;
+    return (uint64_t)parsed;
+}
+
+static double parseDoubleValue(const std::string &value, double fallback) {
+    if (value.empty()) return fallback;
+    char *end = nullptr;
+    const double parsed = std::strtod(value.c_str(), &end);
+    if (end == value.c_str() || (end != nullptr && *end != '\0')) return fallback;
+    return parsed;
+}
+
 const char *toString(ShadowKvMode mode) {
     switch (mode) {
         case ShadowKvMode::ENABLED: return "enabled";
@@ -70,6 +86,15 @@ const char *toString(VgMode mode) {
     return "enabled";
 }
 
+const char *toString(WeightMaterializationMode mode) {
+    switch (mode) {
+        case WeightMaterializationMode::NONE: return "none";
+        case WeightMaterializationMode::LOCAL_LOAD: return "local_load";
+        case WeightMaterializationMode::TCP_TRANSFER: return "tcp_transfer";
+    }
+    return "none";
+}
+
 bool parseShadowKvMode(const std::string &value, ShadowKvMode &mode) {
     if (value == "enabled") { mode = ShadowKvMode::ENABLED; return true; }
     if (value == "disabled_transfer") { mode = ShadowKvMode::DISABLED_TRANSFER; return true; }
@@ -98,6 +123,13 @@ bool parseVgMode(const std::string &value, VgMode &mode) {
     if (value == "random") { mode = VgMode::RANDOM; return true; }
     if (value == "pure_pp") { mode = VgMode::PURE_PP; return true; }
     if (value == "no_elastic_vg") { mode = VgMode::NO_ELASTIC_VG; return true; }
+    return false;
+}
+
+bool parseWeightMaterializationMode(const std::string &value, WeightMaterializationMode &mode) {
+    if (value == "none" || value.empty()) { mode = WeightMaterializationMode::NONE; return true; }
+    if (value == "local_load") { mode = WeightMaterializationMode::LOCAL_LOAD; return true; }
+    if (value == "tcp_transfer" || value == "transfer") { mode = WeightMaterializationMode::TCP_TRANSFER; return true; }
     return false;
 }
 
@@ -131,6 +163,17 @@ static void applyJsonConfig(EdgeVisorAblationConfig &cfg, const json &j) {
     cfg.experimentId = j.value("experiment_id", cfg.experimentId);
     cfg.disableShardingController = j.value("disable_sharding_controller", cfg.disableShardingController);
     cfg.disablePipelineBalancer = j.value("disable_pipeline_balancer", cfg.disablePipelineBalancer);
+    if (j.contains("weight_materialization_mode")) {
+        WeightMaterializationMode mode;
+        const std::string value = j.value("weight_materialization_mode", "none");
+        if (!parseWeightMaterializationMode(value, mode)) {
+            throw std::runtime_error("Invalid weight_materialization_mode: " + value);
+        }
+        cfg.weightMaterializationMode = mode;
+    }
+    cfg.weightMaterializationBytes = j.value("weight_materialization_bytes", cfg.weightMaterializationBytes);
+    cfg.weightMaterializationBandwidthMbps = j.value("weight_materialization_bandwidth_mbps", cfg.weightMaterializationBandwidthMbps);
+    cfg.weightMaterializationPath = j.value("weight_materialization_path", cfg.weightMaterializationPath);
 }
 
 static void applyEnvConfig(EdgeVisorAblationConfig &cfg) {
@@ -164,6 +207,18 @@ static void applyEnvConfig(EdgeVisorAblationConfig &cfg) {
     if (!logPath.empty()) cfg.ablationLogPath = logPath;
     const std::string experiment = envValue("EDGEVISOR_EXPERIMENT_ID");
     if (!experiment.empty()) cfg.experimentId = experiment;
+    const std::string weightMode = envValue("EDGEVISOR_WEIGHT_MATERIALIZATION_MODE");
+    if (!weightMode.empty() && !parseWeightMaterializationMode(weightMode, cfg.weightMaterializationMode)) {
+        throw std::runtime_error("Invalid EDGEVISOR_WEIGHT_MATERIALIZATION_MODE: " + weightMode);
+    }
+    cfg.weightMaterializationBytes = parseUint64Value(
+        envValue("EDGEVISOR_WEIGHT_MATERIALIZATION_BYTES"),
+        cfg.weightMaterializationBytes);
+    cfg.weightMaterializationBandwidthMbps = parseDoubleValue(
+        envValue("EDGEVISOR_WEIGHT_MATERIALIZATION_BANDWIDTH_MBPS"),
+        cfg.weightMaterializationBandwidthMbps);
+    const std::string weightPath = envValue("EDGEVISOR_WEIGHT_MATERIALIZATION_PATH");
+    if (!weightPath.empty()) cfg.weightMaterializationPath = weightPath;
 }
 
 EdgeVisorAblationConfig edgevisorAblationConfigFromSources(
@@ -239,6 +294,10 @@ json edgevisorAblationConfigToJson(const EdgeVisorAblationConfig &config) {
         {"fallback_policy", config.fallbackPolicy},
         {"ablation_log_path", config.ablationLogPath},
         {"experiment_id", config.experimentId},
+        {"weight_materialization_mode", toString(config.weightMaterializationMode)},
+        {"weight_materialization_bytes", config.weightMaterializationBytes},
+        {"weight_materialization_bandwidth_mbps", config.weightMaterializationBandwidthMbps},
+        {"weight_materialization_path", config.weightMaterializationPath},
         {"ablation_variant", edgevisorAblationVariantName(config)}
     };
 }

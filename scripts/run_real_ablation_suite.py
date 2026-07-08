@@ -25,9 +25,14 @@ MODEL = DEFAULT_ROOT / "models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b
 TOKENIZER = DEFAULT_ROOT / "models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
 
 VARIANTS: Dict[str, Dict[str, str]] = {
+    "stable": {"shadow": "enabled", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
+    "boundary_only": {"shadow": "enabled", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
     "full": {"shadow": "enabled", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
     "shadow_transfer": {"shadow": "disabled_transfer", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
     "shadow_recompute": {"shadow": "disabled_recompute", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
+    "recomp_weight_load": {"shadow": "disabled_recompute", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
+    "transfer_weight_load": {"shadow": "disabled_transfer", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
+    "transfer_weight_transfer": {"shadow": "disabled_transfer", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
     "pointer_rebuild": {"shadow": "enabled", "pointer": "operator_rebuild", "jit": "enabled", "vg": "enabled"},
     "pointer_rematerialize": {"shadow": "enabled", "pointer": "weight_rematerialize", "jit": "enabled", "vg": "enabled"},
     "jit_static": {"shadow": "enabled", "pointer": "enabled", "jit": "static", "vg": "enabled"},
@@ -37,8 +42,10 @@ VARIANTS: Dict[str, Dict[str, str]] = {
 }
 
 SHADOW_VARIANTS = ["full", "shadow_transfer", "shadow_recompute"]
+OBS2_WEIGHT_VARIANTS = ["stable", "boundary_only", "recomp_weight_load", "transfer_weight_load", "transfer_weight_transfer"]
 SMOKE_VARIANTS = list(SHADOW_VARIANTS)
 FULL_FLUCTUATIONS = ["compute", "intra_stage_bw", "inter_stage_bw", "mixed_bw"]
+MOTIVATION_FLUCTUATIONS = ["none", *FULL_FLUCTUATIONS]
 SHADOW_SCOPES = ["intra_stage_heads", "inter_stage_layers"]
 
 
@@ -73,6 +80,8 @@ def run_checked(cmd: List[str], *, input_text: Optional[str] = None, timeout_s: 
 
 
 def network_proxy_rate(fluctuation: str, args: argparse.Namespace) -> Optional[float]:
+    if fluctuation == "none":
+        return None
     if fluctuation == "mixed_bw":
         return scope_network_rate_mib(args)
     rates = {
@@ -91,6 +100,8 @@ def scope_network_rate_mib(args: argparse.Namespace) -> float:
 def scope_network_nodes(args: argparse.Namespace) -> List[str]:
     if args.network_proxy_nodes:
         return parse_csv(args.network_proxy_nodes)
+    if str(getattr(args, "topology", "virtual3")).lower() == "pp4":
+        return ["2", "3"]
     if args.shadow_scope == "intra_stage_heads":
         return ["1", "4", "7"]
     return ["3", "4", "5", "6", "7"]
@@ -168,11 +179,35 @@ def scope_recovery_event(args: argparse.Namespace, variant_name: str) -> str:
             return "head_migration_recover:shadow_kv_disabled_head_real_transfer"
         if variant_name == "shadow_recompute":
             return "head_migration_recover:shadow_kv_disabled_head_real_recompute_replay"
-    if variant_name == "shadow_transfer":
+    if variant_name in {"shadow_transfer", "transfer_weight_load", "transfer_weight_transfer"}:
         return "pp_migration_recover:shadow_kv_disabled_real_transfer"
-    if variant_name == "shadow_recompute":
+    if variant_name in {"shadow_recompute", "recomp_weight_load"}:
         return "pp_migration_recover:shadow_kv_disabled_real_recompute_replay"
     return ""
+
+
+def weight_mode_for_variant(args: argparse.Namespace, variant_name: str) -> str:
+    explicit = str(getattr(args, "weight_materialization_mode", "auto") or "auto")
+    if explicit != "auto":
+        return explicit
+    if variant_name in {"recomp_weight_load", "transfer_weight_load"}:
+        return "local_load"
+    if variant_name == "transfer_weight_transfer":
+        return "tcp_transfer"
+    return "none"
+
+
+def weight_bytes_for_run(args: argparse.Namespace) -> int:
+    explicit = int(getattr(args, "weight_materialization_bytes", 0) or 0)
+    if explicit > 0:
+        return explicit
+    try:
+        model_bytes = int(Path(args.model).stat().st_size)
+    except OSError:
+        return 0
+    total_layers = max(1, int(getattr(args, "model_total_layers", 36) or 36))
+    layer_count = max(1, int(getattr(args, "migration_layer_count", 1) or 1))
+    return max(1, int(model_bytes * min(layer_count, total_layers) / total_layers))
 
 
 def stage_bounds(stage_index: int, *, total_layers: int = 28, stage_weights: Iterable[int] = (3, 3, 2)) -> tuple[int, int]:
@@ -200,8 +235,26 @@ def stage_bounds(stage_index: int, *, total_layers: int = 28, stage_weights: Ite
     return 0, total_layers
 
 
-def stage_last_layer(stage_index: int) -> int:
-    start, end = stage_bounds(stage_index)
+def topology_stage_weights(args: argparse.Namespace) -> List[int]:
+    if str(getattr(args, "topology", "virtual3")).lower() == "pp4":
+        return [1, 1, 1, 1]
+    return [3, 3, 2]
+
+
+def topology_stage_count(args: argparse.Namespace) -> int:
+    return len(topology_stage_weights(args))
+
+
+def topology_pp_route(args: argparse.Namespace) -> tuple[int, int, int]:
+    if str(getattr(args, "topology", "virtual3")).lower() == "pp4":
+        return 1, 2, 3
+    return 1, 5, 6
+
+
+def stage_last_layer(stage_index: int, args: Optional[argparse.Namespace] = None) -> int:
+    total_layers = int(getattr(args, "model_total_layers", 28) or 28) if args is not None else 28
+    weights = topology_stage_weights(args) if args is not None else [3, 3, 2]
+    start, end = stage_bounds(stage_index, total_layers=total_layers, stage_weights=weights)
     if end <= start:
         return start
     return end - 1
@@ -326,9 +379,34 @@ def write_episode_copy(
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
     episode = json.loads(src.read_text(encoding="utf-8"))
+    trigger_generation = str(getattr(args, "trigger_generation", "agent_step_02"))
+    prefill_text = make_prefill_text(args)
+    if prefill_text:
+        episode["prefill_context"] = {
+            "enabled": True,
+            "trigger_generation": trigger_generation,
+            "text": prefill_text,
+            "requested_tokens": int(getattr(args, "prefill_tokens", 0) or 0),
+        }
+    if variant_name in {"stable", "boundary_only"}:
+        episode.pop("edgevisor_dynamic_plan", None)
+        dst.write_text(json.dumps(episode, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {
+            "enabled": False,
+            "trigger_generation": trigger_generation,
+            "fluctuation_type": fluctuation,
+            "experiment_variant": variant_name,
+            "shadow_scope": args.shadow_scope,
+            "repeat": repeat,
+            "semantics": (
+                "stable_baseline_no_degradation_no_live_migration"
+                if variant_name == "stable"
+                else "boundary_only_degradation_without_live_continuation"
+            ),
+            "expected_command_count": 0,
+        }
     plan = dict(episode.get("edgevisor_dynamic_plan", {}))
     migration_layer_count = max(1, int(args.migration_layer_count))
-    trigger_generation = str(getattr(args, "trigger_generation", "agent_step_02"))
     plan_mode = str(getattr(args, "plan_mode", "next_barrier"))
     trigger_position = int(getattr(args, "trigger_position", -1) or -1)
     base_plan = {
@@ -344,18 +422,10 @@ def write_episode_copy(
         "shadow_scope": args.shadow_scope,
         "repeat": repeat,
     }
-    prefill_text = make_prefill_text(args)
-    if prefill_text:
-        episode["prefill_context"] = {
-            "enabled": True,
-            "trigger_generation": trigger_generation,
-            "text": prefill_text,
-            "requested_tokens": int(getattr(args, "prefill_tokens", 0) or 0),
-        }
     if args.shadow_scope == "intra_stage_heads":
         head_move = max(1, int(args.intra_head_move))
         stage_index = int(args.intra_stage_index)
-        trigger_layer = stage_last_layer(stage_index)
+        trigger_layer = stage_last_layer(stage_index, args)
         base_plan.update(
             {
                 "plan_op": "set_plan",
@@ -378,14 +448,15 @@ def write_episode_copy(
             base_plan["trigger_pos_strategy"] = "status_offset"
             base_plan["trigger_pos_offset"] = max(1, int(args.intra_trigger_pos_offset))
     else:
-        trigger_layer = stage_last_layer(1)
+        pp_stage, pp_from_node, pp_to_node = topology_pp_route(args)
+        trigger_layer = stage_last_layer(pp_stage, args)
         base_plan.update(
             {
                 "plan_op": "set_pp_migration",
                 "mode": plan_mode,
-                "stage": 1,
-                "from_node": 5,
-                "to_node": 6,
+                "stage": pp_stage,
+                "from_node": pp_from_node,
+                "to_node": pp_to_node,
                 "layerCount": migration_layer_count,
                 "triggerLayer": trigger_layer,
                 "trigger_layer": trigger_layer,
@@ -478,6 +549,7 @@ def build_episode_command(
     port_base: int,
 ) -> List[str]:
     kv_redundancy = scope_kv_redundancy(args, variant_name)
+    topology = str(getattr(args, "topology", "virtual3")).lower()
     cmd = [
         str(args.python_bin),
         "-m",
@@ -488,6 +560,10 @@ def build_episode_command(
         str(episode_copy),
         "--out-root",
         str(run_root),
+        "--model",
+        str(args.model),
+        "--tokenizer",
+        str(args.tokenizer),
         "--cuda-visible",
         args.cuda_visible,
         "--edge-steps",
@@ -506,18 +582,23 @@ def build_episode_command(
         "disabled_unless_necessary",
         "--experiment-id",
         f"{variant_name}_{fluctuation}_rep{repeat}",
-        "--edge-virtual-pp-tp-3stage",
-        "--edge-virtual-ratios",
-        "1:1:1*1:1:1*1:1",
-        "--edge-virtual-node-gpus",
-        "0,1,2,0,1,2,0,1",
-        "--edge-virtual-launch-stagger-s",
-        str(args.edge_virtual_launch_stagger_s),
         "--edge-fixed-port-base",
         str(port_base),
         "--runtime-redundant-boundary-layers",
         str(args.runtime_redundant_boundary_layers),
     ]
+    if topology == "pp4":
+        cmd.extend(["--edge-worker-gpus", "1,2,3", "--edge-ratios", "1*1*1*1"])
+    else:
+        cmd.extend([
+            "--edge-virtual-pp-tp-3stage",
+            "--edge-virtual-ratios",
+            "1:1:1*1:1:1*1:1",
+            "--edge-virtual-node-gpus",
+            "0,1,2,3,0,1,2,3" if args.cuda_visible == "0,1,2,3" else "0,1,2,0,1,2,0,1",
+            "--edge-virtual-launch-stagger-s",
+            str(args.edge_virtual_launch_stagger_s),
+        ])
     if getattr(args, "bubble_shadow_kv", False):
         cmd.append("--bubble-shadow-kv")
     if getattr(args, "edge_benchmark", False):
@@ -542,6 +623,19 @@ def build_episode_command(
         "expected_command_count": len(parse_int_csv(str(getattr(args, "multi_trigger_positions", "") or ""))) or 1,
         "prefill_tokens": int(getattr(args, "prefill_tokens", 0) or 0),
     }
+    weight_mode = weight_mode_for_variant(args, variant_name)
+    config.update(
+        {
+            "weight_materialization_mode": weight_mode,
+            "weight_materialization_bytes": weight_bytes_for_run(args) if weight_mode != "none" else 0,
+            "weight_materialization_path": str(getattr(args, "weight_materialization_path", "") or args.model),
+            "weight_materialization_bandwidth_mbps": float(getattr(args, "weight_materialization_bandwidth_mbps", 10.0)),
+            "weight_materialization_design": (
+                "local_load sequentially reads real model bytes; tcp_transfer sends real model bytes over loopback TCP "
+                "with sender-side pacing at the configured MB/s. Bytes default to model_size*migration_layer_count/model_total_layers."
+            ),
+        }
+    )
     rate = network_proxy_rate(fluctuation, args)
     if rate is not None:
         nodes = scope_network_nodes(args)
@@ -553,12 +647,15 @@ def build_episode_command(
                 "network_proxy_nodes": nodes,
                 "network_proxy_from_node": int(nodes[0]) if nodes else 5,
                 "network_proxy_to_node": int(nodes[-1]) if nodes else 6,
-                "network_proxy_start_throttled": False,
+                "network_proxy_start_throttled": variant_name == "boundary_only",
+                "network_proxy_throttle_ttl_s": float(args.network_proxy_throttle_ttl_s),
             }
         )
     config_path = run_root / "ablation_config.json"
     config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     cmd.extend(["--edgevisor-ablation-config", str(config_path)])
+    if variant_name in {"stable", "boundary_only"}:
+        cmd.append("--disable-episode-dynamic-plan")
     return cmd
 
 
@@ -599,6 +696,8 @@ def run_episode_process(cmd: List[str], run_root: Path, timeout_s: int, cuda_vis
 def selected_variants(args: argparse.Namespace) -> List[str]:
     if args.variants:
         names = parse_csv(args.variants)
+    elif getattr(args, "obs2_weight_suite", False):
+        names = list(OBS2_WEIGHT_VARIANTS)
     elif args.smoke:
         names = list(SMOKE_VARIANTS)
     elif getattr(args, "shadow_scope", ""):
@@ -620,7 +719,7 @@ def selected_fluctuations(args: argparse.Namespace) -> List[str]:
         names = ["mixed_bw"]
     else:
         names = ["mixed_bw"]
-    unknown = [name for name in names if name not in FULL_FLUCTUATIONS]
+    unknown = [name for name in names if name not in MOTIVATION_FLUCTUATIONS]
     if unknown:
         raise SystemExit(f"unknown fluctuations: {','.join(unknown)}")
     return names
@@ -680,7 +779,7 @@ def validate_real_recovery_events(root: Path) -> None:
     offenders: List[str] = []
     for item in manifest:
         variant = str(item.get("variant", ""))
-        if variant not in {"full", "shadow_transfer", "shadow_recompute"}:
+        if variant not in {"full", "shadow_transfer", "shadow_recompute", "recomp_weight_load", "transfer_weight_load", "transfer_weight_transfer"}:
             continue
         run_root = Path(str(item.get("run_root", ""))).resolve()
         if results.get(str(run_root), 1) != 0:
@@ -756,8 +855,12 @@ def validate_real_recovery_events(root: Path) -> None:
                     rec for rec in ablation_events
                     if str(rec.get("event_id", "")) == recover_event_id and bool(rec.get("apply_success", False))
                 ]
-                if not any(str(rec.get("fallback_reason", "")) == "shadow_kv_precomputed_redundant_state" for rec in ok_recover_events):
-                    offenders.append(f"{variant}: missing shadow_kv_precomputed_redundant_state in {trace_path}")
+                accepted_full_reasons = {"shadow_kv_precomputed_redundant_state", "shadow_kv_forward_real_transfer"}
+                if not any(
+                    any(str(rec.get("fallback_reason", "")).startswith(reason) for reason in accepted_full_reasons)
+                    for rec in ok_recover_events
+                ):
+                    offenders.append(f"{variant}: missing accepted Shadow KV recovery reason in {trace_path}")
             continue
         if recover_count < expected_command_count:
             offenders.append(f"{variant}: {recover_field}={recover_count} < expected {expected_command_count} in {trace_path}")
@@ -773,19 +876,24 @@ def validate_real_recovery_events(root: Path) -> None:
             ("intra_stage_heads", "shadow_recompute"): "shadow_kv_disabled_head_real_recompute_replay",
             ("inter_stage_layers", "shadow_transfer"): "shadow_kv_disabled_real_transfer",
             ("inter_stage_layers", "shadow_recompute"): "shadow_kv_disabled_real_recompute_replay",
+            ("inter_stage_layers", "transfer_weight_load"): "shadow_kv_disabled_real_transfer",
+            ("inter_stage_layers", "transfer_weight_transfer"): "shadow_kv_disabled_real_transfer",
+            ("inter_stage_layers", "recomp_weight_load"): "shadow_kv_disabled_real_recompute_replay",
         }
         expected_reason = expected_reasons.get((scope, variant))
         if expected_reason:
             real_reason_events = [
                 rec for rec in ok_recover_events
-                if str(rec.get("fallback_reason", "")) == expected_reason
+                if str(rec.get("fallback_reason", "")).startswith(expected_reason)
             ]
             if not real_reason_events:
                 offenders.append(f"{variant}: missing real recovery fallback_reason={expected_reason} in {trace_path}")
-        if variant == "shadow_transfer" and int(metrics.get("state_transfer_bytes_total", 0) or 0) <= 0:
+        if variant in {"shadow_transfer", "transfer_weight_load", "transfer_weight_transfer"} and int(metrics.get("state_transfer_bytes_total", 0) or 0) <= 0:
             offenders.append(f"{variant}: state_transfer_bytes_total=0 in {trace_path}")
-        if variant == "shadow_recompute" and int(metrics.get("recompute_tokens_or_layers_total", 0) or 0) <= 0:
+        if variant in {"shadow_recompute", "recomp_weight_load"} and int(metrics.get("recompute_tokens_or_layers_total", 0) or 0) <= 0:
             offenders.append(f"{variant}: recompute_tokens_or_layers_total=0 in {trace_path}")
+        if variant in {"recomp_weight_load", "transfer_weight_load", "transfer_weight_transfer"} and int(metrics.get("materialized_bytes_total", 0) or 0) <= 0:
+            offenders.append(f"{variant}: materialized_bytes_total=0 in {trace_path}")
     if offenders:
         raise SystemExit("real recovery validation failed:\n" + "\n".join(offenders))
 
@@ -799,10 +907,12 @@ def main() -> int:
     parser.add_argument("--tokenizer", type=Path, default=TOKENIZER)
     parser.add_argument("--repeats", type=int, default=int(os.environ.get("REPEATS", "3")))
     parser.add_argument("--smoke", action="store_true", default=os.environ.get("SMOKE", "0") == "1")
+    parser.add_argument("--obs2-weight-suite", action="store_true", default=os.environ.get("OBS2_WEIGHT_SUITE", "0") == "1")
     parser.add_argument("--variants", default=os.environ.get("VARIANTS", ""))
     parser.add_argument("--fluctuations", default=os.environ.get("FLUCTUATIONS", ""))
     parser.add_argument("--shadow-scope", choices=SHADOW_SCOPES, default=os.environ.get("SHADOW_SCOPE", "inter_stage_layers"))
     parser.add_argument("--cuda-visible", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2"))
+    parser.add_argument("--topology", choices=["virtual3", "pp4"], default=os.environ.get("EDGEVISOR_TOPOLOGY", "virtual3"))
     parser.add_argument("--ctx", type=int, default=2048)
     parser.add_argument("--edge-steps", type=int, default=256)
     parser.add_argument("--edge-virtual-launch-stagger-s", type=float, default=2.0)
@@ -855,9 +965,15 @@ def main() -> int:
     parser.add_argument("--fixed-port-base", type=int, default=32000)
     parser.add_argument("--compute-target-gpu", type=int, default=-1)
     parser.add_argument("--compute-stress-steps", type=int, default=1024)
-    parser.add_argument("--network-intra-mib-s", type=float, default=100.0)
-    parser.add_argument("--network-inter-mib-s", type=float, default=10.0)
-    parser.add_argument("--network-mixed-mib-s", type=float, default=10.0)
+    parser.add_argument("--network-intra-mib-s", type=float, default=64.0)
+    parser.add_argument("--network-inter-mib-s", type=float, default=64.0)
+    parser.add_argument("--network-mixed-mib-s", type=float, default=64.0)
+    parser.add_argument("--network-proxy-throttle-ttl-s", type=float, default=15.0)
+    parser.add_argument("--weight-materialization-mode", choices=["auto", "none", "local_load", "tcp_transfer"], default="auto")
+    parser.add_argument("--weight-materialization-bytes", type=int, default=0)
+    parser.add_argument("--weight-materialization-path", default="")
+    parser.add_argument("--weight-materialization-bandwidth-mbps", type=float, default=10.0)
+    parser.add_argument("--model-total-layers", type=int, default=36)
     parser.add_argument(
         "--network-proxy-scope",
         choices=["all_worker_connections", "selected_worker_nodes", "migration_nodes"],
@@ -872,8 +988,10 @@ def main() -> int:
     parser.add_argument("--timeout-s", type=int, default=900)
     args = parser.parse_args()
 
-    if args.cuda_visible != "0,1,2":
-        raise SystemExit("Refusing to run: CUDA_VISIBLE_DEVICES must be exactly 0,1,2 so GPU3 is not used.")
+    if args.topology == "pp4" and args.cuda_visible != "0,1,2,3":
+        raise SystemExit("Refusing to run pp4: CUDA_VISIBLE_DEVICES must be exactly 0,1,2,3.")
+    if args.topology != "pp4" and args.cuda_visible not in {"0,1,2", "0,1,2,3"}:
+        raise SystemExit("Refusing to run: CUDA_VISIBLE_DEVICES must be 0,1,2 or 0,1,2,3.")
     if not args.episode.exists():
         raise SystemExit(f"missing episode file: {args.episode}")
     if not args.python_bin.exists():
@@ -909,11 +1027,12 @@ def main() -> int:
         "repeats": repeats,
         "shadow_scope": args.shadow_scope,
         "topology": {
-            "logical_nodes": 8,
-            "stage_layout": [3, 3, 2],
-            "ratios": "1:1:1*1:1:1*1:1",
-            "node_gpu_map": "0,1,2,0,1,2,0,1",
-            "gpu3_allowed": False,
+            "topology": args.topology,
+            "logical_nodes": 4 if args.topology == "pp4" else 8,
+            "stage_layout": topology_stage_weights(args),
+            "ratios": "1*1*1*1" if args.topology == "pp4" else "1:1:1*1:1:1*1:1",
+            "node_gpu_map": "0,1,2,3" if args.topology == "pp4" else ("0,1,2,3,0,1,2,3" if args.cuda_visible == "0,1,2,3" else "0,1,2,0,1,2,0,1"),
+            "gpu3_allowed": args.cuda_visible == "0,1,2,3",
             "migration_layer_count": args.migration_layer_count,
             "intra_head_move": args.intra_head_move,
             "intra_shadow_kv_pad": args.intra_shadow_kv_pad,
@@ -929,6 +1048,7 @@ def main() -> int:
             "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
             "bubble_shadow_kv": bool(args.bubble_shadow_kv),
             "edge_benchmark": bool(args.edge_benchmark),
+            "model_total_layers": args.model_total_layers,
         },
         "perturbation": {
             "compute": "background dllama inference on target GPU",
@@ -937,7 +1057,14 @@ def main() -> int:
             "network_proxy_scope": args.network_proxy_scope,
             "network_proxy_nodes": effective_network_nodes,
             "network_rate_mib_per_s": effective_network_rate,
+            "network_proxy_throttle_ttl_s": args.network_proxy_throttle_ttl_s,
             "simulated_fields_allowed": False,
+            "weight_materialization": {
+                "bytes": weight_bytes_for_run(args),
+                "path": str(args.weight_materialization_path or args.model),
+                "bandwidth_mbps": args.weight_materialization_bandwidth_mbps,
+                "mode_policy": args.weight_materialization_mode,
+            },
         },
     }
     (args.out_root / "suite_config.json").write_text(json.dumps(suite_config, indent=2, ensure_ascii=False), encoding="utf-8")

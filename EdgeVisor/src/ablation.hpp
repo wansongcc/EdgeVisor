@@ -32,6 +32,12 @@ enum class VgMode {
     NO_ELASTIC_VG,
 };
 
+enum class WeightMaterializationMode {
+    NONE,
+    LOCAL_LOAD,
+    TCP_TRANSFER,
+};
+
 struct EdgeVisorAblationConfig {
     ShadowKvMode shadowKvMode = ShadowKvMode::ENABLED;
     PointerSwizzlingMode pointerSwizzlingMode = PointerSwizzlingMode::ENABLED;
@@ -42,6 +48,10 @@ struct EdgeVisorAblationConfig {
     std::string fallbackPolicy = "disabled_unless_necessary";
     std::string ablationLogPath;
     std::string experimentId = "default";
+    WeightMaterializationMode weightMaterializationMode = WeightMaterializationMode::NONE;
+    uint64_t weightMaterializationBytes = 0u;
+    double weightMaterializationBandwidthMbps = 10.0;
+    std::string weightMaterializationPath;
 };
 
 struct EdgeVisorAblationEvent {
@@ -78,11 +88,13 @@ const char *toString(ShadowKvMode mode);
 const char *toString(PointerSwizzlingMode mode);
 const char *toString(JitMode mode);
 const char *toString(VgMode mode);
+const char *toString(WeightMaterializationMode mode);
 
 bool parseShadowKvMode(const std::string &value, ShadowKvMode &mode);
 bool parsePointerSwizzlingMode(const std::string &value, PointerSwizzlingMode &mode);
 bool parseJitMode(const std::string &value, JitMode &mode);
 bool parseVgMode(const std::string &value, VgMode &mode);
+bool parseWeightMaterializationMode(const std::string &value, WeightMaterializationMode &mode);
 
 EdgeVisorAblationConfig edgevisorAblationConfigFromSources(
     const char *jsonPath,

@@ -781,6 +781,7 @@ def run_loop_episode(episode: Dict[str, Any], backend: Backend, out_dir: Path) -
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     events = final_state.get("events", [])
     llm_events = [ev for ev in events if ev.get("type") == "llm_generation"]
+    failed_llm_events = [ev for ev in llm_events if int(ev.get("rc", 0) or 0) != 0]
     tool_events = [ev for ev in events if ev.get("type") == "tool_call"]
     tool_error_events = [ev for ev in events if ev.get("type") == "tool_error"]
     extra_tool_rejections = [ev for ev in events if ev.get("type") == "extra_tool_rejected"]
@@ -840,12 +841,14 @@ def run_loop_episode(episode: Dict[str, Any], backend: Backend, out_dir: Path) -
         "final_answer_missing": final_answer_missing,
         "tool_error_count": len(tool_error_events),
         "extra_tool_rejected_count": len(extra_tool_rejections),
+        "failed_generation_count": len(failed_llm_events),
         "task_success": (
             bool(final_state.get("final_answer"))
             and int(final_state.get("tool_count", 0)) >= int(episode.get("min_tool_calls", 0))
             and required_tools_observed
             and not final_answer_missing
             and not tool_error_events
+            and not failed_llm_events
         ),
     }
     agent_metrics.update(ablation_metric_totals)

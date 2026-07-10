@@ -214,8 +214,10 @@ def make_prefill_text(args: argparse.Namespace) -> str:
     tokens = max(0, int(getattr(args, "prefill_tokens", 0) or 0))
     if tokens <= 0:
         return ""
-    unit = "kv-cache calibration token sequence for late migration measurement. "
-    return ("Prefill context: " + (unit * tokens)).strip()
+    # Llama-family tokenizers encode the repeated " kv" unit as approximately
+    # one token. The previous sentence-sized unit inflated the requested
+    # prefix by roughly an order of magnitude and could exceed --ctx.
+    return ("Prefill context for late KV migration measurement." + (" kv" * tokens)).strip()
 
 
 def port_is_free(port: int) -> bool:
@@ -492,6 +494,8 @@ def build_episode_command(
         args.cuda_visible,
         "--edge-steps",
         str(args.edge_steps),
+        "--edge-timeout-s",
+        str(args.edge_request_timeout_s),
         "--ctx",
         str(args.ctx),
         "--shadow-kv-mode",
@@ -518,6 +522,8 @@ def build_episode_command(
         "--runtime-redundant-boundary-layers",
         str(args.runtime_redundant_boundary_layers),
     ]
+    if args.kv_ack_timeout_ms > 0:
+        cmd.extend(["--kv-ack-timeout-ms", str(args.kv_ack_timeout_ms)])
     if getattr(args, "bubble_shadow_kv", False):
         cmd.append("--bubble-shadow-kv")
     if getattr(args, "edge_benchmark", False):
@@ -805,6 +811,18 @@ def main() -> int:
     parser.add_argument("--cuda-visible", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2"))
     parser.add_argument("--ctx", type=int, default=2048)
     parser.add_argument("--edge-steps", type=int, default=256)
+    parser.add_argument(
+        "--edge-request-timeout-s",
+        type=int,
+        default=240,
+        help="Per-generation EdgeVisor timeout; increase explicitly for long-prefix runs.",
+    )
+    parser.add_argument(
+        "--kv-ack-timeout-ms",
+        type=int,
+        default=0,
+        help="KV migration ACK/control I/O timeout; 0 keeps the runtime default.",
+    )
     parser.add_argument("--edge-virtual-launch-stagger-s", type=float, default=2.0)
     parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=0)
     parser.add_argument("--bubble-shadow-kv", action="store_true", default=os.environ.get("BUBBLE_SHADOW_KV", "0") == "1")
@@ -929,6 +947,8 @@ def main() -> int:
             "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
             "bubble_shadow_kv": bool(args.bubble_shadow_kv),
             "edge_benchmark": bool(args.edge_benchmark),
+            "edge_request_timeout_s": int(args.edge_request_timeout_s),
+            "kv_ack_timeout_ms": int(args.kv_ack_timeout_ms),
         },
         "perturbation": {
             "compute": "background dllama inference on target GPU",

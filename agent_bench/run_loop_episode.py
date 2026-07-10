@@ -80,6 +80,18 @@ def main() -> int:
         help="Delay between launching workers in virtual PP+TP mode to reduce same-GPU initialization contention.",
     )
     parser.add_argument("--edge-steps", type=int, default=256)
+    parser.add_argument(
+        "--edge-timeout-s",
+        type=int,
+        default=240,
+        help="Per-generation timeout for EdgeVisor-family backends.",
+    )
+    parser.add_argument(
+        "--kv-ack-timeout-ms",
+        type=int,
+        default=0,
+        help="Override KV migration ACK/control I/O timeout; 0 keeps the runtime default.",
+    )
     parser.add_argument("--dllama-worker-gpus", default="1", help="Comma-separated worker GPU indices for Dllama.")
     parser.add_argument("--dllama-ratios", default="1:1")
     parser.add_argument("--edge-exo-gpus", default="0,1,2", help="Comma-separated GPU indices for EdgeVisor-EXO.")
@@ -139,6 +151,7 @@ def main() -> int:
             "cuda_visible": args.cuda_visible,
             "ctx": args.ctx,
             "steps": args.edge_steps,
+            "timeout_s": args.edge_timeout_s,
             "ratios": args.edge_ratios,
             "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
             "virtual_topology": virtual_topology,
@@ -149,6 +162,7 @@ def main() -> int:
             "cuda_visible": args.cuda_visible,
             "ctx": args.ctx,
             "steps": args.edge_steps,
+            "timeout_s": args.edge_timeout_s,
             "ratios": args.dllama_ratios,
             "worker_gpus": parse_gpu_list(args.dllama_worker_gpus),
         }
@@ -157,6 +171,7 @@ def main() -> int:
             "cuda_visible": args.cuda_visible,
             "ctx": args.ctx,
             "steps": args.edge_steps,
+            "timeout_s": args.edge_timeout_s,
             "gpu_indices": parse_gpu_list(args.edge_exo_gpus),
             "total_layers": args.edge_exo_total_layers,
             "memory_field": args.edge_exo_memory_field,
@@ -166,6 +181,7 @@ def main() -> int:
             "cuda_visible": args.cuda_visible,
             "ctx": args.ctx,
             "steps": args.edge_steps,
+            "timeout_s": args.edge_timeout_s,
             "gpu_indices": parse_gpu_list(args.lingualinked_gpus),
             "total_layers": args.lingualinked_total_layers,
             "overlap_layers": args.lingualinked_overlap_layers,
@@ -173,6 +189,10 @@ def main() -> int:
         }
     elif args.backend == "edgevisor_ablation":
         extra_env: Dict[str, str] = {}
+        if args.kv_ack_timeout_ms > 0:
+            timeout_ms = str(args.kv_ack_timeout_ms)
+            extra_env["DLLAMA_KV_ACK_TIMEOUT_MS"] = timeout_ms
+            extra_env["DLLAMA_IO_TIMEOUT_MS"] = timeout_ms
         if args.edge_fixed_port_base > 0:
             extra_env["EDGEVISOR_FIXED_PORT_BASE"] = str(args.edge_fixed_port_base)
         if args.bubble_shadow_kv:
@@ -201,6 +221,7 @@ def main() -> int:
             "cuda_visible": args.cuda_visible,
             "ctx": args.ctx,
             "steps": args.edge_steps,
+            "timeout_s": args.edge_timeout_s,
             "ratios": args.edge_ratios,
             "worker_gpus": parse_gpu_list(args.edge_worker_gpus),
             "ablation_config": ablation_config,

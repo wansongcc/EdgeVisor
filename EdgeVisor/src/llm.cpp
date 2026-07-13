@@ -278,6 +278,10 @@ static const char *hiddenActToString(LlmHiddenAct act) {
     throw std::runtime_error("Unsupported hidden act");
 }
 
+static bool siluMulFusionEnabled() {
+    return std::getenv("DLLAMA_DISABLE_SILU_MUL_FUSION") == nullptr;
+}
+
 static const char *ropeTypeToString(NnRopeType type) {
     if (type == ROPE_LLAMA) return "Llama";
     if (type == ROPE_LLAMA3_1) return "Llama3.1";
@@ -879,20 +883,35 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint maxActiv
                         pointerBatchConfig(SRC_BUFFER, dBufferIndex),
                         size0(),
                         NnGeluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
-                } else {
                     ff.addOp(
-                        OP_SILU, "block_act", layerIndex,
+                        OP_MUL, "block_mul", layerIndex,
                         pointerBatchConfig(SRC_BUFFER, dBufferIndex),
                         pointerBatchConfig(SRC_BUFFER, dBufferIndex),
                         size0(),
-                        NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                        NnMulOpCodeConfig{lBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                } else {
+                    if (siluMulFusionEnabled()) {
+                        ff.addOp(
+                            OP_SILU_MUL, "block_act_mul", layerIndex,
+                            pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                            pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                            size0(),
+                            NnMulOpCodeConfig{lBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                    } else {
+                        ff.addOp(
+                            OP_SILU, "block_act", layerIndex,
+                            pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                            pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                            size0(),
+                            NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                        ff.addOp(
+                            OP_MUL, "block_mul", layerIndex,
+                            pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                            pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                            size0(),
+                            NnMulOpCodeConfig{lBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                    }
                 }
-                ff.addOp(
-                    OP_MUL, "block_mul", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    size0(),
-                    NnMulOpCodeConfig{lBufferIndex, NnTensorView{0u, 0u, 0u, 0u, 1u}});
                 if (dBufferIndex != dqBufferIndex) {
                     ff.addOp(
                         OP_CAST, "block_cast_d2", layerIndex,
@@ -1731,36 +1750,43 @@ static NnNodeConfig buildLlmNodeInternal(
                 pointerBatchConfig(SRC_BUFFER, yqBufferIndex), lSlicePtr,
                 w3Slice.sliceSize,
                 makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w3Slice.n, w3Slice.inLen, w3Slice.inStart));
-            {
-                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
-                const NnUint actDim = w1Slice.inLen;
-                if (testSplit && layerIndex == 0u && actDim >= 2u) {
-                    const NnUint half = actDim / 2u;
-                    takeoverFf.addOp(OP_SILU, "block_act_v0", layerIndex,
-                        dSlicePtr, dSlicePtr,
-                        size0(),
-                        NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
-                    takeoverFf.addOp(OP_SILU, "block_act_v1", layerIndex,
-                        dSlicePtr, dSlicePtr,
-                        size0(),
-                        NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
-                } else {
-                    takeoverFf.addOp(OP_SILU, "block_act", layerIndex,
-                        dSlicePtr, dSlicePtr,
-                        size0(),
-                        NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
-                }
-            }
+            const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+            const NnUint actDim = w1Slice.inLen;
             NnMulOpCodeConfig mulCfg = NnMulOpCodeConfig{lBufferIndex};
             if (fullFfnBuffers) {
                 const NnUint ffnStart0 = (plan && plan->ffnSplit.starts) ? plan->ffnSplit.starts[nodeIndex] : 0u;
                 const NnUint ffnLen0 = (plan && plan->ffnSplit.lengths) ? plan->ffnSplit.lengths[nodeIndex] : w1Slice.inLen;
                 mulCfg.view = NnTensorView{ffnStart0, 0u, ffnLen0, 0u, 1u};
             }
-            takeoverFf.addOp(OP_MUL, "block_mul", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                size0(), mulCfg);
+            if (testSplit && layerIndex == 0u && actDim >= 2u) {
+                const NnUint half = actDim / 2u;
+                takeoverFf.addOp(OP_SILU, "block_act_v0", layerIndex,
+                    dSlicePtr, dSlicePtr,
+                    size0(),
+                    NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
+                takeoverFf.addOp(OP_SILU, "block_act_v1", layerIndex,
+                    dSlicePtr, dSlicePtr,
+                    size0(),
+                    NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
+                takeoverFf.addOp(OP_MUL, "block_mul", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size0(), mulCfg);
+            } else if (siluMulFusionEnabled()) {
+                takeoverFf.addOp(OP_SILU_MUL, "block_act_mul", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size0(), mulCfg);
+            } else {
+                takeoverFf.addOp(OP_SILU, "block_act", layerIndex,
+                    dSlicePtr, dSlicePtr,
+                    size0(),
+                    NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                takeoverFf.addOp(OP_MUL, "block_mul", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size0(), mulCfg);
+            }
             if (dBufferIndex != dqBufferIndex) {
                 takeoverFf.addOp(OP_CAST, "block_cast_d2", layerIndex,
                     dSlicePtr, dqSlicePtr,
@@ -2070,17 +2096,6 @@ static NnNodeConfig buildLlmNodeInternal(
 
             ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), dSlicePtr, w1Slice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w1Slice.n, w1Slice.inLen, w1Slice.inStart));
             ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), lSlicePtr, w3Slice.sliceSize, makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w3Slice.n, w3Slice.inLen, w3Slice.inStart));
-            {
-                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
-                const NnUint actDim = w1Slice.inLen;
-                if (testSplit && layerIndex == 0u && actDim >= 2u) {
-                    const NnUint half = actDim / 2u;
-                    ff.addOp(OP_SILU, "block_act_v0", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
-                    ff.addOp(OP_SILU, "block_act_v1", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
-                } else {
-                    ff.addOp(OP_SILU, "block_act", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
-                }
-            }
             // OP_MUL reads multiplier from a buffer index (not via pointer config),
             // so when using full buffers we must use view(offset/len) to align d and l slices.
             // NOTE:
@@ -2096,10 +2111,30 @@ static NnNodeConfig buildLlmNodeInternal(
                 const NnUint ffnLen0 = (plan && plan->ffnSplit.lengths) ? plan->ffnSplit.lengths[nodeIndex] : w1Slice.inLen;
                 mulCfg.view = NnTensorView{ffnStart0, 0u, ffnLen0, 0u, 1u};
             }
-            ff.addOp(OP_MUL, "block_mul", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                size0(), mulCfg);
+            {
+                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+                const NnUint actDim = w1Slice.inLen;
+                if (testSplit && layerIndex == 0u && actDim >= 2u) {
+                    const NnUint half = actDim / 2u;
+                    ff.addOp(OP_SILU, "block_act_v0", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, half, 0u, 1u}});
+                    ff.addOp(OP_SILU, "block_act_v1", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
+                    ff.addOp(OP_MUL, "block_mul", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        size0(), mulCfg);
+                } else if (siluMulFusionEnabled()) {
+                    ff.addOp(OP_SILU_MUL, "block_act_mul", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        size0(), mulCfg);
+                } else {
+                    ff.addOp(OP_SILU, "block_act", layerIndex, dSlicePtr, dSlicePtr, size0(), NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
+                    ff.addOp(OP_MUL, "block_mul", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        size0(), mulCfg);
+                }
+            }
             if (dBufferIndex != dqBufferIndex) {
                 ff.addOp(OP_CAST, "block_cast_d2", layerIndex, dSlicePtr, dqSlicePtr, size0(), NnCastOpCodeConfig{});
             }

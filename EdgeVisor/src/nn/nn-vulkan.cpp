@@ -1114,6 +1114,9 @@ static const char *getShaderFileName(const NnOpCode opCode, const NnOpQuantType 
     if (opCode == OP_MUL) {
         if (quantType == F32_F32_F32) return "mul-forward-f32-f32.spv";
     }
+    if (opCode == OP_SILU_MUL) {
+        if (quantType == F32_F32_F32) return "silu-mul-forward-f32-f32.spv";
+    }
     if (opCode == OP_SCALE) {
         if (quantType == F32_F32_F32) return "scale-forward-f32-f32.spv";
     }
@@ -1155,7 +1158,8 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
             const NnRmsNormOpConfig *config = (NnRmsNormOpConfig *)opConfig->config;
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->invRmsBufferIndex)});
         } break;
-        case OP_MUL: {
+        case OP_MUL:
+        case OP_SILU_MUL: {
             const NnMulOpCodeConfig *config = (NnMulOpCodeConfig *)opConfig->config;
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->multiplierBufferIndex)});
         } break;
@@ -1273,6 +1277,7 @@ static std::vector<NnUint> resolveShaderConstants(
         opConfig->code == OP_MATMUL ||
         opConfig->code == OP_MERGE_SUM ||
         opConfig->code == OP_MUL ||
+        opConfig->code == OP_SILU_MUL ||
         opConfig->code == OP_REPEAT_Z ||
         opConfig->code == OP_SCALE ||
         opConfig->code == OP_SILU ||
@@ -1362,10 +1367,16 @@ static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const
         return ((NnMultiHeadAttOpConfig *)opConfig->config)->nHeads0;
     if (opConfig->code == OP_INV_RMS)
         return ((NnInvRmsOpConfig *)opConfig->config)->nColumns;
+    if (opConfig->code == OP_MUL || opConfig->code == OP_SILU_MUL) {
+        constexpr NnUint chunkSize = 4u; // Shader constant
+        const NnMulOpCodeConfig *config = (const NnMulOpCodeConfig *)opConfig->config;
+        const NnUint logicalSizeX =
+            (config != nullptr && config->view.sizeX != 0u) ? config->view.sizeX : outputSize.x;
+        return (logicalSizeX + chunkSize - 1u) / chunkSize;
+    }
     if (
         opConfig->code == OP_EMBEDDING ||
         opConfig->code == OP_RMS_NORM ||
-        opConfig->code == OP_MUL ||
         opConfig->code == OP_SCALE ||
         opConfig->code == OP_SILU ||
         opConfig->code == OP_SHIFT ||
@@ -1965,6 +1976,13 @@ void NnVulkanDeviceSegment::refreshPointers() {
             outputSize = size3D(outputSize.floatType, outputSize.z, outputSize.y, inputSize.x);
         }
 
+        if ((opConfig->code == OP_MUL || opConfig->code == OP_SILU_MUL) && opConfig->config != nullptr) {
+            auto *cfg = (NnMulOpCodeConfig *)opConfig->config;
+            if (const NnSize3D *multSize = data->getBufferSize(cfg->multiplierBufferIndex)) {
+                cfg->multiplierRowStride = multSize->x;
+            }
+        }
+
         if (plan != nullptr && opConfig->config != nullptr) {
             if (opConfig->code == OP_MULTIHEAD_ATT) {
                 auto *cfg = (NnMultiHeadAttOpConfig *)opConfig->config;
@@ -2021,7 +2039,7 @@ void NnVulkanDeviceSegment::refreshPointers() {
                 }
                 if (cfg->aView.sizeX != 0u) cfg->aView.sizeX = inputSize.x;
                 if (cfg->cView.sizeX != 0u) cfg->cView.sizeX = outputSize.x;
-            } else if (opConfig->code == OP_MUL) {
+            } else if (opConfig->code == OP_MUL || opConfig->code == OP_SILU_MUL) {
                 auto *cfg = (NnMulOpCodeConfig *)opConfig->config;
                 if (plan->ffnSplit.starts && plan->ffnSplit.lengths && cfg->view.sizeX != 0u) {
                     cfg->view.offset = plan->ffnSplit.starts[nodeIndex];

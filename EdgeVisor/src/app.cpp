@@ -414,6 +414,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.workerHosts = nullptr;
     args.workerPorts = nullptr;
     args.port = 9990;
+    args.listenUnixPath = nullptr;
     args.temperature = 0.8f;
     args.topp = 0.9f;
     args.steps = 0;
@@ -692,9 +693,15 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
             for (int s = 0; s < count; s++) {
                 char *v = argv[i + 1 + s];
+                if (std::strncmp(v, "unix:", 5) == 0) {
+                    args.workerHosts[s] = new char[std::strlen(v) + 1];
+                    std::strcpy(args.workerHosts[s], v);
+                    args.workerPorts[s] = 0;
+                    continue;
+                }
                 char *separator = std::strstr(v, ":");
                 if (separator == NULL) {
-                    throw std::runtime_error("Invalid worker address: " + std::string(v));
+                    throw std::runtime_error("Invalid worker address: " + std::string(v) + " (expected host:port or unix:/path.sock)");
                 }
                 int hostLen = separator - v;
                 args.workerHosts[s] = new char[hostLen + 1];
@@ -739,6 +746,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.kvRedundancyStr = value;
         } else if (std::strcmp(name, "--port") == 0) {
             args.port = atoi(value);
+        } else if (std::strcmp(name, "--listen-unix") == 0) {
+            args.listenUnixPath = value;
         } else if (std::strcmp(name, "--nthreads") == 0) {
             args.nThreads = atoi(value);
         } else if (std::strcmp(name, "--max-active-seqs") == 0) {
@@ -4704,7 +4713,9 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
 void runWorkerApp(AppCliArgs *args) {
     while (true) {
-        std::unique_ptr<NnNetwork> networkPtr = NnNetwork::serve(args->port);
+        std::unique_ptr<NnNetwork> networkPtr = args->listenUnixPath != nullptr
+            ? NnNetwork::serveUnix(args->listenUnixPath)
+            : NnNetwork::serve(args->port);
         NnNetwork *network = networkPtr.get();
 
         // Read bootstrap settings from root.

@@ -327,6 +327,7 @@ enum NnOpCode {
     OP_GELU,
     OP_SILU,
     OP_MUL,
+    OP_SILU_MUL,
     OP_SCALE,
     OP_CAST,
     OP_REPEAT_Z,
@@ -623,6 +624,9 @@ typedef struct {
 typedef struct {
     NnUint multiplierBufferIndex;
     NnTensorView view;
+    // Optional physical row stride for the multiplier buffer. 0 means "use the
+    // input row width", preserving the legacy packed-buffer behavior.
+    NnUint multiplierRowStride;
 } NnMulOpCodeConfig;
 
 typedef struct {

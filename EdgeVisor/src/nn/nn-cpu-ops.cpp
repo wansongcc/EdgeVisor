@@ -2898,6 +2898,37 @@ static void mulForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batch
     }
 }
 
+static void siluMulForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    const NnMulOpCodeConfig *config = (NnMulOpCodeConfig *)context->opConfig;
+    const float *multiplier = (float *)context->buffers[config->multiplierBufferIndex];
+
+    const NnUint multRowStride = context->bufferConfigs[config->multiplierBufferIndex].size.x;
+
+    const NnTensorView *view = &config->view;
+    const NnUint strideX = (view->strideX == 0u) ? 1u : view->strideX;
+    const NnUint len = (view->sizeX == 0u) ? context->outputSize.x : view->sizeX;
+    const NnUint offset = view->offset;
+
+    for (NnUint z = 0u; z < context->inputSize.z; z++) {
+        const NnUint zOffset = z * context->inputSize.y;
+        for (NnUint y = 0u; y < batchSize; y++) {
+            float *outBase = (float *)context->output[zOffset + y];
+            const float *inBase = (float *)context->input[zOffset + y];
+            const float *mBase = &multiplier[multRowStride * (zOffset + y)];
+
+            float *out = &outBase[offset];
+            const float *in = &inBase[offset];
+            const float *m = &mBase[offset];
+
+            for (NnUint i = threadIndex; i < len; i += nThreads) {
+                const NnUint ix = i * strideX;
+                const float v = in[ix];
+                out[ix] = (v / (1.0f + std::exp(-v))) * m[ix];
+            }
+        }
+    }
+}
+
 static void scaleForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     const NnScaleOpCodeConfig *config = (NnScaleOpCodeConfig *)context->opConfig;
     const float *scale = (float *)context->buffers[config->scaleBufferIndex];
@@ -3343,7 +3374,7 @@ NnCpuOpForwardInit getCpuOpForwardInit(NnOpCode code, NnOpQuantType quantType) {
         return initMultiHeadAttForward;
     if (code == OP_MATMUL)
         return initMatmulForward;
-    if (code == OP_MUL)
+    if (code == OP_MUL || code == OP_SILU_MUL)
         return initMulForward;
     if (code == OP_CAST)
         return initCastForward;
@@ -3395,6 +3426,9 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     }
     if (code == OP_MUL) {
         if (quantType == F32_F32_F32) return mulForward_F32_F32;
+    }
+    if (code == OP_SILU_MUL) {
+        if (quantType == F32_F32_F32) return siluMulForward_F32_F32;
     }
     if (code == OP_SCALE) {
         if (quantType == F32_F32_F32) return scaleForward_F32_F32;

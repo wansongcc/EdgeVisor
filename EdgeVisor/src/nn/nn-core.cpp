@@ -88,6 +88,7 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_GELU) return "GELU";
     if (code == OP_SILU) return "SILU";
     if (code == OP_MUL) return "MUL";
+    if (code == OP_SILU_MUL) return "SILU_MUL";
     if (code == OP_SCALE) return "SCALE";
     if (code == OP_CAST) return "CAST";
     if (code == OP_REPEAT_Z) return "REPEAT_Z";

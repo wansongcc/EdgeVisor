@@ -18,6 +18,7 @@ void setReuseAddr(int socket);
 void writeSocket(int socket, const void* data, NnSize size);
 void readSocket(int socket, void* data, NnSize size);
 int createServerSocket(int port);
+int createUnixServerSocket(const char *path);
 void destroySocket(int serverSocket);
 
 class NnConnectionSocketException : public std::runtime_error {
@@ -99,6 +100,7 @@ private:
 
 public:
     static std::unique_ptr<NnNetwork> serve(int port);
+    static std::unique_ptr<NnNetwork> serveUnix(const char *path);
     static std::unique_ptr<NnNetwork> connect(NnUint nSockets, char **hosts, NnUint *ports);
 
     NnUint nSockets;

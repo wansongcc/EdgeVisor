@@ -49,7 +49,8 @@ void main() {
 
     [[unroll]] for (uint i = 0; i < CHUNK_SIZE; i++) {
         if (chunkOffset + i < logicalSizeX) {
-            y[xyOffset + i] = x[xyOffset + i] * m[mOffset + i];
+            float v = x[xyOffset + i];
+            y[xyOffset + i] = (v / (1.0f + exp(-v))) * m[mOffset + i];
         }
     }
 }

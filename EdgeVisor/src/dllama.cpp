@@ -904,6 +904,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 
     int token = inputTokens[pos];
     printf("%s\n", effectivePrompt.c_str());
+    const auto evalWallStart = std::chrono::steady_clock::now();
     for (;;) {
         long remainingTokens = nInputTokens - 1 - (long)pos;
         if (remainingTokens <= 0)
@@ -1355,6 +1356,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     NnUint nPredTokens = pos - nEvalTokens;
     float evalTotalTimeMs = evalTotalTime / 1000.0;
     float predTotalTimeMs = predTotalTime / 1000.0;
+    const auto evalWallEnd = std::chrono::steady_clock::now();
+    const double evalWallMs = std::chrono::duration<double, std::milli>(evalWallEnd - evalWallStart).count();
     const double predWallTimeMs = std::chrono::duration<double, std::milli>(predWallEnd - predWallStart).count();
     printf("\n");
     printf("Evaluation\n");
@@ -1363,6 +1366,14 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
         (nEvalTokens * 1000) / evalTotalTimeMs,
         evalTotalTimeMs / ((float) nEvalTokens));
+    printf("Evaluation (root wall-clock)\n");
+    printf("    nTokens: %d\n", nEvalTokens);
+    if (nEvalTokens > 0 && evalWallMs > 0.0) {
+        printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
+            ((double)nEvalTokens * 1000.0) / evalWallMs, evalWallMs / (double)nEvalTokens);
+    } else {
+        printf("   tokens/s: n/a\n");
+    }
     printf("Prediction\n");
     printf("    nTokens: %d\n", nPredTokens);
     if (nPredTokens > 0 && predTotalTimeMs > 0.0f) {

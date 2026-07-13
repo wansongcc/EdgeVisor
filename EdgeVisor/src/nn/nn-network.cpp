@@ -10,6 +10,7 @@ typedef SSIZE_T ssize_t;
 #include <unistd.h>
 #include <netdb.h>  // for getaddrinfo
 #include <poll.h>
+#include <sys/un.h>
 #endif
 #include "nn-network.hpp"
 #include "nn/io-profile.hpp"
@@ -282,6 +283,26 @@ static inline void setQuickAck(int socket) {
         throw std::runtime_error("Error setting quick ack");
 #endif
 #endif
+}
+
+static inline bool isUnixSocketAddress(const char *host) {
+    return host != nullptr && std::strncmp(host, "unix:", 5) == 0 && host[5] != '\0';
+}
+
+static inline const char *unixSocketPath(const char *host) {
+    return isUnixSocketAddress(host) ? host + 5 : host;
+}
+
+static inline void setTcpSocketOptionsIfSupported(int socket) {
+#ifndef _WIN32
+    int domain = AF_UNSPEC;
+    socklen_t domainLen = sizeof(domain);
+    if (getsockopt(socket, SOL_SOCKET, SO_DOMAIN, &domain, &domainLen) == 0 && domain != AF_INET) {
+        return;
+    }
+#endif
+    setNoDelay(socket);
+    setQuickAck(socket);
 }
 
 void setReuseAddr(int socket) {
@@ -719,6 +740,33 @@ static inline NnUint peerWorkerToSocketIndex(NnUint myWorkerIndex, NnUint peerWo
 }
 
 static inline int connectSocket(char *host, int port) {
+    if (isUnixSocketAddress(host)) {
+#ifdef _WIN32
+        throw NnConnectionSocketException("Unix-domain sockets are not supported on Windows");
+#else
+        const char *path = unixSocketPath(host);
+        struct sockaddr_un addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        if (std::strlen(path) >= sizeof(addr.sun_path)) {
+            throw NnConnectionSocketException("Unix socket path is too long");
+        }
+        std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+        int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0)
+            throw std::runtime_error("Cannot create unix socket");
+
+        int connectResult = ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+        if (connectResult != 0) {
+            printf("Cannot connect to %s (%s)\n", host, SOCKET_LAST_ERROR);
+            close(sock);
+            throw NnConnectionSocketException("Cannot connect unix socket");
+        }
+        return sock;
+#endif
+    }
+
     struct addrinfo hints;
     struct addrinfo *addr = NULL;
     std::memset(&hints, 0, sizeof(hints));
@@ -745,8 +793,7 @@ static inline int connectSocket(char *host, int port) {
         throw NnConnectionSocketException("Cannot connect");
     }
 
-    setNoDelay(sock);
-    setQuickAck(sock);
+    setTcpSocketOptionsIfSupported(sock);
     return sock;
 }
 
@@ -793,9 +840,67 @@ int createServerSocket(int port) {
 
     printf("Listening on %s:%d...\n", host, port);
 
-    setNoDelay(serverSocket);
-    setQuickAck(serverSocket);
+    setTcpSocketOptionsIfSupported(serverSocket);
     return serverSocket;
+}
+
+#ifndef _WIN32
+static void unlinkStaleUnixSocket(const char *path) {
+    struct stat st;
+    if (::lstat(path, &st) != 0) {
+        if (errno == ENOENT) return;
+        throw std::runtime_error("Cannot stat unix socket path: " + std::string(strerror(errno)));
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+        throw std::runtime_error("Refusing to unlink non-socket unix path: " + std::string(path));
+    }
+    if (::unlink(path) != 0) {
+        throw std::runtime_error("Cannot unlink stale unix socket: " + std::string(strerror(errno)));
+    }
+}
+#endif
+
+int createUnixServerSocket(const char *path) {
+#ifdef _WIN32
+    (void)path;
+    throw std::runtime_error("Unix-domain sockets are not supported on Windows");
+#else
+    if (path == nullptr || path[0] == '\0') {
+        throw std::runtime_error("Unix socket path is empty");
+    }
+    struct sockaddr_un serverAddr;
+    std::memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sun_family = AF_UNIX;
+    if (std::strlen(path) >= sizeof(serverAddr.sun_path)) {
+        throw std::runtime_error("Unix socket path is too long");
+    }
+    std::strncpy(serverAddr.sun_path, path, sizeof(serverAddr.sun_path) - 1);
+
+    int serverSocket = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (serverSocket < 0)
+        throw std::runtime_error("Cannot create unix socket");
+
+    try {
+        unlinkStaleUnixSocket(path);
+    } catch (...) {
+        close(serverSocket);
+        throw;
+    }
+
+    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        close(serverSocket);
+        throw std::runtime_error("Cannot bind unix socket: " + std::string(strerror(errno)));
+    }
+
+    int listenResult = listen(serverSocket, SOMAXCONN);
+    if (listenResult != 0) {
+        close(serverSocket);
+        throw std::runtime_error("Cannot listen on unix socket: " + std::string(strerror(errno)));
+    }
+
+    printf("Listening on unix:%s...\n", path);
+    return serverSocket;
+#endif
 }
 
 void destroySocket(int serverSocket) {
@@ -808,13 +913,10 @@ void destroySocket(int serverSocket) {
 }
 
 int acceptSocket(int serverSocket) {
-    struct sockaddr_in clientAddr;
-    socklen_t clientAddrSize = sizeof(clientAddr);
-    int clientSocket = ::accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrSize);
+    int clientSocket = ::accept(serverSocket, nullptr, nullptr);
     if (clientSocket < 0)
         throw std::runtime_error("Error accepting connection");
-    setNoDelay(clientSocket);
-    setQuickAck(clientSocket);
+    setTcpSocketOptionsIfSupported(clientSocket);
     return clientSocket;
 }
 
@@ -867,12 +969,11 @@ int NnSocket::release() {
     return fd;
 }
 
-std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
-    NnSocket socketSocket(createServerSocket(port));
+static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
 
     NnUint nSockets;
     NnUint nodeIndex;
-    int rootSocketFd = acceptSocket(socketSocket.fd);
+    int rootSocketFd = acceptSocket(socketSocket->fd);
     NnSocket rootSocket(rootSocketFd);
     printf("⭕ The root node has connected\n");
 
@@ -915,11 +1016,18 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
         const NnUint peerWorkerIndex = (i < nodeIndex) ? i : (i + 1u);
 
         if (i >= nodeIndex) {
-            printf("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s:%d)\n",
-                   nodeIndex,
-                   peerWorkerIndex,
-                   host,
-                   port);
+            if (isUnixSocketAddress(host)) {
+                printf("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s)\n",
+                       nodeIndex,
+                       peerWorkerIndex,
+                       host);
+            } else {
+                printf("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s:%d)\n",
+                       nodeIndex,
+                       peerWorkerIndex,
+                       host,
+                       port);
+            }
 
             int fd = connectSocket(host, port);
             NnUint actualPeerWorkerIndex = 0u;
@@ -950,7 +1058,7 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
                    nodeIndex,
                    nodeIndex == 0 ? 0 : (nodeIndex - 1u));
 
-            int fd = acceptSocket(socketSocket.fd);
+            int fd = acceptSocket(socketSocket->fd);
             NnUint actualPeerWorkerIndex = 0u;
             exchangeWorkerPeerIndex(fd, nodeIndex, &actualPeerWorkerIndex);
 
@@ -989,14 +1097,27 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
     return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets, &peerNodeBySocket));
 }
 
+std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
+    NnSocket socketSocket(createServerSocket(port));
+    return serveFromSocket(&socketSocket);
+}
+
+std::unique_ptr<NnNetwork> NnNetwork::serveUnix(const char *path) {
+    NnSocket socketSocket(createUnixServerSocket(path));
+    return serveFromSocket(&socketSocket);
+}
+
 std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnUint *ports) {
     assert(nSockets > 0);
 
     std::vector<NnSocket> sockets(nSockets);
     std::vector<NnUint> peerNodeBySocket(nSockets, 0u);
-    struct sockaddr_in addr;
     for (NnUint i = 0; i < nSockets; i++) {
-        printf("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
+        if (isUnixSocketAddress(hosts[i])) {
+            printf("⭕ Socket[%d]: connecting to %s worker\n", i, hosts[i]);
+        } else {
+            printf("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
+        }
         int fd = connectSocket(hosts[i], ports[i]);
         sockets[i].assign(fd);
         writeSocket(fd, &nSockets, sizeof(nSockets));

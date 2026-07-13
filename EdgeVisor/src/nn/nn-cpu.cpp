@@ -332,7 +332,7 @@ static inline void printTpAffectedRange(
     // Print FFN split only when it's relevant to the op.
     // Attention ops (e.g. block_matmul_wo) are driven by headSplit, not ffnSplit.
     bool ffnRelevant = false;
-    if (context->opCode == OP_MUL || context->opCode == OP_SILU) {
+    if (context->opCode == OP_MUL || context->opCode == OP_SILU || context->opCode == OP_SILU_MUL) {
         ffnRelevant = true;
     } else if (context->opCode == OP_MATMUL) {
         const auto *cfg = (const NnMatmulOpConfig *)context->opConfig;
@@ -418,11 +418,13 @@ static inline void printTpAffectedRange(
             (size_t)expertBase);
         break;
     }
-    case OP_MUL: {
+    case OP_MUL:
+    case OP_SILU_MUL: {
         const auto *cfg = (const NnMulOpCodeConfig *)context->opConfig;
         const NnUint viewLen = (cfg->view.sizeX != 0u) ? cfg->view.sizeX : context->inputSize.x;
         const NnUint strideX = (cfg->view.strideX != 0u) ? cfg->view.strideX : 1u;
-        printf("    MUL multBuf=%u view={start=%u len=%u stride=%u} (raw:off=%u sizeX=%u strideX=%u)\n",
+        printf("    %s multBuf=%u view={start=%u len=%u stride=%u} (raw:off=%u sizeX=%u strideX=%u)\n",
+            context->opCode == OP_SILU_MUL ? "SILU_MUL" : "MUL",
             (unsigned)cfg->multiplierBufferIndex,
             (unsigned)cfg->view.offset,
             (unsigned)viewLen,
@@ -1306,7 +1308,7 @@ static inline bool isFfnTraceOp(const NnCpuOpContext *context) {
                nameHas(context->name, "block_matmul_w3") ||
                nameHas(context->name, "block_moe_");
     }
-    if (context->opCode == OP_MUL || context->opCode == OP_SILU || context->opCode == OP_GELU) {
+    if (context->opCode == OP_MUL || context->opCode == OP_SILU || context->opCode == OP_SILU_MUL || context->opCode == OP_GELU) {
         return nameHas(context->name, "block_mul") || nameHas(context->name, "block_act");
     }
     return false;

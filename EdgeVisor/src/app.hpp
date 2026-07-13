@@ -94,6 +94,7 @@ public:
 
     // worker
     NnUint port;
+    char *listenUnixPath;
 
     static AppCliArgs parse(int argc, char **argv, bool hasMode);
     static const char *backendToString(Backend backend);

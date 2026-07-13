@@ -21,6 +21,12 @@ layout(binding = 1) buffer outputBuffer { float y[]; };
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_Z * N_BATCHES]; };
 layout(binding = 3) readonly uniform configBuffer {
     uint multiplierBufferIndex;
+    uint viewOffset;
+    uint viewSizeY;
+    uint viewSizeX;
+    uint viewStrideY;
+    uint viewStrideX;
+    uint multiplierRowStride;
 };
 layout(binding = 4) readonly buffer multiplierBuffer { float m[]; };
 
@@ -32,10 +38,18 @@ void main() {
 
     const BatchInfo info = infos[b];
     const uint chunkOffset = chunkIndex * CHUNK_SIZE;
-    const uint xyOffset = info.inputOffset + chunkOffset;
-    const uint mOffset = info.inputSizeX * b + chunkOffset;
+    const uint logicalSizeX = viewSizeX != 0 ? viewSizeX : info.inputSizeX;
+    const uint multStride = multiplierRowStride != 0 ? multiplierRowStride : info.inputSizeX;
+    if (chunkOffset >= logicalSizeX) {
+        return;
+    }
+
+    const uint xyOffset = info.inputOffset + viewOffset + chunkOffset;
+    const uint mOffset = multStride * b + viewOffset + chunkOffset;
 
     [[unroll]] for (uint i = 0; i < CHUNK_SIZE; i++) {
-        y[xyOffset + i] = x[xyOffset + i] * m[mOffset + i];
+        if (chunkOffset + i < logicalSizeX) {
+            y[xyOffset + i] = x[xyOffset + i] * m[mOffset + i];
+        }
     }
 }

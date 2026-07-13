@@ -745,18 +745,17 @@ static inline int connectSocket(char *host, int port) {
         throw NnConnectionSocketException("Unix-domain sockets are not supported on Windows");
 #else
         const char *path = unixSocketPath(host);
-        if (std::strlen(path) >= sizeof(sockaddr_un::sun_path)) {
+        struct sockaddr_un addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        if (std::strlen(path) >= sizeof(addr.sun_path)) {
             throw NnConnectionSocketException("Unix socket path is too long");
         }
+        std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
         int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (sock < 0)
             throw std::runtime_error("Cannot create unix socket");
-
-        struct sockaddr_un addr;
-        std::memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
         int connectResult = ::connect(sock, (struct sockaddr*)&addr, sizeof(addr));
         if (connectResult != 0) {
@@ -845,6 +844,22 @@ int createServerSocket(int port) {
     return serverSocket;
 }
 
+#ifndef _WIN32
+static void unlinkStaleUnixSocket(const char *path) {
+    struct stat st;
+    if (::lstat(path, &st) != 0) {
+        if (errno == ENOENT) return;
+        throw std::runtime_error("Cannot stat unix socket path: " + std::string(strerror(errno)));
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+        throw std::runtime_error("Refusing to unlink non-socket unix path: " + std::string(path));
+    }
+    if (::unlink(path) != 0) {
+        throw std::runtime_error("Cannot unlink stale unix socket: " + std::string(strerror(errno)));
+    }
+}
+#endif
+
 int createUnixServerSocket(const char *path) {
 #ifdef _WIN32
     (void)path;
@@ -853,20 +868,24 @@ int createUnixServerSocket(const char *path) {
     if (path == nullptr || path[0] == '\0') {
         throw std::runtime_error("Unix socket path is empty");
     }
-    if (std::strlen(path) >= sizeof(sockaddr_un::sun_path)) {
+    struct sockaddr_un serverAddr;
+    std::memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sun_family = AF_UNIX;
+    if (std::strlen(path) >= sizeof(serverAddr.sun_path)) {
         throw std::runtime_error("Unix socket path is too long");
     }
+    std::strncpy(serverAddr.sun_path, path, sizeof(serverAddr.sun_path) - 1);
 
     int serverSocket = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (serverSocket < 0)
         throw std::runtime_error("Cannot create unix socket");
 
-    ::unlink(path);
-
-    struct sockaddr_un serverAddr;
-    std::memset(&serverAddr, 0, sizeof(serverAddr));
-    serverAddr.sun_family = AF_UNIX;
-    std::strncpy(serverAddr.sun_path, path, sizeof(serverAddr.sun_path) - 1);
+    try {
+        unlinkStaleUnixSocket(path);
+    } catch (...) {
+        close(serverSocket);
+        throw;
+    }
 
     if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
         close(serverSocket);
@@ -894,9 +913,7 @@ void destroySocket(int serverSocket) {
 }
 
 int acceptSocket(int serverSocket) {
-    struct sockaddr_storage clientAddr;
-    socklen_t clientAddrSize = sizeof(clientAddr);
-    int clientSocket = ::accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrSize);
+    int clientSocket = ::accept(serverSocket, nullptr, nullptr);
     if (clientSocket < 0)
         throw std::runtime_error("Error accepting connection");
     setTcpSocketOptionsIfSupported(clientSocket);

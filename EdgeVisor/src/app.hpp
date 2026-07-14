@@ -221,6 +221,7 @@ static constexpr NnUint LLM_KV_EXPORT_RESPONSE_MAGIC = 0x5352584bu; // 'KXRS'
 static constexpr NnUint LLM_KV_TRANSFER_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_VERSION = 1u;
+static constexpr NnUint LLM_LAYER_SWITCH_STAGE_BYPASS_VERSION = 2u;
 static constexpr NnUint LLM_KV_TRANSFER_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_VERSION = 1u;

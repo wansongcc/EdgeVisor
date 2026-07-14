@@ -3190,6 +3190,8 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
                 if (selfIsTarget) executor->setRedundantLayerEnabled(layer, true);
             }
             if (stageBypass && selfIsSource) {
+                // Only the ejected/source stage disables PP sync. The target
+                // stage must keep PP_RECV enabled for its new direct predecessor.
                 executor->setPpSyncEnabled(false);
             }
             maybeEnableShiftedPpStartForSourceStage(
@@ -3213,16 +3215,19 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     sbh.count = (NnUint)switchLayers.size();
     sbh.reserved = 0u;
     network->writeAll(&sbh, sizeof(sbh));
+    bool stageBypassFlagEmitted = false;
     for (NnUint layer : switchLayers) {
         LlmLayerSwitchPacket switchPkt{};
         switchPkt.magic = LLM_LAYER_SWITCH_MAGIC;
-        switchPkt.version = LLM_LAYER_SWITCH_VERSION;
+        switchPkt.version = stageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS_VERSION : LLM_LAYER_SWITCH_VERSION;
         switchPkt.boundaryLayer = layer;
         switchPkt.fromNodeIndex = migrationFromNodeIndex;
         switchPkt.toNodeIndex = nextStageRootNode;
-        switchPkt.reserved0 = stageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
-        switchPkt.reserved1 = bypassEjectedStage;
-        switchPkt.reserved2 = bypassTargetStage;
+        const bool carryStageBypass = stageBypass && !stageBypassFlagEmitted;
+        switchPkt.reserved0 = carryStageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
+        switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
+        switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
+        stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
         network->writeAll(&switchPkt, sizeof(switchPkt));
     }
     if (stageBypass) {
@@ -3594,6 +3599,9 @@ void RootLlmInference::forward(bool collectProfile) {
                     }
                 }
                 if (stageBypass && selfIsSource) {
+                    // Only the ejected/source stage disables PP sync. The target
+                    // stage must keep PP_RECV enabled to receive directly from
+                    // the previous active stage after bypass routing is applied.
                     executor->setPpSyncEnabled(false);
                 }
                 maybeEnableShiftedPpStartForSourceStage(
@@ -3650,16 +3658,19 @@ void RootLlmInference::forward(bool collectProfile) {
             sbh.count = (NnUint)switchLayers.size();
             sbh.reserved = 0u;
             network->writeAll(&sbh, sizeof(sbh));
+            bool stageBypassFlagEmitted = false;
             for (NnUint layer : switchLayers) {
                 LlmLayerSwitchPacket switchPkt{};
                 switchPkt.magic = LLM_LAYER_SWITCH_MAGIC;
-                switchPkt.version = LLM_LAYER_SWITCH_VERSION;
+                switchPkt.version = stageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS_VERSION : LLM_LAYER_SWITCH_VERSION;
                 switchPkt.boundaryLayer = layer;
                 switchPkt.fromNodeIndex = migrationFromNodeIndex;
                 switchPkt.toNodeIndex = nextStageRootNode;
-                switchPkt.reserved0 = stageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
-                switchPkt.reserved1 = bypassEjectedStage;
-                switchPkt.reserved2 = bypassTargetStage;
+                const bool carryStageBypass = stageBypass && !stageBypassFlagEmitted;
+                switchPkt.reserved0 = carryStageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
+                switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
+                switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
+                stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
                 network->writeAll(&switchPkt, sizeof(switchPkt));
             }
             if (stageBypass) {
@@ -4439,7 +4450,10 @@ bool WorkerLlmInference::tryReadControlPacket() {
             for (NnUint i = 0u; i < sbh.count; ++i) {
                 LlmLayerSwitchPacket pkt{};
                 network->read(ROOT_SOCKET_INDEX, &pkt, sizeof(pkt));
-                if (pkt.magic == LLM_LAYER_SWITCH_MAGIC && pkt.version == LLM_LAYER_SWITCH_VERSION) {
+                const bool supportedVersion =
+                    pkt.version == LLM_LAYER_SWITCH_VERSION ||
+                    pkt.version == LLM_LAYER_SWITCH_STAGE_BYPASS_VERSION;
+                if (pkt.magic == LLM_LAYER_SWITCH_MAGIC && supportedVersion) {
                     pendingLayerSwitches.push_back(pkt);
                 }
             }
@@ -5090,6 +5104,8 @@ void runWorkerApp(AppCliArgs *args) {
                     if (localIsSourceStage) {
                         executor.setPrimaryLayerEnabled(switchPkt.boundaryLayer, false);
                         if ((switchPkt.reserved0 & LLM_LAYER_SWITCH_STAGE_BYPASS) != 0u) {
+                            // Only the ejected/source stage disables PP sync. A target
+                            // stage still needs PP_RECV for the new direct predecessor.
                             executor.setPpSyncEnabled(false);
                         }
                         std::printf("🔁 [worker-switch] node=%u sleep primary layer=%u (source-stage)\n",

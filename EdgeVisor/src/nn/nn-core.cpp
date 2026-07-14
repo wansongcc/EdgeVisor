@@ -1314,31 +1314,17 @@ bool applyPpStageBypass(NnUnevenPartitionPlan *plan, NnUint ejectedStageIndex, N
     if (plan == nullptr || plan->nStages == 0u || plan->stages == nullptr) return false;
     if (ejectedStageIndex >= plan->nStages || targetStageIndex >= plan->nStages) return false;
     if (ejectedStageIndex == targetStageIndex) return false;
-
-    if (plan->ppPrevStageIndex == nullptr || plan->ppNextStageIndex == nullptr) {
-        delete[] plan->ppPrevStageIndex;
-        delete[] plan->ppNextStageIndex;
-        plan->ppPrevStageIndex = new NnUint[plan->nStages];
-        plan->ppNextStageIndex = new NnUint[plan->nStages];
-        for (NnUint s = 0u; s < plan->nStages; ++s) {
-            plan->ppPrevStageIndex[s] = (s == 0u) ? (NnUint)-1 : (s - 1u);
-            plan->ppNextStageIndex[s] = (s + 1u < plan->nStages) ? (s + 1u) : (NnUint)-1;
-        }
-    }
+    if (plan->ppPrevStageIndex == nullptr || plan->ppNextStageIndex == nullptr) return false;
 
     const NnUint prev = getPpPrevStageIndex(plan, ejectedStageIndex);
     const NnUint next = getPpNextStageIndex(plan, ejectedStageIndex);
-    if (prev == (NnUint)-1 && next == (NnUint)-1) return true; // already bypassed
-    // First implementation supports ejecting only a middle stage. Ejecting the
-    // first/last stage also changes embedding/logits ownership and needs a
-    // separate protocol.
+    // Middle-stage ejection only. First/last stage bypass would also change
+    // embedding/logits ownership and needs a separate protocol.
     if (prev == (NnUint)-1 || next == (NnUint)-1) return false;
     if (targetStageIndex != prev && targetStageIndex != next) return false;
 
-    const NnUint left = (targetStageIndex == prev) ? targetStageIndex : prev;
-    const NnUint right = (targetStageIndex == next) ? targetStageIndex : next;
-    if (left != (NnUint)-1) plan->ppNextStageIndex[left] = right;
-    if (right != (NnUint)-1) plan->ppPrevStageIndex[right] = left;
+    plan->ppNextStageIndex[prev] = next;
+    plan->ppPrevStageIndex[next] = prev;
     plan->ppPrevStageIndex[ejectedStageIndex] = (NnUint)-1;
     plan->ppNextStageIndex[ejectedStageIndex] = (NnUint)-1;
     return true;

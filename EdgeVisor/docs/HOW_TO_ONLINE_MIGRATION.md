@@ -183,6 +183,48 @@ export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
 [worker-switch] node=1 activate redundant layer=...
 ```
 
+
+
+### 3.5 GPU 算力波动注入脚本
+
+强 GPU 扰动场景建议在目标 worker Jetson（例如 `.13 / Stage 2` 所在机器）上使用脚本启动后台 Vulkan 推理负载：
+
+```bash
+cd /home/jetson/cc/EdgeVisor/EdgeVisor
+
+./scripts/gpu_compute_disturbance.sh start
+```
+
+默认负载为 `1xQwen3-14B + 1xQwen3-8B`，使用 `--backend vulkan --gpu-index 0`，持续 240 秒并预热 60 秒。该强度用于制造稳定的 GPU-side compute contention，适合验证自动 TPOT 下发 PP migration。
+
+查看状态与日志：
+
+```bash
+./scripts/gpu_compute_disturbance.sh status
+
+tail -n 40 /tmp/edgevisor_disturbance/gpu_disturb_14b.log
+tail -n 40 /tmp/edgevisor_disturbance/gpu_disturb_8b.log
+```
+
+停止扰动：
+
+```bash
+./scripts/gpu_compute_disturbance.sh stop
+```
+
+Do not use `pkill -x dllama` after workers are running；这会同时杀掉同机的 EdgeVisor worker。脚本只记录并停止自己的扰动进程组。
+
+常用覆盖参数：
+
+```bash
+./scripts/gpu_compute_disturbance.sh start \
+  --duration 240 \
+  --preheat 60 \
+  --bin-dir /home/jetson/cc/EdgeVisor/EdgeVisor \
+  --models-src /home/jetson/cc/models \
+  --gpu-index 0
+```
+
 ---
 
 ## 4. 如何验证“迁移起效了”

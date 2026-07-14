@@ -52,3 +52,50 @@ For automatic PP/TPOT scheduling, start root inference with
 `--enable-dynamic-tpot --plan-ctrl-socket <path>` and add
 `--runtime-redundant-boundary-layers 1` when PP layer migration needs redundant
 boundary weights.
+
+## GPU Compute Disturbance Injection
+
+For PP auto-migration experiments that need strong GPU-side contention, use the
+Jetson-side disturbance helper:
+
+```bash
+cd /home/jetson/cc/EdgeVisor/EdgeVisor
+
+./scripts/gpu_compute_disturbance.sh start
+```
+
+The default workload is `1xQwen3-14B + 1xQwen3-8B` Vulkan inference on
+`--gpu-index 0`, with a 240 second disturbance window and 60 second preheat.
+It creates `/tmp/edgevisor_models -> /home/jetson/cc/models` when that source
+directory exists, and writes logs/pid files under `/tmp/edgevisor_disturbance`.
+
+Check status and logs:
+
+```bash
+./scripts/gpu_compute_disturbance.sh status
+
+tail -n 40 /tmp/edgevisor_disturbance/gpu_disturb_14b.log
+tail -n 40 /tmp/edgevisor_disturbance/gpu_disturb_8b.log
+```
+
+Stop only the disturbance processes:
+
+```bash
+./scripts/gpu_compute_disturbance.sh stop
+```
+
+Do not use `pkill -x dllama` after workers are running; it will also kill the
+EdgeVisor worker on the same Jetson. The helper records its own process groups
+and stops only those groups.
+
+Useful overrides:
+
+```bash
+./scripts/gpu_compute_disturbance.sh start \
+  --duration 240 \
+  --preheat 60 \
+  --bin-dir /home/jetson/cc/EdgeVisor/EdgeVisor \
+  --models-src /home/jetson/cc/models \
+  --gpu-index 0
+```
+

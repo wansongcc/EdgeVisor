@@ -108,8 +108,14 @@ struct NnUnevenPartitionPlan {
     NnDimSplit ffnSplit;
     NnDimSplit dimSplit;
 
+    // Runtime PP active links. UINT32_MAX means no active neighbor. When null,
+    // callers fall back to the static adjacent stage topology.
+    NnUint *ppPrevStageIndex;
+    NnUint *ppNextStageIndex;
+
     // 默认构造函数
-    NnUnevenPartitionPlan() : nNodes(0), nStages(0), stages(nullptr) {
+    NnUnevenPartitionPlan() : nNodes(0), nStages(0), stages(nullptr),
+        ppPrevStageIndex(nullptr), ppNextStageIndex(nullptr) {
         std::memset(&headSplit, 0, sizeof(headSplit));
         std::memset(&kvHeadSplit, 0, sizeof(kvHeadSplit));
         std::memset(&headComputeSplit, 0, sizeof(headComputeSplit));
@@ -132,6 +138,10 @@ struct NnUnevenPartitionPlan {
         freeSplit(vocabSplit);
         freeSplit(ffnSplit);
         freeSplit(dimSplit);
+        delete[] ppPrevStageIndex;
+        delete[] ppNextStageIndex;
+        ppPrevStageIndex = nullptr;
+        ppNextStageIndex = nullptr;
     }
 
     // 移动构造函数：用于 std::move 和 unique_ptr
@@ -145,7 +155,9 @@ struct NnUnevenPartitionPlan {
                     kvHeadComputeSplit(other.kvHeadComputeSplit),
                     vocabSplit(other.vocabSplit),
                     ffnSplit(other.ffnSplit),
-                    dimSplit(other.dimSplit) {
+                    dimSplit(other.dimSplit),
+                    ppPrevStageIndex(other.ppPrevStageIndex),
+                    ppNextStageIndex(other.ppNextStageIndex) {
         
         // 剥夺源对象的所有权
                 other.stages = nullptr; // 接管 stages
@@ -157,6 +169,8 @@ struct NnUnevenPartitionPlan {
         zeroSplit(other.vocabSplit);
         zeroSplit(other.ffnSplit);
         zeroSplit(other.dimSplit);
+        other.ppPrevStageIndex = nullptr;
+        other.ppNextStageIndex = nullptr;
         other.nNodes = 0;
     }
 
@@ -774,6 +788,9 @@ NnUnevenPartitionPlan createPartitionPlan(
     NnUint globalDim,
     const std::vector<NnUint>& globalKvRedundancyPerNode = {} // 每个节点的 KV 冗余 head 数量
 );
+NnUint getPpPrevStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex);
+NnUint getPpNextStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex);
+bool applyPpStageBypass(NnUnevenPartitionPlan *plan, NnUint ejectedStageIndex, NnUint targetStageIndex);
 
 // 释放计划 (旧接口，如果使用栈上对象+析构函数可忽略，但保留以防遗留调用)
 void releasePartitionPlan(NnUnevenPartitionPlan* plan);

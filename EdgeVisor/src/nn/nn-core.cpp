@@ -739,6 +739,12 @@ NnUnevenPartitionPlan createPartitionPlan(
 
     // 2. 初始化全局数组
     plan.stages = new NnStageConfig[plan.nStages];
+    plan.ppPrevStageIndex = new NnUint[plan.nStages];
+    plan.ppNextStageIndex = new NnUint[plan.nStages];
+    for (NnUint s = 0; s < plan.nStages; ++s) {
+        plan.ppPrevStageIndex[s] = (s == 0u) ? (NnUint)-1 : (s - 1u);
+        plan.ppNextStageIndex[s] = (s + 1u < plan.nStages) ? (s + 1u) : (NnUint)-1;
+    }
     
     // Helper to allocate split arrays
     auto allocSplit = [&](NnDimSplit& s) {
@@ -1292,6 +1298,38 @@ void fullfillRopeCache(const NnRopeOpConfig *config, float *cache) {
         throw std::invalid_argument("Unsupported rope type");
 }
 
+NnUint getPpPrevStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex) {
+    if (plan == nullptr || stageIndex >= plan->nStages) return (NnUint)-1;
+    if (plan->ppPrevStageIndex != nullptr) return plan->ppPrevStageIndex[stageIndex];
+    return (stageIndex == 0u) ? (NnUint)-1 : (stageIndex - 1u);
+}
+
+NnUint getPpNextStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex) {
+    if (plan == nullptr || stageIndex >= plan->nStages) return (NnUint)-1;
+    if (plan->ppNextStageIndex != nullptr) return plan->ppNextStageIndex[stageIndex];
+    return (stageIndex + 1u < plan->nStages) ? (stageIndex + 1u) : (NnUint)-1;
+}
+
+bool applyPpStageBypass(NnUnevenPartitionPlan *plan, NnUint ejectedStageIndex, NnUint targetStageIndex) {
+    if (plan == nullptr || plan->nStages == 0u || plan->stages == nullptr) return false;
+    if (ejectedStageIndex >= plan->nStages || targetStageIndex >= plan->nStages) return false;
+    if (ejectedStageIndex == targetStageIndex) return false;
+    if (plan->ppPrevStageIndex == nullptr || plan->ppNextStageIndex == nullptr) return false;
+
+    const NnUint prev = getPpPrevStageIndex(plan, ejectedStageIndex);
+    const NnUint next = getPpNextStageIndex(plan, ejectedStageIndex);
+    // Middle-stage ejection only. First/last stage bypass would also change
+    // embedding/logits ownership and needs a separate protocol.
+    if (prev == (NnUint)-1 || next == (NnUint)-1) return false;
+    if (targetStageIndex != prev && targetStageIndex != next) return false;
+
+    plan->ppNextStageIndex[prev] = next;
+    plan->ppPrevStageIndex[next] = prev;
+    plan->ppPrevStageIndex[ejectedStageIndex] = (NnUint)-1;
+    plan->ppNextStageIndex[ejectedStageIndex] = (NnUint)-1;
+    return true;
+}
+
 //release uneven partition plan
 void releasePartitionPlan(NnUnevenPartitionPlan* plan) {
     if (plan == nullptr) return;
@@ -1331,5 +1369,9 @@ void releasePartitionPlan(NnUnevenPartitionPlan* plan) {
     plan->vocabSplit = {nullptr, nullptr};
     plan->ffnSplit = {nullptr, nullptr};
     plan->dimSplit = {nullptr, nullptr};
+    delete[] plan->ppPrevStageIndex;
+    delete[] plan->ppNextStageIndex;
+    plan->ppPrevStageIndex = nullptr;
+    plan->ppNextStageIndex = nullptr;
     plan->nNodes = 0;
 }

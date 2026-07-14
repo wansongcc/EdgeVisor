@@ -203,6 +203,37 @@ void testTensorViews() {
     }, "out-of-bounds tensor view must be rejected");
 }
 
+void testPpStageBypassLinks() {
+    std::vector<NnStageDef> stageDefs = {
+        {1u, {1.0f}, {}},
+        {1u, {1.0f}, {}},
+        {1u, {1.0f}, {}}
+    };
+    NnUnevenPartitionPlan plan = createPartitionPlan(
+        stageDefs,
+        4u,   // globalNHeads
+        4u,   // globalNKvHeads
+        16u,  // globalVocabSize
+        16u,  // globalFfnDim
+        16u); // globalDim
+
+    require(plan.nStages == 3u, "three-stage plan");
+    require(getPpPrevStageIndex(&plan, 0u) == (NnUint)-1, "first stage has no prev");
+    require(getPpNextStageIndex(&plan, 0u) == 1u, "stage 0 initially links to stage 1");
+    require(getPpPrevStageIndex(&plan, 1u) == 0u, "stage 1 initially links back to stage 0");
+    require(getPpNextStageIndex(&plan, 1u) == 2u, "stage 1 initially links to stage 2");
+
+    require(applyPpStageBypass(&plan, 1u, 2u), "middle stage bypass accepted");
+    require(getPpNextStageIndex(&plan, 0u) == 2u, "stage 0 relinks directly to stage 2");
+    require(getPpPrevStageIndex(&plan, 2u) == 0u, "stage 2 relinks directly to stage 0");
+    require(getPpPrevStageIndex(&plan, 1u) == (NnUint)-1, "ejected stage has no prev");
+    require(getPpNextStageIndex(&plan, 1u) == (NnUint)-1, "ejected stage has no next");
+
+    require(!applyPpStageBypass(&plan, 0u, 2u), "first stage bypass rejected");
+    require(!applyPpStageBypass(&plan, 2u, 0u), "last stage bypass rejected");
+    require(!applyPpStageBypass(&plan, 1u, 2u), "already ejected stage bypass rejected");
+}
+
 } // namespace
 
 int main() {
@@ -213,6 +244,7 @@ int main() {
     testStageLocalAndStackedSlices();
     testQuantizedAlignmentAndBounds();
     testTensorViews();
+    testPpStageBypassLinks();
     std::printf("All pointer/slice/view tests passed\n");
     return 0;
 }

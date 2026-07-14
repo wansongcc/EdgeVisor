@@ -652,6 +652,50 @@ void PlanUdsController::run() {
                 populateAblationPlanEvent(ev, cmd, jcmd, "pp_migration_emit", 1u);
                 edgevisorAblationLogEvent(ev);
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}, {"ppMigration", true}, {"layerCount", cmd.reserved0}};
+            } else if (op == "set_stage_bypass") {
+                if (!req.contains("cmd")) throw std::runtime_error("missing cmd");
+                const json &jcmd = req.at("cmd");
+
+                PlanCommand cmd = makeEmptyPlanCommand();
+                cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
+                cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+                cmd.seq = parseU32(jcmd, "seq", 0u);
+
+                const std::string modeStr = jcmd.value("mode", "next_barrier");
+                if (!parseMode(modeStr, cmd.mode)) {
+                    throw std::runtime_error("bad mode (use exact/next_barrier)");
+                }
+                if (cmd.mode != PLAN_CMD_MODE_NEXT_BARRIER) {
+                    throw std::runtime_error("stage bypass currently supports next_barrier only");
+                }
+
+                cmd.stageIndex = parseU32(jcmd, "ejectStageIndex", parseU32(jcmd, "stageIndex", 0xFFFFFFFFu));
+                cmd.reserved0 = parseU32(jcmd, "targetStageIndex", 0xFFFFFFFFu);
+                cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
+                cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 0u);
+                cmd.cmdKind = PLAN_CMD_KIND_STAGE_BYPASS;
+                cmd.nHeadsToMove = 0u;
+                cmd.nFfnToMove = 0u;
+                cmd.nMoves = 0u;
+                cmd.triggerPos = 0xFFFFFFFFu;
+                cmd.triggerLayer = 0xFFFFFFFFu;
+                if (cmd.stageIndex == 0xFFFFFFFFu || cmd.reserved0 == 0xFFFFFFFFu || cmd.stageIndex == cmd.reserved0) {
+                    throw std::runtime_error("stage bypass requires distinct ejectStageIndex and targetStageIndex");
+                }
+
+                const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+                if (cfg.disablePipelineBalancer) {
+                    resp = json{{"ok", false}, {"rejected", true}, {"reason", "pipeline_balancer_disabled"}, {"cmd", cmdToJson(cmd)}, {"stageBypass", true}};
+                    writeLine(cfd, resp.dump());
+                    ::close(cfd);
+                    continue;
+                }
+
+                const uint64_t cacheSeq = planCommandCache().store(cmd);
+                EdgeVisorAblationEvent ev;
+                populateAblationPlanEvent(ev, cmd, jcmd, "stage_bypass_emit", 1u);
+                edgevisorAblationLogEvent(ev);
+                resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}, {"stageBypass", true}};
             } else if (op == "set_runtime_gate") {
                 if (inference_ == nullptr) throw std::runtime_error("inference not available");
                 const bool primaryEnabled = parseBool(req, "primaryEnabled", true);

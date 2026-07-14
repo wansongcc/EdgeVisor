@@ -170,10 +170,14 @@ typedef struct {
     NnUint boundaryLayer;
     NnUint fromNodeIndex;
     NnUint toNodeIndex;
-    NnUint reserved0;
-    NnUint reserved1;
-    NnUint reserved2;
+    NnUint reserved0;      // flags
+    NnUint reserved1;      // optional ejected stage index
+    NnUint reserved2;      // optional target stage index
 } LlmLayerSwitchPacket;
+
+enum LlmLayerSwitchFlags : NnUint {
+    LLM_LAYER_SWITCH_STAGE_BYPASS = 1u << 0,
+};
 
 typedef struct {
     NnUint magic;          // 'LSWB'
@@ -217,6 +221,7 @@ static constexpr NnUint LLM_KV_EXPORT_RESPONSE_MAGIC = 0x5352584bu; // 'KXRS'
 static constexpr NnUint LLM_KV_TRANSFER_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_VERSION = 1u;
+static constexpr NnUint LLM_LAYER_SWITCH_STAGE_BYPASS_VERSION = 2u;
 static constexpr NnUint LLM_KV_TRANSFER_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_VERSION = 1u;
@@ -403,6 +408,9 @@ private:
     bool migrationAckSeen = false;
     int migrationAckPos = -1;
     int migrationAckLayer = -1;
+    bool pendingStageBypass = false;
+    NnUint pendingBypassEjectedStage = 0xFFFFFFFFu;
+    NnUint pendingBypassTargetStage = 0xFFFFFFFFu;
     unsigned long long lastPpPlanCacheSeqApplied = 0ull;
     unsigned long long lastHeadRecoveryPlanCacheSeqApplied = 0ull;
     unsigned long long headRecoveryRangeCacheSeq = 0ull;

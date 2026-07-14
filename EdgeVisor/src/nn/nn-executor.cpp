@@ -1305,6 +1305,24 @@ void NnExecutor::setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled) 
     std::fflush(stdout);
 }
 
+void NnExecutor::setPpSyncEnabled(bool enabled) {
+    if (segmentEnabled == nullptr || nodeConfig == nullptr) return;
+    NnUint matched = 0u;
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        if (s >= segmentSyncProfileKinds.size()) continue;
+        const NnByte kind = segmentSyncProfileKinds[s];
+        if (kind == SEG_SYNC_PP_SEND || kind == SEG_SYNC_PP_RECV) {
+            segmentEnabled[s].store(enabled ? 1u : 0u, std::memory_order_relaxed);
+            matched += 1u;
+        }
+    }
+    std::printf("🛂 [stage-bypass] node=%u ppSyncEnabled=%u matchedSegs=%u\n",
+        (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+        enabled ? 1u : 0u,
+        (unsigned)matched);
+    std::fflush(stdout);
+}
+
 bool NnExecutor::exportLayerKvRow(
     NnUint layerIndex,
     NnUint position,

@@ -237,6 +237,7 @@ public:
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
     void setRedundantLayerEnabled(NnUint layerIndex, bool enabled);
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
+    void setPpSyncEnabled(bool enabled);
     bool exportLayerKvRow(
         NnUint layerIndex,
         NnUint position,

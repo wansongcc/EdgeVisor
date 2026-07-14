@@ -90,6 +90,18 @@ def cmd_set_pp_migration(args: argparse.Namespace) -> Dict[str, Any]:
     return {"op": "set_pp_migration", "cmd": cmd}
 
 
+def cmd_set_stage_bypass(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.eject_stage == args.target_stage:
+        raise SystemExit("--eject-stage and --target-stage must differ")
+    cmd: Dict[str, Any] = {
+        "seq": args.seq,
+        "mode": "next_barrier",
+        "ejectStageIndex": args.eject_stage,
+        "targetStageIndex": args.target_stage,
+    }
+    return {"op": "set_stage_bypass", "cmd": cmd}
+
+
 def cmd_layer_prof(args: argparse.Namespace) -> Dict[str, Any]:
     req: Dict[str, Any] = {"op": "layer_prof"}
     if args.path:
@@ -174,6 +186,11 @@ def main() -> int:
     spp.add_argument("--layer-count", type=int, default=1)
     spp.add_argument("--trigger-pos", type=int, default=None)
     spp.add_argument("--trigger-layer", type=int, default=None)
+
+    sbp = sub.add_parser("set_stage_bypass", help="eject a PP stage and directly link its active neighbors")
+    sbp.add_argument("--seq", type=int, default=1)
+    sbp.add_argument("--eject-stage", type=int, required=True)
+    sbp.add_argument("--target-stage", type=int, required=True)
 
     rg = sub.add_parser("set_runtime_gate", help="toggle primary/redundant segment gate at runtime")
     rg.add_argument("--primary", type=int, choices=[0, 1], required=True, help="enable primary segments (0/1)")
@@ -264,6 +281,8 @@ def main() -> int:
         req = cmd_set_plan(args)
     elif args.op == "set_pp_migration":
         req = cmd_set_pp_migration(args)
+    elif args.op == "set_stage_bypass":
+        req = cmd_set_stage_bypass(args)
     elif args.op == "set_runtime_gate":
         req = {
             "op": "set_runtime_gate",

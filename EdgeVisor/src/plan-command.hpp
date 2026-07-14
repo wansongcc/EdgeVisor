@@ -29,7 +29,10 @@ enum PlanCommandMode : uint32_t {
 enum PlanCommandKind : uint32_t {
     PLAN_CMD_KIND_HEAD = 1u,
     PLAN_CMD_KIND_FFN = 2u,
-    PLAN_CMD_KIND_BOTH = 3u
+    PLAN_CMD_KIND_BOTH = 3u,
+    // Control-plane only: bypass/eject a PP stage. stageIndex is the ejected
+    // stage, toNodeIndex is the target stage root, reserved0 is targetStageIndex.
+    PLAN_CMD_KIND_STAGE_BYPASS = 5u
 };
 
 #pragma pack(push, 1)

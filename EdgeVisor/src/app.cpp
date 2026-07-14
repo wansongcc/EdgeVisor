@@ -1945,6 +1945,34 @@ static bool areNodesInSameStageLocal(const NnUnevenPartitionPlan *plan, NnUint n
     return stageContainsNodeLocal(stageA, nodeB);
 }
 
+static bool stageHasRedundantCoverageLocal(
+    const RuntimeStageLayerPlan *runtimePlan,
+    const NnStageConfig *ejectedStage,
+    const NnStageConfig *targetStage,
+    std::string *reason = nullptr) {
+    if (runtimePlan == nullptr || ejectedStage == nullptr || targetStage == nullptr) {
+        if (reason != nullptr) *reason = "missing runtime/stage plan";
+        return false;
+    }
+    if (runtimePlan->nStages <= targetStage->stageIndex || runtimePlan->nLayers == 0u) {
+        if (reason != nullptr) *reason = "runtime plan does not cover target stage";
+        return false;
+    }
+    for (NnUint layer = ejectedStage->startLayer; layer < ejectedStage->endLayer; ++layer) {
+        if (layer >= runtimePlan->nLayers) {
+            if (reason != nullptr) *reason = "ejected layer outside runtime plan";
+            return false;
+        }
+        if (runtimePlan->getRole(targetStage->stageIndex, layer) != RUNTIME_LAYER_REDUNDANT) {
+            if (reason != nullptr) {
+                *reason = "target stage lacks redundant layer " + std::to_string(layer);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::vector<NnUint> stageNodeListLocal(const NnStageConfig *stage) {
     std::vector<NnUint> out;
     if (stage == nullptr) return out;
@@ -3139,11 +3167,20 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
 bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     if (network == nullptr) return false;
     std::vector<NnUint> switchLayers;
+    bool stageBypass = false;
+    NnUint bypassEjectedStage = 0xFFFFFFFFu;
+    NnUint bypassTargetStage = 0xFFFFFFFFu;
     {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
         if (pendingLayerSwitchLayers.empty()) return false;
         switchLayers = pendingLayerSwitchLayers;
         pendingLayerSwitchLayers.clear();
+        stageBypass = pendingStageBypass;
+        bypassEjectedStage = pendingBypassEjectedStage;
+        bypassTargetStage = pendingBypassTargetStage;
+        pendingStageBypass = false;
+        pendingBypassEjectedStage = 0xFFFFFFFFu;
+        pendingBypassTargetStage = 0xFFFFFFFFu;
         if (executor != nullptr) {
             const NnUint selfNodeIndex = 0u;
             const bool selfIsSource = areNodesInSameStageLocal(plan, selfNodeIndex, migrationFromNodeIndex);
@@ -3151,6 +3188,9 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
             for (NnUint layer : switchLayers) {
                 if (selfIsSource) executor->setPrimaryLayerEnabled(layer, false);
                 if (selfIsTarget) executor->setRedundantLayerEnabled(layer, true);
+            }
+            if (stageBypass && selfIsSource) {
+                executor->setPpSyncEnabled(false);
             }
             maybeEnableShiftedPpStartForSourceStage(
                 switchLayers,
@@ -3180,10 +3220,19 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         switchPkt.boundaryLayer = layer;
         switchPkt.fromNodeIndex = migrationFromNodeIndex;
         switchPkt.toNodeIndex = nextStageRootNode;
-        switchPkt.reserved0 = 0u;
-        switchPkt.reserved1 = 0u;
-        switchPkt.reserved2 = 0u;
+        switchPkt.reserved0 = stageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
+        switchPkt.reserved1 = bypassEjectedStage;
+        switchPkt.reserved2 = bypassTargetStage;
         network->writeAll(&switchPkt, sizeof(switchPkt));
+    }
+    if (stageBypass) {
+        NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
+        const bool ok = applyPpStageBypass(mutablePlan, bypassEjectedStage, bypassTargetStage);
+        std::printf("🔁 [stage-bypass] root apply ejectedStage=%u targetStage=%u status=%s\n",
+            (unsigned)bypassEjectedStage,
+            (unsigned)bypassTargetStage,
+            ok ? "ok" : "reject");
+        std::fflush(stdout);
     }
     return true;
 }
@@ -3488,6 +3537,9 @@ void RootLlmInference::forward(bool collectProfile) {
     bool sendLayerSwitch = false;
     std::vector<PendingKvTransferItem> kvTransfers;
     std::vector<NnUint> switchLayers;
+    bool stageBypass = false;
+    NnUint bypassEjectedStage = 0xFFFFFFFFu;
+    NnUint bypassTargetStage = 0xFFFFFFFFu;
 
     {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
@@ -3523,6 +3575,12 @@ void RootLlmInference::forward(bool collectProfile) {
             sendLayerSwitch = true;
             switchLayers = pendingLayerSwitchLayers;
             pendingLayerSwitchLayers.clear();
+            stageBypass = pendingStageBypass;
+            bypassEjectedStage = pendingBypassEjectedStage;
+            bypassTargetStage = pendingBypassTargetStage;
+            pendingStageBypass = false;
+            pendingBypassEjectedStage = 0xFFFFFFFFu;
+            pendingBypassTargetStage = 0xFFFFFFFFu;
             if (executor != nullptr) {
                 const NnUint selfNodeIndex = 0u;
                 const bool selfIsSource = areNodesInSameStageLocal(plan, selfNodeIndex, migrationFromNodeIndex);
@@ -3534,6 +3592,9 @@ void RootLlmInference::forward(bool collectProfile) {
                     if (selfIsTarget) {
                         executor->setRedundantLayerEnabled(layer, true);
                     }
+                }
+                if (stageBypass && selfIsSource) {
+                    executor->setPpSyncEnabled(false);
                 }
                 maybeEnableShiftedPpStartForSourceStage(
                     switchLayers,
@@ -3596,10 +3657,19 @@ void RootLlmInference::forward(bool collectProfile) {
                 switchPkt.boundaryLayer = layer;
                 switchPkt.fromNodeIndex = migrationFromNodeIndex;
                 switchPkt.toNodeIndex = nextStageRootNode;
-                switchPkt.reserved0 = 0u;
-                switchPkt.reserved1 = 0u;
-                switchPkt.reserved2 = 0u;
+                switchPkt.reserved0 = stageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
+                switchPkt.reserved1 = bypassEjectedStage;
+                switchPkt.reserved2 = bypassTargetStage;
                 network->writeAll(&switchPkt, sizeof(switchPkt));
+            }
+            if (stageBypass) {
+                NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
+                const bool ok = applyPpStageBypass(mutablePlan, bypassEjectedStage, bypassTargetStage);
+                std::printf("🔁 [stage-bypass] root apply ejectedStage=%u targetStage=%u status=%s\n",
+                    (unsigned)bypassEjectedStage,
+                    (unsigned)bypassTargetStage,
+                    ok ? "ok" : "reject");
+                std::fflush(stdout);
             }
         }
         if ((out.flags & LLM_CTRL_HAS_BATCH_META) != 0u) {
@@ -3767,10 +3837,72 @@ void RootLlmInference::forward(bool collectProfile) {
         const PlanCommandSnapshot snap = planCommandCache().load();
         const PlanCommand &pc = snap.cmd;
         const bool isNewPpCommand = (snap.cacheSeq != lastPpPlanCacheSeqApplied);
+        const bool isStageBypassCmd =
+            (pc.cmdKind == PLAN_CMD_KIND_STAGE_BYPASS) &&
+            (pc.version == DLLAMA_PLAN_CMD_VERSION_V2) &&
+            (pc.nMoves == 0u);
         const bool isPpMigrationCmd =
             (pc.cmdKind == 0u) &&
             ((pc.version == DLLAMA_PLAN_CMD_VERSION_V1) ||
              (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 0u));
+        if (isNewPpCommand && isValidPlanCommandHeader(pc) && pc.mode != PLAN_CMD_MODE_NONE && isStageBypassCmd) {
+            if (waitingKvAck) {
+                std::printf("⚠️  [stage-bypass] defer command cacheSeq=%llu: waiting previous ack\n",
+                    (unsigned long long)snap.cacheSeq);
+                std::fflush(stdout);
+            } else {
+                const NnUint ejectedStageIndex = pc.stageIndex;
+                const NnUint targetStageIndex = pc.reserved0;
+                const NnStageConfig *ejectedStage = findStageByIndexLocal(plan, ejectedStageIndex);
+                const NnStageConfig *targetStage = findStageByIndexLocal(plan, targetStageIndex);
+                std::string rejectReason;
+                const NnUint prevStageIndex = getPpPrevStageIndex(plan, ejectedStageIndex);
+                const NnUint nextStageIndex = getPpNextStageIndex(plan, ejectedStageIndex);
+                const bool adjacentTarget =
+                    ejectedStage != nullptr &&
+                    targetStage != nullptr &&
+                    prevStageIndex != (NnUint)-1 &&
+                    nextStageIndex != (NnUint)-1 &&
+                    (targetStageIndex == prevStageIndex || targetStageIndex == nextStageIndex);
+                const bool covered = stageHasRedundantCoverageLocal(runtimePlan, ejectedStage, targetStage, &rejectReason);
+                if (!adjacentTarget) {
+                    rejectReason = "target stage is not an active neighbor of ejected stage";
+                }
+                if (ejectedStage == nullptr || targetStage == nullptr || !adjacentTarget || !covered) {
+                    std::printf("⚠️  [stage-bypass] reject ejectedStage=%u targetStage=%u reason=%s\n",
+                        (unsigned)ejectedStageIndex,
+                        (unsigned)targetStageIndex,
+                        rejectReason.empty() ? "invalid stages" : rejectReason.c_str());
+                    std::fflush(stdout);
+                    lastPpPlanCacheSeqApplied = snap.cacheSeq;
+                    planCommandCache().consumeIfCacheSeq(snap.cacheSeq);
+                } else {
+                    migrationFromNodeIndex = ejectedStage->rootNodeIndex;
+                    nextStageRootNode = targetStage->rootNodeIndex;
+                    kvAckSocketIndex = (network != nullptr) ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
+                    migrationLayers.clear();
+                    for (NnUint layer = ejectedStage->startLayer; layer < ejectedStage->endLayer; ++layer) {
+                        appendUniqueLayer(migrationLayers, layer);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(kvTransferMutex);
+                        pendingLayerSwitchLayers = migrationLayers;
+                        pendingStageBypass = true;
+                        pendingBypassEjectedStage = ejectedStageIndex;
+                        pendingBypassTargetStage = targetStageIndex;
+                    }
+                    const bool switched = sendPendingLayerSwitchControlOnly();
+                    lastPpPlanCacheSeqApplied = snap.cacheSeq;
+                    if (switched) planCommandCache().consumeIfCacheSeq(snap.cacheSeq);
+                    std::printf("🔁 [stage-bypass] apply ejectedStage=%u targetStage=%u layers=%zu status=%s\n",
+                        (unsigned)ejectedStageIndex,
+                        (unsigned)targetStageIndex,
+                        migrationLayers.size(),
+                        switched ? "ok" : "fail");
+                    std::fflush(stdout);
+                }
+            }
+        } else
         if (isNewPpCommand && isValidPlanCommandHeader(pc) && pc.mode != PLAN_CMD_MODE_NONE && isPpMigrationCmd) {
             if (waitingKvAck) {
                 std::printf("⚠️  [kv-migrate] defer new pp command cacheSeq=%llu: waiting previous ack\n",
@@ -4957,6 +5089,9 @@ void runWorkerApp(AppCliArgs *args) {
 
                     if (localIsSourceStage) {
                         executor.setPrimaryLayerEnabled(switchPkt.boundaryLayer, false);
+                        if ((switchPkt.reserved0 & LLM_LAYER_SWITCH_STAGE_BYPASS) != 0u) {
+                            executor.setPpSyncEnabled(false);
+                        }
                         std::printf("🔁 [worker-switch] node=%u sleep primary layer=%u (source-stage)\n",
                             (unsigned)nodeConfig.nodeIndex,
                             (unsigned)switchPkt.boundaryLayer);
@@ -4981,6 +5116,15 @@ void runWorkerApp(AppCliArgs *args) {
                                     (unsigned)shiftedStartLayer);
                                 std::fflush(stdout);
                             }
+                        }
+                        if ((switchPkt.reserved0 & LLM_LAYER_SWITCH_STAGE_BYPASS) != 0u) {
+                            const bool ok = applyPpStageBypass(planPtr.get(), switchPkt.reserved1, switchPkt.reserved2);
+                            std::printf("🔁 [worker-bypass] node=%u ejectedStage=%u targetStage=%u status=%s\n",
+                                (unsigned)nodeConfig.nodeIndex,
+                                (unsigned)switchPkt.reserved1,
+                                (unsigned)switchPkt.reserved2,
+                                ok ? "ok" : "reject");
+                            std::fflush(stdout);
                         }
                     }
                 }

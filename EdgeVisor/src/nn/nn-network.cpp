@@ -2123,9 +2123,9 @@ static void syncPpSend(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
         for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
             if (plan->stages[s].nodeIndices[i] == myNodeIndex) {
                 myStage = &plan->stages[s];
-                // 如果还有下一个 Stage
-                if (s + 1 < plan->nStages) {
-                    nextStage = &plan->stages[s+1];
+                const NnUint nextStageIndex = getPpNextStageIndex(plan, s);
+                if (nextStageIndex != (NnUint)-1 && nextStageIndex < plan->nStages) {
+                    nextStage = &plan->stages[nextStageIndex];
                 }
                 break;
             }
@@ -2156,8 +2156,9 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
         for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
             if (plan->stages[s].nodeIndices[i] == myNodeIndex) {
                 myStage = &plan->stages[s];
-                if (s > 0) {
-                    prevStage = &plan->stages[s-1];
+                const NnUint prevStageIndex = getPpPrevStageIndex(plan, s);
+                if (prevStageIndex != (NnUint)-1 && prevStageIndex < plan->nStages) {
+                    prevStage = &plan->stages[prevStageIndex];
                 }
                 break;
             }

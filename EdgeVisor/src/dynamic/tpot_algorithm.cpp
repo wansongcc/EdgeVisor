@@ -52,6 +52,11 @@ double tpGainThresholdMs(const StageSnapshot &stage, const SchedulerConfig &cfg)
     return maxDouble(cfg.minTpGainMs, 0.03 * stage.stageTimeMs);
 }
 
+static double ppLocalGainThresholdMs(const StageSnapshot &source, const StageSnapshot &target, const SchedulerConfig &cfg) {
+    const double localMs = maxDouble(0.0, source.stageTimeMs) + maxDouble(0.0, target.stageTimeMs);
+    return maxDouble(cfg.minPpGainMs, 0.03 * localMs);
+}
+
 static Candidate makeRejected(CandidateKind kind, const char *reason) {
     Candidate c;
     c.kind = kind;
@@ -84,9 +89,10 @@ static double ppBoundaryDeltaOutMs(const StageSnapshot &source, const StageSnaps
 Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double currentTpotMs, const SchedulerConfig &cfg) {
     if (stages.size() < 2u) return makeRejected(CandidateKind::PP_MOVE, "need at least two stages");
 
+    (void)currentTpotMs;
     Candidate best;
     best.kind = CandidateKind::PP_MOVE;
-    best.thresholdMs = ppGainThresholdMs(currentTpotMs, cfg);
+    best.thresholdMs = cfg.minPpGainMs;
     best.reason = "no profitable pp move";
 
     const double migCost = migrationCostPerToken(cfg.ppMigrationCostMs, cfg.expectedRemainingTokens);
@@ -106,17 +112,17 @@ Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double curre
             const double gain =
                 ppBoundaryDeltaOutMs(source, target, cfg) -
                 ppDeltaInMs(target, cfg) -
-                target.boundaryCommMs -
                 migCost -
                 cfg.ppRiskMarginMs -
                 target.riskPenalty * maxDouble(1.0, target.avgLayerMs);
 
+            const double threshold = ppLocalGainThresholdMs(source, target, cfg);
             Candidate c;
             c.kind = CandidateKind::PP_MOVE;
-            c.valid = gain > best.thresholdMs;
+            c.valid = gain > threshold;
             c.reason = c.valid ? "" : "gain below threshold";
             c.gainMs = gain;
-            c.thresholdMs = best.thresholdMs;
+            c.thresholdMs = threshold;
             c.fromStageIndex = source.stageIndex;
             c.toStageIndex = target.stageIndex;
             c.fromNodeIndex = source.rootNodeIndex;

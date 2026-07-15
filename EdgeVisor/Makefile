@@ -158,6 +158,8 @@ endif
 # llm
 tokenizer.o: src/tokenizer.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+token-timing.o: src/token_timing.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 llm.o: src/llm.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 app.o: src/app.cpp
@@ -182,6 +184,9 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o
 	$(CXX) $(CXXFLAGS) $(filter-out %.hpp %.h, $^) -o $@ $(LIBS)
 
+token-timing-test: src/test/test_token_timing.cpp token-timing.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
 # --- (您的新测试目标) ---
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
@@ -195,7 +200,7 @@ Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-netwo
 pointer-swizzling-microbench: src/test/pointer_swizzling_microbench.cpp nn-quants.o nn-core.o nn-executor.o nn-cpu.o nn-cpu-ops.o llamafile-sgemm.o plan-command.o ablation.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+dllama: src/dllama.cpp token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 dllama-api: src/dllama-api.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}

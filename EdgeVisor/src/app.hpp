@@ -250,6 +250,11 @@ typedef struct {
     NnUint rightBoundaryLayerUs;
 } LlmPerfPacket;
 
+typedef struct {
+    unsigned long long seq;
+    std::vector<LlmPerfPacket> packets;
+} LlmPerfHistorySample;
+
 // Bootstrap settings sent from root to worker after socket connect and before
 // sending net/node configs. This removes the need for workers to pass --model/--ratios.
 enum LlmBootstrapFlags : NnUint {
@@ -335,6 +340,8 @@ public:
 
     float *logitsPipe;
     const std::vector<LlmPerfPacket>& getLastPerf() const { return lastPerf; }
+    std::vector<LlmPerfPacket> getLastPerfSnapshot() const;
+    std::vector<LlmPerfHistorySample> getPerfHistorySince(unsigned long long afterSeq, size_t maxSamples, unsigned long long *latestSeq = nullptr) const;
     NnUint getPosition() const { return controlPacket.position; }
     NnUint getBatchSize() const { return controlPacket.batchSize; }
     const NnUnevenPartitionPlan* getPartitionPlan() const { return plan; }
@@ -377,7 +384,10 @@ private:
     bool profileEnabled = false;
     const NnUnevenPartitionPlan* plan = nullptr;
     const RuntimeStageLayerPlan* runtimePlan = nullptr;
+    mutable std::mutex lastPerfMutex;
     std::vector<LlmPerfPacket> lastPerf;
+    std::deque<LlmPerfHistorySample> perfHistory;
+    unsigned long long perfHistorySeq = 0ull;
     NnUint lastPlanCmdSeqSent = 0u;
     NnBubbleShadowStats lastBubbleShadowStats{};
     int asyncKvCollectLayer = -1;

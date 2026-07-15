@@ -104,6 +104,16 @@ export DLLAMA_POISON_CHECK_LIMIT=50
   - 数据布局（v1）：`Header(DLPS)` + `NnLayerPerfMsg[nLayers][nStageNodes]`。
   - 示例：`DLLAMA_LAYER_PROF_PATH=/tmp/layerprof.bin ./dllama inference ...`
 
+
+### 1.3.2 Root 逐 token 端到端与节点计时打印
+
+- `DLLAMA_TOKEN_TIMING_PRINT`（布尔，默认 `0`）
+  - 作用：在 `dllama inference` 的普通 prediction loop 中，每生成一个 token 后由 root 打印：
+    - `[token-e2e]`：该 token 在 root 侧的端到端 wall-clock 时间，覆盖 `forward()`、profile 等待、采样、decode、token 输出和 flush。
+    - `[token-prof]`：每个节点该 token 的 `total/exec/sync/bubble` 时间，来自已有 `LlmPerfPacket`。
+  - 说明：`[token-e2e]` 只需要设置该变量；`[token-prof]` 需要同时启用 executor profiling，例如 `--benchmark` 或 `--enable-dynamic-tpot`。
+  - 示例：`DLLAMA_TOKEN_TIMING_PRINT=1 ./dllama inference ... --benchmark`
+
 ### 1.4 在线迁移 / 计划屏障 / PP layer 迁移
 
 完整使用与验证流程见：[HOW_TO_ONLINE_MIGRATION.md](HOW_TO_ONLINE_MIGRATION.md)。UDS 协议细节见：[README_DYNAMIC_UDS.md](README_DYNAMIC_UDS.md)。

@@ -240,6 +240,15 @@ static uint32_t parseU32(const json &j, const char *key, uint32_t fallback) {
     }
 }
 
+static unsigned long long parseU64(const json &j, const char *key, unsigned long long fallback) {
+    if (!j.contains(key)) return fallback;
+    try {
+        return j.at(key).get<unsigned long long>();
+    } catch (...) {
+        return fallback;
+    }
+}
+
 static bool parseBool(const json &j, const char *key, bool fallback) {
     if (!j.contains(key)) return fallback;
     try {
@@ -265,6 +274,30 @@ static double parseDouble(const json &j, const char *key, double fallback) {
         return fallback;
     }
     return fallback;
+}
+
+static json perfPacketToJson(const LlmPerfPacket &p) {
+    return json{
+        {"position", p.position},
+        {"batchSize", p.batchSize},
+        {"nodeIndex", p.nodeIndex},
+        {"stageIndex", p.stageIndex},
+        {"execUs", p.execUs},
+        {"syncUs", p.syncUs},
+        {"syncPpSendUs", p.syncPpSendUs},
+        {"syncPpRecvUs", p.syncPpRecvUs},
+        {"syncRootWaitUs", p.syncRootWaitUs},
+        {"syncLogitsUs", p.syncLogitsUs},
+        {"syncOtherUs", p.syncOtherUs},
+        {"bubbleUs", p.bubbleUs},
+        {"bubbleSegments", p.bubbleSegments},
+        {"bubbleOps", p.bubbleOps},
+        {"bubbleSkippedSyncs", p.bubbleSkippedSyncs},
+        {"bubbleDrainUs", p.bubbleDrainUs},
+        {"bubbleCompleted", p.bubbleCompleted},
+        {"leftBoundaryLayerUs", p.leftBoundaryLayerUs},
+        {"rightBoundaryLayerUs", p.rightBoundaryLayerUs}
+    };
 }
 
 static std::string modeToStr(uint32_t mode) {
@@ -718,7 +751,7 @@ void PlanUdsController::run() {
                 if (inference_ != nullptr) {
                     resp["position"] = inference_->getPosition();
                     resp["batchSize"] = inference_->getBatchSize();
-                    resp["perfSamples"] = (uint32_t)inference_->getLastPerf().size();
+                    resp["perfSamples"] = (uint32_t)inference_->getLastPerfSnapshot().size();
                     json pp = json::object();
                     pp["fromNodeIndex"] = inference_->getMigrationFromNodeIndex();
                     pp["toNodeIndex"] = inference_->getMigrationTargetNodeIndex();
@@ -740,20 +773,35 @@ void PlanUdsController::run() {
                 }
             } else if (op == "perf") {
                 resp = json{{"ok", true}};
+                const unsigned long long afterSeq = parseU64(req, "afterSeq", 0ull);
+                const size_t maxSamples = (size_t)parseU32(req, "maxSamples", 64u);
                 json arr = json::array();
                 if (inference_ != nullptr) {
-                    for (const auto &p : inference_->getLastPerf()) {
-                        arr.push_back(json{
-                            {"position", p.position},
-                            {"batchSize", p.batchSize},
-                            {"nodeIndex", p.nodeIndex},
-                            {"stageIndex", p.stageIndex},
-                            {"execUs", p.execUs},
-                            {"syncUs", p.syncUs},
-                            {"leftBoundaryLayerUs", p.leftBoundaryLayerUs},
-                            {"rightBoundaryLayerUs", p.rightBoundaryLayerUs}
-                        });
+                    const std::vector<LlmPerfPacket> latest = inference_->getLastPerfSnapshot();
+                    for (const auto &p : latest) {
+                        arr.push_back(perfPacketToJson(p));
                     }
+
+                    unsigned long long historyLatestSeq = 0ull;
+                    const std::vector<LlmPerfHistorySample> samples =
+                        inference_->getPerfHistorySince(afterSeq, maxSamples, &historyLatestSeq);
+                    json history = json::array();
+                    unsigned long long latestReturnedSeq = afterSeq;
+                    for (const LlmPerfHistorySample &sample : samples) {
+                        json perf = json::array();
+                        for (const LlmPerfPacket &p : sample.packets) {
+                            perf.push_back(perfPacketToJson(p));
+                        }
+                        history.push_back(json{{"seq", sample.seq}, {"perf", perf}});
+                        latestReturnedSeq = sample.seq;
+                    }
+                    resp["samples"] = history;
+                    resp["latestSeq"] = latestReturnedSeq;
+                    resp["historyLatestSeq"] = historyLatestSeq;
+                } else {
+                    resp["samples"] = json::array();
+                    resp["latestSeq"] = afterSeq;
+                    resp["historyLatestSeq"] = 0ull;
                 }
                 resp["perf"] = arr;
             } else if (op == "layer_prof") {

@@ -8,6 +8,7 @@
 #include "llm.hpp"
 #include "tokenizer.hpp"
 #include "app.hpp"
+#include "token_timing.hpp"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -898,6 +899,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     const NnUint migrationWindowTokens = 20u;
     const NnUint predPhaseStartPos = (NnUint)(nInputTokens - 1);
     MigrationTpotSummary migrationTpotSummary;
+    const bool tokenTimingPrint = dllamaTokenTimingPrintEnabled();
     if (context->args->benchmark) {
         perfAgg.resize(nNodes);
     }
@@ -1033,9 +1035,11 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     // forward(), worker/profile waits, sampling/decoding, and token output/flush.
     const auto predWallStart = std::chrono::steady_clock::now();
     for (; pos < maxPos; pos++) {
+        const auto tokenWallStart = std::chrono::steady_clock::now();
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
         context->inference->forward();
+        const std::vector<LlmPerfPacket>& tokenPerf = context->inference->getLastPerf();
 
         NnUint lastStageToken = 0u;
         const bool haveLastStageToken =
@@ -1064,7 +1068,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 
         NnUint predBubbleTime = 0;
         if (context->args->benchmark) {
-            const std::vector<LlmPerfPacket>& perf = context->inference->getLastPerf();
+            const std::vector<LlmPerfPacket>& perf = tokenPerf;
             for (const LlmPerfPacket& p : perf) {
                 if (p.nodeIndex == 0u) predBubbleTime += p.bubbleUs;
                 if (p.nodeIndex >= perfAgg.size()) continue;
@@ -1341,6 +1345,24 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             recvBytes / 1024,
             delta == nullptr ? (eosType == EOS ? "[EOS]" : "") : delta);
         fflush(stdout);
+        if (tokenTimingPrint) {
+            const auto tokenWallEnd = std::chrono::steady_clock::now();
+            const double tokenWallMs = std::chrono::duration<double, std::milli>(tokenWallEnd - tokenWallStart).count();
+            const std::string e2eLine = formatTokenE2eTimingLine((unsigned int)pos, token, tokenWallMs);
+            printf("%s\n", e2eLine.c_str());
+            for (const LlmPerfPacket& p : tokenPerf) {
+                DllamaTokenNodeTiming timing;
+                timing.nodeIndex = p.nodeIndex;
+                timing.stageIndex = p.stageIndex;
+                timing.hasStage = true;
+                timing.execUs = p.execUs;
+                timing.syncUs = p.syncUs;
+                timing.bubbleUs = p.bubbleUs;
+                const std::string nodeLine = formatTokenNodeTimingLine((unsigned int)pos, timing);
+                printf("%s\n", nodeLine.c_str());
+            }
+            fflush(stdout);
+        }
         if (eosType == NOT_EOS || eosType == EOS) {
             eosDetector.reset();
         }

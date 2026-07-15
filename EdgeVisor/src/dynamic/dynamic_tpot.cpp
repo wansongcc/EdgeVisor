@@ -103,6 +103,7 @@ struct ControllerRuntime {
     std::string logPath;
     uint32_t lastObservedPos = 0xFFFFFFFFu;
     bool haveObservedPos = false;
+    unsigned long long lastPerfSeq = 0ull;
     uint32_t cooldownUntilPos = 0u;
     uint32_t stableWindows = 0u;
     WindowSummary window;
@@ -273,11 +274,8 @@ static double packetBoundaryCommMs(const json &p) {
     return (sendUs + recvUs) / 1000.0;
 }
 
-static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, uint32_t statusPos) {
-    if (!perfResp.value("ok", false)) return false;
-    if (!perfResp.contains("perf") || !perfResp.at("perf").is_array()) return false;
-    const json &arr = perfResp.at("perf");
-    if (arr.empty()) return false;
+static bool updateWindowFromPerfArray(ControllerRuntime &rt, const json &arr, uint32_t statusPos) {
+    if (!arr.is_array() || arr.empty()) return false;
 
     uint32_t samplePos = statusPos;
     bool havePacket = false;
@@ -302,6 +300,7 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
         const double ms = packetTimeMs(p);
         const double computeMs = packetComputeMs(p);
         if (ms <= 0.0 && computeMs <= 0.0) continue;
+        if (computeMs <= 0.0) continue;
         havePacket = true;
         if (stageMaxMs.find(stageIndex) == stageMaxMs.end() || ms > stageMaxMs[stageIndex]) {
             stageMaxMs[stageIndex] = ms;
@@ -329,12 +328,14 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
     // characteristics; skip these samples so the scheduler window contains
     // only comparable pred-phase (batchSize=1) tokens.
     if (isEvalSample) {
-        rt.lastObservedPos = samplePos;
+        if (!rt.haveObservedPos || samplePos > rt.lastObservedPos) {
+            rt.lastObservedPos = samplePos;
+        }
         return false;
     }
 
-    if (!havePacket || stageMaxMs.empty()) return false;
-    if (rt.haveObservedPos && samplePos == rt.lastObservedPos) return false;
+    if (!havePacket || stageComputeMaxMs.empty()) return false;
+    if (rt.haveObservedPos && samplePos <= rt.lastObservedPos) return false;
     if (!rt.haveObservedPos) {
         rt.metrics.startPos = samplePos;
         rt.metrics.startTime = std::chrono::steady_clock::now();
@@ -347,11 +348,11 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
     rt.window.samples += 1u;
 
     double tokenTpot = 0.0;
-    for (std::map<uint32_t, double>::const_iterator it = stageMaxMs.begin(); it != stageMaxMs.end(); ++it) {
+    for (std::map<uint32_t, double>::const_iterator it = stageComputeMaxMs.begin(); it != stageComputeMaxMs.end(); ++it) {
         const uint32_t stageIndex = it->first;
-        const double stageMs = it->second;
-        const double stageComputeMs = stageComputeMaxMs[stageIndex];
-        tokenTpot += stageMs;
+        const double stageComputeMs = it->second;
+        const double stageMs = stageMaxMs.count(stageIndex) != 0u ? stageMaxMs[stageIndex] : stageComputeMs;
+        tokenTpot += stageComputeMs;
         StageWindowStats &st = rt.window.stages[stageIndex];
         st.stageTotalMs += stageMs;
         st.stageComputeMs += stageComputeMs;
@@ -371,6 +372,24 @@ static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, ui
     if (tokenTpot > rt.metrics.maxObservedTpotMs) rt.metrics.maxObservedTpotMs = tokenTpot;
     if (rt.metrics.baselineTpotMs <= 0.0) rt.metrics.baselineTpotMs = tokenTpot;
     return true;
+}
+
+static bool updateWindowFromPerf(ControllerRuntime &rt, const json &perfResp, uint32_t statusPos) {
+    if (!perfResp.value("ok", false)) return false;
+
+    bool updated = false;
+    if (perfResp.contains("samples") && perfResp.at("samples").is_array()) {
+        const json &samples = perfResp.at("samples");
+        for (size_t i = 0u; i < samples.size(); ++i) {
+            const json &sample = samples.at(i);
+            if (!sample.is_object() || !sample.contains("perf") || !sample.at("perf").is_array()) continue;
+            updated = updateWindowFromPerfArray(rt, sample.at("perf"), statusPos) || updated;
+        }
+        return updated;
+    }
+
+    if (!perfResp.contains("perf") || !perfResp.at("perf").is_array()) return false;
+    return updateWindowFromPerfArray(rt, perfResp.at("perf"), statusPos);
 }
 
 static void finalizeWindow(WindowSummary &w) {
@@ -772,9 +791,12 @@ void DynamicTpotController::run() {
 
             json perfReq;
             perfReq["op"] = "perf";
+            perfReq["afterSeq"] = rt.lastPerfSeq;
+            perfReq["maxSamples"] = std::max(1, rt.cfg.windowTokens * 4);
             const json perf = udsRequest(socketPath_, perfReq, rt.timeoutMs);
             const uint32_t statusPos = status.value("position", 0u);
             (void)updateWindowFromPerf(rt, perf, statusPos);
+            rt.lastPerfSeq = perf.value("latestSeq", rt.lastPerfSeq);
 
             const bool enoughTokens = rt.window.samples >= (uint32_t)rt.cfg.windowTokens;
             const bool enoughSamples = rt.window.samples >= (uint32_t)rt.cfg.minSamples;

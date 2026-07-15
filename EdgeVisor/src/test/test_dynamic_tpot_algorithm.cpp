@@ -85,6 +85,19 @@ int main() {
     require(!riskPp.valid, "target risk penalty suppresses candidate");
     pp[1].riskPenalty = 0.0;
 
+    std::vector<tpot::StageSnapshot> ppWithUnrelatedSlowStage;
+    ppWithUnrelatedSlowStage.push_back(stage(0, 0, 0, 4, 25.0));
+    ppWithUnrelatedSlowStage.push_back(stage(1, 1, 4, 2, 5.0));
+    ppWithUnrelatedSlowStage.push_back(stage(2, 2, 6, 1, 1000.0));
+    tpot::Candidate localPp = tpot::bestPpCandidate(ppWithUnrelatedSlowStage, 1110.0, cfg);
+    require(localPp.valid, "PP threshold uses local affected stages, not unrelated global TPOT");
+    require(localPp.fromStageIndex == 0u && localPp.toStageIndex == 1u, "local PP candidate is still the profitable boundary");
+
+    pp[1].boundaryCommMs = 1000.0;
+    tpot::Candidate commPp = tpot::bestPpCandidate(pp, 110.0, cfg);
+    require(commPp.valid, "PP automation decision ignores communication/bubble timing and uses compute time");
+    pp[1].boundaryCommMs = 0.0;
+
     pp[0].nLayers = 1u;
     pp[0].endLayer = 1u;
     tpot::Candidate emptyPp = tpot::bestPpCandidate(pp, 110.0, cfg);

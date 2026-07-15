@@ -3285,9 +3285,41 @@ void RootLlmInference::collectDeferredProfile(const LlmPerfPacket &rootPacket, s
     }
 }
 
+std::vector<LlmPerfPacket> RootLlmInference::getLastPerfSnapshot() const {
+    std::lock_guard<std::mutex> lk(lastPerfMutex);
+    return lastPerf;
+}
+
+std::vector<LlmPerfHistorySample> RootLlmInference::getPerfHistorySince(
+    unsigned long long afterSeq,
+    size_t maxSamples,
+    unsigned long long *latestSeq) const {
+    std::lock_guard<std::mutex> lk(lastPerfMutex);
+    if (latestSeq != nullptr) *latestSeq = perfHistorySeq;
+    std::vector<LlmPerfHistorySample> out;
+    if (maxSamples == 0u) return out;
+    for (const LlmPerfHistorySample &sample : perfHistory) {
+        if (sample.seq <= afterSeq) continue;
+        out.push_back(sample);
+        if (out.size() >= maxSamples) break;
+    }
+    return out;
+}
+
 void RootLlmInference::collectProfilePackets() {
     if (!profileEnabled) return;
-    collectDeferredProfile(makeRootPerfPacket(), lastPerf);
+    std::vector<LlmPerfPacket> perf;
+    collectDeferredProfile(makeRootPerfPacket(), perf);
+    std::lock_guard<std::mutex> lk(lastPerfMutex);
+    lastPerf = perf;
+    if (!perf.empty()) {
+        LlmPerfHistorySample sample;
+        sample.seq = ++perfHistorySeq;
+        sample.packets = perf;
+        perfHistory.push_back(std::move(sample));
+        const size_t maxHistory = 512u;
+        while (perfHistory.size() > maxHistory) perfHistory.pop_front();
+    }
 }
 
 bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens) {
@@ -4317,7 +4349,9 @@ void RootLlmInference::forward(bool collectProfile) {
             collectProfilePackets();
         }
     } else {
+        std::lock_guard<std::mutex> lk(lastPerfMutex);
         lastPerf.clear();
+        perfHistory.clear();
     }
 }
 

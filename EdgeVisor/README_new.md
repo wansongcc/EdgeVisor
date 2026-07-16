@@ -241,6 +241,32 @@ stageWeights*tpStage0*tpStage1*...
 
 `--enable-dynamic-tpot` 会自动开启 `--enable-plan-barrier`、`--enable-pp-migration`、KV aggregate、stage full weights，并设置 PP KV ACK timeout 与 collector 默认行为。
 
+### 4.1.1 单进程内存上限与自动 TPOT 档位
+
+每个 root/worker 都可以独立传入 `--memory-limit-gib <GiB>`，Linux 上会在进程内设置 `RLIMIT_AS`，无需 `sudo systemd-run`。图构建完成后还会检查该节点已知的静态 pipes、buffers、weights 和 op config 是否超过上限的 90%，保留 10% 运行时余量。该限制是进程虚拟地址空间上限，不等同于 cgroup 的 `MemoryMax`。
+
+```bash
+# 两台 4 GiB Nano worker
+./dllama worker --port 9999 --backend vulkan --gpu-index 0 --nthreads 1 --memory-limit-gib 4
+
+# 8 GiB root：自动开启 PP 迁移依赖、末 stage sampling 和 layer profiling
+./dllama inference ... \
+  --memory-limit-gib 8 \
+  --enable-dynamic-tpot \
+  --dynamic-tpot-profile aggressive \
+  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock
+```
+
+`--dynamic-tpot-profile` 可取 `conservative`、`balanced`（默认）或 `aggressive`。档位只填充未设置的环境变量，显式 CLI 字段优先级最高：
+
+| 档位 | window | min samples | cooldown | rollback | min PP gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| conservative | 16 | 8 | 32 | 16 | 5 ms |
+| balanced | 8 | 8 | 16 | 12 | 3 ms |
+| aggressive | 6 | 6 | 8 | 8 | 1 ms |
+
+可覆盖单项：`--tpot-window-tokens`、`--tpot-min-samples`、`--tpot-cooldown-tokens`、`--tpot-rollback-window`、`--tpot-min-pp-gain-ms`、`--tpot-pp-risk-margin-ms`、`--tpot-pp-migration-cost-ms`、`--tpot-expected-remaining-tokens`。例如算力波动注入实验可使用 `--dynamic-tpot-profile aggressive --tpot-window-tokens 6 --tpot-min-samples 6`，以缩短触发所需的采样长度。
+
 手动 UDS 迁移：
 
 ```bash

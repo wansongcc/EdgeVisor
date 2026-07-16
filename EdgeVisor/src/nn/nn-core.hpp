@@ -745,6 +745,7 @@ NnTensorViewLayout resolveTensorView(
 void releaseNetConfig(NnNetConfig *netConfig);
 void releaseNodeConfig(NnNodeConfig *nodeConfig);
 
+NnSize getNodeRequiredMemory(const NnNetConfig *netConfig, const NnNodeConfig *nodeConfig);
 void printNodeRequiredMemory(NnNetConfig *netConfig, NnNodeConfig *nodeConfig);
 
 class Timer {

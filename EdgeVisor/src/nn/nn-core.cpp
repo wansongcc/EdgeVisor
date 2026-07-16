@@ -468,8 +468,8 @@ void releaseNodeConfig(NnNodeConfig *nodeConfig) {
     delete[] nodeConfig->segments;
 }
 
-void printNodeRequiredMemory(NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
-    unsigned long total = 0;
+NnSize getNodeRequiredMemory(const NnNetConfig *netConfig, const NnNodeConfig *nodeConfig) {
+    NnSize total = 0;
     for (NnUint pipeIndex = 0; pipeIndex < netConfig->nPipes; pipeIndex++)
         total += netConfig->pipes[pipeIndex].size.nBytes;
     for (NnUint bufferIndex = 0; bufferIndex < nodeConfig->nBuffers; bufferIndex++)
@@ -481,7 +481,12 @@ void printNodeRequiredMemory(NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
             total += segment->ops[opIndex].configSize;
         }
     }
-    printf("📀 RequiredMemory: %lu MB\n", total / (1024 * 1024));
+    return total;
+}
+
+void printNodeRequiredMemory(NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
+    const NnSize total = getNodeRequiredMemory(netConfig, nodeConfig);
+    printf("📀 RequiredMemory: %llu MB\n", (unsigned long long)(total / (1024 * 1024)));
 }
 
 Timer::Timer() {

@@ -22,6 +22,10 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <cerrno>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
@@ -67,6 +71,106 @@ static void setEnvIfUnsetOrEmpty(const char *name, const char *value) {
     const char *current = std::getenv(name);
     if (current == nullptr || current[0] == '\0') {
         setenv(name, value, 1);
+    }
+}
+
+static NnSize parseMemoryLimitGiB(const char *value) {
+    errno = 0;
+    char *end = nullptr;
+    const double gib = std::strtod(value, &end);
+    const double bytesPerGiB = 1024.0 * 1024.0 * 1024.0;
+    if (errno != 0 || end == value || *end != '\0' || !std::isfinite(gib) || gib <= 0.0 ||
+        gib > (double)std::numeric_limits<NnSize>::max() / bytesPerGiB) {
+        throw std::runtime_error("--memory-limit-gib must be a positive number of GiB");
+    }
+    return (NnSize)(gib * bytesPerGiB);
+}
+
+static void appendSyncedEnvironmentVariable(const char *name) {
+    const char *current = std::getenv("DLLAMA_SYNC_ENV_VARS");
+    if (current == nullptr || current[0] == '\0') {
+        setenv("DLLAMA_SYNC_ENV_VARS", name, 1);
+        return;
+    }
+    std::stringstream stream(current);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (item == name) return;
+    }
+    std::string merged(current);
+    merged += ",";
+    merged += name;
+    setenv("DLLAMA_SYNC_ENV_VARS", merged.c_str(), 1);
+}
+
+static void setTpotProfileDefaults(const char *profile) {
+    if (std::strcmp(profile, "conservative") == 0) {
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_WINDOW_TOKENS", "16");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_SAMPLES", "8");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_COOLDOWN_TOKENS", "32");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_ROLLBACK_WINDOW", "16");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_PP_GAIN_MS", "5");
+    } else if (std::strcmp(profile, "balanced") == 0) {
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_WINDOW_TOKENS", "8");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_SAMPLES", "8");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_COOLDOWN_TOKENS", "16");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_ROLLBACK_WINDOW", "12");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_PP_GAIN_MS", "3");
+    } else if (std::strcmp(profile, "aggressive") == 0) {
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_WINDOW_TOKENS", "6");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_SAMPLES", "6");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_COOLDOWN_TOKENS", "8");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_ROLLBACK_WINDOW", "8");
+        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_PP_GAIN_MS", "1");
+    } else {
+        throw std::runtime_error("Invalid --dynamic-tpot-profile: " + std::string(profile) +
+            " (expected conservative, balanced, or aggressive)");
+    }
+}
+
+static void setTpotOverride(const char *environmentName, const char *value) {
+    if (value != nullptr && value[0] != '\0') setenv(environmentName, value, 1);
+}
+
+static void configureDynamicTpot(const AppCliArgs &args) {
+    setTpotProfileDefaults(args.dynamicTpotProfile == nullptr ? "balanced" : args.dynamicTpotProfile);
+    setTpotOverride("DLLAMA_TPOT_WINDOW_TOKENS", args.tpotWindowTokensStr);
+    setTpotOverride("DLLAMA_TPOT_MIN_SAMPLES", args.tpotMinSamplesStr);
+    setTpotOverride("DLLAMA_TPOT_COOLDOWN_TOKENS", args.tpotCooldownTokensStr);
+    setTpotOverride("DLLAMA_TPOT_ROLLBACK_WINDOW", args.tpotRollbackWindowStr);
+    setTpotOverride("DLLAMA_TPOT_MIN_PP_GAIN_MS", args.tpotMinPpGainMsStr);
+    setTpotOverride("DLLAMA_TPOT_PP_RISK_MARGIN_MS", args.tpotPpRiskMarginMsStr);
+    setTpotOverride("DLLAMA_TPOT_PP_MIGRATION_COST_MS", args.tpotPpMigrationCostMsStr);
+    setTpotOverride("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS", args.tpotExpectedRemainingTokensStr);
+    setenv("DLLAMA_LAYER_PROF_ENABLE", "1", 1);
+    appendSyncedEnvironmentVariable("DLLAMA_LAYER_PROF_ENABLE");
+}
+
+static void applyProcessMemoryLimit(NnSize memoryLimitBytes) {
+    if (memoryLimitBytes == 0) return;
+#if defined(__linux__)
+    struct rlimit limit;
+    limit.rlim_cur = (rlim_t)memoryLimitBytes;
+    limit.rlim_max = (rlim_t)memoryLimitBytes;
+    if (setrlimit(RLIMIT_AS, &limit) != 0) {
+        throw std::runtime_error("Failed to apply --memory-limit-gib via RLIMIT_AS: " + std::string(std::strerror(errno)));
+    }
+    std::printf("📀 MemoryLimit: %llu MiB (RLIMIT_AS)\n", (unsigned long long)(memoryLimitBytes / (1024 * 1024)));
+#else
+    std::printf("⚠️  MemoryLimit: --memory-limit-gib is only enforced on Linux\n");
+#endif
+}
+
+static void validateStaticMemoryBudget(NnSize memoryLimitBytes, const NnNetConfig *netConfig, const NnNodeConfig *nodeConfig) {
+    if (memoryLimitBytes == 0) return;
+    const NnSize requiredBytes = getNodeRequiredMemory(netConfig, nodeConfig);
+    const NnSize safeLimitBytes = memoryLimitBytes - memoryLimitBytes / 10u;
+    const NnSize headroomBytes = requiredBytes < memoryLimitBytes ? memoryLimitBytes - requiredBytes : 0u;
+    std::printf("📀 StaticRequiredMemory: %llu MiB | SafetyHeadroom: %llu MiB\n",
+        (unsigned long long)(requiredBytes / (1024 * 1024)),
+        (unsigned long long)(headroomBytes / (1024 * 1024)));
+    if (requiredBytes > safeLimitBytes) {
+        throw std::runtime_error("Static graph memory exceeds 90% of --memory-limit-gib; increase the limit or reduce the model/sequence configuration");
     }
 }
 
@@ -401,6 +505,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.help = false;
     args.backend = BACKEND_AUTO;
     args.backendStr = nullptr;
+    args.memoryLimitBytes = 0;
     args.mode = nullptr;
     args.nBatches = 32;
     args.nThreads = 1;
@@ -446,6 +551,15 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.enableKvAggregate = false;
     args.enablePpMigration = false;
     args.enableDynamicTpot = envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false);
+    args.dynamicTpotProfile = nullptr;
+    args.tpotWindowTokensStr = nullptr;
+    args.tpotMinSamplesStr = nullptr;
+    args.tpotCooldownTokensStr = nullptr;
+    args.tpotRollbackWindowStr = nullptr;
+    args.tpotMinPpGainMsStr = nullptr;
+    args.tpotPpRiskMarginMsStr = nullptr;
+    args.tpotPpMigrationCostMsStr = nullptr;
+    args.tpotExpectedRemainingTokensStr = nullptr;
     args.planCtrlSocketPath = std::getenv("DLLAMA_PLAN_CTRL_SOCKET") != nullptr && std::getenv("DLLAMA_PLAN_CTRL_SOCKET")[0] != '\0'
         ? const_cast<char*>(std::getenv("DLLAMA_PLAN_CTRL_SOCKET"))
         : nullptr;
@@ -721,6 +835,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
         if (std::strcmp(name, "--model") == 0) {
             args.modelPath = value;
+        } else if (std::strcmp(name, "--memory-limit-gib") == 0) {
+            args.memoryLimitBytes = parseMemoryLimitGiB(value);
         } else if (std::strcmp(name, "--tokenizer") == 0) {
             args.tokenizerPath = value;
         } else if (std::strcmp(name, "--prompt") == 0) {
@@ -818,6 +934,24 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.ioProfileLogPath = value;
         } else if (std::strcmp(name, "--plan-ctrl-socket") == 0) {
             args.planCtrlSocketPath = value;
+        } else if (std::strcmp(name, "--dynamic-tpot-profile") == 0) {
+            args.dynamicTpotProfile = value;
+        } else if (std::strcmp(name, "--tpot-window-tokens") == 0) {
+            args.tpotWindowTokensStr = value;
+        } else if (std::strcmp(name, "--tpot-min-samples") == 0) {
+            args.tpotMinSamplesStr = value;
+        } else if (std::strcmp(name, "--tpot-cooldown-tokens") == 0) {
+            args.tpotCooldownTokensStr = value;
+        } else if (std::strcmp(name, "--tpot-rollback-window") == 0) {
+            args.tpotRollbackWindowStr = value;
+        } else if (std::strcmp(name, "--tpot-min-pp-gain-ms") == 0) {
+            args.tpotMinPpGainMsStr = value;
+        } else if (std::strcmp(name, "--tpot-pp-risk-margin-ms") == 0) {
+            args.tpotPpRiskMarginMsStr = value;
+        } else if (std::strcmp(name, "--tpot-pp-migration-cost-ms") == 0) {
+            args.tpotPpMigrationCostMsStr = value;
+        } else if (std::strcmp(name, "--tpot-expected-remaining-tokens") == 0) {
+            args.tpotExpectedRemainingTokensStr = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -849,6 +983,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     }
 #endif
     if (args.enableDynamicTpot) {
+        configureDynamicTpot(args);
         if (args.planCtrlSocketPath == nullptr || args.planCtrlSocketPath[0] == '\0') {
             args.planCtrlSocketPath = (char *)"/tmp/dllama_plan.sock";
             std::printf("⚠️  [tpot-auto] --enable-dynamic-tpot requires a plan UDS; using --plan-ctrl-socket %s\n",
@@ -870,6 +1005,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         setEnvIfUnsetOrEmpty("DLLAMA_KV_ACK_TIMEOUT_MS", "180000");
         setEnvIfUnsetOrEmpty("DLLAMA_IO_TIMEOUT_MS", "180000");
         setEnvIfUnsetOrEmpty("DLLAMA_ASYNC_KV_COLLECT_SUBMIT", "0");
+        if (args.nWorkers > 0u && !args.lastStageSampling) {
+            args.lastStageSampling = true;
+            setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+            std::printf("[tpot-auto] auto enabling last-stage sampling for distributed PP\n");
+            std::fflush(stdout);
+        }
     } else {
         setenv("DLLAMA_DYNAMIC_TPOT_ENABLE", "0", 1);
         if (args.planCtrlSocketPath != nullptr && args.planCtrlSocketPath[0] != '\0') {
@@ -4671,6 +4812,7 @@ void WorkerLlmInference::flushPendingKvAck() {
 }
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    applyProcessMemoryLimit(args->memoryLimitBytes);
     if (args != nullptr && args->ioProfileLogPath != nullptr && args->ioProfileLogPath[0] != '\0') {
         dllamaIoProbeConfigure(args->ioProfileLogPath);
     } else {
@@ -4784,6 +4926,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
 
+    validateStaticMemoryBudget(args->memoryLimitBytes, &net.netConfig, rootNodeConfig);
+
     if (args->info) {
         tokenizer.printHeader();
         printLlmHeader(&header);
@@ -4892,6 +5036,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 }
 
 void runWorkerApp(AppCliArgs *args) {
+    applyProcessMemoryLimit(args->memoryLimitBytes);
     while (true) {
         std::unique_ptr<NnNetwork> networkPtr = args->listenUnixPath != nullptr
             ? NnNetwork::serveUnix(args->listenUnixPath)
@@ -4973,6 +5118,7 @@ void runWorkerApp(AppCliArgs *args) {
         std::unique_ptr<NnNodeConfig, void(*)(NnNodeConfig *)> nodeConfigPtr(&nodeConfig, releaseNodeConfig);
 
         printNodeRequiredMemory(&netConfig, &nodeConfig);
+        validateStaticMemoryBudget(args->memoryLimitBytes, &netConfig, &nodeConfig);
 
         NnNetExecution execution(args->nThreads, &netConfig);
 

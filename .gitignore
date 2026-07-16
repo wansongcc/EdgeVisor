@@ -19,3 +19,4 @@ EdgeVisor/dllama_gpu_*
 *.o
 *.d
 reasonix.toml
+.worktrees/

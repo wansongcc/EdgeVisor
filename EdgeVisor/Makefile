@@ -187,6 +187,9 @@ dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o
 token-timing-test: src/test/test_token_timing.cpp token-timing.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
+mmap-range-test: src/test/test_mmap_range.cpp
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
 app-cli-test: src/test/test_app_cli.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 

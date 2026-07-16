@@ -2574,26 +2574,39 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
             nodeIndex, primaryLoadLayers, redundantLoadLayers);
     }
 
-    MmapFile file;
-    openMmapFile(&file, path, net->header->fileSize);
-    std::unique_ptr<MmapFile, void(*)(MmapFile *)> fdPtr(&file, closeMmapFile);
-    
     printf("💿 Loading weights for Node %u (Layers [%u, %u))...\n", nodeIndex, startLayer, endLayer);
 
     Timer timer;
-    NnByte *data = (NnByte *)file.data;
-    NnByte *b = &data[net->header->headerSize];
     LlmHeader *h = net->header;
+    typedef std::unique_ptr<MmapFile, void(*)(MmapFile *)> MmapFilePtr;
+    std::vector<MmapFilePtr> weightMappings;
+    NnSize mappedWeightBytes = 0u;
+    auto mapWeightRange = [&](NnSize offset, NnSize size) -> NnByte * {
+        MmapFilePtr mappedFile(new MmapFile(), [](MmapFile *file) {
+            closeMmapFile(file);
+            delete file;
+        });
+        openMmapFileRange(mappedFile.get(), path, offset, size);
+        NnByte *data = (NnByte *)mappedFile->data;
+        mappedWeightBytes += size;
+        weightMappings.push_back(std::move(mappedFile));
+        return data;
+    };
+    NnSize fileOffset = h->headerSize;
 
     // --- 1. Embedding ---
     const bool isStageRoot = (myStage == nullptr)
         ? (nodeIndex == 0u)
         : (nodeIndex == myStage->rootNodeIndex);
+    const NnSize embeddingBytes = tokenEmbeddingFileSize(h).nBytes;
     if (isFirstStage && isStageRoot) {
+        NnByte *b = mapWeightRange(fileOffset, embeddingBytes);
         b += loadRootTokenEmbeddingQ80(loader, h, b);
-    } else {
-        b += tokenEmbeddingFileSize(h).nBytes;
+        if ((NnSize)(b - (NnByte *)weightMappings.back()->data) != embeddingBytes) {
+            throw std::runtime_error("Token embedding size mismatch");
+        }
     }
+    fileOffset += embeddingBytes;
 
     // --- 2. 逐层加载 ---
     for (NnUint layerIndex = 0u; layerIndex < h->nLayers; layerIndex++) {
@@ -2616,6 +2629,7 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         NnSize layerBytes = calculateLayerBytes(h, net->moeGateSize, net->rmsNormSize, net->qkRmsNormSize);
 
         if (shouldLoadLayer && (isPrimaryLayer || isRedundantLayer)) {
+            NnByte *b = mapWeightRange(fileOffset, layerBytes);
             NnByte* layerStartPtr = b;
 
             // Attention
@@ -2682,11 +2696,8 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
                 // 校验通过，说明 Skip 逻辑是安全的
                 // printf("✅ Layer %u alignment verified.\n", layerIndex);
             }
-
-        } else {
-            // [Skip]
-            b += layerBytes;
         }
+        fileOffset += layerBytes;
 
         if (timer.elapsedMiliseconds() > 5000) {
             printf("💿 Loaded %u/%u layers...\n", layerIndex + 1, h->nLayers);
@@ -2698,6 +2709,7 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     NnSize finalBlockBytes = net->rmsNormSize.nBytes + size2D(h->weightType, h->dim, h->vocabSize).nBytes;
     
     if (isLastStage) {
+        NnByte *b = mapWeightRange(fileOffset, finalBlockBytes);
         NnByte* finalStart = b;
         b += loader->loadAll("final_norm", 0u, net->rmsNormSize.nBytes, b);
         b += loader->loadRowMatmulSlicesUneven("final_matmul_logits", 0u, 0u,
@@ -2708,15 +2720,17 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         if ((NnSize)(b - finalStart) != finalBlockBytes) {
              throw std::runtime_error("Final block size mismatch");
         }
-    } else {
-        b += finalBlockBytes;
     }
+    fileOffset += finalBlockBytes;
 
     // --- 4. 结束检查 ---
-    long long diff = (long long)(b - data) - net->header->fileSize;
+    long long diff = (long long)fileOffset - net->header->fileSize;
     if (diff != 0) {
         printf("⚠️ Warning: File pointer drift by %lld bytes (Padding or Error?)\n", diff);
     }
+    printf("💿 MappedWeightFile: %llu MiB / %llu MiB\n",
+        (unsigned long long)(mappedWeightBytes / (1024 * 1024)),
+        (unsigned long long)(h->fileSize / (1024 * 1024)));
     
     loader->finish();
 }

@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "EdgeVisor" / "scripts" / "jetson_gpu_freq_inject.sh"
+README = ROOT / "EdgeVisor" / "README.md"
 
 
 def require(condition: bool, message: str) -> None:
@@ -170,6 +171,12 @@ def test_root_check_and_lock_contention() -> None:
             require("already running" in result.stderr, "lock failure should identify contention")
 
 
+def test_readme_documents_usage() -> None:
+    text = README.read_text(encoding="utf-8")
+    for token in ("jetson_gpu_freq_inject.sh", "--level 20", "--duration 8", "thermal"):
+        require(token in text, f"README must document {token!r}")
+
+
 def main() -> int:
     require(SCRIPT.exists(), f"missing script: {SCRIPT}")
     test_help_and_list()
@@ -178,6 +185,7 @@ def main() -> int:
     test_sigterm_restores_state()
     test_invalid_inputs_and_missing_sysfs()
     test_root_check_and_lock_contention()
+    test_readme_documents_usage()
     print("PASS: Jetson GPU frequency injector semantic tests")
     return 0
 

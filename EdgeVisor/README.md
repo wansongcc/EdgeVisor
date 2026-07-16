@@ -18,6 +18,28 @@ Supports Linux, macOS, and Windows. Optimized for ARM and x86_64 AVX2 CPUs.
 - [🧭 Online Migration (PlanCommand + UDS)](./docs/HOW_TO_ONLINE_MIGRATION.md)
 - [⚖️ Uneven TP/PP Startup Configuration](./docs/UNEVEN_TP_PP_CONFIG.md)
 
+### Jetson Orin GPU Frequency Disturbance
+
+On Jetson Orin Nano and Orin NX, list the GPU frequencies allowed by the
+current power mode:
+
+```bash
+scripts/jetson_gpu_freq_inject.sh --list
+```
+
+Inject a one-shot GPU compute-capacity disturbance at level 20 for the default
+20 seconds, or override the duration:
+
+```bash
+sudo scripts/jetson_gpu_freq_inject.sh --level 20
+sudo scripts/jetson_gpu_freq_inject.sh --level 20 --duration 8
+```
+
+The script changes only the GPU frequency bounds. It restores the previous
+bounds and 3D scaling state after normal completion, Ctrl+C, or SIGTERM.
+Hardware thermal, electrical, and power-mode limits can still throttle the
+observed clock.
+
 **News**
 - 16 Sep 2025 - Qwen 3 MoE models are now supported on Vulkan.
 - 5 Sep 2025 - Qwen 3 MoE models are now supported on CPU.

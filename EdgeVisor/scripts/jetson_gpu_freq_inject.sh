@@ -30,12 +30,20 @@ require_value() {
   (( count >= 2 )) || die "${option} requires a value"
 }
 
+try_read_uint() {
+  local file="$1"
+  local value
+  [[ -r "${file}" ]] || return 1
+  value="$(tr -d '[:space:]' < "${file}")" || return 1
+  [[ "${value}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${value}"
+}
+
 read_uint() {
   local file="$1"
   local value
-  [[ -r "${file}" ]] || die "missing or unreadable sysfs file: ${file}"
-  value="$(tr -d '[:space:]' < "${file}")"
-  [[ "${value}" =~ ^[0-9]+$ ]] || die "invalid integer in ${file}: ${value}"
+  value="$(try_read_uint "${file}")" || \
+    die "missing, unreadable, or invalid unsigned integer in sysfs file: ${file}"
   printf '%s\n' "${value}"
 }
 
@@ -110,9 +118,9 @@ select_frequency() {
 write_value() {
   local file="$1"
   local value="$2"
-  printf '%s\n' "${value}" > "${file}"
+  printf '%s\n' "${value}" > "${file}" || return 1
   if [[ -n "${JETSON_GPU_WRITE_LOG:-}" ]]; then
-    printf '%s=%s\n' "${file##*/}" "${value}" >> "${JETSON_GPU_WRITE_LOG}"
+    printf '%s=%s\n' "${file##*/}" "${value}" >> "${JETSON_GPU_WRITE_LOG}" || return 1
   fi
 }
 
@@ -120,18 +128,18 @@ set_bounds() {
   local desired_min="$1"
   local desired_max="$2"
   local current_min current_max
-  current_min="$(read_uint "${MIN_FILE}")"
-  current_max="$(read_uint "${MAX_FILE}")"
+  current_min="$(try_read_uint "${MIN_FILE}")" || return 1
+  current_max="$(try_read_uint "${MAX_FILE}")" || return 1
 
   if (( desired_max < current_min )); then
-    write_value "${MIN_FILE}" "${desired_min}"
-    write_value "${MAX_FILE}" "${desired_max}"
+    write_value "${MIN_FILE}" "${desired_min}" || return 1
+    write_value "${MAX_FILE}" "${desired_max}" || return 1
   elif (( desired_min > current_max )); then
-    write_value "${MAX_FILE}" "${desired_max}"
-    write_value "${MIN_FILE}" "${desired_min}"
+    write_value "${MAX_FILE}" "${desired_max}" || return 1
+    write_value "${MIN_FILE}" "${desired_min}" || return 1
   else
-    write_value "${MIN_FILE}" "${desired_min}"
-    write_value "${MAX_FILE}" "${desired_max}"
+    write_value "${MIN_FILE}" "${desired_min}" || return 1
+    write_value "${MAX_FILE}" "${desired_max}" || return 1
   fi
 }
 

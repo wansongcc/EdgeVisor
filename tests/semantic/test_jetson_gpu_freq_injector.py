@@ -171,6 +171,40 @@ def test_root_check_and_lock_contention() -> None:
             require("already running" in result.stderr, "lock failure should identify contention")
 
 
+def test_restore_failures_print_manual_recovery() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = FakeSysfs(Path(tmp))
+        (fake.gpu / "min_freq").chmod(0o444)
+        result = run(fake, "--level", "20")
+        require(result.returncode != 0, "a sysfs write failure must fail the command")
+        require("automatic restoration failed" in result.stderr,
+                "a restoration write failure must not be masked by later writes")
+        require("Manual recovery:" in result.stderr,
+                "a restoration write failure must print manual recovery commands")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = FakeSysfs(Path(tmp))
+        proc = subprocess.Popen(
+            ["bash", str(SCRIPT), "--level", "0", "--duration", "5", "--sysfs-root", str(fake.root)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=fake.env(no_sleep=False),
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and fake.read("max_freq") != "306000000":
+            require(proc.poll() is None, "injector exited before applying the lock")
+            time.sleep(0.01)
+        require(fake.read("max_freq") == "306000000", "injector did not lock before timeout")
+        (fake.gpu / "min_freq").unlink()
+        proc.send_signal(signal.SIGTERM)
+        _, stderr = proc.communicate(timeout=3)
+        require("automatic restoration failed" in stderr,
+                "a missing sysfs node during restoration must be reported")
+        require("Manual recovery:" in stderr,
+                "a restoration read failure must print manual recovery commands")
+
+
 def test_readme_documents_usage() -> None:
     text = README.read_text(encoding="utf-8")
     for token in ("jetson_gpu_freq_inject.sh", "--level 20", "--duration 8", "thermal"):
@@ -185,6 +219,7 @@ def main() -> int:
     test_sigterm_restores_state()
     test_invalid_inputs_and_missing_sysfs()
     test_root_check_and_lock_contention()
+    test_restore_failures_print_manual_recovery()
     test_readme_documents_usage()
     print("PASS: Jetson GPU frequency injector semantic tests")
     return 0

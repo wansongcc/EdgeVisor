@@ -83,7 +83,7 @@ Parse options without `eval`; reject unknown or duplicate positional input.
 Check root after read-only argument handling. Acquire the lock with:
 
 ```bash
-exec 9>"${JETSON_GPU_LOCK_FILE:-/tmp/jetson_gpu_freq_inject.lock}"
+exec 9>"${JETSON_GPU_LOCK_FILE:-/run/lock/jetson_gpu_freq_inject.lock}"
 flock -n 9 || die "another GPU frequency injection is already running"
 ```
 

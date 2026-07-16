@@ -274,7 +274,7 @@ EFFECTIVE_UID="${JETSON_GPU_TEST_EUID:-${EUID}}"
 (( EFFECTIVE_UID == 0 )) || die "root privileges are required; run with sudo"
 command -v flock >/dev/null 2>&1 || die "flock is required (install util-linux)"
 
-LOCK_FILE="${JETSON_GPU_LOCK_FILE:-/tmp/jetson_gpu_freq_inject.lock}"
+LOCK_FILE="${JETSON_GPU_LOCK_FILE:-/run/lock/jetson_gpu_freq_inject.lock}"
 exec 9>"${LOCK_FILE}"
 flock -n 9 || die "another GPU frequency injection is already running"
 

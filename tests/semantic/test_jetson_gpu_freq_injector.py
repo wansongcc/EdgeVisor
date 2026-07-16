@@ -98,6 +98,12 @@ def test_help_and_list() -> None:
         require("current_freq_hz=612000000" in result.stdout, "list must print current frequency")
 
 
+def test_default_lock_uses_root_owned_directory() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    require("JETSON_GPU_LOCK_FILE:-/run/lock/jetson_gpu_freq_inject.lock" in text,
+            "the root process must not create its predictable lock in world-writable /tmp")
+
+
 def test_level_mapping_and_normal_restore() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         fake = FakeSysfs(Path(tmp))
@@ -234,6 +240,7 @@ def test_readme_documents_usage() -> None:
 def main() -> int:
     require(SCRIPT.exists(), f"missing script: {SCRIPT}")
     test_help_and_list()
+    test_default_lock_uses_root_owned_directory()
     test_level_mapping_and_normal_restore()
     test_jetpack_5_ga10b_layout()
     test_safe_write_order()

@@ -20,8 +20,8 @@ Supports Linux, macOS, and Windows. Optimized for ARM and x86_64 AVX2 CPUs.
 
 ### Jetson Orin GPU Frequency Disturbance
 
-On Jetson Orin Nano and Orin NX, list the GPU frequencies allowed by the
-current power mode:
+On Jetson Orin Nano and Orin NX with JetPack 5 or 6, list the GPU frequencies
+allowed by the current power mode:
 
 ```bash
 scripts/jetson_gpu_freq_inject.sh --list

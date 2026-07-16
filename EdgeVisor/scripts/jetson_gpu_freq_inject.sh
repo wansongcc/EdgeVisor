@@ -7,8 +7,8 @@ Usage:
   jetson_gpu_freq_inject.sh --level PERCENT [--duration SEC] [--sysfs-root PATH]
   jetson_gpu_freq_inject.sh --list [--sysfs-root PATH]
 
-Temporarily locks the GPU frequency on Jetson Orin Nano or Orin NX, then
-restores the previous GPU frequency limits and 3D scaling state.
+Temporarily locks the GPU frequency on Jetson Orin Nano or Orin NX with
+JetPack 5 or 6, then restores the previous limits and 3D scaling state.
 
 Options:
   --level PERCENT    Disturbance level from 0 (lowest) to 100 (highest)
@@ -65,15 +65,27 @@ seconds_to_ms() {
 
 discover_paths() {
   local prefix="${SYSFS_ROOT%/}"
-  PLATFORM_DIR="${prefix}/devices/platform/17000000.gpu"
-  GPU_DIR="${PLATFORM_DIR}/devfreq/17000000.gpu"
+  local r36_platform="${prefix}/devices/platform/17000000.gpu"
+  local r35_platform="${prefix}/devices/17000000.ga10b"
+  local gpu_name
+
+  if [[ -d "${r36_platform}/devfreq/17000000.gpu" ]]; then
+    PLATFORM_DIR="${r36_platform}"
+    gpu_name="17000000.gpu"
+  elif [[ -d "${r35_platform}/devfreq/17000000.ga10b" ]]; then
+    PLATFORM_DIR="${r35_platform}"
+    gpu_name="17000000.ga10b"
+  else
+    die "Jetson Orin GPU devfreq directory not found under ${r36_platform} or ${r35_platform}"
+  fi
+
+  GPU_DIR="${PLATFORM_DIR}/devfreq/${gpu_name}"
   AVAILABLE_FILE="${GPU_DIR}/available_frequencies"
   MIN_FILE="${GPU_DIR}/min_freq"
   MAX_FILE="${GPU_DIR}/max_freq"
   CUR_FILE="${GPU_DIR}/cur_freq"
   SCALING_FILE="${PLATFORM_DIR}/enable_3d_scaling"
 
-  [[ -d "${GPU_DIR}" ]] || die "Jetson Orin GPU devfreq directory not found: ${GPU_DIR}"
   [[ -r "${AVAILABLE_FILE}" ]] || die "missing available GPU frequencies: ${AVAILABLE_FILE}"
   read_uint "${MIN_FILE}" >/dev/null
   read_uint "${MAX_FILE}" >/dev/null

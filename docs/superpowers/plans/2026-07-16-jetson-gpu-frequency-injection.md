@@ -4,14 +4,16 @@
 
 **Goal:** Add a safe one-shot GPU frequency disturbance injector for Jetson Orin Nano and Orin NX.
 
-**Architecture:** A standalone Bash CLI discovers the Orin GPU devfreq files beneath a configurable sysfs root, maps a percentage to a supported frequency, locks min/max for a bounded interval, and restores state from an EXIT trap. A Python semantic test drives the real Bash script against a temporary fake sysfs tree.
+**Architecture:** A standalone Bash CLI discovers the JetPack 5 or 6 Orin GPU devfreq files beneath a configurable sysfs root, maps a percentage to a supported frequency, locks min/max for a bounded interval, and restores state from an EXIT trap. A Python semantic test drives the real Bash script against a temporary fake sysfs tree.
 
 **Tech Stack:** Bash 4+, Linux devfreq/sysfs, util-linux `flock`, Python 3 standard library.
 
 ## Global Constraints
 
 - Modify only GPU frequency controls; never invoke `nvpmodel`, `jetson_clocks`, CPU controls, or EMC controls.
-- Support Jetson Orin Nano and Orin NX through `/devices/platform/17000000.gpu`.
+- Support Jetson Orin Nano and Orin NX through the JetPack 6
+  `/devices/platform/17000000.gpu` and JetPack 5 `/devices/17000000.ga10b`
+  layouts.
 - `--level` is 0 through 100 and maps linearly by frequency value to the nearest available frequency, choosing the lower frequency on a tie.
 - `--duration` defaults to exactly 20 seconds and accepts positive decimals.
 - Always restore original min/max and 3D scaling state after any trappable exit.

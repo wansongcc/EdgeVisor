@@ -33,10 +33,12 @@ it, and retain frequencies no greater than the pre-injection `max_freq`. Map the
 level linearly over the numeric frequency range, then select the nearest real
 frequency. A tie selects the lower frequency.
 
-The default GPU path is:
+The script auto-detects the NVIDIA-documented GPU path for the installed
+JetPack generation:
 
 ```text
-/sys/devices/platform/17000000.gpu/devfreq/17000000.gpu
+JetPack 6: /sys/devices/platform/17000000.gpu/devfreq/17000000.gpu
+JetPack 5: /sys/devices/17000000.ga10b/devfreq/17000000.ga10b
 ```
 
 ## Injection and Restoration
@@ -64,4 +66,3 @@ hooks. It covers help/defaults, list mode, level mapping, safe write order,
 normal restoration, SIGTERM restoration, root enforcement, invalid input,
 missing sysfs data, and lock contention. Verification also runs `bash -n` and
 the existing semantic test suite.
-

@@ -28,10 +28,18 @@ class FakeSysfs:
         minimum: int = 306_000_000,
         maximum: int = 1_020_000_000,
         current: int = 612_000_000,
+        layout: str = "r36",
     ) -> None:
         self.root = root / "sys"
-        self.platform = self.root / "devices" / "platform" / "17000000.gpu"
-        self.gpu = self.platform / "devfreq" / "17000000.gpu"
+        if layout == "r36":
+            self.platform = self.root / "devices" / "platform" / "17000000.gpu"
+            gpu_name = "17000000.gpu"
+        elif layout == "r35":
+            self.platform = self.root / "devices" / "17000000.ga10b"
+            gpu_name = "17000000.ga10b"
+        else:
+            raise ValueError(f"unsupported fake layout: {layout}")
+        self.gpu = self.platform / "devfreq" / gpu_name
         self.gpu.mkdir(parents=True)
         self.write("available_frequencies", "306000000 408000000 612000000 816000000 1020000000")
         self.write("min_freq", str(minimum))
@@ -104,6 +112,18 @@ def test_level_mapping_and_normal_restore() -> None:
         result = run(fake, "--level", "100", "--duration", "0.01")
         require(result.returncode == 0, result.stderr)
         require("target_freq_hz=1020000000" in result.stdout, "level 100 must select current max")
+
+
+def test_jetpack_5_ga10b_layout() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = FakeSysfs(Path(tmp), layout="r35")
+        result = run(fake, "--level", "20")
+        require(result.returncode == 0, result.stderr)
+        require("target_freq_hz=408000000" in result.stdout,
+                "JetPack 5 ga10b layout must use the same level mapping")
+        require(fake.read("min_freq") == "306000000", "r35 minimum was not restored")
+        require(fake.read("max_freq") == "1020000000", "r35 maximum was not restored")
+        require(fake.scaling == "1", "r35 3D scaling state was not restored")
 
 
 def test_safe_write_order() -> None:
@@ -215,6 +235,7 @@ def main() -> int:
     require(SCRIPT.exists(), f"missing script: {SCRIPT}")
     test_help_and_list()
     test_level_mapping_and_normal_restore()
+    test_jetpack_5_ga10b_layout()
     test_safe_write_order()
     test_sigterm_restores_state()
     test_invalid_inputs_and_missing_sysfs()

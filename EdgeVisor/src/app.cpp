@@ -507,7 +507,16 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.backendStr = nullptr;
     args.memoryLimitBytes = 0;
     args.mode = nullptr;
+    args.nThreadsExplicit = false;
     args.nBatches = 32;
+    if (const char *p = std::getenv("DLLAMA_NBATCHES")) {
+        // Test knob: larger prefill chunks amortize the per-forward sync
+        // round trips over more prompt tokens.
+        try {
+            NnUint v = (NnUint)std::stoul(std::string(p));
+            if (v > 0) args.nBatches = v;
+        } catch (...) {}
+    }
     args.nThreads = 1;
     args.modelPath = nullptr;
     args.tokenizerPath = nullptr;
@@ -866,6 +875,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.listenUnixPath = value;
         } else if (std::strcmp(name, "--nthreads") == 0) {
             args.nThreads = atoi(value);
+            args.nThreadsExplicit = true;
         } else if (std::strcmp(name, "--max-active-seqs") == 0) {
             int x = std::atoi(value);
             if (x < 1) x = 1;
@@ -1739,6 +1749,43 @@ static double warmupMaxStageNodeMs(
     return maxMs;
 }
 
+
+// Returns the number of sync peers of the node in its TP stage (0 for
+// single-node stages / pure PP), used to auto-size executor threads.
+static NnUint resolveStagePeerCount(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint nNodes) {
+    if (plan == nullptr || plan->nStages == 0u) {
+        return nNodes > 0u ? nNodes - 1u : 0u;
+    }
+    for (NnUint s = 0; s < plan->nStages; s++) {
+        const NnStageConfig *stage = &plan->stages[s];
+        for (NnUint i = 0; i < stage->nNodes; i++) {
+            if (stage->nodeIndices[i] == myNodeIndex) {
+                return stage->nNodes > 0u ? stage->nNodes - 1u : 0u;
+            }
+        }
+    }
+    return 0u;
+}
+
+// Auto-size executor threads for the Vulkan backend when the user did not
+// pass --nthreads: sync exchanges parallelize across stage peers, so more
+// threads cut the per-token sync time on TP topologies. Pure-PP (single-node
+// stages) keeps 1 thread, where extra threads only add overhead.
+static void autoTuneThreads(AppCliArgs *args, const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint nNodes) {
+    if (args->nThreadsExplicit || args->nThreads != 1u) return;
+    if (args->backend != AppCliArgs::BACKEND_VULKAN) return;
+    const NnUint peers = resolveStagePeerCount(plan, myNodeIndex, nNodes);
+    if (peers == 0u) return;
+    NnUint hw = (NnUint)std::thread::hardware_concurrency();
+    if (hw == 0u) hw = 1u;
+    NnUint n = 2u * peers;
+    if (n > hw) n = hw;
+    if (n > 1u) {
+        args->nThreads = n;
+        std::printf("🧵 [auto] nThreads=%u (stage peers=%u; pass --nthreads to override)\n", (unsigned)n, (unsigned)peers);
+    }
+}
+
 static WarmupCandidateResult probeWarmupCandidate(
     AppCliArgs *args,
     LlmHeader *header,
@@ -1775,6 +1822,7 @@ static WarmupCandidateResult probeWarmupCandidate(
             : buildLlmNet(header, nNodes, args->nBatches, args->maxActiveSeqs);
         std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
         NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
+        autoTuneThreads(args, planPtr.get(), 0u, nNodes);
         NnNetExecution execution(args->nThreads, &net.netConfig);
         std::vector<char*> candidateHosts;
         std::vector<NnUint> candidatePorts;
@@ -4934,6 +4982,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         printNodeRequiredMemory(&net.netConfig, rootNodeConfig);
     }
 
+    autoTuneThreads(args, planPtr.get(), 0u, nNodes);
     NnNetExecution execution(args->nThreads, &net.netConfig);
 
     std::unique_ptr<NnNodeSynchronizer> synchronizer(nullptr);
@@ -5148,6 +5197,7 @@ void runWorkerApp(AppCliArgs *args) {
 
         dllamaIoProbeSetNode(nodeConfig.nodeIndex, getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex));
 
+        autoTuneThreads(args, planPtr.get(), nodeConfig.nodeIndex, netConfig.nNodes);
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
         // Initialize Synchronizer with Plan

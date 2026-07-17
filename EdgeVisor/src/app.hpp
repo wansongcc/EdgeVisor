@@ -27,6 +27,7 @@ public:
 
     char *mode;
     NnUint nThreads;
+    bool nThreadsExplicit; // true when --nthreads was passed (auto-tune skipped)
     NnUint nBatches;
     bool info;
     bool help;

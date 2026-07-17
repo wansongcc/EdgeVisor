@@ -144,6 +144,13 @@ int main() {
     require(tpMove.fromNodeIndex == 0u && tpMove.toNodeIndex == 1u, "TP candidate moves from slow node to neighbor");
     require(tpMove.gainMs > 0.0, "TP candidate has positive gain");
 
+    cfg.ppGainRatio = 0.0;
+    tp[0].stageTimeMs = 400.0;
+    require(near(tpot::tpGainThresholdMs(tp[0], cfg), 12.0), "PP gain ratio does not change TP threshold");
+    tpot::Candidate tpRatioIsolation = tpot::bestTpCandidate(tp, cfg);
+    require(!tpRatioIsolation.valid, "PP gain ratio does not change TP candidate selection");
+    cfg.ppGainRatio = 0.03;
+
     tp[0].nodes[0].timeMs = 12.0;
     tp[0].nodes[1].timeMs = 11.0;
     tp[0].stageTimeMs = 12.0;

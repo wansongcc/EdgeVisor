@@ -49,7 +49,7 @@ double ppGainThresholdMs(double currentTpotMs, const SchedulerConfig &cfg) {
 }
 
 double tpGainThresholdMs(const StageSnapshot &stage, const SchedulerConfig &cfg) {
-    return maxDouble(cfg.minTpGainMs, cfg.ppGainRatio * stage.stageTimeMs);
+    return maxDouble(cfg.minTpGainMs, 0.03 * stage.stageTimeMs);
 }
 
 static double ppLocalGainThresholdMs(const StageSnapshot &source, const StageSnapshot &target, const SchedulerConfig &cfg) {

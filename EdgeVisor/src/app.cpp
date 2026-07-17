@@ -1773,7 +1773,7 @@ static NnUint resolveStagePeerCount(const NnUnevenPartitionPlan *plan, NnUint my
 // stages) keeps 1 thread, where extra threads only add overhead.
 static void autoTuneThreads(AppCliArgs *args, const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint nNodes) {
     if (args->nThreadsExplicit || args->nThreads != 1u) return;
-    if (args->backend != AppCliArgs::BACKEND_VULKAN) return;
+    if (args->backend != AppCliArgs::BACKEND_VULKAN && args->backend != AppCliArgs::BACKEND_CUDA) return;
     const NnUint peers = resolveStagePeerCount(plan, myNodeIndex, nNodes);
     if (peers == 0u) return;
     NnUint hw = (NnUint)std::thread::hardware_concurrency();

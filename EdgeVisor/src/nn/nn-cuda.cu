@@ -1417,7 +1417,9 @@ NnCudaDevice::~NnCudaDevice() {
 }
 
 NnUint NnCudaDevice::maxNThreads() {
-    return 1u;
+    // Same model as the Vulkan backend: compute stays on thread 0, extra
+    // threads parallelize per-peer socket exchanges in sync steps.
+    return std::thread::hardware_concurrency();
 }
 
 std::string NnCudaDevice::launchConfigInfo() const {

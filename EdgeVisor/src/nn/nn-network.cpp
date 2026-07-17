@@ -2624,10 +2624,17 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
 
         // Slice exchanges are batched across all rows: a single call issues
         // one duplex phase per peer instead of one ordered exchange per row.
+        // Broadcasts and PP handoffs are batched too: pipe rows are
+        // contiguous, so the whole slab is transferred in one network phase.
         const bool batchedSliceSync = (syncConfig->syncType == SYNC_NODE_SLICES)
             || (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT)
             || (syncConfig->syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT);
-        const NnUint nSyncRows = batchedSliceSync ? 1u : execution->batchSize;
+        const bool batchedSync = batchedSliceSync
+            || (syncConfig->syncType == SYNC_WITH_ROOT)
+            || (syncConfig->syncType == SYNC_PP_SEND)
+            || (syncConfig->syncType == SYNC_PP_RECV);
+        const NnUint nSyncRows = batchedSync ? 1u : execution->batchSize;
+        const NnSize slabBytes = batchBytes * (NnSize)execution->batchSize;
         for (NnUint batchIndex = 0; batchIndex < nSyncRows; batchIndex++) {
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
 
@@ -2652,7 +2659,7 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
 
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
                 syncTypeStr = "SYNC_WITH_ROOT";
-                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage, plan);
+                syncWithRoot(network, nodeConfig->nodeIndex, pipe, slabBytes, nThreads, threadIndex, this->myStage, plan);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeStr = "SYNC_NODE_SLICES";
                 syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements, execution->batchSize);
@@ -2667,14 +2674,14 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncTypeStr = "PP_SEND";
                 // PP 只要单线程执行一次
                 if (threadIndex == 0) {
-                    syncPpSend(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, plan);
+                    syncPpSend(network, nodeConfig->nodeIndex, pipe, slabBytes, plan);
                 }
             }
             else if (syncConfig->syncType == SYNC_PP_RECV) {
                 syncTypeStr = "PP_RECV";
                 // PP 只要单线程执行一次
                 if (threadIndex == 0) {
-                    syncPpRecv(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, plan);
+                    syncPpRecv(network, nodeConfig->nodeIndex, pipe, slabBytes, plan);
                 }
             }else {
                 throw std::invalid_argument("Unknown sync type");

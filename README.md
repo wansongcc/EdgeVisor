@@ -2,7 +2,7 @@
 
 ## English
 
-EdgeVisor GPU Version is an experimental distributed LLM inference project for heterogeneous edge devices. It extends the original distributed inference workflow with GPU/Vulkan execution, uneven static tensor parallelism, pipeline parallelism, hybrid PP/TP layouts, UDS-controlled runtime migration, Shadow KV support, last-stage local sampling, and memory-oriented optimizations such as Q80-resident root token embeddings.
+EdgeVisor GPU Version is an experimental distributed LLM inference project for heterogeneous edge devices. It extends the original distributed inference workflow with GPU/Vulkan execution and an optional CUDA backend, uneven static tensor parallelism, pipeline parallelism, hybrid PP/TP layouts, UDS-controlled runtime migration, Shadow KV support, last-stage local sampling, continuous batching, and memory-oriented optimizations such as Q80-resident root token embeddings.
 
 ### Acknowledgement
 
@@ -13,7 +13,7 @@ EdgeVisor is developed based on [distributed-llama](https://github.com/b4rtaz/di
 ```text
 EdgeVisor_GPU_Version/
 ├── EdgeVisor/                 # Core C++/Vulkan inference engine
-│   ├── src/                   # Inference, networking, migration, tokenizer, CPU/Vulkan backends
+│   ├── src/                   # Inference, networking, migration, tokenizer, CPU/Vulkan/CUDA backends
 │   ├── examples/              # UDS client and original examples
 │   ├── docs/                  # Engine-level documentation
 │   └── Makefile               # Core binary build entry
@@ -21,8 +21,10 @@ EdgeVisor_GPU_Version/
 ├── scripts/                   # Maintained script entry points
 │   ├── semantic/              # CPU/GPU semantic regression scripts
 │   ├── gpu/                   # GPU PP, migration, and debug scripts
+│   ├── run_*.py / run_*.sh    # Agentic ablation suite, motivation observations, summarizers
 │   └── build.sh               # Standard build script
 ├── tests/semantic/            # Six-test benchmark regression and record generator
+├── agent_bench/               # LangGraph agent episode runner for backend comparison
 ├── docs/test_records/         # Generated acceptance/regression records
 ├── maintenance/               # Archived patches, temporary fixes, and debug scripts
 ├── artifacts/                 # Archived historical logs and experiment outputs
@@ -35,15 +37,18 @@ Top-level `run_semantic_*.sh` and `run_gpu_*.sh` files are kept as compatibility
 
 ### Main Capabilities
 
-- CPU and Vulkan GPU inference.
+- CPU, Vulkan GPU, and optional CUDA inference (see `EdgeVisor/docs/CUDA_SUPPORT.md`).
 - Uneven tensor parallelism for heterogeneous devices.
 - Pipeline parallelism and hybrid PP/TP layouts, for example `1@14*1:1@14`.
 - Local weight loading for distributed nodes.
-- Runtime migration controlled through UDS plan commands.
+- Runtime migration controlled through UDS plan commands, including control-plane PP stage bypass/eject via the `set_stage_bypass` command (see `EdgeVisor/examples/plan-uds-client.py`).
 - Shadow KV and migration-readiness mechanisms.
 - Last-stage local sampling, including TP last-stage gather before sampling, to avoid sending a full vocabulary logits tensor back to the root.
 - Q80-resident root token embedding to reduce root memory footprint while keeping the model file format unchanged.
-- Agentic workload and ablation harnesses for multi-generation, tool-using tasks.
+- Fused SiLU-mul FFN activation on CPU and Vulkan.
+- Unix-domain-socket worker data plane (`--listen-unix`) alongside TCP for single-host deployments.
+- Continuous batching with PP microbatching (`--continuous-batching`, `--max-active-seqs`, `--decode-batch-size`, `--pp-microbatch-size`, `--pp-inflight`).
+- Agentic workload and ablation harnesses for multi-generation, tool-using tasks (`agent_bench/`, `scripts/run_real_ablation_suite.py`).
 - Auto warmup selection: automatically probes candidate partition topologies and worker subsets, then selects the configuration that minimizes the slowest node's per-token time.
 
 ### Environment
@@ -63,7 +68,7 @@ export EDGEVISOR_TOKENIZER=/path/to/dllama_tokenizer.t
 export EDGEVISOR_LOG_ROOT=/path/to/runtime_logs
 ```
 
-On the shared GPU test server, use GPU0, GPU1, and GPU2 unless a test explicitly says otherwise. Do not use `--gpu-index 3` and do not terminate processes on GPU3.
+On the shared GPU test server, GPU0, GPU1, GPU2, and GPU3 are all available. Select devices with `--gpu-index` as the test requires.
 
 ### Build
 
@@ -86,6 +91,14 @@ CPU-only build:
 
 ```bash
 DLLAMA_VULKAN=0 bash build.sh
+```
+
+Optional CUDA build:
+
+```bash
+source config/env.sh
+cd "$EDGEVISOR_ENGINE_DIR"
+make DLLAMA_CUDA=1 dllama
 ```
 
 ### Common Runs
@@ -186,7 +199,7 @@ python3 tests/semantic/generate_test_records.py \
 
 ## 中文
 
-EdgeVisor GPU 版本是面向异构边缘设备的分布式大模型推理实验工程。它在原有分布式推理流程的基础上，扩展了 GPU/Vulkan 执行、非均匀静态张量并行、流水线并行、PP/TP 混合切分、UDS 控制的运行时迁移、Shadow KV、最后 Stage 本地采样，以及 Q80 常驻 Root token embedding 等面向内存和通信开销的优化。
+EdgeVisor GPU 版本是面向异构边缘设备的分布式大模型推理实验工程。它在原有分布式推理流程的基础上，扩展了 GPU/Vulkan 执行与可选 CUDA 后端、非均匀静态张量并行、流水线并行、PP/TP 混合切分、UDS 控制的运行时迁移、Shadow KV、最后 Stage 本地采样、连续批处理，以及 Q80 常驻 Root token embedding 等面向内存和通信开销的优化。
 
 ### 致谢
 
@@ -197,7 +210,7 @@ EdgeVisor 基于 [distributed-llama](https://github.com/b4rtaz/distributed-llama
 ```text
 EdgeVisor_GPU_Version/
 ├── EdgeVisor/                 # 核心 C++/Vulkan 推理引擎
-│   ├── src/                   # 推理、网络同步、动态迁移、tokenizer、CPU/Vulkan backend
+│   ├── src/                   # 推理、网络同步、动态迁移、tokenizer、CPU/Vulkan/CUDA backend
 │   ├── examples/              # UDS client 和原始示例
 │   ├── docs/                  # 引擎级使用说明
 │   └── Makefile               # 核心二进制构建入口
@@ -205,8 +218,10 @@ EdgeVisor_GPU_Version/
 ├── scripts/                   # 维护后的脚本入口
 │   ├── semantic/              # CPU/GPU 语义回归与分布式推理脚本
 │   ├── gpu/                   # GPU PP、迁移和调试脚本
+│   ├── run_*.py / run_*.sh    # Agentic ablation 套件、motivation 观测与结果汇总
 │   └── build.sh               # 标准构建脚本
 ├── tests/semantic/            # 六项 benchmark 回归和测试记录生成器
+├── agent_bench/               # 基于 LangGraph 的 agent episode 后端对比运行器
 ├── docs/test_records/         # 生成的验收/回归测试记录
 ├── maintenance/               # 历史补丁、临时修复脚本、调试配置归档
 ├── artifacts/                 # 历史日志和实验结果归档
@@ -219,15 +234,18 @@ EdgeVisor_GPU_Version/
 
 ### 主要能力
 
-- CPU 和 Vulkan GPU 推理。
+- CPU、Vulkan GPU 与可选 CUDA 推理（见 `EdgeVisor/docs/CUDA_SUPPORT.md`）。
 - 面向异构设备的非均匀张量并行。
 - 流水线并行和 PP/TP 混合切分，例如 `1@14*1:1@14`。
 - 分布式节点本地加载权重。
-- 通过 UDS plan command 控制运行时迁移。
+- 通过 UDS plan command 控制运行时迁移，包括控制面 PP stage bypass/eject（`set_stage_bypass` 命令，见 `EdgeVisor/examples/plan-uds-client.py`）。
 - Shadow KV 和迁移就绪机制。
 - 最后 Stage 本地采样；当最后 Stage 内部使用 TP 时，会先在最后 Stage 内部汇聚 logits slice，再由 Stage root 采样，避免把完整 vocab logits 回传给全局 Root。
 - Root token embedding 使用 Q80 常驻，降低 Root 内存占用，同时不改变原始模型文件格式。
-- 支持多轮 generation、工具调用和迁移注入的 Agentic workload 与 ablation harness。
+- CPU 与 Vulkan 上融合的 SiLU-mul FFN 激活算子。
+- Worker 数据面支持 Unix domain socket（`--listen-unix`），与 TCP 并存，适合单机部署。
+- 连续批处理与 PP microbatching（`--continuous-batching`、`--max-active-seqs`、`--decode-batch-size`、`--pp-microbatch-size`、`--pp-inflight`）。
+- 支持多轮 generation、工具调用和迁移注入的 Agentic workload 与 ablation harness（`agent_bench/`、`scripts/run_real_ablation_suite.py`）。
 - 自动预热选优：自动探测候选切分拓扑和 Worker 组合，选择最小化最慢节点每 token 耗时的配置。
 
 ### 环境配置
@@ -247,7 +265,7 @@ export EDGEVISOR_TOKENIZER=/path/to/dllama_tokenizer.t
 export EDGEVISOR_LOG_ROOT=/path/to/runtime_logs
 ```
 
-在共享 GPU 测试服务器上，除非测试明确要求，否则只使用 GPU0、GPU1、GPU2。不要使用 `--gpu-index 3`，也不要终止 GPU3 上的进程。
+在共享 GPU 测试服务器上，GPU0、GPU1、GPU2、GPU3 均可使用，按测试需要通过 `--gpu-index` 选择设备。
 
 ### 构建
 
@@ -270,6 +288,14 @@ CPU-only 构建：
 
 ```bash
 DLLAMA_VULKAN=0 bash build.sh
+```
+
+可选 CUDA 构建：
+
+```bash
+source config/env.sh
+cd "$EDGEVISOR_ENGINE_DIR"
+make DLLAMA_CUDA=1 dllama
 ```
 
 ### 常用运行方式

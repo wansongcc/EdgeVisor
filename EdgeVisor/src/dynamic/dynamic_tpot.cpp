@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -155,6 +156,10 @@ static tpot::SchedulerConfig loadSchedulerConfig() {
     cfg.minPpGainMs = parseEnvDouble("DLLAMA_TPOT_MIN_PP_GAIN_MS", cfg.minPpGainMs);
     cfg.minTpGainMs = parseEnvDouble("DLLAMA_TPOT_MIN_TP_GAIN_MS", cfg.minTpGainMs);
     cfg.loadPenaltyBeta = parseEnvDouble("DLLAMA_TPOT_LOAD_PENALTY_BETA", cfg.loadPenaltyBeta);
+    cfg.ppGainRatio = parseEnvDouble("DLLAMA_TPOT_PP_GAIN_RATIO", cfg.ppGainRatio);
+    if (!std::isfinite(cfg.ppGainRatio) || cfg.ppGainRatio < 0.0 || cfg.ppGainRatio > 1.0) {
+        throw std::runtime_error("DLLAMA_TPOT_PP_GAIN_RATIO must be a finite number in [0,1]");
+    }
     cfg.ppRiskMarginMs = parseEnvDouble("DLLAMA_TPOT_PP_RISK_MARGIN_MS", cfg.ppRiskMarginMs);
     cfg.tpRiskMarginMs = parseEnvDouble("DLLAMA_TPOT_TP_RISK_MARGIN_MS", cfg.tpRiskMarginMs);
     cfg.ppMigrationCostMs = parseEnvDouble("DLLAMA_TPOT_PP_MIGRATION_COST_MS", cfg.ppMigrationCostMs);

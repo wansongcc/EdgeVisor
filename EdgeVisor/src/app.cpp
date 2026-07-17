@@ -86,6 +86,16 @@ static NnSize parseMemoryLimitGiB(const char *value) {
     return (NnSize)(gib * bytesPerGiB);
 }
 
+static void validateUnitIntervalOption(const char *name, const char *value) {
+    errno = 0;
+    char *end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (errno != 0 || end == value || *end != '\0' ||
+        !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0) {
+        throw std::runtime_error(std::string(name) + " must be a finite number in [0,1]");
+    }
+}
+
 static void appendSyncedEnvironmentVariable(const char *name) {
     const char *current = std::getenv("DLLAMA_SYNC_ENV_VARS");
     if (current == nullptr || current[0] == '\0') {
@@ -139,6 +149,7 @@ static void configureDynamicTpot(const AppCliArgs &args) {
     setTpotOverride("DLLAMA_TPOT_COOLDOWN_TOKENS", args.tpotCooldownTokensStr);
     setTpotOverride("DLLAMA_TPOT_ROLLBACK_WINDOW", args.tpotRollbackWindowStr);
     setTpotOverride("DLLAMA_TPOT_MIN_PP_GAIN_MS", args.tpotMinPpGainMsStr);
+    setTpotOverride("DLLAMA_TPOT_PP_GAIN_RATIO", args.tpotPpGainRatioStr);
     setTpotOverride("DLLAMA_TPOT_PP_RISK_MARGIN_MS", args.tpotPpRiskMarginMsStr);
     setTpotOverride("DLLAMA_TPOT_PP_MIGRATION_COST_MS", args.tpotPpMigrationCostMsStr);
     setTpotOverride("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS", args.tpotExpectedRemainingTokensStr);
@@ -557,6 +568,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.tpotCooldownTokensStr = nullptr;
     args.tpotRollbackWindowStr = nullptr;
     args.tpotMinPpGainMsStr = nullptr;
+    args.tpotPpGainRatioStr = nullptr;
     args.tpotPpRiskMarginMsStr = nullptr;
     args.tpotPpMigrationCostMsStr = nullptr;
     args.tpotExpectedRemainingTokensStr = nullptr;
@@ -946,6 +958,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.tpotRollbackWindowStr = value;
         } else if (std::strcmp(name, "--tpot-min-pp-gain-ms") == 0) {
             args.tpotMinPpGainMsStr = value;
+        } else if (std::strcmp(name, "--tpot-pp-gain-ratio") == 0) {
+            validateUnitIntervalOption(name, value);
+            args.tpotPpGainRatioStr = value;
         } else if (std::strcmp(name, "--tpot-pp-risk-margin-ms") == 0) {
             args.tpotPpRiskMarginMsStr = value;
         } else if (std::strcmp(name, "--tpot-pp-migration-cost-ms") == 0) {

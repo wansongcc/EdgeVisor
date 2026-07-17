@@ -82,6 +82,7 @@ public:
     char *tpotCooldownTokensStr;
     char *tpotRollbackWindowStr;
     char *tpotMinPpGainMsStr;
+    char *tpotPpGainRatioStr;
     char *tpotPpRiskMarginMsStr;
     char *tpotPpMigrationCostMsStr;
     char *tpotExpectedRemainingTokensStr;

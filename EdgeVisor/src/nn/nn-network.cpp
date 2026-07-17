@@ -175,6 +175,20 @@ static inline NnSize getSyncDuplexMaxBytes() {
     return cached.load(std::memory_order_acquire);
 }
 
+static inline bool getSyncBcastAckEnabled() {
+    // Default OFF: the broadcast ACK barrier in syncWithRoot is redundant with
+    // TCP stream ordering and costs one round trip per broadcast per worker.
+    // DLLAMA_SYNC_BCAST_ACK=1 restores the legacy barrier; the setting must be
+    // identical on every node or the root will wait for ACKs that never come.
+    static std::atomic<bool> cached{false};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        cached.store(envFlagEnabled("DLLAMA_SYNC_BCAST_ACK"), std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
 static inline int remainingPollTimeoutMs(unsigned long timeoutMs, long long startMs, const char *what) {
     if (timeoutMs == 0ul) return -1;
     const long long elapsed = nowMsSteady() - startMs;
@@ -1715,22 +1729,27 @@ static void syncWithRoot(
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
 
-        // [新增] Root 等待 Workers 确认 (ACK)
-        // 确保 Workers 已经接收完数据，实现同步屏障
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            try {
-                network->readAckWithTimeout(ios[i].socketIndex, ackTimeoutMs);
-            } catch (const std::exception &e) {
-                const NnUint targetNode = targetNodes[startIdx + i];
-                std::fprintf(stderr,
-                             "❌ syncWithRoot ack timeout/fail root=%u targetNode=%u socket=%u stageRoot=%u stageNodes=%u err=%s\n",
-                             (unsigned)myNodeIndex,
-                             (unsigned)targetNode,
-                             (unsigned)ios[i].socketIndex,
-                             (unsigned)groupRootIndex,
-                             stage ? (unsigned)stage->nNodes : 0u,
-                             e.what());
-                throw;
+        // The ACK barrier is optional (DLLAMA_SYNC_BCAST_ACK=1 restores it):
+        // TCP stream ordering already guarantees workers consume this
+        // broadcast before any later message, and the workers' next upstream
+        // slice acts as the natural synchronization point, so the extra
+        // per-worker ACK round trip is pure latency on every broadcast.
+        if (getSyncBcastAckEnabled()) {
+            for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                try {
+                    network->readAckWithTimeout(ios[i].socketIndex, ackTimeoutMs);
+                } catch (const std::exception &e) {
+                    const NnUint targetNode = targetNodes[startIdx + i];
+                    std::fprintf(stderr,
+                                 "❌ syncWithRoot ack timeout/fail root=%u targetNode=%u socket=%u stageRoot=%u stageNodes=%u err=%s\n",
+                                 (unsigned)myNodeIndex,
+                                 (unsigned)targetNode,
+                                 (unsigned)ios[i].socketIndex,
+                                 (unsigned)groupRootIndex,
+                                 stage ? (unsigned)stage->nNodes : 0u,
+                                 e.what());
+                    throw;
+                }
             }
         }
 
@@ -1750,8 +1769,10 @@ static void syncWithRoot(
         ios.socketIndex = rootSocketIndex; // [修正] 使用查找到的 Socket，而不是硬编码 0
         network->readMany(1, &ios);
 
-        // [新增] Worker 发送确认 (ACK) 给 Root
-        network->writeAck(rootSocketIndex);
+        // Optional ACK barrier (DLLAMA_SYNC_BCAST_ACK=1): see the root side.
+        if (getSyncBcastAckEnabled()) {
+            network->writeAck(rootSocketIndex);
+        }
     }
 }
 

@@ -87,7 +87,7 @@ static double ppBoundaryDeltaOutMs(const StageSnapshot &source, const StageSnaps
 }
 
 Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double currentTpotMs, const SchedulerConfig &cfg) {
-    if (stages.size() < 2u) return makeRejected(CandidateKind::PP_MOVE, "need at least two stages");
+    if (stages.size() < 2u) return makeRejected(CandidateKind::PP_MOVE, "no eligible pp candidate");
 
     (void)currentTpotMs;
     Candidate best;

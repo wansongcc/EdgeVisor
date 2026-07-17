@@ -1,4 +1,6 @@
 #include "app.hpp"
+#include "dynamic/dynamic_tpot.hpp"
+#include "dynamic/tpot_algorithm.hpp"
 
 #include <assert.h>
 #include <cstdio>
@@ -38,6 +40,18 @@ static bool rejectsPpGainRatio(const char *text) {
     return false;
 }
 
+static bool rejectsEnvironmentPpGainRatio(const char *text) {
+    setenv("DLLAMA_TPOT_PP_GAIN_RATIO", text, 1);
+    try {
+        (void)dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+    } catch (...) {
+        unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+        return true;
+    }
+    unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+    return false;
+}
+
 int main() {
     {
         char arg0[] = "dllama";
@@ -66,6 +80,19 @@ int main() {
 
     clearTpotEnvironment();
     {
+        const dllama::dynamic_tpot::SchedulerConfig cfg =
+            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        assert(cfg.ppGainRatio == 0.03);
+    }
+    setenv("DLLAMA_TPOT_PP_GAIN_RATIO", "0.5", 1);
+    {
+        const dllama::dynamic_tpot::SchedulerConfig cfg =
+            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        assert(cfg.ppGainRatio == 0.5);
+    }
+    unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+
+    {
         char arg0[] = "dllama";
         char arg1[] = "inference";
         char arg2[] = "--enable-dynamic-tpot";
@@ -93,6 +120,14 @@ int main() {
     assert(rejectsPpGainRatio("nan"));
     assert(rejectsPpGainRatio("inf"));
     assert(rejectsPpGainRatio("not-a-number"));
+    assert(rejectsPpGainRatio("0.5junk"));
+
+    assert(rejectsEnvironmentPpGainRatio("garbage"));
+    assert(rejectsEnvironmentPpGainRatio("0.5junk"));
+    assert(rejectsEnvironmentPpGainRatio("nan"));
+    assert(rejectsEnvironmentPpGainRatio("inf"));
+    assert(rejectsEnvironmentPpGainRatio("-0.01"));
+    assert(rejectsEnvironmentPpGainRatio("1.01"));
 
     return 0;
 }

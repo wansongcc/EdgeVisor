@@ -7,6 +7,7 @@
 #include "plan-command.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -146,7 +147,19 @@ static double parseEnvDouble(const char *name, double fallback) {
     return x;
 }
 
-static tpot::SchedulerConfig loadSchedulerConfig() {
+static double parseEnvUnitInterval(const char *name, double fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    errno = 0;
+    char *end = nullptr;
+    const double x = std::strtod(v, &end);
+    if (errno != 0 || end == v || *end != '\0' || !std::isfinite(x) || x < 0.0 || x > 1.0) {
+        throw std::runtime_error(std::string(name) + " must be a finite number in [0,1]");
+    }
+    return x;
+}
+
+static tpot::SchedulerConfig loadSchedulerConfigFromEnvironmentImpl() {
     tpot::SchedulerConfig cfg;
     cfg.windowTokens = std::max(1, parseEnvInt("DLLAMA_TPOT_WINDOW_TOKENS", cfg.windowTokens));
     cfg.minSamples = std::max(1, parseEnvInt("DLLAMA_TPOT_MIN_SAMPLES", cfg.minSamples));
@@ -157,10 +170,7 @@ static tpot::SchedulerConfig loadSchedulerConfig() {
     cfg.minPpGainMs = parseEnvDouble("DLLAMA_TPOT_MIN_PP_GAIN_MS", cfg.minPpGainMs);
     cfg.minTpGainMs = parseEnvDouble("DLLAMA_TPOT_MIN_TP_GAIN_MS", cfg.minTpGainMs);
     cfg.loadPenaltyBeta = parseEnvDouble("DLLAMA_TPOT_LOAD_PENALTY_BETA", cfg.loadPenaltyBeta);
-    cfg.ppGainRatio = parseEnvDouble("DLLAMA_TPOT_PP_GAIN_RATIO", cfg.ppGainRatio);
-    if (!std::isfinite(cfg.ppGainRatio) || cfg.ppGainRatio < 0.0 || cfg.ppGainRatio > 1.0) {
-        throw std::runtime_error("DLLAMA_TPOT_PP_GAIN_RATIO must be a finite number in [0,1]");
-    }
+    cfg.ppGainRatio = parseEnvUnitInterval("DLLAMA_TPOT_PP_GAIN_RATIO", cfg.ppGainRatio);
     cfg.ppRiskMarginMs = parseEnvDouble("DLLAMA_TPOT_PP_RISK_MARGIN_MS", cfg.ppRiskMarginMs);
     cfg.tpRiskMarginMs = parseEnvDouble("DLLAMA_TPOT_TP_RISK_MARGIN_MS", cfg.tpRiskMarginMs);
     cfg.ppMigrationCostMs = parseEnvDouble("DLLAMA_TPOT_PP_MIGRATION_COST_MS", cfg.ppMigrationCostMs);
@@ -722,6 +732,16 @@ static void logDecision(
 
 } // namespace
 
+namespace dllama {
+namespace dynamic_tpot {
+
+SchedulerConfig loadSchedulerConfigFromEnvironment() {
+    return loadSchedulerConfigFromEnvironmentImpl();
+}
+
+} // namespace dynamic_tpot
+} // namespace dllama
+
 std::unique_ptr<DynamicTpotController> DynamicTpotController::start(const std::string &socketPath, RootLlmInference *inference) {
 #ifdef _WIN32
     (void)socketPath;
@@ -735,6 +755,17 @@ std::unique_ptr<DynamicTpotController> DynamicTpotController::start(const std::s
         ? std::string(logEnv)
         : std::string("/tmp/dllama_tpot_scheduler.log");
 
+    tpot::SchedulerConfig config;
+    try {
+        config = tpot::loadSchedulerConfigFromEnvironment();
+    } catch (const std::exception &e) {
+        appendLog(logPath, std::string("tpot_sched seq=0 state=DISABLED best=none gain_ms=0 note=invalid_configuration:") + e.what());
+        return nullptr;
+    } catch (...) {
+        appendLog(logPath, "tpot_sched seq=0 state=DISABLED best=none gain_ms=0 note=invalid_configuration:unknown_exception");
+        return nullptr;
+    }
+
     if (socketPath.empty()) {
         appendLog(logPath, "tpot_sched seq=0 state=DISABLED best=none gain_ms=0 note=missing_DLLAMA_PLAN_CTRL_SOCKET");
         return nullptr;
@@ -747,7 +778,7 @@ std::unique_ptr<DynamicTpotController> DynamicTpotController::start(const std::s
         appendLog(logPath, "tpot_sched seq=0 state=START best=none gain_ms=0 note=pp_migration_disabled_pp_candidates_filtered");
     }
 
-    std::unique_ptr<DynamicTpotController> ctrl(new DynamicTpotController(socketPath, inference));
+    std::unique_ptr<DynamicTpotController> ctrl(new DynamicTpotController(socketPath, inference, config));
     DynamicTpotController *c = ctrl.get();
     ctrl->worker_ = std::thread([c]() { c->run(); });
     appendLog(logPath, "tpot_sched seq=0 state=START best=none gain_ms=0 note=controller_started");
@@ -755,8 +786,11 @@ std::unique_ptr<DynamicTpotController> DynamicTpotController::start(const std::s
 #endif
 }
 
-DynamicTpotController::DynamicTpotController(const std::string &socketPath, RootLlmInference *inference)
-    : socketPath_(socketPath), inference_(inference) {}
+DynamicTpotController::DynamicTpotController(
+    const std::string &socketPath,
+    RootLlmInference *inference,
+    const tpot::SchedulerConfig &config)
+    : socketPath_(socketPath), inference_(inference), config_(config) {}
 
 DynamicTpotController::~DynamicTpotController() {
     stop_.store(true);
@@ -768,7 +802,7 @@ void DynamicTpotController::run() {
     return;
 #else
     ControllerRuntime rt;
-    rt.cfg = loadSchedulerConfig();
+    rt.cfg = config_;
     rt.pollMs = std::max(10, parseEnvInt("DLLAMA_TPOT_POLL_MS", 200));
     rt.timeoutMs = std::max(100, parseEnvInt("DLLAMA_TPOT_UDS_TIMEOUT_MS", 2000));
     const char *logEnv = std::getenv("DLLAMA_TPOT_LOG");

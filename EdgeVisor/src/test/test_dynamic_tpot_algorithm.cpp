@@ -86,6 +86,23 @@ int main() {
     std::vector<tpot::StageSnapshot> pp;
     pp.push_back(stage(0, 0, 0, 4, 25.0));
     pp.push_back(stage(1, 1, 4, 2, 5.0));
+
+    cfg.minPpGainMs = 1.0;
+    cfg.ppGainRatio = 0.0;
+    const tpot::Candidate zeroRatioPp = tpot::bestPpCandidate(pp, 110.0, cfg);
+    require(zeroRatioPp.valid && near(zeroRatioPp.thresholdMs, 1.0),
+        "zero PP ratio uses the absolute scheduler threshold");
+    cfg.ppGainRatio = 0.03;
+    const tpot::Candidate defaultRatioPp = tpot::bestPpCandidate(pp, 110.0, cfg);
+    require(defaultRatioPp.valid && near(defaultRatioPp.thresholdMs, 3.3),
+        "default PP ratio sets the scheduler threshold");
+    cfg.ppGainRatio = 0.20;
+    const tpot::Candidate customRatioPp = tpot::bestPpCandidate(pp, 110.0, cfg);
+    require(!customRatioPp.valid && near(customRatioPp.thresholdMs, 22.0),
+        "custom PP ratio rejects a scheduler candidate below its threshold");
+    cfg.minPpGainMs = 5.0;
+    cfg.ppGainRatio = 0.03;
+
     tpot::Candidate ppMove = tpot::bestPpCandidate(pp, 110.0, cfg);
     require(ppMove.valid, "profitable PP candidate selected");
     require(ppMove.fromStageIndex == 0u && ppMove.toStageIndex == 1u, "PP candidate direction source slow to target fast");
@@ -143,6 +160,12 @@ int main() {
     tpot::Candidate emptyPp = tpot::bestPpCandidate(pp, 110.0, cfg);
     require(emptyPp.fromStageIndex != 0u || !emptyPp.valid, "PP candidate does not empty source stage");
 
+    std::vector<tpot::StageSnapshot> singleStage;
+    singleStage.push_back(stage(0, 0, 0, 4, 10.0));
+    const tpot::Candidate singleStagePp = tpot::bestPpCandidate(singleStage, 40.0, cfg);
+    require(!singleStagePp.valid && singleStagePp.reason == "no eligible pp candidate",
+        "single-stage PP rejection uses the canonical reason");
+
     std::vector<tpot::StageSnapshot> tp;
     tpot::StageSnapshot ts = stage(0, 0, 0, 2, 10.0);
     ts.nodes.push_back(node(0, 30.0, 3u, 1024u));
@@ -157,11 +180,21 @@ int main() {
     require(tpMove.fromNodeIndex == 0u && tpMove.toNodeIndex == 1u, "TP candidate moves from slow node to neighbor");
     require(tpMove.gainMs > 0.0, "TP candidate has positive gain");
 
+    tp[0].stageTimeMs = 300.0;
+    cfg.ppGainRatio = 0.03;
+    const tpot::Candidate defaultRatioTp = tpot::bestTpCandidate(tp, cfg);
     cfg.ppGainRatio = 0.0;
-    tp[0].stageTimeMs = 400.0;
-    require(near(tpot::tpGainThresholdMs(tp[0], cfg), 12.0), "PP gain ratio does not change TP threshold");
-    tpot::Candidate tpRatioIsolation = tpot::bestTpCandidate(tp, cfg);
-    require(!tpRatioIsolation.valid, "PP gain ratio does not change TP candidate selection");
+    const tpot::Candidate zeroRatioTp = tpot::bestTpCandidate(tp, cfg);
+    cfg.ppGainRatio = 0.75;
+    const tpot::Candidate customRatioTp = tpot::bestTpCandidate(tp, cfg);
+    require(defaultRatioTp.valid && zeroRatioTp.valid && customRatioTp.valid,
+        "PP gain ratio preserves TP candidate validity");
+    require(near(defaultRatioTp.thresholdMs, 9.0) && near(zeroRatioTp.thresholdMs, 9.0) &&
+            near(customRatioTp.thresholdMs, 9.0),
+        "PP gain ratio preserves TP scheduler thresholds");
+    require(near(defaultRatioTp.gainMs, zeroRatioTp.gainMs) &&
+            near(defaultRatioTp.gainMs, customRatioTp.gainMs),
+        "PP gain ratio preserves TP scheduler gains");
     cfg.ppGainRatio = 0.03;
 
     tp[0].nodes[0].timeMs = 12.0;

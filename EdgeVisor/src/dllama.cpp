@@ -1021,6 +1021,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         debugSyncTopkTrace(logitsRow, vocabSize, "eval", pos, statBatch);
         evalTotalTime += evalTime + syncTime + evalBubbleTime;
     }
+    const auto evalWallEnd = std::chrono::steady_clock::now();
 
     // 生成阶段的起始 token 应该是 prompt 的最后一个 token（位置为 nInputTokens-1）
     token = inputTokens[nInputTokens - 1];
@@ -1378,7 +1379,6 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     NnUint nPredTokens = pos - nEvalTokens;
     float evalTotalTimeMs = evalTotalTime / 1000.0;
     float predTotalTimeMs = predTotalTime / 1000.0;
-    const auto evalWallEnd = std::chrono::steady_clock::now();
     const double evalWallMs = std::chrono::duration<double, std::milli>(evalWallEnd - evalWallStart).count();
     const double predWallTimeMs = std::chrono::duration<double, std::milli>(predWallEnd - predWallStart).count();
     printf("\n");

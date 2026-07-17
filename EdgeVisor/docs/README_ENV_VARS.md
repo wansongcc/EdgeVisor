@@ -221,7 +221,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 | `--plan-ctrl-socket <path>` | CLI 参数 | 未设置 | 指定自动调度器和 plan controller 使用的 UDS 路径 | 不适用 |
 | `--enable-pp-migration` | CLI 开关 | 自动模式会开启 | 启用 PP layer 迁移执行路径 | 不适用 |
 | `DLLAMA_DYNAMIC_TPOT_ENABLE` | 布尔 | `0` | 直接启用/关闭自动 TPOT 调度器 | 不适用 |
-| `DLLAMA_TPOT_LOG` | 路径 | `/tmp/dllama_tpot_scheduler.log` | 调度器结构化日志，包含 `gain_ms`、`threshold_ms`、`note` 等 | 不影响策略 |
+| `DLLAMA_TPOT_LOG` | 路径 | `/tmp/dllama_tpot_scheduler.log` | 调度器结构化日志，包含 `gain_ms`、`threshold_ms`、`note`，以及 PP 候选字段 `pp_best_valid`、`pp_best_gain_ms`、`pp_best_threshold_ms`、`pp_best_reason`、`pp_best_from_stage`、`pp_best_to_stage`、`pp_best_layer` | 不影响策略 |
 | `DLLAMA_TPOT_WINDOW_TOKENS` | 整数 | `16` | 每次决策累计的 decode token 窗口 | 决策更稳但更慢 |
 | `DLLAMA_TPOT_MIN_SAMPLES` | 整数 | `8` | 形成一次有效决策窗口所需最少样本 | 降低低样本误判 |
 | `DLLAMA_TPOT_COOLDOWN_TOKENS` | 整数 | `32` | 一次迁移后禁止再次迁移的 token 数 | 减少连续迁移 |
@@ -233,7 +233,8 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 | `DLLAMA_TPOT_TP_RISK_MARGIN_MS` | 浮点 ms | `0` | TP 候选额外风险余量，会从收益中扣除 | 要求 TP 收益更确定 |
 | `DLLAMA_TPOT_PP_MIGRATION_COST_MS` | 浮点 ms | `0` | PP 迁移成本模型输入 | 避免小收益 PP 迁移 |
 | `DLLAMA_TPOT_TP_MIGRATION_COST_MS` | 浮点 ms | `0` | TP 迁移成本模型输入 | 避免小收益 TP 迁移 |
-| `DLLAMA_TPOT_LOAD_PENALTY_BETA` | 浮点 | `0.08` | 负载惩罚系数 | 更偏向保守分配 |
+| `DLLAMA_TPOT_LOAD_PENALTY_BETA` | 浮点 | `0` | 负载惩罚系数 | 更偏向保守分配 |
+| `DLLAMA_TPOT_PP_GAIN_RATIO` / `--tpot-pp-gain-ratio` | 浮点 `[0,1]` | `0.03` | PP 收益相对门槛系数；`0` 表示只使用绝对毫秒门槛 | 越小越容易触发 PP 迁移 |
 | `DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS` | 整数 | `128` | 预期剩余 token，用于摊销迁移成本 | 越小越保守 |
 | `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` | 整数 | `1` | 单次 PP 最多迁移 layer 数 | 更大时单次迁移幅度更大 |
 | `DLLAMA_TPOT_MAX_HEAD_MOVE` | 整数 | `1` | 单次 TP head 迁移数量 | 更大时单次迁移幅度更大 |

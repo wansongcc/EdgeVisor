@@ -2,6 +2,7 @@
 
 #include "app.hpp"
 #include "dynamic/tpot_algorithm.hpp"
+#include "dynamic/tpot_log.hpp"
 #include "json.hpp"
 #include "plan-command.hpp"
 
@@ -642,6 +643,7 @@ static void logDecision(
     ControllerRuntime &rt,
     const WindowSummary &window,
     const tpot::Candidate &best,
+    const tpot::Candidate &bestPp,
     bool issued,
     const char *extra,
     const PendingAction *comparison = nullptr,
@@ -712,6 +714,7 @@ static void logDecision(
         << " samples=" << window.samples
         << " pos_begin=" << window.posBegin
         << " pos_end=" << window.posEnd;
+    oss << " " << tpot::formatPpCandidateLogFields(bestPp);
     if (extra != nullptr && extra[0] != '\0') oss << " note=" << extra;
     oss << " " << metricsString(rt.metrics, window.posEnd);
     appendLog(rt.logPath, oss.str());
@@ -869,14 +872,14 @@ void DynamicTpotController::run() {
                 } else {
                     note = "verify_wait";
                 }
-                logDecision(rt, window, pendingForLog.candidate, verifyIssued, note, &pendingForLog, elapsed);
+                logDecision(rt, window, pendingForLog.candidate, bestPp, verifyIssued, note, &pendingForLog, elapsed);
                 std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
                 continue;
             }
 
             if (window.posEnd < rt.cooldownUntilPos) {
                 note = "cooldown";
-                logDecision(rt, window, best, false, note);
+                logDecision(rt, window, best, bestPp, false, note);
                 std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
                 continue;
             }
@@ -920,7 +923,7 @@ void DynamicTpotController::run() {
                 note = stable ? "no_gain_stable" : "no_gain";
             }
 
-            logDecision(rt, window, best, issued, note);
+            logDecision(rt, window, best, bestPp, issued, note);
         } catch (const std::exception &e) {
             std::ostringstream oss;
             oss << "tpot_sched seq=" << rt.decisionSeq << " state=" << stateName(rt.state)

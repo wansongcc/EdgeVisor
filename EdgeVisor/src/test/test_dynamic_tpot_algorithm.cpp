@@ -1,8 +1,10 @@
 #include "dynamic/tpot_algorithm.hpp"
+#include "dynamic/tpot_log.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace tpot = dllama::dynamic_tpot;
@@ -96,6 +98,17 @@ int main() {
     require(noPp.fromStageIndex == 0u && noPp.toStageIndex == 1u, "rejected candidate retains direction");
     require(noPp.layerIndex == 3u, "rejected candidate retains boundary layer");
     require(noPp.gainMs > 0.0 && near(noPp.thresholdMs, 100.0), "rejected candidate retains scores");
+    const std::string rejectedPpLog = tpot::formatPpCandidateLogFields(noPp);
+    require(rejectedPpLog.find("pp_best_valid=0") != std::string::npos, "rejected PP log includes validity");
+    require(rejectedPpLog.find("pp_best_gain_ms=") != std::string::npos, "rejected PP log includes gain");
+    require(rejectedPpLog.find("pp_best_threshold_ms=100") != std::string::npos, "rejected PP log includes threshold");
+    require(rejectedPpLog.find("pp_best_reason=gain_below_threshold") != std::string::npos, "rejected PP log sanitizes reason");
+    require(rejectedPpLog.find("pp_best_from_stage=0") != std::string::npos, "rejected PP log includes source stage");
+    require(rejectedPpLog.find("pp_best_to_stage=1") != std::string::npos, "rejected PP log includes target stage");
+    require(rejectedPpLog.find("pp_best_layer=3") != std::string::npos, "rejected PP log includes layer");
+    const std::string validPpLog = tpot::formatPpCandidateLogFields(ppMove);
+    require(validPpLog.find("pp_best_valid=1") != std::string::npos, "valid PP log includes validity");
+    require(validPpLog.find("pp_best_reason=none") != std::string::npos, "valid PP log includes no reason");
     cfg.minPpGainMs = 5.0;
 
     std::vector<tpot::StageSnapshot> mixed;

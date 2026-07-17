@@ -175,6 +175,27 @@ static inline NnSize getSyncDuplexMaxBytes() {
     return cached.load(std::memory_order_acquire);
 }
 
+static inline unsigned long getNetSimDelayUs() {
+    // Test-only LAN simulator (DLLAMA_NET_SIM_DELAY_US): sleeps once per
+    // writeMany/readMany batch to emulate per-round-trip network latency.
+    // Default 0 (disabled).
+    static std::atomic<unsigned long> cached{0ul};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        unsigned long v = 0ul;
+        if (const char *p = std::getenv("DLLAMA_NET_SIM_DELAY_US")) {
+            try {
+                v = std::stoul(std::string(p));
+            } catch (...) {
+                v = 0ul;
+            }
+        }
+        cached.store(v, std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
 static inline bool getSyncBcastAckEnabled() {
     // Default OFF: the broadcast ACK barrier in syncWithRoot is redundant with
     // TCP stream ordering and costs one round trip per broadcast per worker.
@@ -1466,6 +1487,10 @@ bool NnNetwork::tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 }
 
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
+    {
+        const unsigned long simDelayUs = getNetSimDelayUs();
+        if (simDelayUs > 0ul) usleep(simDelayUs);
+    }
     bool isWriting;
     const bool ioProfile = dllamaIoProbeEnabled();
     const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
@@ -1542,6 +1567,10 @@ void NnNetwork::writeAll(const void *data, NnSize size) {
 }
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
+    {
+        const unsigned long simDelayUs = getNetSimDelayUs();
+        if (simDelayUs > 0ul) usleep(simDelayUs);
+    }
     bool isReading;
     const bool ioProfile = dllamaIoProbeEnabled();
     const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
@@ -2536,11 +2565,11 @@ void NnNetworkNodeSynchronizer::onSyncStepComplete(NnUint segmentIndex) {
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
 
-    const bool kvAggProof = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF") != nullptr);
-    const bool kvAggProofAllBatches = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES") != nullptr);
-    const bool syncTrace = (std::getenv("DLLAMA_SYNC_TRACE") != nullptr);
-    const bool syncTraceAllThreads = (std::getenv("DLLAMA_SYNC_TRACE_ALL_THREADS") != nullptr);
-    const bool syncProfile = (std::getenv("DLLAMA_SYNC_PROFILE") != nullptr);
+    static const bool kvAggProof = envFlagEnabled("DLLAMA_KV_AGGREGATE_PROOF");
+    static const bool kvAggProofAllBatches = envFlagEnabled("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES");
+    static const bool syncTrace = envFlagEnabled("DLLAMA_SYNC_TRACE");
+    static const bool syncTraceAllThreads = envFlagEnabled("DLLAMA_SYNC_TRACE_ALL_THREADS");
+    static const bool syncProfile = envFlagEnabled("DLLAMA_SYNC_PROFILE");
 
     auto nowUs = []() -> long long {
         return (long long)std::chrono::duration_cast<std::chrono::microseconds>(

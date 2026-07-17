@@ -2252,6 +2252,28 @@ static bool getHeadMigrationTargetRangeLocal(
     return true;
 }
 
+void RootLlmInference::setSkipLogits(bool skip) {
+    skipLogits_ = skip;
+}
+
+// Segments that only carry the logits gather (end segment on the last stage,
+// root_wait on node 0 with PP); their compute+sync are skipped for non-final
+// prefill chunks because those logits are never consumed.
+static std::vector<NnUint> findLogitsSegmentIndices(const NnNodeConfig *nodeConfig) {
+    std::vector<NnUint> out;
+    for (NnUint s = 0; s < nodeConfig->nSegments; s++) {
+        const NnSegmentConfig *seg = &nodeConfig->segments[s];
+        for (NnUint j = 0; j < seg->nSyncs; j++) {
+            if (seg->syncs[j].syncType == SYNC_NODE_SLICES_EXCEPT_ROOT ||
+                seg->syncs[j].syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT) {
+                out.push_back(s);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
 RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
@@ -2265,6 +2287,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->network = network;
     this->plan = plan;
     this->runtimePlan = (net != nullptr) ? &net->runtimeStageLayerPlan : nullptr;
+    this->logitsSegmentIndices = findLogitsSegmentIndices(&net->nodeConfigs[0]);
     this->profileEnabled = profileEnabled;
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
     this->controlPacket.planCmdSeq = 0u;
@@ -3841,6 +3864,12 @@ void RootLlmInference::forward(bool collectProfile) {
 
         LlmControlPacket out = controlPacket;
         out.flags = controlPacket.flags;
+        if (skipLogits_) {
+            out.flags |= LLM_CTRL_SKIP_LOGITS;
+        }
+        for (NnUint segIndex : logitsSegmentIndices) {
+            executor->setSegmentEnabled(segIndex, !skipLogits_);
+        }
         out.planCmdSeq = planCmdSeqLo;
 
         const bool planChanged = (planCmdSeqLo != lastPlanCmdSeqSent);
@@ -5252,6 +5281,7 @@ void runWorkerApp(AppCliArgs *args) {
             lastStageSampler.reset(new Sampler((int)samplerVocabSize, boot.samplerTemperature, boot.samplerTopP, boot.samplerSeed));
         }
         WorkerLlmInference inference(&execution, network, nodeConfig.nodeIndex, logitsPipeIndex, lastStageSampler.get());
+        const std::vector<NnUint> logitsSegmentIndices = findLogitsSegmentIndices(&nodeConfig);
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
@@ -5396,6 +5426,15 @@ void runWorkerApp(AppCliArgs *args) {
                     }
                     isFirstAttempt = true;
                     continue;
+                }
+
+                // Non-final prefill chunks skip the end-segment logits
+                // compute+gather (flag from the root's control packet).
+                {
+                    const bool skipLogits = inference.isSkipLogits();
+                    for (NnUint segIndex : logitsSegmentIndices) {
+                        executor.setSegmentEnabled(segIndex, !skipLogits);
+                    }
                 }
 
                 executor.forward();

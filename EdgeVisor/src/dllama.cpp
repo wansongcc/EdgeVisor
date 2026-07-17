@@ -920,6 +920,11 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         for (NnUint i = 0; i < batchSize; i++)
             context->inference->setToken(i, inputTokens[pos + i]);
 
+        // Non-final prefill chunks never consume logits: skip the end-segment
+        // vocab matmul + logits gather entirely (all nodes stay consistent
+        // via the control-packet flag).
+        const bool isFinalChunk = (remainingTokens <= (long)batchSize);
+        context->inference->setSkipLogits(!context->args->lastStageSampling && !isFinalChunk);
         context->inference->forward();
 
         NnUint evalBubbleTime = 0;
@@ -958,10 +963,13 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 
         // Always compute basic logits stats (even when TOPK debug isn't compiled).
         // In eval stage logits pipe is [batch][vocab]. Use the latest row of this window.
+        // Non-final chunks skip the logits compute; their pipe rows are stale.
         const NnUint statBatch = (batchSize > 0u) ? (batchSize - 1u) : 0u;
         const float* logitsRow = logits + (size_t)statBatch * (size_t)vocabSize;
         NnUint zeroCount = 0u;
-        computeLogitsStats(logitsRow, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
+        if (isFinalChunk) {
+            computeLogitsStats(logitsRow, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
+        }
 
 #if DLLAMA_DEBUG_TOPK_LOGITS
         debugValidateLogits(logits, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex);
@@ -1011,17 +1019,22 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             recvBytes / 1024,
             batchSize);
         const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && vocabSize > 0u);
-        printf("🧪 [Root Logits] (eval batchIndex=%u) Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | Zero: %u/%u | NetDelta: S=%zu R=%zu\n",
-            (unsigned)statBatch,
-            statsOk ? "✅ OK" : "❌ FAIL",
-            minLogit, maxLogit, maxIndex,
-            (unsigned)zeroCount, (unsigned)vocabSize,
-            sentBytes, recvBytes);
-        printRootLogitsSplitStats("eval", pos, logitsRow, vocabSize);
-        debugSyncTopkTrace(logitsRow, vocabSize, "eval", pos, statBatch);
+        if (isFinalChunk) {
+            printf("🧪 [Root Logits] (eval batchIndex=%u) Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | Zero: %u/%u | NetDelta: S=%zu R=%zu\n",
+                (unsigned)statBatch,
+                statsOk ? "✅ OK" : "❌ FAIL",
+                minLogit, maxLogit, maxIndex,
+                (unsigned)zeroCount, (unsigned)vocabSize,
+                sentBytes, recvBytes);
+            printRootLogitsSplitStats("eval", pos, logitsRow, vocabSize);
+            debugSyncTopkTrace(logitsRow, vocabSize, "eval", pos, statBatch);
+        } else {
+            printf("🧪 [Root Logits] (eval) skipped (non-final prefill chunk)\n");
+        }
         evalTotalTime += evalTime + syncTime + evalBubbleTime;
     }
     const auto evalWallEnd = std::chrono::steady_clock::now();
+    context->inference->setSkipLogits(false);
 
     // 生成阶段的起始 token 应该是 prompt 的最后一个 token（位置为 nInputTokens-1）
     token = inputTokens[nInputTokens - 1];

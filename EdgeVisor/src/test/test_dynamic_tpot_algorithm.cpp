@@ -47,20 +47,34 @@ static tpot::NodeSnapshot node(uint32_t idx, double ms, uint32_t heads, uint32_t
 
 int main() {
     tpot::SchedulerConfig cfg;
+    require(near(cfg.loadPenaltyBeta, 0.0), "load penalty defaults to zero");
+    require(near(cfg.ppGainRatio, 0.03), "PP gain ratio defaults to three percent");
     cfg.minPpGainMs = 5.0;
     cfg.minTpGainMs = 2.0;
-    cfg.loadPenaltyBeta = 0.08;
     cfg.ppRiskMarginMs = 0.0;
     cfg.tpRiskMarginMs = 0.0;
 
     tpot::StageSnapshot s = stage(0, 0, 0, 4, 10.0);
     require(near(tpot::stageCostMs(s, 4, cfg), 40.0), "F_s(n) base cost");
-    require(near(tpot::ppDeltaInMs(s, cfg), 14.0), "delta_in includes soft-capacity load penalty");
+    require(near(tpot::ppDeltaInMs(s, cfg), 10.0), "default delta_in has no load penalty");
+    cfg.loadPenaltyBeta = 0.08;
+    require(near(tpot::ppDeltaInMs(s, cfg), 14.0), "explicit beta preserves legacy cost");
+    cfg.loadPenaltyBeta = 0.0;
     require(near(tpot::ppDeltaOutMs(s, cfg), 10.0), "delta_out base layer cost");
+
+    cfg.ppGainRatio = 0.03;
+    require(near(tpot::ppGainThresholdMs(200.0, cfg), 6.0), "ratio controls PP threshold");
+    cfg.ppGainRatio = 0.0;
+    require(near(tpot::ppGainThresholdMs(200.0, cfg), 5.0), "zero ratio leaves absolute threshold");
+    cfg.ppGainRatio = 0.10;
+    require(near(tpot::ppGainThresholdMs(200.0, cfg), 20.0), "custom ratio changes threshold");
+    cfg.ppGainRatio = 0.03;
 
     tpot::StageSnapshot over = s;
     over.softCapacity = 3;
+    cfg.loadPenaltyBeta = 0.08;
     require(tpot::ppDeltaInMs(over, cfg) > tpot::ppDeltaInMs(s, cfg), "delta_in grows past soft capacity");
+    cfg.loadPenaltyBeta = 0.0;
 
     tpot::StageSnapshot trend = s;
     trend.recentAvgMs = 13.0;
@@ -78,7 +92,20 @@ int main() {
     cfg.minPpGainMs = 100.0;
     tpot::Candidate noPp = tpot::bestPpCandidate(pp, 110.0, cfg);
     require(!noPp.valid, "PP candidate rejected below threshold");
+    require(noPp.reason == "gain below threshold", "rejected candidate reports reason");
+    require(noPp.fromStageIndex == 0u && noPp.toStageIndex == 1u, "rejected candidate retains direction");
+    require(noPp.layerIndex == 3u, "rejected candidate retains boundary layer");
+    require(noPp.gainMs > 0.0 && near(noPp.thresholdMs, 100.0), "rejected candidate retains scores");
     cfg.minPpGainMs = 5.0;
+
+    std::vector<tpot::StageSnapshot> mixed;
+    mixed.push_back(stage(0, 0, 0, 4, 30.0));
+    mixed.push_back(stage(1, 1, 4, 4, 5.0));
+    mixed.push_back(stage(2, 2, 8, 4, 3.0));
+    mixed[0].rightBoundaryLayerMs = 30.0;
+    tpot::Candidate mixedBest = tpot::bestPpCandidate(mixed, 152.0, cfg);
+    require(mixedBest.valid, "valid PP candidate wins over rejected alternatives");
+    require(mixedBest.fromStageIndex == 0u && mixedBest.toStageIndex == 1u, "valid PP route remains selected");
 
     pp[1].riskPenalty = 20.0;
     tpot::Candidate riskPp = tpot::bestPpCandidate(pp, 110.0, cfg);

@@ -45,16 +45,16 @@ double ppDeltaOutMs(const StageSnapshot &stage, const SchedulerConfig &cfg) {
 }
 
 double ppGainThresholdMs(double currentTpotMs, const SchedulerConfig &cfg) {
-    return maxDouble(cfg.minPpGainMs, 0.03 * currentTpotMs);
+    return maxDouble(cfg.minPpGainMs, cfg.ppGainRatio * currentTpotMs);
 }
 
 double tpGainThresholdMs(const StageSnapshot &stage, const SchedulerConfig &cfg) {
-    return maxDouble(cfg.minTpGainMs, 0.03 * stage.stageTimeMs);
+    return maxDouble(cfg.minTpGainMs, cfg.ppGainRatio * stage.stageTimeMs);
 }
 
 static double ppLocalGainThresholdMs(const StageSnapshot &source, const StageSnapshot &target, const SchedulerConfig &cfg) {
     const double localMs = maxDouble(0.0, source.stageTimeMs) + maxDouble(0.0, target.stageTimeMs);
-    return maxDouble(cfg.minPpGainMs, 0.03 * localMs);
+    return maxDouble(cfg.minPpGainMs, cfg.ppGainRatio * localMs);
 }
 
 static Candidate makeRejected(CandidateKind kind, const char *reason) {
@@ -93,7 +93,8 @@ Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double curre
     Candidate best;
     best.kind = CandidateKind::PP_MOVE;
     best.thresholdMs = cfg.minPpGainMs;
-    best.reason = "no profitable pp move";
+    best.reason = "no eligible pp candidate";
+    bool haveRejected = false;
 
     const double migCost = migrationCostPerToken(cfg.ppMigrationCostMs, cfg.expectedRemainingTokens);
     for (size_t i = 0u; i + 1u < stages.size(); ++i) {
@@ -132,7 +133,12 @@ Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double curre
             } else {
                 c.layerIndex = source.startLayer;
             }
-            considerBest(best, c);
+            if (c.valid) {
+                considerBest(best, c);
+            } else if (!best.valid && (!haveRejected || c.gainMs > best.gainMs)) {
+                best = c;
+                haveRejected = true;
+            }
         }
     }
     return best;

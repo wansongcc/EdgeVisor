@@ -22,7 +22,8 @@ struct SchedulerConfig {
     double ewmaAlpha = 0.2;
     double minPpGainMs = 5.0;
     double minTpGainMs = 2.0;
-    double loadPenaltyBeta = 0.08;
+    double loadPenaltyBeta = 0.0;
+    double ppGainRatio = 0.03;
     double ppRiskMarginMs = 0.0;
     double tpRiskMarginMs = 0.0;
     double ppMigrationCostMs = 0.0;

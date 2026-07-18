@@ -96,6 +96,15 @@ static void validateUnitIntervalOption(const char *name, const char *value) {
     }
 }
 
+static void validateMaxPpLayerMoveOption(const char *name, const char *value) {
+    errno = 0;
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 1 || parsed > 64) {
+        throw std::runtime_error(std::string(name) + " must be a decimal integer in [1,64]");
+    }
+}
+
 static void appendSyncedEnvironmentVariable(const char *name) {
     const char *current = std::getenv("DLLAMA_SYNC_ENV_VARS");
     if (current == nullptr || current[0] == '\0') {
@@ -153,6 +162,7 @@ static void configureDynamicTpot(const AppCliArgs &args) {
     setTpotOverride("DLLAMA_TPOT_PP_RISK_MARGIN_MS", args.tpotPpRiskMarginMsStr);
     setTpotOverride("DLLAMA_TPOT_PP_MIGRATION_COST_MS", args.tpotPpMigrationCostMsStr);
     setTpotOverride("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS", args.tpotExpectedRemainingTokensStr);
+    setTpotOverride("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", args.tpotMaxPpLayerMoveStr);
     setenv("DLLAMA_LAYER_PROF_ENABLE", "1", 1);
     appendSyncedEnvironmentVariable("DLLAMA_LAYER_PROF_ENABLE");
 }
@@ -581,6 +591,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.tpotPpRiskMarginMsStr = nullptr;
     args.tpotPpMigrationCostMsStr = nullptr;
     args.tpotExpectedRemainingTokensStr = nullptr;
+    args.tpotMaxPpLayerMoveStr = nullptr;
     args.planCtrlSocketPath = std::getenv("DLLAMA_PLAN_CTRL_SOCKET") != nullptr && std::getenv("DLLAMA_PLAN_CTRL_SOCKET")[0] != '\0'
         ? const_cast<char*>(std::getenv("DLLAMA_PLAN_CTRL_SOCKET"))
         : nullptr;
@@ -977,6 +988,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.tpotPpMigrationCostMsStr = value;
         } else if (std::strcmp(name, "--tpot-expected-remaining-tokens") == 0) {
             args.tpotExpectedRemainingTokensStr = value;
+        } else if (std::strcmp(name, "--tpot-max-pp-layer-move") == 0) {
+            validateMaxPpLayerMoveOption(name, value);
+            args.tpotMaxPpLayerMoveStr = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }

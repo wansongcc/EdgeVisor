@@ -87,6 +87,7 @@ public:
     char *tpotPpRiskMarginMsStr;
     char *tpotPpMigrationCostMsStr;
     char *tpotExpectedRemainingTokensStr;
+    char *tpotMaxPpLayerMoveStr;
     char *planCtrlSocketPath; // UDS path used by plan controller and dynamic TPOT scheduler
     NnUint runtimeRedundantBoundaryLayers; // Runtime redundant boundary span in layers
     bool runtimeActiveSegEnabled; // Default gate for primary segments

@@ -138,6 +138,19 @@ static int parseEnvInt(const char *name, int fallback) {
     return (int)x;
 }
 
+static uint32_t parseEnvBoundedUint(const char *name, uint32_t fallback, long minimum, long maximum) {
+    const char *v = std::getenv(name);
+    if (v == nullptr) return fallback;
+    errno = 0;
+    char *end = nullptr;
+    const long x = std::strtol(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0' || x < minimum || x > maximum) {
+        throw std::runtime_error(std::string(name) + " must be a decimal integer in [" +
+            std::to_string(minimum) + "," + std::to_string(maximum) + "]");
+    }
+    return (uint32_t)x;
+}
+
 static double parseEnvDouble(const char *name, double fallback) {
     const char *v = std::getenv(name);
     if (v == nullptr || v[0] == '\0') return fallback;
@@ -176,7 +189,7 @@ static tpot::SchedulerConfig loadSchedulerConfigFromEnvironmentImpl() {
     cfg.ppMigrationCostMs = parseEnvDouble("DLLAMA_TPOT_PP_MIGRATION_COST_MS", cfg.ppMigrationCostMs);
     cfg.tpMigrationCostMs = parseEnvDouble("DLLAMA_TPOT_TP_MIGRATION_COST_MS", cfg.tpMigrationCostMs);
     cfg.expectedRemainingTokens = std::max(1, parseEnvInt("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS", cfg.expectedRemainingTokens));
-    cfg.maxPpLayerMove = (uint32_t)std::max(1, parseEnvInt("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", (int)cfg.maxPpLayerMove));
+    cfg.maxPpLayerMove = parseEnvBoundedUint("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", cfg.maxPpLayerMove, 1, 64);
     cfg.maxHeadMove = (uint32_t)std::max(1, parseEnvInt("DLLAMA_TPOT_MAX_HEAD_MOVE", (int)cfg.maxHeadMove));
     cfg.maxFfnMove = (uint32_t)std::max(1, parseEnvInt("DLLAMA_TPOT_MAX_FFN_MOVE", (int)cfg.maxFfnMove));
     return cfg;

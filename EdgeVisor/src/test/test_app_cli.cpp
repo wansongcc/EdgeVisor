@@ -21,6 +21,7 @@ static void clearTpotEnvironment() {
     unsetenv("DLLAMA_TPOT_PP_MIGRATION_COST_MS");
     unsetenv("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS");
     unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+    unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
     unsetenv("DLLAMA_LAYER_PROF_ENABLE");
     unsetenv("DLLAMA_SYNC_ENV_VARS");
 }
@@ -49,6 +50,33 @@ static bool rejectsEnvironmentPpGainRatio(const char *text) {
         return true;
     }
     unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+    return false;
+}
+
+static bool rejectsMaxPpLayerMove(const char *text) {
+    char arg0[] = "dllama";
+    char arg1[] = "inference";
+    char arg2[] = "--tpot-max-pp-layer-move";
+    char value[32];
+    std::snprintf(value, sizeof(value), "%s", text);
+    char *argv[] = {arg0, arg1, arg2, value};
+    try {
+        parseArgs(4, argv);
+    } catch (...) {
+        return true;
+    }
+    return false;
+}
+
+static bool rejectsEnvironmentMaxPpLayerMove(const char *text) {
+    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", text, 1);
+    try {
+        (void)dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+    } catch (...) {
+        unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
+        return true;
+    }
+    unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
     return false;
 }
 
@@ -83,6 +111,7 @@ int main() {
         const dllama::dynamic_tpot::SchedulerConfig cfg =
             dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
         assert(cfg.ppGainRatio == 0.03);
+        assert(cfg.maxPpLayerMove == 1u);
     }
     setenv("DLLAMA_TPOT_PP_GAIN_RATIO", "0.5", 1);
     {
@@ -91,6 +120,20 @@ int main() {
         assert(cfg.ppGainRatio == 0.5);
     }
     unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+
+    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", "4", 1);
+    {
+        const dllama::dynamic_tpot::SchedulerConfig cfg =
+            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        assert(cfg.maxPpLayerMove == 4u);
+    }
+    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", "64", 1);
+    {
+        const dllama::dynamic_tpot::SchedulerConfig cfg =
+            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        assert(cfg.maxPpLayerMove == 64u);
+    }
+    unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
 
     {
         char arg0[] = "dllama";
@@ -115,6 +158,32 @@ int main() {
         assert(strstr(getenv("DLLAMA_SYNC_ENV_VARS"), "DLLAMA_LAYER_PROF_ENABLE") != nullptr);
     }
 
+    {
+        char arg0[] = "dllama";
+        char arg1[] = "inference";
+        char arg2[] = "--enable-dynamic-tpot";
+        char arg3[] = "--tpot-max-pp-layer-move";
+        char arg4[] = "4";
+        char *argv[] = {arg0, arg1, arg2, arg3, arg4};
+        AppCliArgs args = parseArgs(5, argv);
+        (void)args;
+        assert(strcmp(getenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE"), "4") == 0);
+    }
+
+    {
+        char arg0[] = "dllama";
+        char arg1[] = "inference";
+        char arg2[] = "--tpot-max-pp-layer-move";
+        char *argv[] = {arg0, arg1, arg2};
+        bool rejected = false;
+        try {
+            parseArgs(3, argv);
+        } catch (...) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+
     assert(rejectsPpGainRatio("-0.01"));
     assert(rejectsPpGainRatio("1.01"));
     assert(rejectsPpGainRatio("nan"));
@@ -128,6 +197,20 @@ int main() {
     assert(rejectsEnvironmentPpGainRatio("inf"));
     assert(rejectsEnvironmentPpGainRatio("-0.01"));
     assert(rejectsEnvironmentPpGainRatio("1.01"));
+
+    assert(rejectsMaxPpLayerMove("0"));
+    assert(rejectsMaxPpLayerMove("65"));
+    assert(rejectsMaxPpLayerMove("-1"));
+    assert(rejectsMaxPpLayerMove("garbage"));
+    assert(rejectsMaxPpLayerMove("4junk"));
+    assert(rejectsMaxPpLayerMove(""));
+
+    assert(rejectsEnvironmentMaxPpLayerMove("0"));
+    assert(rejectsEnvironmentMaxPpLayerMove("65"));
+    assert(rejectsEnvironmentMaxPpLayerMove("-1"));
+    assert(rejectsEnvironmentMaxPpLayerMove("garbage"));
+    assert(rejectsEnvironmentMaxPpLayerMove("4junk"));
+    assert(rejectsEnvironmentMaxPpLayerMove(""));
 
     return 0;
 }

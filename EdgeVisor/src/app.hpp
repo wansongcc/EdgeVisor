@@ -27,6 +27,7 @@ public:
 
     char *mode;
     NnUint nThreads;
+    bool nThreadsExplicit; // true when --nthreads was passed (auto-tune skipped)
     NnUint nBatches;
     bool info;
     bool help;
@@ -128,6 +129,7 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_HAS_KV_EXPORT_REQUEST = 1u << 4,
     LLM_CTRL_CONTROL_ONLY = 1u << 5,
     LLM_CTRL_HAS_BATCH_META = 1u << 6,
+    LLM_CTRL_SKIP_LOGITS = 1u << 7, // non-final prefill chunk: skip end-segment logits compute+gather
 };
 
 static constexpr NnUint LLM_BATCH_META_MAGIC = 0x4d54424du; // 'MBTM' little-endian
@@ -371,6 +373,9 @@ public:
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
     bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
+    // Non-final prefill chunks skip the end-segment logits compute+gather
+    // (their logits are never consumed); broadcast to workers via control flags.
+    void setSkipLogits(bool skip);
     bool hasAsyncKvCollector() const;
     bool tryPopAsyncKvRow(RootKvAggRowPacket &packet);
     KvTransferSubmitStatus submitBoundaryKvTransferDetailed(
@@ -395,6 +400,8 @@ private:
     bool profileEnabled = false;
     const NnUnevenPartitionPlan* plan = nullptr;
     const RuntimeStageLayerPlan* runtimePlan = nullptr;
+    bool skipLogits_ = false;
+    std::vector<NnUint> logitsSegmentIndices;
     mutable std::mutex lastPerfMutex;
     std::vector<LlmPerfPacket> lastPerf;
     std::deque<LlmPerfHistorySample> perfHistory;
@@ -521,6 +528,7 @@ private:
     std::deque<std::pair<LlmKvExportRequestHeader, std::vector<NnUint>>> pendingKvExportRequests;
 public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex, NnUint logitsPipeIndex, Sampler *lastStageSampler);
+    bool isSkipLogits() const { return (controlPacket.flags & LLM_CTRL_SKIP_LOGITS) != 0u; }
     bool tryReadControlPacket();
 };
 

@@ -153,6 +153,63 @@ static inline bool getIoEagainPollEnabled() {
     return cached.load(std::memory_order_acquire);
 }
 
+static inline NnSize getSyncDuplexMaxBytes() {
+    // Upper bound on the per-connection in-flight payload for the full-duplex
+    // (send-all-rows-first, then read-all) slice exchange. Larger transfers
+    // fall back to the ordered per-row exchange to rule out write-side
+    // deadlock on platforms with small socket buffers. Default 128 KiB.
+    static std::atomic<NnSize> cached{(NnSize)0};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        NnSize v = (NnSize)(128 * 1024);
+        if (const char *p = std::getenv("DLLAMA_SYNC_DUPLEX_MAX_BYTES")) {
+            try {
+                v = (NnSize)std::stoull(std::string(p));
+            } catch (...) {
+                v = (NnSize)(128 * 1024);
+            }
+        }
+        cached.store(v, std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
+static inline unsigned long getNetSimDelayUs() {
+    // Test-only LAN simulator (DLLAMA_NET_SIM_DELAY_US): sleeps once per
+    // writeMany/readMany batch to emulate per-round-trip network latency.
+    // Default 0 (disabled).
+    static std::atomic<unsigned long> cached{0ul};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        unsigned long v = 0ul;
+        if (const char *p = std::getenv("DLLAMA_NET_SIM_DELAY_US")) {
+            try {
+                v = std::stoul(std::string(p));
+            } catch (...) {
+                v = 0ul;
+            }
+        }
+        cached.store(v, std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
+static inline bool getSyncBcastAckEnabled() {
+    // Default OFF: the broadcast ACK barrier in syncWithRoot is redundant with
+    // TCP stream ordering and costs one round trip per broadcast per worker.
+    // DLLAMA_SYNC_BCAST_ACK=1 restores the legacy barrier; the setting must be
+    // identical on every node or the root will wait for ACKs that never come.
+    static std::atomic<bool> cached{false};
+    static std::atomic<bool> inited{false};
+    if (!inited.load(std::memory_order_acquire)) {
+        cached.store(envFlagEnabled("DLLAMA_SYNC_BCAST_ACK"), std::memory_order_release);
+        inited.store(true, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
 static inline int remainingPollTimeoutMs(unsigned long timeoutMs, long long startMs, const char *what) {
     if (timeoutMs == 0ul) return -1;
     const long long elapsed = nowMsSteady() - startMs;
@@ -1430,6 +1487,10 @@ bool NnNetwork::tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 }
 
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
+    {
+        const unsigned long simDelayUs = getNetSimDelayUs();
+        if (simDelayUs > 0ul) usleep(simDelayUs);
+    }
     bool isWriting;
     const bool ioProfile = dllamaIoProbeEnabled();
     const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
@@ -1455,6 +1516,18 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
             NnSocketIo *io = &ios[i];
             if (io->size > 0) {
                 isWriting = true;
+                // Per-socket stream order guard: a socket's byte stream is
+                // strictly ordered, so a later io must not be written while an
+                // earlier io on the same socket is still pending — otherwise a
+                // partial or EAGAIN send would interleave the streams.
+                bool blockedByEarlier = false;
+                for (NnUint j = 0; j < i; j++) {
+                    if (ios[j].size > 0 && ios[j].socketIndex == io->socketIndex) {
+                        blockedByEarlier = true;
+                        break;
+                    }
+                }
+                if (blockedByEarlier) continue;
                 int socket = sockets[io->socketIndex];
                 ssize_t chunkSize = io->size > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : io->size;
                 const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
@@ -1494,6 +1567,10 @@ void NnNetwork::writeAll(const void *data, NnSize size) {
 }
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
+    {
+        const unsigned long simDelayUs = getNetSimDelayUs();
+        if (simDelayUs > 0ul) usleep(simDelayUs);
+    }
     bool isReading;
     const bool ioProfile = dllamaIoProbeEnabled();
     const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
@@ -1519,6 +1596,18 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
             NnSocketIo *io = &ios[i];
             if (io->size > 0) {
                 isReading = true;
+                // Per-socket stream order guard: bytes for an earlier pending
+                // io on the same socket arrive first, so a later io must wait
+                // — otherwise recv would consume bytes that belong to the
+                // earlier io and scramble every following io.
+                bool blockedByEarlier = false;
+                for (NnUint j = 0; j < i; j++) {
+                    if (ios[j].size > 0 && ios[j].socketIndex == io->socketIndex) {
+                        blockedByEarlier = true;
+                        break;
+                    }
+                }
+                if (blockedByEarlier) continue;
                 int socket = sockets[io->socketIndex];
                 const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
                 ssize_t r = recv(socket, (char*)io->data, io->size, 0);
@@ -1669,22 +1758,27 @@ static void syncWithRoot(
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
 
-        // [新增] Root 等待 Workers 确认 (ACK)
-        // 确保 Workers 已经接收完数据，实现同步屏障
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            try {
-                network->readAckWithTimeout(ios[i].socketIndex, ackTimeoutMs);
-            } catch (const std::exception &e) {
-                const NnUint targetNode = targetNodes[startIdx + i];
-                std::fprintf(stderr,
-                             "❌ syncWithRoot ack timeout/fail root=%u targetNode=%u socket=%u stageRoot=%u stageNodes=%u err=%s\n",
-                             (unsigned)myNodeIndex,
-                             (unsigned)targetNode,
-                             (unsigned)ios[i].socketIndex,
-                             (unsigned)groupRootIndex,
-                             stage ? (unsigned)stage->nNodes : 0u,
-                             e.what());
-                throw;
+        // The ACK barrier is optional (DLLAMA_SYNC_BCAST_ACK=1 restores it):
+        // TCP stream ordering already guarantees workers consume this
+        // broadcast before any later message, and the workers' next upstream
+        // slice acts as the natural synchronization point, so the extra
+        // per-worker ACK round trip is pure latency on every broadcast.
+        if (getSyncBcastAckEnabled()) {
+            for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                try {
+                    network->readAckWithTimeout(ios[i].socketIndex, ackTimeoutMs);
+                } catch (const std::exception &e) {
+                    const NnUint targetNode = targetNodes[startIdx + i];
+                    std::fprintf(stderr,
+                                 "❌ syncWithRoot ack timeout/fail root=%u targetNode=%u socket=%u stageRoot=%u stageNodes=%u err=%s\n",
+                                 (unsigned)myNodeIndex,
+                                 (unsigned)targetNode,
+                                 (unsigned)ios[i].socketIndex,
+                                 (unsigned)groupRootIndex,
+                                 stage ? (unsigned)stage->nNodes : 0u,
+                                 e.what());
+                    throw;
+                }
             }
         }
 
@@ -1704,8 +1798,10 @@ static void syncWithRoot(
         ios.socketIndex = rootSocketIndex; // [修正] 使用查找到的 Socket，而不是硬编码 0
         network->readMany(1, &ios);
 
-        // [新增] Worker 发送确认 (ACK) 给 Root
-        network->writeAck(rootSocketIndex);
+        // Optional ACK barrier (DLLAMA_SYNC_BCAST_ACK=1): see the root side.
+        if (getSyncBcastAckEnabled()) {
+            network->writeAck(rootSocketIndex);
+        }
     }
 }
 
@@ -1714,15 +1810,16 @@ static void syncNodeSlices(
     NnNetwork *network, 
     NnUint myNodeIndex, 
     NnUint nTotalNodes, 
-    NnByte *buffer, 
-    NnSize nBytes, 
+    NnByte *buffer, // base of row 0; row r starts at buffer + r * nBytes
+    NnSize nBytes, // per-row bytes
     NnFloatType floatType,
     NnUint nThreads, 
     NnUint threadIndex, 
     const NnUnevenPartitionPlan *plan,
     const NnStageConfig *stage, // 指定同步组
     NnSliceTag forcedTag, // disambiguate split kind when needed
-    NnUint totalElements = 0 // [New] Total elements for Q80 matching
+    NnUint totalElements = 0, // [New] Total elements for Q80 matching
+    NnUint nRows = 1 // batch rows to exchange in one duplex phase
 ) {
     // ---------------------------------------------------------
     // 0. [核心修改] 确定当前组的 Root 身份
@@ -1870,8 +1967,6 @@ static void syncNodeSlices(
 #endif
 
 
-    std::vector<NnSocketIo> ios(nSocketsPerThread);
-
     // My own slice (may be unused depending on mode)
     const NnSize mySliceOffset = sliceOffsets[myNodeIndex];
     NnByte *mySliceData = &buffer[mySliceOffset];
@@ -1924,85 +2019,157 @@ static void syncNodeSlices(
     // - senders: writeMany()
     // - receivers: readMany()
     // This mode doesn't have a symmetric exchange and thus doesn't benefit from
-    // per-peer ordering.
+    // per-peer ordering. Sender(s) write while the receiver reads, so batching
+    // all rows into one write/read phase cannot deadlock regardless of size.
     if (onlyFromWorkerToRoot) {
         if (iShouldSend) {
+            std::vector<NnSocketIo> batchIos;
+            batchIos.reserve((size_t)nSocketsPerThread * nRows);
             for (NnUint i = 0; i < nSocketsPerThread; i++) {
                 const NnUint idx = startIdx + i;
-                ios[i].socketIndex = targetSockets[idx];
-                ios[i].data = mySliceData;
-                ios[i].size = mySliceSize;
+                for (NnUint r = 0; r < nRows; r++) {
+                    NnSocketIo io{};
+                    io.socketIndex = (NnUint)targetSockets[idx];
+                    io.data = mySliceData + (size_t)r * (size_t)nBytes;
+                    io.size = mySliceSize;
+                    batchIos.push_back(io);
+                }
             }
-            network->writeMany(nSocketsPerThread, &ios[0]);
+            network->writeMany((NnUint)batchIos.size(), batchIos.data());
         }
 
         if (iShouldRecv) {
+            std::vector<NnSocketIo> batchIos;
+            batchIos.reserve((size_t)nSocketsPerThread * nRows);
             for (NnUint i = 0; i < nSocketsPerThread; i++) {
                 const NnUint idx = startIdx + i;
                 const NnUint targetNode = targetNodeIndices[idx];
-
-                ios[i].socketIndex = targetSockets[idx];
-                ios[i].data = &buffer[sliceOffsets[targetNode]];
-                ios[i].size = sliceSizes[targetNode];
+                for (NnUint r = 0; r < nRows; r++) {
+                    NnSocketIo io{};
+                    io.socketIndex = (NnUint)targetSockets[idx];
+                    io.data = buffer + (size_t)r * (size_t)nBytes + sliceOffsets[targetNode];
+                    io.size = sliceSizes[targetNode];
+                    batchIos.push_back(io);
+                }
             }
-            network->readMany(nSocketsPerThread, &ios[0]);
+            network->readMany((NnUint)batchIos.size(), batchIos.data());
         }
     } else {
-        // Full all-gather style exchange: for each peer connection, enforce a total order
-        // based on node indices so that one side is send-first and the other is recv-first.
-        // This prevents cross-node deadlocks/hangs caused by symmetric send/recv ordering.
-        std::vector<NnSocketIo> sendFirst;
-        std::vector<NnSocketIo> recvFirst;
-        std::vector<NnSocketIo> sendSecond;
-        std::vector<NnSocketIo> recvSecond;
-        sendFirst.reserve(nSocketsPerThread);
-        recvFirst.reserve(nSocketsPerThread);
-        sendSecond.reserve(nSocketsPerThread);
-        recvSecond.reserve(nSocketsPerThread);
-
+        // All-gather exchange.
+        //
+        // Fast full-duplex path: issue every send (all peers x all rows)
+        // first — bounded payloads land in kernel socket buffers — then read
+        // every peer. One exchange costs ~half an RTT instead of ~1 RTT per
+        // row for the ordered handshake, and batching collapses nRows
+        // sequential exchanges into one. Oversized in-flight payloads fall
+        // back to the ordered per-row exchange, which cannot deadlock even
+        // with tiny socket buffers. Every node derives the same decision from
+        // the shared slice table and row count, so all peers pick the same
+        // path.
+        NnSize maxPeerSlice = 0;
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            const NnUint idx = startIdx + i;
-            const NnUint targetNode = targetNodeIndices[idx];
-            const int sock = targetSockets[idx];
+            const NnUint targetNode = targetNodeIndices[startIdx + i];
+            if (sliceSizes[targetNode] > maxPeerSlice) maxPeerSlice = sliceSizes[targetNode];
+        }
+        const NnSize duplexMax = getSyncDuplexMaxBytes();
+        const bool duplexOk = (!iShouldSend || (NnSize)nRows * mySliceSize <= duplexMax)
+            && (!iShouldRecv || (NnSize)nRows * maxPeerSlice <= duplexMax);
 
-            const bool amSendFirst = (myNodeIndex < targetNode);
-
-            if (iShouldSend) {
-                NnSocketIo s{};
-                s.socketIndex = (NnUint)sock;
-                s.data = mySliceData;
-                s.size = mySliceSize;
-                if (amSendFirst) {
-                    sendFirst.push_back(s);
-                } else {
-                    sendSecond.push_back(s);
+        if (duplexOk) {
+            std::vector<NnSocketIo> sendIos;
+            std::vector<NnSocketIo> recvIos;
+            if (iShouldSend) sendIos.reserve((size_t)nSocketsPerThread * nRows);
+            if (iShouldRecv) recvIos.reserve((size_t)nSocketsPerThread * nRows);
+            for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                const NnUint idx = startIdx + i;
+                const NnUint targetNode = targetNodeIndices[idx];
+                const int sock = targetSockets[idx];
+                for (NnUint r = 0; r < nRows; r++) {
+                    if (iShouldSend) {
+                        NnSocketIo s{};
+                        s.socketIndex = (NnUint)sock;
+                        s.data = mySliceData + (size_t)r * (size_t)nBytes;
+                        s.size = mySliceSize;
+                        sendIos.push_back(s);
+                    }
+                    if (iShouldRecv) {
+                        NnSocketIo q{};
+                        q.socketIndex = (NnUint)sock;
+                        q.data = buffer + (size_t)r * (size_t)nBytes + sliceOffsets[targetNode];
+                        q.size = sliceSizes[targetNode];
+                        recvIos.push_back(q);
+                    }
                 }
             }
+            if (!sendIos.empty()) {
+                network->writeMany((NnUint)sendIos.size(), sendIos.data());
+            }
+            if (!recvIos.empty()) {
+                network->readMany((NnUint)recvIos.size(), recvIos.data());
+            }
+        } else {
+            // Ordered exchange (per row): for each peer connection, enforce a
+            // total order based on node indices so that one side is send-first
+            // and the other is recv-first. This prevents cross-node
+            // deadlocks/hangs caused by symmetric send/recv ordering.
+            for (NnUint r = 0; r < nRows; r++) {
+                NnByte *rowBuffer = buffer + (size_t)r * (size_t)nBytes;
+                NnByte *myRowSliceData = mySliceData + (size_t)r * (size_t)nBytes;
 
-            if (iShouldRecv) {
-                NnSocketIo r{};
-                r.socketIndex = (NnUint)sock;
-                r.data = &buffer[sliceOffsets[targetNode]];
-                r.size = sliceSizes[targetNode];
-                if (amSendFirst) {
-                    recvSecond.push_back(r);
-                } else {
-                    recvFirst.push_back(r);
+                std::vector<NnSocketIo> sendFirst;
+                std::vector<NnSocketIo> recvFirst;
+                std::vector<NnSocketIo> sendSecond;
+                std::vector<NnSocketIo> recvSecond;
+                sendFirst.reserve(nSocketsPerThread);
+                recvFirst.reserve(nSocketsPerThread);
+                sendSecond.reserve(nSocketsPerThread);
+                recvSecond.reserve(nSocketsPerThread);
+
+                for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                    const NnUint idx = startIdx + i;
+                    const NnUint targetNode = targetNodeIndices[idx];
+                    const int sock = targetSockets[idx];
+
+                    const bool amSendFirst = (myNodeIndex < targetNode);
+
+                    if (iShouldSend) {
+                        NnSocketIo s{};
+                        s.socketIndex = (NnUint)sock;
+                        s.data = myRowSliceData;
+                        s.size = mySliceSize;
+                        if (amSendFirst) {
+                            sendFirst.push_back(s);
+                        } else {
+                            sendSecond.push_back(s);
+                        }
+                    }
+
+                    if (iShouldRecv) {
+                        NnSocketIo q{};
+                        q.socketIndex = (NnUint)sock;
+                        q.data = &rowBuffer[sliceOffsets[targetNode]];
+                        q.size = sliceSizes[targetNode];
+                        if (amSendFirst) {
+                            recvSecond.push_back(q);
+                        } else {
+                            recvFirst.push_back(q);
+                        }
+                    }
+                }
+
+                if (iShouldSend && !sendFirst.empty()) {
+                    network->writeMany((NnUint)sendFirst.size(), sendFirst.data());
+                }
+                if (iShouldRecv && !recvFirst.empty()) {
+                    network->readMany((NnUint)recvFirst.size(), recvFirst.data());
+                }
+                if (iShouldRecv && !recvSecond.empty()) {
+                    network->readMany((NnUint)recvSecond.size(), recvSecond.data());
+                }
+                if (iShouldSend && !sendSecond.empty()) {
+                    network->writeMany((NnUint)sendSecond.size(), sendSecond.data());
                 }
             }
-        }
-
-        if (iShouldSend && !sendFirst.empty()) {
-            network->writeMany((NnUint)sendFirst.size(), sendFirst.data());
-        }
-        if (iShouldRecv && !recvFirst.empty()) {
-            network->readMany((NnUint)recvFirst.size(), recvFirst.data());
-        }
-        if (iShouldRecv && !recvSecond.empty()) {
-            network->readMany((NnUint)recvSecond.size(), recvSecond.data());
-        }
-        if (iShouldSend && !sendSecond.empty()) {
-            network->writeMany((NnUint)sendSecond.size(), sendSecond.data());
         }
     }
 
@@ -2398,11 +2565,11 @@ void NnNetworkNodeSynchronizer::onSyncStepComplete(NnUint segmentIndex) {
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
 
-    const bool kvAggProof = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF") != nullptr);
-    const bool kvAggProofAllBatches = (std::getenv("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES") != nullptr);
-    const bool syncTrace = (std::getenv("DLLAMA_SYNC_TRACE") != nullptr);
-    const bool syncTraceAllThreads = (std::getenv("DLLAMA_SYNC_TRACE_ALL_THREADS") != nullptr);
-    const bool syncProfile = (std::getenv("DLLAMA_SYNC_PROFILE") != nullptr);
+    static const bool kvAggProof = envFlagEnabled("DLLAMA_KV_AGGREGATE_PROOF");
+    static const bool kvAggProofAllBatches = envFlagEnabled("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES");
+    static const bool syncTrace = envFlagEnabled("DLLAMA_SYNC_TRACE");
+    static const bool syncTraceAllThreads = envFlagEnabled("DLLAMA_SYNC_TRACE_ALL_THREADS");
+    static const bool syncProfile = envFlagEnabled("DLLAMA_SYNC_PROFILE");
 
     auto nowUs = []() -> long long {
         return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2505,7 +2672,20 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
 
         const char* syncTypeStr = "UNKNOWN";
 
-        for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
+        // Slice exchanges are batched across all rows: a single call issues
+        // one duplex phase per peer instead of one ordered exchange per row.
+        // Broadcasts and PP handoffs are batched too: pipe rows are
+        // contiguous, so the whole slab is transferred in one network phase.
+        const bool batchedSliceSync = (syncConfig->syncType == SYNC_NODE_SLICES)
+            || (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT)
+            || (syncConfig->syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT);
+        const bool batchedSync = batchedSliceSync
+            || (syncConfig->syncType == SYNC_WITH_ROOT)
+            || (syncConfig->syncType == SYNC_PP_SEND)
+            || (syncConfig->syncType == SYNC_PP_RECV);
+        const NnUint nSyncRows = batchedSync ? 1u : execution->batchSize;
+        const NnSize slabBytes = batchBytes * (NnSize)execution->batchSize;
+        for (NnUint batchIndex = 0; batchIndex < nSyncRows; batchIndex++) {
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
 
             if (syncTrace && (syncTraceAllThreads || threadIndex == 0) && batchIndex == 0) {
@@ -2529,29 +2709,29 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
 
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
                 syncTypeStr = "SYNC_WITH_ROOT";
-                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage, plan);
+                syncWithRoot(network, nodeConfig->nodeIndex, pipe, slabBytes, nThreads, threadIndex, this->myStage, plan);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeStr = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements, execution->batchSize);
             }else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeStr = "SYNC_LOGITS";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements, execution->batchSize);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT) {
                 syncTypeStr = "SYNC_STAGE_LOGITS";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements, execution->batchSize);
             }
             else if (syncConfig->syncType == SYNC_PP_SEND) {
                 syncTypeStr = "PP_SEND";
                 // PP 只要单线程执行一次
                 if (threadIndex == 0) {
-                    syncPpSend(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, plan);
+                    syncPpSend(network, nodeConfig->nodeIndex, pipe, slabBytes, plan);
                 }
             }
             else if (syncConfig->syncType == SYNC_PP_RECV) {
                 syncTypeStr = "PP_RECV";
                 // PP 只要单线程执行一次
                 if (threadIndex == 0) {
-                    syncPpRecv(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, plan);
+                    syncPpRecv(network, nodeConfig->nodeIndex, pipe, slabBytes, plan);
                 }
             }else {
                 throw std::invalid_argument("Unknown sync type");
@@ -2577,7 +2757,12 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 // Proof: after KV aggregation all-gather, dump head/tail bytes.
                 if (kvAggProof && syncConfig->syncType == SYNC_NODE_SLICES && pipeConfig->name != nullptr &&
                     (std::strcmp(pipeConfig->name, "KC") == 0 || std::strcmp(pipeConfig->name, "VC") == 0)) {
-                    if (kvAggProofAllBatches || batchIndex == 0u) {
+                    if (batchedSliceSync) {
+                        const NnUint maxProofRows = kvAggProofAllBatches ? execution->batchSize : 1u;
+                        for (NnUint proofRow = 0u; proofRow < maxProofRows; proofRow++) {
+                            printHeadTail16(pipeConfig->name, syncConfig->pipeIndex, proofRow, &pipe[proofRow * batchBytes], batchBytes);
+                        }
+                    } else if (kvAggProofAllBatches || batchIndex == 0u) {
                         printHeadTail16(pipeConfig->name, syncConfig->pipeIndex, batchIndex, pipeBatch, batchBytes);
                     }
                 }

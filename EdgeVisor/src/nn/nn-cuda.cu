@@ -101,6 +101,7 @@ static const NnTensorView *opTensorView(const NnOpConfig &op) {
         case OP_SILU: return &((const NnSiluOpCodeConfig *)op.config)->view;
         case OP_GELU: return &((const NnGeluOpCodeConfig *)op.config)->view;
         case OP_MUL: return &((const NnMulOpCodeConfig *)op.config)->view;
+        case OP_SILU_MUL: return &((const NnMulOpCodeConfig *)op.config)->view;
         case OP_SCALE: return &((const NnScaleOpCodeConfig *)op.config)->view;
         case OP_INV_RMS: return &((const NnInvRmsOpConfig *)op.config)->view;
         case OP_RMS_NORM: return &((const NnRmsNormOpConfig *)op.config)->view;
@@ -512,6 +513,33 @@ __global__ static void mulKernel(
     float *out = (float *)cudaRowBase(outputBase, output, z, y);
     const float *m = multiplier + row * multRowStride;
     out[idx] = in[idx] * m[idx];
+}
+
+__global__ static void siluMulKernel(
+    const NnByte *inputBase,
+    NnPointerLayout input,
+    NnByte *outputBase,
+    NnPointerLayout output,
+    const float *multiplier,
+    NnUint multRowStride,
+    NnTensorViewLayout view,
+    NnUint batchSize) {
+    const NnSize total = (NnSize)input.logicalSize.z * batchSize * view.sizeY * view.sizeX;
+    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    const NnUint x = (NnUint)(tid % view.sizeX);
+    NnSize t = tid / view.sizeX;
+    const NnUint vy = (NnUint)(t % view.sizeY);
+    t /= view.sizeY;
+    const NnUint y = (NnUint)(t % batchSize);
+    const NnUint z = (NnUint)(t / batchSize);
+    const NnUint row = z * input.logicalSize.y + y;
+    const NnSize idx = view.offset + vy * view.strideY + x * view.strideX;
+    const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, z, y);
+    float *out = (float *)cudaRowBase(outputBase, output, z, y);
+    const float *m = multiplier + row * multRowStride;
+    const float v = in[idx];
+    out[idx] = (v / (1.0f + expf(-v))) * m[idx];
 }
 
 __global__ static void scaleKernel(
@@ -1417,7 +1445,10 @@ NnCudaDevice::~NnCudaDevice() {
 }
 
 NnUint NnCudaDevice::maxNThreads() {
-    return 1u;
+    // Same model as the Vulkan backend: compute stays on thread 0, extra
+    // threads parallelize per-peer socket exchanges in sync steps.
+    const NnUint nThreads = std::thread::hardware_concurrency();
+    return nThreads == 0u ? 1u : nThreads;
 }
 
 std::string NnCudaDevice::launchConfigInfo() const {
@@ -2138,6 +2169,23 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             const NnSize total = (NnSize)in.layout.logicalSize.z * batchSize * view.sizeY * view.sizeX;
             if (total != 0u) {
                 mulKernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
+                    (const NnByte *)in.buffer->data(), in.layout,
+                    (NnByte *)out.buffer->data(), out.layout,
+                    (const float *)multBuf->data(), multRowStride,
+                    view, batchSize);
+                NN_CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
+        case OP_SILU_MUL: {
+            const NnMulOpCodeConfig *config = (const NnMulOpCodeConfig *)op.config;
+            if (config == nullptr) throw std::runtime_error("CUDA SILU_MUL missing config");
+            const NnTensorViewLayout view = resolveOpView(op, out.layout.logicalSize, out.layout.logicalSize.x);
+            NnCudaBuffer *multBuf = device->data.resolveBuffer(config->multiplierBufferIndex);
+            const NnUint multRowStride = nodeConfig->buffers[config->multiplierBufferIndex].size.x;
+            const NnSize total = (NnSize)in.layout.logicalSize.z * batchSize * view.sizeY * view.sizeX;
+            if (total != 0u) {
+                siluMulKernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     (const float *)multBuf->data(), multRowStride,

@@ -1068,7 +1068,10 @@ void NnVulkanDevice::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
 }
 
 NnUint NnVulkanDevice::maxNThreads() {
-    return 1;
+    // Segment compute stays on thread 0; additional threads parallelize the
+    // per-peer socket exchanges in sync steps.
+    const NnUint nThreads = std::thread::hardware_concurrency();
+    return nThreads == 0u ? 1u : nThreads;
 }
 
 NnDeviceSegment *NnVulkanDevice::createSegment(NnUint segmentIndex) {
@@ -2081,7 +2084,9 @@ void NnVulkanDeviceSegment::refreshPointers() {
 }
 
 void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize)  {
-    assert(threadIndex == 0);
+    // GPU segments are single-threaded; extra executor threads only take part
+    // in sync steps (socket partitioning) and must no-op here.
+    if (threadIndex != 0) return;
 
     if (opIndex != 0) {
         // TODO: this is a design problem, executor tries to forward all ops in a segment

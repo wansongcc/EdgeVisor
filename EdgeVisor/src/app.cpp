@@ -518,7 +518,16 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.backendStr = nullptr;
     args.memoryLimitBytes = 0;
     args.mode = nullptr;
+    args.nThreadsExplicit = false;
     args.nBatches = 32;
+    if (const char *p = std::getenv("DLLAMA_NBATCHES")) {
+        // Test knob: larger prefill chunks amortize the per-forward sync
+        // round trips over more prompt tokens.
+        try {
+            NnUint v = (NnUint)std::stoul(std::string(p));
+            if (v > 0) args.nBatches = v;
+        } catch (...) {}
+    }
     args.nThreads = 1;
     args.modelPath = nullptr;
     args.tokenizerPath = nullptr;
@@ -878,6 +887,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.listenUnixPath = value;
         } else if (std::strcmp(name, "--nthreads") == 0) {
             args.nThreads = atoi(value);
+            args.nThreadsExplicit = true;
         } else if (std::strcmp(name, "--max-active-seqs") == 0) {
             int x = std::atoi(value);
             if (x < 1) x = 1;
@@ -1461,10 +1471,12 @@ struct ArgsRestoreGuard {
     char *ratios;
     bool benchmark;
     NnUint nWorkers;
+    NnUint nThreads;
     ~ArgsRestoreGuard() {
         args->ratiosStr = ratios;
         args->benchmark = benchmark;
         args->nWorkers = nWorkers;
+        args->nThreads = nThreads;
     }
 };
 
@@ -1754,6 +1766,43 @@ static double warmupMaxStageNodeMs(
     return maxMs;
 }
 
+
+// Returns the number of sync peers of the node in its TP stage (0 for
+// single-node stages / pure PP), used to auto-size executor threads.
+static NnUint resolveStagePeerCount(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint nNodes) {
+    if (plan == nullptr || plan->nStages == 0u) {
+        return nNodes > 0u ? nNodes - 1u : 0u;
+    }
+    for (NnUint s = 0; s < plan->nStages; s++) {
+        const NnStageConfig *stage = &plan->stages[s];
+        for (NnUint i = 0; i < stage->nNodes; i++) {
+            if (stage->nodeIndices[i] == myNodeIndex) {
+                return stage->nNodes > 0u ? stage->nNodes - 1u : 0u;
+            }
+        }
+    }
+    return 0u;
+}
+
+// Auto-size executor threads for the Vulkan backend when the user did not
+// pass --nthreads: sync exchanges parallelize across stage peers, so more
+// threads cut the per-token sync time on TP topologies. Pure-PP (single-node
+// stages) keeps 1 thread, where extra threads only add overhead.
+static void autoTuneThreads(AppCliArgs *args, const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint nNodes) {
+    if (args->nThreadsExplicit || args->nThreads != 1u) return;
+    if (args->backend != AppCliArgs::BACKEND_VULKAN && args->backend != AppCliArgs::BACKEND_CUDA) return;
+    const NnUint peers = resolveStagePeerCount(plan, myNodeIndex, nNodes);
+    if (peers == 0u) return;
+    NnUint hw = (NnUint)std::thread::hardware_concurrency();
+    if (hw == 0u) hw = 1u;
+    NnUint n = 2u * peers;
+    if (n > hw) n = hw;
+    if (n > 1u) {
+        args->nThreads = n;
+        std::printf("🧵 [auto] nThreads=%u (stage peers=%u; pass --nthreads to override)\n", (unsigned)n, (unsigned)peers);
+    }
+}
+
 static WarmupCandidateResult probeWarmupCandidate(
     AppCliArgs *args,
     LlmHeader *header,
@@ -1764,6 +1813,13 @@ static WarmupCandidateResult probeWarmupCandidate(
     result.nWorkers = candidate.nWorkers;
     result.workerIndices = candidate.workerIndices;
     try {
+        ArgsRestoreGuard argsGuard{
+            args,
+            args->ratiosStr,
+            args->benchmark,
+            args->nWorkers,
+            args->nThreads,
+        };
         const NnUint nWorkers = candidate.nWorkers;
         const NnUint nNodes = nWorkers + 1u;
         const bool distributed = nWorkers > 0u;
@@ -1790,6 +1846,7 @@ static WarmupCandidateResult probeWarmupCandidate(
             : buildLlmNet(header, nNodes, args->nBatches, args->maxActiveSeqs);
         std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
         NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
+        autoTuneThreads(args, planPtr.get(), 0u, nNodes);
         NnNetExecution execution(args->nThreads, &net.netConfig);
         std::vector<char*> candidateHosts;
         std::vector<NnUint> candidatePorts;
@@ -1802,7 +1859,6 @@ static WarmupCandidateResult probeWarmupCandidate(
         char *savedRatios = args->ratiosStr;
         const bool savedBenchmark = args->benchmark;
         const NnUint savedWorkers = args->nWorkers;
-        ArgsRestoreGuard argsGuard{args, savedRatios, savedBenchmark, savedWorkers};
         std::string probeRatios = candidate.ratios;
         args->nWorkers = nWorkers;
         args->ratiosStr = uneven ? const_cast<char*>(probeRatios.c_str()) : nullptr;
@@ -2219,6 +2275,28 @@ static bool getHeadMigrationTargetRangeLocal(
     return true;
 }
 
+void RootLlmInference::setSkipLogits(bool skip) {
+    skipLogits_ = skip;
+}
+
+// Segments that only carry the logits gather (end segment on the last stage,
+// root_wait on node 0 with PP); their compute+sync are skipped for non-final
+// prefill chunks because those logits are never consumed.
+static std::vector<NnUint> findLogitsSegmentIndices(const NnNodeConfig *nodeConfig) {
+    std::vector<NnUint> out;
+    for (NnUint s = 0; s < nodeConfig->nSegments; s++) {
+        const NnSegmentConfig *seg = &nodeConfig->segments[s];
+        for (NnUint j = 0; j < seg->nSyncs; j++) {
+            if (seg->syncs[j].syncType == SYNC_NODE_SLICES_EXCEPT_ROOT ||
+                seg->syncs[j].syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT) {
+                out.push_back(s);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
 RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
@@ -2232,6 +2310,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->network = network;
     this->plan = plan;
     this->runtimePlan = (net != nullptr) ? &net->runtimeStageLayerPlan : nullptr;
+    this->logitsSegmentIndices = findLogitsSegmentIndices(&net->nodeConfigs[0]);
     this->profileEnabled = profileEnabled;
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
     this->controlPacket.planCmdSeq = 0u;
@@ -3808,6 +3887,12 @@ void RootLlmInference::forward(bool collectProfile) {
 
         LlmControlPacket out = controlPacket;
         out.flags = controlPacket.flags;
+        if (skipLogits_) {
+            out.flags |= LLM_CTRL_SKIP_LOGITS;
+        }
+        for (NnUint segIndex : logitsSegmentIndices) {
+            executor->setSegmentEnabled(segIndex, !skipLogits_);
+        }
         out.planCmdSeq = planCmdSeqLo;
 
         const bool planChanged = (planCmdSeqLo != lastPlanCmdSeqSent);
@@ -4949,6 +5034,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         printNodeRequiredMemory(&net.netConfig, rootNodeConfig);
     }
 
+    autoTuneThreads(args, planPtr.get(), 0u, nNodes);
     NnNetExecution execution(args->nThreads, &net.netConfig);
 
     std::unique_ptr<NnNodeSynchronizer> synchronizer(nullptr);
@@ -5135,8 +5221,6 @@ void runWorkerApp(AppCliArgs *args) {
         printNodeRequiredMemory(&netConfig, &nodeConfig);
         validateStaticMemoryBudget(args->memoryLimitBytes, &netConfig, &nodeConfig);
 
-        NnNetExecution execution(args->nThreads, &netConfig);
-
            // 1. Initialize Plan Pointer (Worker Side)
            std::unique_ptr<NnUnevenPartitionPlan> planPtr;
         
@@ -5163,6 +5247,8 @@ void runWorkerApp(AppCliArgs *args) {
 
         dllamaIoProbeSetNode(nodeConfig.nodeIndex, getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex));
 
+        autoTuneThreads(args, planPtr.get(), nodeConfig.nodeIndex, netConfig.nNodes);
+        NnNetExecution execution(args->nThreads, &netConfig);
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
         // Initialize Synchronizer with Plan
@@ -5217,6 +5303,7 @@ void runWorkerApp(AppCliArgs *args) {
             lastStageSampler.reset(new Sampler((int)samplerVocabSize, boot.samplerTemperature, boot.samplerTopP, boot.samplerSeed));
         }
         WorkerLlmInference inference(&execution, network, nodeConfig.nodeIndex, logitsPipeIndex, lastStageSampler.get());
+        const std::vector<NnUint> logitsSegmentIndices = findLogitsSegmentIndices(&nodeConfig);
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
@@ -5361,6 +5448,15 @@ void runWorkerApp(AppCliArgs *args) {
                     }
                     isFirstAttempt = true;
                     continue;
+                }
+
+                // Non-final prefill chunks skip the end-segment logits
+                // compute+gather (flag from the root's control packet).
+                {
+                    const bool skipLogits = inference.isSkipLogits();
+                    for (NnUint segIndex : logitsSegmentIndices) {
+                        executor.setSegmentEnabled(segIndex, !skipLogits);
+                    }
                 }
 
                 executor.forward();

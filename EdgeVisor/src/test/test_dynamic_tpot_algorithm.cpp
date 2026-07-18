@@ -213,6 +213,9 @@ int main() {
         "scheduler selects the interior optimum instead of the largest allowed batch");
     require(multiMove.layerIndex == multi[0].endLayer - multiMove.layerCount,
         "forward candidate identifies the first layer in the contiguous range");
+    const std::string multiLog = tpot::formatPpCandidateLogFields(multiMove);
+    require(multiLog.find("pp_best_layer_count=" + std::to_string(multiMove.layerCount)) != std::string::npos,
+        "PP candidate log includes selected layer count");
 
     tpot::Candidate predicted = multiMove;
     tpot::applyPpMove(multi, predicted);

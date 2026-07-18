@@ -27,7 +27,8 @@ inline std::string formatPpCandidateLogFields(const Candidate &candidate) {
         << " pp_best_reason=" << sanitizeCandidateLogValue(candidate.reason)
         << " pp_best_from_stage=" << candidate.fromStageIndex
         << " pp_best_to_stage=" << candidate.toStageIndex
-        << " pp_best_layer=" << candidate.layerIndex;
+        << " pp_best_layer=" << candidate.layerIndex
+        << " pp_best_layer_count=" << candidate.layerCount;
     return oss.str();
 }
 

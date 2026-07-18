@@ -611,15 +611,8 @@ static json makePpCommand(uint32_t seq, const tpot::Candidate &c) {
     cmd["mode"] = "next_barrier";
     cmd["fromNodeIndex"] = c.fromNodeIndex;
     cmd["toNodeIndex"] = c.toNodeIndex;
-    cmd["layerCount"] = 1u;
+    cmd["layerCount"] = tpot::ppCommandLayerCount(c);
     return json{{"op", "set_pp_migration"}, {"cmd", cmd}};
-}
-
-static tpot::Candidate reverseCandidate(const tpot::Candidate &c) {
-    tpot::Candidate r = c;
-    std::swap(r.fromNodeIndex, r.toNodeIndex);
-    std::swap(r.fromStageIndex, r.toStageIndex);
-    return r;
 }
 
 static bool issueCandidate(const std::string &socketPath, int timeoutMs, uint32_t seq, const tpot::Candidate &c, json *resp) {
@@ -886,7 +879,7 @@ void DynamicTpotController::run() {
                 if (elapsed >= (uint32_t)rt.cfg.rollbackWindow) {
                     const bool degraded = window.tpotMs > rt.pending.beforeTpotMs * 1.05;
                     if (degraded) {
-                        tpot::Candidate reverse = reverseCandidate(rt.pending.candidate);
+                        tpot::Candidate reverse = tpot::reversePpCandidate(rt.pending.candidate);
                         json resp;
                         if (issueCandidate(socketPath_, rt.timeoutMs, rt.seq++, reverse, &resp)) {
                             rt.metrics.rollbackCount += 1u;

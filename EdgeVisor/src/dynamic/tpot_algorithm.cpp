@@ -86,6 +86,51 @@ static double ppBoundaryDeltaOutMs(const StageSnapshot &source, const StageSnaps
     return measured > 0.0 ? measured : ppDeltaOutMs(source, cfg);
 }
 
+Candidate ppCandidateForMove(
+    const StageSnapshot &source,
+    const StageSnapshot &target,
+    uint32_t layerCount,
+    const SchedulerConfig &cfg) {
+    Candidate c;
+    c.kind = CandidateKind::PP_MOVE;
+    c.fromStageIndex = source.stageIndex;
+    c.toStageIndex = target.stageIndex;
+    c.fromNodeIndex = source.rootNodeIndex;
+    c.toNodeIndex = target.rootNodeIndex;
+    c.layerCount = layerCount;
+
+    const uint32_t sourceLayers = stageLayerCount(source);
+    const uint32_t targetLayers = stageLayerCount(target);
+    if (!target.hasFullWeights || layerCount == 0u || sourceLayers <= layerCount) {
+        c.reason = "no eligible pp candidate";
+        return c;
+    }
+
+    const double firstOut = ppBoundaryDeltaOutMs(source, target, cfg);
+    const double remainingOut = layerCount > 1u
+        ? stageCostMs(source, sourceLayers - 1u, cfg) -
+          stageCostMs(source, sourceLayers - layerCount, cfg)
+        : 0.0;
+    const double targetIn =
+        stageCostMs(target, targetLayers + layerCount, cfg) -
+        stageCostMs(target, targetLayers, cfg);
+    const double scaledRisk = (double)layerCount *
+        (cfg.ppRiskMarginMs + target.riskPenalty * maxDouble(1.0, target.avgLayerMs));
+    const double migrationCost = (double)layerCount *
+        migrationCostPerToken(cfg.ppMigrationCostMs, cfg.expectedRemainingTokens);
+
+    c.gainMs = firstOut + remainingOut - targetIn - migrationCost - scaledRisk;
+    c.thresholdMs = ppLocalGainThresholdMs(source, target, cfg);
+    c.valid = c.gainMs > c.thresholdMs;
+    c.reason = c.valid ? "" : "gain below threshold";
+    if (target.stageIndex > source.stageIndex) {
+        c.layerIndex = source.endLayer - layerCount;
+    } else {
+        c.layerIndex = source.startLayer;
+    }
+    return c;
+}
+
 Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double currentTpotMs, const SchedulerConfig &cfg) {
     if (stages.size() < 2u) return makeRejected(CandidateKind::PP_MOVE, "no eligible pp candidate");
 
@@ -96,7 +141,6 @@ Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double curre
     best.reason = "no eligible pp candidate";
     bool haveRejected = false;
 
-    const double migCost = migrationCostPerToken(cfg.ppMigrationCostMs, cfg.expectedRemainingTokens);
     for (size_t i = 0u; i + 1u < stages.size(); ++i) {
         const StageSnapshot &left = stages[i];
         const StageSnapshot &right = stages[i + 1u];
@@ -110,39 +154,9 @@ Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double curre
             if (!target.hasFullWeights) continue;
             if (sourceLayers <= 1u) continue;
 
-            const uint32_t targetLayers = stageLayerCount(target);
             const uint32_t maxMove = std::min(cfg.maxPpLayerMove, sourceLayers - 1u);
             for (uint32_t k = 1u; k <= maxMove; ++k) {
-                const double firstOut = ppBoundaryDeltaOutMs(source, target, cfg);
-                const double remainingOut = k > 1u
-                    ? stageCostMs(source, sourceLayers - 1u, cfg) -
-                      stageCostMs(source, sourceLayers - k, cfg)
-                    : 0.0;
-                const double targetIn =
-                    stageCostMs(target, targetLayers + k, cfg) -
-                    stageCostMs(target, targetLayers, cfg);
-                const double scaledRisk = (double)k *
-                    (cfg.ppRiskMarginMs + target.riskPenalty * maxDouble(1.0, target.avgLayerMs));
-                const double gain = firstOut + remainingOut - targetIn -
-                    (double)k * migCost - scaledRisk;
-
-                const double threshold = ppLocalGainThresholdMs(source, target, cfg);
-                Candidate c;
-                c.kind = CandidateKind::PP_MOVE;
-                c.valid = gain > threshold;
-                c.reason = c.valid ? "" : "gain below threshold";
-                c.gainMs = gain;
-                c.thresholdMs = threshold;
-                c.fromStageIndex = source.stageIndex;
-                c.toStageIndex = target.stageIndex;
-                c.fromNodeIndex = source.rootNodeIndex;
-                c.toNodeIndex = target.rootNodeIndex;
-                c.layerCount = k;
-                if (target.stageIndex > source.stageIndex) {
-                    c.layerIndex = source.endLayer - k;
-                } else {
-                    c.layerIndex = source.startLayer;
-                }
+                const Candidate c = ppCandidateForMove(source, target, k, cfg);
                 if (c.valid) {
                     considerBest(best, c);
                 } else if (!best.valid && (!haveRejected || c.gainMs > best.gainMs)) {
@@ -278,6 +292,14 @@ Candidate reversePpCandidate(const Candidate &candidate) {
     std::swap(reverse.fromStageIndex, reverse.toStageIndex);
     std::swap(reverse.fromNodeIndex, reverse.toNodeIndex);
     return reverse;
+}
+
+Candidate filterPpCandidateForStaticLayout(const Candidate &candidate, bool layoutChanged) {
+    if (!layoutChanged || candidate.kind != CandidateKind::PP_MOVE) return candidate;
+    Candidate filtered = candidate;
+    filtered.valid = false;
+    filtered.reason = "pp layout changed; restart or rollback required";
+    return filtered;
 }
 
 uint32_t ppCommandLayerCount(const Candidate &candidate) {

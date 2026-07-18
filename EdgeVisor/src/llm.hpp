@@ -99,6 +99,10 @@ struct RuntimeStageLayerPlan {
     }
 };
 
+RuntimeStageLayerPlan buildRuntimeStageLayerPlan(
+    const NnUnevenPartitionPlan *plan,
+    NnUint nLayers);
+
 typedef struct {
     LlmHeader *header;
     NnNetConfig netConfig;

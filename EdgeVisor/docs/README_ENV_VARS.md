@@ -191,10 +191,15 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 - `--runtime-redundant-boundary-layers <n>`（命令行参数）
   - 默认：`1`
   - 作用：为 PP boundary 周围保留可激活的 redundant layer 权重/segment。纯 PP 自动迁移通常至少需要 `1`。
+  - 自动 TPOT：未显式配置时会在 graph 构建和 worker bootstrap 前自动提升到 `K`；若 CLI/环境显式配置的值小于 `K`，启动参数校验会拒绝该配置。
 
 - `set_pp_migration.layerCount`（UDS 字段）
   - 默认：`1`
   - 作用：控制 PP 迁移时按边界向内扩展的层数。自动调度会在 `1..K` 的候选层数中选择；其中 `K` 由 `--tpot-max-pp-layer-move` 或 `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` 配置。
+
+- `set_pp_migration.firstLayer`（UDS 字段）
+  - 默认：未设置时按静态边界兼容推导。
+  - 作用：指定连续迁移范围的第一个 layer；自动调度始终发送该字段，使前向迁移与回滚使用完全相同的 `[firstLayer, firstLayer + layerCount)` 范围。
 
 - `DLLAMA_MIGRATION_LAYER_LIST`（逗号分隔整数列表）
   - 默认：未设置
@@ -221,7 +226,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 | `--plan-ctrl-socket <path>` | CLI 参数 | 未设置 | 指定自动调度器和 plan controller 使用的 UDS 路径 | 不适用 |
 | `--enable-pp-migration` | CLI 开关 | 自动模式会开启 | 启用 PP layer 迁移执行路径 | 不适用 |
 | `DLLAMA_DYNAMIC_TPOT_ENABLE` | 布尔 | `0` | 直接启用/关闭自动 TPOT 调度器 | 不适用 |
-| `DLLAMA_TPOT_LOG` | 路径 | `/tmp/dllama_tpot_scheduler.log` | 调度器结构化日志，包含 `gain_ms`、`threshold_ms`、`note`，以及 PP 候选字段 `pp_best_valid`、`pp_best_gain_ms`、`pp_best_threshold_ms`、`pp_best_reason`、`pp_best_from_stage`、`pp_best_to_stage`、`pp_best_layer` | 不影响策略 |
+| `DLLAMA_TPOT_LOG` | 路径 | `/tmp/dllama_tpot_scheduler.log` | 调度器结构化日志，包含所选/待验证动作字段 `gain_ms`、`threshold_ms`、`layer_count`、`note`，以及新鲜 PP 候选字段 `pp_best_valid`、`pp_best_gain_ms`、`pp_best_threshold_ms`、`pp_best_reason`、`pp_best_from_stage`、`pp_best_to_stage`、`pp_best_layer`、`pp_best_layer_count` | 不影响策略 |
 | `DLLAMA_TPOT_WINDOW_TOKENS` | 整数 | `16` | 每次决策累计的 decode token 窗口 | 决策更稳但更慢 |
 | `DLLAMA_TPOT_MIN_SAMPLES` | 整数 | `8` | 形成一次有效决策窗口所需最少样本 | 降低低样本误判 |
 | `DLLAMA_TPOT_COOLDOWN_TOKENS` | 整数 | `32` | 一次迁移后禁止再次迁移的 token 数 | 减少连续迁移 |
@@ -263,6 +268,8 @@ export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
 ```bash
 ./dllama inference ... --enable-dynamic-tpot --tpot-max-pp-layer-move 4
 ```
+
+该命令未显式指定 `--runtime-redundant-boundary-layers` 时，会自动按 `4` 层构建 boundary 两侧的 runtime redundant coverage。若显式同时指定较小的值（例如 `--runtime-redundant-boundary-layers 2`），启动会拒绝配置，避免 target 未 provisioned 时关闭 source layer。一次成功 PP layout 变更后，当前进程不再生成新的 PP 候选；若验证触发并成功下发回滚，则恢复候选资格。TP 候选不受影响。
 
 ### 1.5.1 KV/网络稳定性与 collector
 

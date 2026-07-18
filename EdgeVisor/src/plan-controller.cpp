@@ -346,6 +346,44 @@ static bool parseMode(const std::string &s, uint32_t &out) {
     return false;
 }
 
+PlanCommand decodePpMigrationCommand(const json &jcmd) {
+    PlanCommand cmd = makeEmptyPlanCommand();
+    cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
+    cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+    cmd.seq = parseU32(jcmd, "seq", 0u);
+
+    const std::string modeStr = jcmd.value("mode", "");
+    if (!parseMode(modeStr, cmd.mode)) {
+        throw std::runtime_error("bad mode (use exact/next_barrier)");
+    }
+
+    cmd.stageIndex = parseU32(jcmd, "stageIndex", 0xFFFFFFFFu);
+    cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
+    cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 1u);
+    cmd.cmdKind = 0u;
+    cmd.nHeadsToMove = 0u;
+    cmd.nFfnToMove = 0u;
+    cmd.nMoves = 0u;
+    cmd.reserved0 = parseU32(jcmd, "layerCount", 1u);
+    if (cmd.reserved0 == 0u) {
+        throw std::runtime_error("layerCount must be >= 1");
+    }
+
+    cmd.triggerLayer = parseU32(
+        jcmd,
+        "firstLayer",
+        parseU32(jcmd, "triggerLayer", 0xFFFFFFFFu));
+    if (cmd.mode == PLAN_CMD_MODE_EXACT) {
+        if (!jcmd.contains("triggerPos")) {
+            throw std::runtime_error("exact mode requires triggerPos");
+        }
+        cmd.triggerPos = parseU32(jcmd, "triggerPos", 0xFFFFFFFFu);
+    } else {
+        cmd.triggerPos = 0xFFFFFFFFu;
+    }
+    return cmd;
+}
+
 static std::string nodePairString(const PlanCommand &cmd) {
     std::ostringstream oss;
     oss << "stage=" << cmd.stageIndex << ",from=" << cmd.fromNodeIndex << ",to=" << cmd.toNodeIndex;
@@ -636,40 +674,7 @@ void PlanUdsController::run() {
                 if (!req.contains("cmd")) throw std::runtime_error("missing cmd");
                 const json &jcmd = req.at("cmd");
 
-                PlanCommand cmd = makeEmptyPlanCommand();
-                cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
-                cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
-                cmd.seq = parseU32(jcmd, "seq", 0u);
-
-                const std::string modeStr = jcmd.value("mode", "");
-                if (!parseMode(modeStr, cmd.mode)) {
-                    throw std::runtime_error("bad mode (use exact/next_barrier)");
-                }
-
-                cmd.stageIndex = parseU32(jcmd, "stageIndex", 0xFFFFFFFFu);
-                cmd.fromNodeIndex = parseU32(jcmd, "fromNodeIndex", 0u);
-                cmd.toNodeIndex = parseU32(jcmd, "toNodeIndex", 1u);
-
-                // cmdKind=0 + no moves => reserved for PP layer migration control path.
-                cmd.cmdKind = 0u;
-                cmd.nHeadsToMove = 0u;
-                cmd.nFfnToMove = 0u;
-                cmd.nMoves = 0u;
-                cmd.reserved0 = parseU32(jcmd, "layerCount", 1u);
-                if (cmd.reserved0 == 0u) {
-                    throw std::runtime_error("layerCount must be >= 1");
-                }
-
-                if (cmd.mode == PLAN_CMD_MODE_EXACT) {
-                    if (!jcmd.contains("triggerPos")) {
-                        throw std::runtime_error("exact mode requires triggerPos");
-                    }
-                    cmd.triggerPos = parseU32(jcmd, "triggerPos", 0xFFFFFFFFu);
-                    cmd.triggerLayer = parseU32(jcmd, "triggerLayer", 0xFFFFFFFFu);
-                } else {
-                    cmd.triggerPos = 0xFFFFFFFFu;
-                    cmd.triggerLayer = 0xFFFFFFFFu;
-                }
+                PlanCommand cmd = decodePpMigrationCommand(jcmd);
 
                 const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
                 if (cfg.disablePipelineBalancer) {

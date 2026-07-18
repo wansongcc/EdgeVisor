@@ -2296,7 +2296,7 @@ static NnNodeConfig buildLlmNodeInternal(
     return config;
 }
 
-static RuntimeStageLayerPlan buildRuntimeStageLayerPlanStatic(const NnUnevenPartitionPlan *plan, NnUint nLayers) {
+RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *plan, NnUint nLayers) {
     RuntimeStageLayerPlan out;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages == 0u || nLayers == 0u) return out;
 
@@ -2364,7 +2364,7 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
     LlmNet n;
     n.maxActiveSeqs = std::max<NnUint>(1u, maxActiveSeqs);
     n.header = h;
-    n.runtimeStageLayerPlan = buildRuntimeStageLayerPlanStatic(plan, h->nLayers);
+    n.runtimeStageLayerPlan = buildRuntimeStageLayerPlan(plan, h->nLayers);
 
     // 1. Global Dimensions
     n.tokenEmbeddingSize = tokenEmbeddingResidentSize(h);

@@ -90,9 +90,15 @@ double ppGainThresholdMs(double currentTpotMs, const SchedulerConfig &cfg);
 double tpGainThresholdMs(const StageSnapshot &stage, const SchedulerConfig &cfg);
 
 Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double currentTpotMs, const SchedulerConfig &cfg);
+Candidate ppCandidateForMove(
+    const StageSnapshot &source,
+    const StageSnapshot &target,
+    uint32_t layerCount,
+    const SchedulerConfig &cfg);
 Candidate bestTpCandidate(const std::vector<StageSnapshot> &stages, const SchedulerConfig &cfg);
 Candidate betterCandidate(const Candidate &a, const Candidate &b);
 Candidate reversePpCandidate(const Candidate &candidate);
+Candidate filterPpCandidateForStaticLayout(const Candidate &candidate, bool layoutChanged);
 uint32_t ppCommandLayerCount(const Candidate &candidate);
 
 void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate);

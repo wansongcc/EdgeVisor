@@ -58,7 +58,7 @@ struct PlanCommand {
 
     uint32_t stageIndex;   // UINT32_MAX = any stage
     uint32_t triggerPos;   // used only for EXACT
-    uint32_t triggerLayer; // used only for EXACT
+    uint32_t triggerLayer; // EXACT trigger layer; PP NEXT_BARRIER reuses it as firstLayer
 
     uint32_t fromNodeIndex;
     uint32_t toNodeIndex;

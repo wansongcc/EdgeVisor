@@ -6,7 +6,12 @@
 #include <string>
 #include <thread>
 
+#include "json.hpp"
+#include "plan-command.hpp"
+
 class RootLlmInference;
+
+PlanCommand decodePpMigrationCommand(const nlohmann::json &commandJson);
 
 // Lightweight UDS controller for online migration PlanCommand.
 // Protocol: one-line JSON request per connection (or per line), one-line JSON response.

@@ -5,6 +5,7 @@
 #include <deque>
 #include <mutex>
 #include <chrono>
+#include <string>
 #include <utility>
 #include "nn/nn-core.hpp"
 #include "nn/nn-cpu.hpp"
@@ -90,6 +91,7 @@ public:
     char *tpotMaxPpLayerMoveStr;
     char *planCtrlSocketPath; // UDS path used by plan controller and dynamic TPOT scheduler
     NnUint runtimeRedundantBoundaryLayers; // Runtime redundant boundary span in layers
+    bool runtimeRedundantBoundaryLayersExplicit;
     bool runtimeActiveSegEnabled; // Default gate for primary segments
     bool runtimeRedundantSegEnabled; // Default gate for redundant segments
     char *runtimePrimarySkipLayersStr; // Comma-separated primary layers to disable, e.g. "14,15"
@@ -114,6 +116,13 @@ public:
     ~AppCliArgs();
 
 };
+
+bool resolvePpMigrationLayers(
+    const PlanCommand &command,
+    const NnUnevenPartitionPlan *plan,
+    const RuntimeStageLayerPlan *runtimePlan,
+    std::vector<NnUint> &layers,
+    std::string *reason = nullptr);
 
 typedef struct {
     NnUint position;
@@ -191,6 +200,7 @@ typedef struct {
 
 enum LlmLayerSwitchFlags : NnUint {
     LLM_LAYER_SWITCH_STAGE_BYPASS = 1u << 0,
+    LLM_LAYER_SWITCH_NEW_PP_START = 1u << 1,
 };
 
 typedef struct {

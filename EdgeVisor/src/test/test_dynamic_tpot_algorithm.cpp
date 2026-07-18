@@ -89,6 +89,55 @@ int main() {
     cfg.ppRiskMarginMs = 0.0;
     cfg.tpRiskMarginMs = 0.0;
 
+    tpot::StageSnapshot scoredSource = stage(0, 0, 0, 6, 20.0);
+    tpot::StageSnapshot scoredTarget = stage(1, 1, 6, 2, 5.0);
+    scoredSource.rightBoundaryLayerMs = 20.0;
+    scoredTarget.riskPenalty = 0.5;
+    cfg.minPpGainMs = 1.0;
+    cfg.ppGainRatio = 0.10;
+    cfg.ppRiskMarginMs = 2.0;
+    cfg.ppMigrationCostMs = 384.0;
+    cfg.expectedRemainingTokens = 128;
+    const tpot::Candidate scoredOne = tpot::ppCandidateForMove(scoredSource, scoredTarget, 1u, cfg);
+    const tpot::Candidate scoredFour = tpot::ppCandidateForMove(scoredSource, scoredTarget, 4u, cfg);
+    tpot::SchedulerConfig unpenalizedCfg = cfg;
+    unpenalizedCfg.ppRiskMarginMs = 0.0;
+    unpenalizedCfg.ppMigrationCostMs = 0.0;
+    scoredTarget.riskPenalty = 0.0;
+    const tpot::Candidate unpenalizedOne = tpot::ppCandidateForMove(scoredSource, scoredTarget, 1u, unpenalizedCfg);
+    const tpot::Candidate unpenalizedFour = tpot::ppCandidateForMove(scoredSource, scoredTarget, 4u, unpenalizedCfg);
+    require(near(unpenalizedOne.gainMs - scoredOne.gainMs, 7.5),
+        "one-layer PP risk and migration deductions use one unit");
+    require(near(unpenalizedFour.gainMs - scoredFour.gainMs, 30.0),
+        "four-layer PP risk and migration deductions scale by four");
+    require(near(scoredOne.thresholdMs, scoredFour.thresholdMs),
+        "PP acceptance threshold does not scale with layer count");
+
+    tpot::Candidate selectedForLog = scoredFour;
+    selectedForLog.layerCount = 3u;
+    tpot::Candidate freshBestForLog = scoredOne;
+    freshBestForLog.layerCount = 1u;
+    const std::string decisionLog = tpot::formatSelectedCandidateLogFields(selectedForLog) + " " +
+        tpot::formatPpCandidateLogFields(freshBestForLog);
+    require(decisionLog.find("layer_count=3") != std::string::npos,
+        "selected or pending layer count remains stable in decision logs");
+    require(decisionLog.find("pp_best_layer_count=1") != std::string::npos,
+        "fresh best PP layer count is logged independently");
+
+    tpot::Candidate layoutCandidate = scoredOne;
+    layoutCandidate.valid = true;
+    const tpot::Candidate blockedAfterMove = tpot::filterPpCandidateForStaticLayout(layoutCandidate, true);
+    require(!blockedAfterMove.valid && blockedAfterMove.reason == "pp layout changed; restart or rollback required",
+        "accepted PP layout changes suppress stale later PP candidates");
+    const tpot::Candidate allowedAfterRollback = tpot::filterPpCandidateForStaticLayout(layoutCandidate, false);
+    require(allowedAfterRollback.valid, "successful rollback restores PP candidate eligibility");
+
+    cfg = tpot::SchedulerConfig();
+    cfg.minPpGainMs = 5.0;
+    cfg.minTpGainMs = 2.0;
+    cfg.ppRiskMarginMs = 0.0;
+    cfg.tpRiskMarginMs = 0.0;
+
     tpot::StageSnapshot s = stage(0, 0, 0, 4, 10.0);
     require(near(tpot::stageCostMs(s, 4, cfg), 40.0), "F_s(n) base cost");
     require(near(tpot::ppDeltaInMs(s, cfg), 10.0), "default delta_in has no load penalty");

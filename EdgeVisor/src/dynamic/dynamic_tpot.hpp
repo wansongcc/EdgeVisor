@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dynamic/tpot_algorithm.hpp"
+#include "json.hpp"
 
 #include <atomic>
 #include <memory>
@@ -13,6 +14,7 @@ namespace dllama {
 namespace dynamic_tpot {
 
 SchedulerConfig loadSchedulerConfigFromEnvironment();
+nlohmann::json makePpCommandRequest(uint32_t seq, const Candidate &candidate);
 
 } // namespace dynamic_tpot
 } // namespace dllama

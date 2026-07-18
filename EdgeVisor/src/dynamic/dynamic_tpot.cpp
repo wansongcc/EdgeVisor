@@ -115,6 +115,7 @@ struct ControllerRuntime {
     std::map<uint32_t, double> riskPenaltyByStage;
     PendingAction pending;
     std::set<std::string> issuedPpKeys;
+    bool ppLayoutChanged = false;
     SchedulerMetrics metrics;
 };
 
@@ -575,10 +576,6 @@ static bool tpotJitterStable(const std::vector<double> &recent) {
     return ((maxV - minV) / avg) <= 0.03;
 }
 
-static std::string commandName(const tpot::Candidate &c) {
-    return tpot::candidateKindName(c.kind);
-}
-
 static std::string ppCandidateKey(const tpot::Candidate &c) {
     std::ostringstream oss;
     oss << c.fromStageIndex << ":" << c.toStageIndex << ":" << c.layerIndex;
@@ -605,16 +602,6 @@ static json makeTpCommand(uint32_t seq, const tpot::Candidate &c) {
     return json{{"op", "set_plan"}, {"cmd", cmd}};
 }
 
-static json makePpCommand(uint32_t seq, const tpot::Candidate &c) {
-    json cmd;
-    cmd["seq"] = seq;
-    cmd["mode"] = "next_barrier";
-    cmd["fromNodeIndex"] = c.fromNodeIndex;
-    cmd["toNodeIndex"] = c.toNodeIndex;
-    cmd["layerCount"] = tpot::ppCommandLayerCount(c);
-    return json{{"op", "set_pp_migration"}, {"cmd", cmd}};
-}
-
 static bool issueCandidate(const std::string &socketPath, int timeoutMs, uint32_t seq, const tpot::Candidate &c, json *resp) {
 #ifdef _WIN32
     (void)socketPath;
@@ -625,7 +612,7 @@ static bool issueCandidate(const std::string &socketPath, int timeoutMs, uint32_
     return false;
 #else
     json req;
-    if (c.kind == tpot::CandidateKind::PP_MOVE) req = makePpCommand(seq, c);
+    if (c.kind == tpot::CandidateKind::PP_MOVE) req = tpot::makePpCommandRequest(seq, c);
     else if (c.kind == tpot::CandidateKind::TP_HEAD || c.kind == tpot::CandidateKind::TP_FFN) req = makeTpCommand(seq, c);
     else return false;
     const json out = udsRequest(socketPath, req, timeoutMs);
@@ -696,17 +683,8 @@ static void logDecision(
     std::ostringstream oss;
     oss << "tpot_sched seq=" << rt.decisionSeq
         << " state=" << stateName(rt.state)
-        << " best=" << commandName(best)
-        << " gain_ms=" << best.gainMs
-        << " threshold_ms=" << best.thresholdMs
+        << " " << tpot::formatSelectedCandidateLogFields(best)
         << " issued=" << (issued ? 1 : 0)
-        << " from_stage=" << best.fromStageIndex
-        << " to_stage=" << best.toStageIndex
-        << " from_node=" << best.fromNodeIndex
-        << " to_node=" << best.toNodeIndex
-        << " layer=" << best.layerIndex
-        << " head_move=" << best.headMove
-        << " ffn_move=" << best.ffnMove
         << " tpot_before=" << beforeTpotMs
         << " tpot_after=" << afterTpotMs
         << " tpot_delta_ms=" << deltaMs
@@ -743,6 +721,17 @@ namespace dynamic_tpot {
 
 SchedulerConfig loadSchedulerConfigFromEnvironment() {
     return loadSchedulerConfigFromEnvironmentImpl();
+}
+
+nlohmann::json makePpCommandRequest(uint32_t seq, const Candidate &candidate) {
+    json cmd;
+    cmd["seq"] = seq;
+    cmd["mode"] = "next_barrier";
+    cmd["fromNodeIndex"] = candidate.fromNodeIndex;
+    cmd["toNodeIndex"] = candidate.toNodeIndex;
+    cmd["firstLayer"] = candidate.layerIndex;
+    cmd["layerCount"] = ppCommandLayerCount(candidate);
+    return json{{"op", "set_pp_migration"}, {"cmd", cmd}};
 }
 
 } // namespace dynamic_tpot
@@ -863,6 +852,7 @@ void DynamicTpotController::run() {
             std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status);
             tpot::Candidate bestTp = tpot::bestTpCandidate(stages, rt.cfg);
             tpot::Candidate bestPp = tpot::bestPpCandidate(stages, window.tpotMs, rt.cfg);
+            bestPp = tpot::filterPpCandidateForStaticLayout(bestPp, rt.ppLayoutChanged);
             if (bestPp.valid && rt.issuedPpKeys.count(ppCandidateKey(bestPp)) != 0u) {
                 bestPp.valid = false;
                 bestPp.reason = "pp boundary already issued";
@@ -885,6 +875,7 @@ void DynamicTpotController::run() {
                             rt.metrics.rollbackCount += 1u;
                             rt.cooldownUntilPos = window.posEnd + (uint32_t)std::max(64, rt.cfg.cooldownTokens);
                             if (rt.pending.candidate.kind == tpot::CandidateKind::PP_MOVE) {
+                                rt.ppLayoutChanged = false;
                                 rt.riskPenaltyByStage[rt.pending.candidate.toStageIndex] += 0.1;
                                 const NnStageConfig *target = findStageByIndex(plan, rt.pending.candidate.toStageIndex);
                                 if (target != nullptr) {
@@ -931,6 +922,7 @@ void DynamicTpotController::run() {
                     rt.metrics.migrationCount += 1u;
                     if (best.kind == tpot::CandidateKind::PP_MOVE) {
                         rt.issuedPpKeys.insert(ppCandidateKey(best));
+                        rt.ppLayoutChanged = true;
                     }
                     rt.pending.active = true;
                     rt.pending.candidate = best;

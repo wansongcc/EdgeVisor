@@ -32,5 +32,21 @@ inline std::string formatPpCandidateLogFields(const Candidate &candidate) {
     return oss.str();
 }
 
+inline std::string formatSelectedCandidateLogFields(const Candidate &candidate) {
+    std::ostringstream oss;
+    oss << "best=" << candidateKindName(candidate.kind)
+        << " gain_ms=" << candidate.gainMs
+        << " threshold_ms=" << candidate.thresholdMs
+        << " from_stage=" << candidate.fromStageIndex
+        << " to_stage=" << candidate.toStageIndex
+        << " from_node=" << candidate.fromNodeIndex
+        << " to_node=" << candidate.toNodeIndex
+        << " layer=" << candidate.layerIndex
+        << " layer_count=" << candidate.layerCount
+        << " head_move=" << candidate.headMove
+        << " ffn_move=" << candidate.ffnMove;
+    return oss.str();
+}
+
 } // namespace dynamic_tpot
 } // namespace dllama

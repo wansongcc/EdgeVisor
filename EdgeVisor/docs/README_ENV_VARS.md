@@ -194,7 +194,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 
 - `set_pp_migration.layerCount`（UDS 字段）
   - 默认：`1`
-  - 作用：控制 PP 迁移时按边界向内扩展的层数。当前自动调度 v1 每次最多迁移 1 层。
+  - 作用：控制 PP 迁移时按边界向内扩展的层数。自动调度会在 `1..K` 的候选层数中选择；其中 `K` 由 `--tpot-max-pp-layer-move` 或 `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` 配置。
 
 - `DLLAMA_MIGRATION_LAYER_LIST`（逗号分隔整数列表）
   - 默认：未设置
@@ -236,7 +236,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 | `DLLAMA_TPOT_LOAD_PENALTY_BETA` | 浮点 | `0` | 负载惩罚系数 | 更偏向保守分配 |
 | `DLLAMA_TPOT_PP_GAIN_RATIO` / `--tpot-pp-gain-ratio` | 浮点 `[0,1]` | `0.03` | PP 收益相对门槛系数；`0` 表示只使用绝对毫秒门槛 | 越小越容易触发 PP 迁移 |
 | `DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS` | 整数 | `128` | 预期剩余 token，用于摊销迁移成本 | 越小越保守 |
-| `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` | 整数 | `1` | 单次 PP 最多迁移 layer 数 | 更大时单次迁移幅度更大 |
+| `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` / `--tpot-max-pp-layer-move K` | 整数 | `1` | 单次 PP 最多迁移 layer 数；CLI 参数映射到 `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` | 有效范围 `1..64`；调度器评估 `1..K` 的所有候选层数，并始终保留源 stage 至少一层。更大的 `K` 会增加迁移状态/KV 的迁移成本。 |
 | `DLLAMA_TPOT_MAX_HEAD_MOVE` | 整数 | `1` | 单次 TP head 迁移数量 | 更大时单次迁移幅度更大 |
 | `DLLAMA_TPOT_MAX_FFN_MOVE` | 整数 | `256` | 单次 TP FFN 维度迁移数量 | 更大时单次迁移幅度更大 |
 | `DLLAMA_TPOT_POLL_MS` | 整数 ms | `200` | 自动调度线程轮询 UDS 的间隔 | 降低调度频率 |
@@ -256,6 +256,12 @@ export DLLAMA_TPOT_PP_RISK_MARGIN_MS=0
 export DLLAMA_TPOT_PP_MIGRATION_COST_MS=0
 export DLLAMA_TPOT_MIN_TP_GAIN_MS=1000000
 export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
+```
+
+例如，允许调度器在一次 PP 决策中评估并选择最多 4 层的迁移量：
+
+```bash
+./dllama inference ... --enable-dynamic-tpot --tpot-max-pp-layer-move 4
 ```
 
 ### 1.5.1 KV/网络稳定性与 collector

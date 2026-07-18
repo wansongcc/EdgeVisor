@@ -284,6 +284,37 @@ int main() {
     assert(resolvePpMigrationLayers(reverse, &rangePlan, &runtimePlan, reverseLayers, &rangeReason));
     assert(reverseLayers == forwardLayers);
 
+    const json invalidExactJson = {
+        {"seq", 19u},
+        {"mode", "exact"},
+        {"triggerPos", 23u},
+        {"triggerLayer", 2u},
+        {"firstLayer", 4u},
+        {"layerCount", 2u},
+        {"fromNodeIndex", 0u},
+        {"toNodeIndex", 1u},
+    };
+    bool rejectedExactFirstLayer = false;
+    try {
+        (void)decodePpMigrationCommand(invalidExactJson);
+    } catch (const std::runtime_error &) {
+        rejectedExactFirstLayer = true;
+    }
+    assert(rejectedExactFirstLayer);
+
+    json exactJson = invalidExactJson;
+    exactJson.erase("firstLayer");
+    const PlanCommand exact = decodePpMigrationCommand(exactJson);
+    assert(exact.triggerLayer == 2u);
+    std::vector<NnUint> exactLayers;
+    assert(resolvePpMigrationLayers(exact, &rangePlan, &runtimePlan, exactLayers, &rangeReason));
+    assert((exactLayers == std::vector<NnUint>{6u, 7u}));
+
+    assert(ppStartLayerSwitchFlag(&runtimePlan, 1u, 0u, 11u) ==
+        LLM_LAYER_SWITCH_NEW_PP_START);
+    assert(ppStartLayerSwitchFlag(&runtimePlan, 0u, 1u, 11u) ==
+        LLM_LAYER_SWITCH_RESTORE_PP_START);
+
     runtimePlan.setRole(1u, 6u, RUNTIME_LAYER_DISABLED);
     std::vector<NnUint> unsafeLayers;
     assert(!resolvePpMigrationLayers(forward, &rangePlan, &runtimePlan, unsafeLayers, &rangeReason));

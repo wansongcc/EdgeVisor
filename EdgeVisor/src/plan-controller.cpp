@@ -369,16 +369,20 @@ PlanCommand decodePpMigrationCommand(const json &jcmd) {
         throw std::runtime_error("layerCount must be >= 1");
     }
 
-    cmd.triggerLayer = parseU32(
-        jcmd,
-        "firstLayer",
-        parseU32(jcmd, "triggerLayer", 0xFFFFFFFFu));
     if (cmd.mode == PLAN_CMD_MODE_EXACT) {
+        if (jcmd.contains("firstLayer")) {
+            throw std::runtime_error("exact mode does not accept firstLayer; use triggerLayer");
+        }
+        cmd.triggerLayer = parseU32(jcmd, "triggerLayer", 0xFFFFFFFFu);
         if (!jcmd.contains("triggerPos")) {
             throw std::runtime_error("exact mode requires triggerPos");
         }
         cmd.triggerPos = parseU32(jcmd, "triggerPos", 0xFFFFFFFFu);
     } else {
+        cmd.triggerLayer = parseU32(
+            jcmd,
+            "firstLayer",
+            parseU32(jcmd, "triggerLayer", 0xFFFFFFFFu));
         cmd.triggerPos = 0xFFFFFFFFu;
     }
     return cmd;

@@ -1,6 +1,7 @@
 #include "nn-core.hpp"
 #include "nn-config-builder.hpp"
 #include "nn-cpu.hpp"
+#include <cassert>
 #include <cstdio>
 
 #define DIM 32
@@ -43,8 +44,51 @@ void print2D(const char *name, NnUint x, NnUint y, float *w) {
     }
 }
 
+void testShiftedPpStartRoundTrip() {
+    NnNetConfigBuilder netBuilder(1u, 1u);
+    const NnUint xPipeIndex = netBuilder.addPipe("X", size2D(F_32, 1u, 1u));
+    NnNodeConfigBuilder nodeBuilder(0u);
+    const NnUint bufferIndex = nodeBuilder.addBuffer("scratch", size2D(F_32, 1u, 1u));
+
+    NnSegmentConfigBuilder primary;
+    primary.addOp(OP_INV_RMS, "block_matmul_q", 8u,
+        pointerBatchConfig(SRC_PIPE, xPipeIndex),
+        pointerBatchConfig(SRC_BUFFER, bufferIndex),
+        size0(), NnInvRmsOpConfig{1e-5f, 1u});
+    nodeBuilder.addSegment(primary.build());
+
+    NnSegmentConfigBuilder shifted;
+    shifted.addOp(OP_INV_RMS, "runtime_shifted_pp_start_block_matmul_q", 8u,
+        pointerBatchConfig(SRC_PIPE, xPipeIndex),
+        pointerBatchConfig(SRC_BUFFER, bufferIndex),
+        size0(), NnInvRmsOpConfig{1e-5f, 1u});
+    nodeBuilder.addSegment(shifted.build());
+
+    NnNetConfig netConfig = netBuilder.build();
+    NnNodeConfig nodeConfig = nodeBuilder.build();
+    {
+        NnNetExecution execution(1u, &netConfig);
+        std::vector<NnExecutorDevice> devices;
+        devices.emplace_back(new NnCpuDevice(&netConfig, &nodeConfig, &execution), -1, -1);
+        NnFakeNodeSynchronizer synchronizer;
+        NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
+
+        assert(executor.isSegmentEnabled(0u));
+        assert(!executor.isSegmentEnabled(1u));
+        executor.setShiftedPpStartLayerEnabled(8u, true);
+        assert(!executor.isSegmentEnabled(0u));
+        assert(executor.isSegmentEnabled(1u));
+        executor.setShiftedPpStartLayerEnabled(8u, false);
+        assert(executor.isSegmentEnabled(0u));
+        assert(!executor.isSegmentEnabled(1u));
+    }
+    releaseNetConfig(&netConfig);
+    releaseNodeConfig(&nodeConfig);
+}
+
 int main() {
     initQuants();
+    testShiftedPpStartRoundTrip();
 
     NnUint nThreads = 2;
     NnNetConfig netConfig;

@@ -1305,6 +1305,13 @@ void NnExecutor::setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled) 
     std::fflush(stdout);
 }
 
+bool NnExecutor::isSegmentEnabled(NnUint segmentIndex) const {
+    if (segmentEnabled == nullptr || nodeConfig == nullptr || segmentIndex >= nodeConfig->nSegments) {
+        return false;
+    }
+    return segmentEnabled[segmentIndex].load(std::memory_order_relaxed) != 0u;
+}
+
 void NnExecutor::setPpSyncEnabled(bool enabled) {
     if (segmentEnabled == nullptr || nodeConfig == nullptr) return;
     NnUint matched = 0u;

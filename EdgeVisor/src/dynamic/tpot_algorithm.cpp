@@ -302,6 +302,33 @@ Candidate filterPpCandidateForStaticLayout(const Candidate &candidate, bool layo
     return filtered;
 }
 
+std::string PpLayoutGuard::candidateKey(const Candidate &candidate) {
+    return std::to_string(candidate.fromStageIndex) + ":" +
+        std::to_string(candidate.toStageIndex) + ":" +
+        std::to_string(candidate.layerIndex);
+}
+
+Candidate PpLayoutGuard::filter(const Candidate &candidate) const {
+    Candidate filtered = filterPpCandidateForStaticLayout(candidate, layoutChanged_);
+    if (filtered.valid && issuedKeys_.count(candidateKey(filtered)) != 0u) {
+        filtered.valid = false;
+        filtered.reason = "pp boundary already issued";
+    }
+    return filtered;
+}
+
+void PpLayoutGuard::markIssued(const Candidate &candidate) {
+    if (candidate.kind != CandidateKind::PP_MOVE || !candidate.valid) return;
+    issuedKeys_.insert(candidateKey(candidate));
+    layoutChanged_ = true;
+}
+
+void PpLayoutGuard::markRolledBack(const Candidate &candidate) {
+    if (candidate.kind != CandidateKind::PP_MOVE) return;
+    issuedKeys_.erase(candidateKey(candidate));
+    layoutChanged_ = false;
+}
+
 uint32_t ppCommandLayerCount(const Candidate &candidate) {
     return std::max<uint32_t>(1u, candidate.layerCount);
 }

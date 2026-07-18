@@ -2222,7 +2222,12 @@ bool resolvePpMigrationLayers(
     }
 
     const NnUint count = command.reserved0 > 0u ? command.reserved0 : 1u;
-    NnUint firstLayer = command.triggerLayer;
+    // NEXT_BARRIER dynamic PP commands reuse triggerLayer as an exact
+    // firstLayer on the wire. EXACT keeps its legacy trigger semantics and
+    // derives the migration range from the static stage boundary.
+    NnUint firstLayer = command.mode == PLAN_CMD_MODE_NEXT_BARRIER
+        ? command.triggerLayer
+        : 0xFFFFFFFFu;
     if (firstLayer == 0xFFFFFFFFu) {
         if (toStage->stageIndex < fromStage->stageIndex) {
             firstLayer = fromStage->startLayer;
@@ -2260,6 +2265,28 @@ bool resolvePpMigrationLayers(
     }
     if (reason != nullptr) reason->clear();
     return true;
+}
+
+NnUint ppStartLayerSwitchFlag(
+    const RuntimeStageLayerPlan *runtimePlan,
+    NnUint fromStageIndex,
+    NnUint toStageIndex,
+    NnUint boundaryLayer) {
+    if (runtimePlan == nullptr || fromStageIndex >= runtimePlan->nStages ||
+            toStageIndex >= runtimePlan->nStages || boundaryLayer >= runtimePlan->nLayers) {
+        return 0u;
+    }
+    const RuntimeLayerRole fromRole = runtimePlan->getRole(fromStageIndex, boundaryLayer);
+    const RuntimeLayerRole toRole = runtimePlan->getRole(toStageIndex, boundaryLayer);
+    if (toStageIndex < fromStageIndex && fromRole == RUNTIME_LAYER_PRIMARY &&
+            toRole == RUNTIME_LAYER_REDUNDANT) {
+        return LLM_LAYER_SWITCH_NEW_PP_START;
+    }
+    if (toStageIndex > fromStageIndex && fromRole == RUNTIME_LAYER_REDUNDANT &&
+            toRole == RUNTIME_LAYER_PRIMARY) {
+        return LLM_LAYER_SWITCH_RESTORE_PP_START;
+    }
+    return 0u;
 }
 
 static bool stageHasRedundantCoverageLocal(
@@ -2616,29 +2643,26 @@ void RootLlmInference::setShiftedPpStartLayerEnabled(NnUint layerIndex, bool ena
     executor->setShiftedPpStartLayerEnabled(layerIndex, enabled);
 }
 
-void RootLlmInference::maybeEnableShiftedPpStartForSourceStage(
+void RootLlmInference::maybeApplyShiftedPpStartForStageMove(
     const std::vector<NnUint> &switchLayers,
     NnUint sourceNodeIndex,
     NnUint targetNodeIndex,
-    bool selfIsSource) {
-    if (!selfIsSource || executor == nullptr || switchLayers.empty()) return;
+    bool selfIsSource,
+    bool selfIsTarget) {
+    if (executor == nullptr || switchLayers.empty()) return;
     const NnStageConfig *fromStage = findStageForNodeLocal(plan, sourceNodeIndex);
     const NnStageConfig *toStage = findStageForNodeLocal(plan, targetNodeIndex);
     if (fromStage == nullptr || toStage == nullptr) return;
-    if (toStage->stageIndex >= fromStage->stageIndex) return;
-
-    for (NnUint layer : switchLayers) {
-        if (runtimePlan == nullptr ||
-                runtimePlan->getRole(fromStage->stageIndex, layer) != RUNTIME_LAYER_PRIMARY) {
-            return;
-        }
-    }
-
-    // Root applies batched switches. After migrating multiple consecutive
-    // start layers, the first retained layer becomes the new PP entry.
-    const NnUint shiftedStartLayer = *std::max_element(switchLayers.begin(), switchLayers.end()) + 1u;
-    if (shiftedStartLayer < fromStage->endLayer) {
+    const NnUint highestLayer = *std::max_element(switchLayers.begin(), switchLayers.end());
+    const NnUint flag = ppStartLayerSwitchFlag(
+        runtimePlan, fromStage->stageIndex, toStage->stageIndex, highestLayer);
+    const NnUint shiftedStartLayer = highestLayer + 1u;
+    if (flag == LLM_LAYER_SWITCH_NEW_PP_START && selfIsSource &&
+            shiftedStartLayer < fromStage->endLayer) {
         executor->setShiftedPpStartLayerEnabled(shiftedStartLayer, true);
+    } else if (flag == LLM_LAYER_SWITCH_RESTORE_PP_START && selfIsTarget &&
+            shiftedStartLayer < toStage->endLayer) {
+        executor->setShiftedPpStartLayerEnabled(shiftedStartLayer, false);
     }
 }
 
@@ -3547,11 +3571,12 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
                 // stage must keep PP_RECV enabled for its new direct predecessor.
                 executor->setPpSyncEnabled(false);
             }
-            maybeEnableShiftedPpStartForSourceStage(
+            maybeApplyShiftedPpStartForStageMove(
                 switchLayers,
                 migrationFromNodeIndex,
                 nextStageRootNode,
-                selfIsSource);
+                selfIsSource,
+                selfIsTarget);
         }
     }
 
@@ -3569,16 +3594,17 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     sbh.reserved = 0u;
     network->writeAll(&sbh, sizeof(sbh));
     bool stageBypassFlagEmitted = false;
-    NnUint shiftedPpStartSourceLayer = 0xFFFFFFFFu;
+    NnUint ppStartBoundaryLayer = 0xFFFFFFFFu;
+    NnUint ppStartFlag = 0u;
     const NnStageConfig *switchFromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
     const NnStageConfig *switchToStage = findStageForNodeLocal(plan, nextStageRootNode);
-    if (switchFromStage != nullptr && switchToStage != nullptr &&
-            switchToStage->stageIndex < switchFromStage->stageIndex && !switchLayers.empty()) {
-        const NnUint highestLayer = *std::max_element(switchLayers.begin(), switchLayers.end());
-        if (runtimePlan != nullptr &&
-                runtimePlan->getRole(switchFromStage->stageIndex, highestLayer) == RUNTIME_LAYER_PRIMARY) {
-            shiftedPpStartSourceLayer = highestLayer;
-        }
+    if (switchFromStage != nullptr && switchToStage != nullptr && !switchLayers.empty()) {
+        ppStartBoundaryLayer = *std::max_element(switchLayers.begin(), switchLayers.end());
+        ppStartFlag = ppStartLayerSwitchFlag(
+            runtimePlan,
+            switchFromStage->stageIndex,
+            switchToStage->stageIndex,
+            ppStartBoundaryLayer);
     }
     for (NnUint layer : switchLayers) {
         LlmLayerSwitchPacket switchPkt{};
@@ -3589,7 +3615,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         switchPkt.toNodeIndex = nextStageRootNode;
         const bool carryStageBypass = stageBypass && !stageBypassFlagEmitted;
         switchPkt.reserved0 = carryStageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
-        if (layer == shiftedPpStartSourceLayer) switchPkt.reserved0 |= LLM_LAYER_SWITCH_NEW_PP_START;
+        if (layer == ppStartBoundaryLayer) switchPkt.reserved0 |= ppStartFlag;
         switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
         switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
         stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
@@ -4003,11 +4029,12 @@ void RootLlmInference::forward(bool collectProfile) {
                     // the previous active stage after bypass routing is applied.
                     executor->setPpSyncEnabled(false);
                 }
-                maybeEnableShiftedPpStartForSourceStage(
+                maybeApplyShiftedPpStartForStageMove(
                     switchLayers,
                     migrationFromNodeIndex,
                     nextStageRootNode,
-                    selfIsSource);
+                    selfIsSource,
+                    selfIsTarget);
             }
         }
     }
@@ -4064,16 +4091,17 @@ void RootLlmInference::forward(bool collectProfile) {
             sbh.reserved = 0u;
             network->writeAll(&sbh, sizeof(sbh));
             bool stageBypassFlagEmitted = false;
-            NnUint shiftedPpStartSourceLayer = 0xFFFFFFFFu;
+            NnUint ppStartBoundaryLayer = 0xFFFFFFFFu;
+            NnUint ppStartFlag = 0u;
             const NnStageConfig *switchFromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
             const NnStageConfig *switchToStage = findStageForNodeLocal(plan, nextStageRootNode);
-            if (switchFromStage != nullptr && switchToStage != nullptr &&
-                    switchToStage->stageIndex < switchFromStage->stageIndex && !switchLayers.empty()) {
-                const NnUint highestLayer = *std::max_element(switchLayers.begin(), switchLayers.end());
-                if (runtimePlan != nullptr &&
-                        runtimePlan->getRole(switchFromStage->stageIndex, highestLayer) == RUNTIME_LAYER_PRIMARY) {
-                    shiftedPpStartSourceLayer = highestLayer;
-                }
+            if (switchFromStage != nullptr && switchToStage != nullptr && !switchLayers.empty()) {
+                ppStartBoundaryLayer = *std::max_element(switchLayers.begin(), switchLayers.end());
+                ppStartFlag = ppStartLayerSwitchFlag(
+                    runtimePlan,
+                    switchFromStage->stageIndex,
+                    switchToStage->stageIndex,
+                    ppStartBoundaryLayer);
             }
             for (NnUint layer : switchLayers) {
                 LlmLayerSwitchPacket switchPkt{};
@@ -4084,7 +4112,7 @@ void RootLlmInference::forward(bool collectProfile) {
                 switchPkt.toNodeIndex = nextStageRootNode;
                 const bool carryStageBypass = stageBypass && !stageBypassFlagEmitted;
                 switchPkt.reserved0 = carryStageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
-                if (layer == shiftedPpStartSourceLayer) switchPkt.reserved0 |= LLM_LAYER_SWITCH_NEW_PP_START;
+                if (layer == ppStartBoundaryLayer) switchPkt.reserved0 |= ppStartFlag;
                 switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
                 switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
                 stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
@@ -5517,6 +5545,17 @@ void runWorkerApp(AppCliArgs *args) {
                             if (shiftedStartLayer < fromStage->endLayer) {
                                 executor.setShiftedPpStartLayerEnabled(shiftedStartLayer, true);
                                 std::printf("🔁 [worker-switch] node=%u shifted pp-start layer=%u (source-stage)\n",
+                                    (unsigned)nodeConfig.nodeIndex,
+                                    (unsigned)shiftedStartLayer);
+                                std::fflush(stdout);
+                            }
+                        }
+                        if (localIsTargetStage && fromStage != nullptr && toStage != nullptr &&
+                                (switchPkt.reserved0 & LLM_LAYER_SWITCH_RESTORE_PP_START) != 0u) {
+                            const NnUint shiftedStartLayer = switchPkt.boundaryLayer + 1u;
+                            if (shiftedStartLayer < toStage->endLayer) {
+                                executor.setShiftedPpStartLayerEnabled(shiftedStartLayer, false);
+                                std::printf("🔁 [worker-switch] node=%u restore pp-start layer=%u (target-stage)\n",
                                     (unsigned)nodeConfig.nodeIndex,
                                     (unsigned)shiftedStartLayer);
                                 std::fflush(stdout);

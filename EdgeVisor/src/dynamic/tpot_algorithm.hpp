@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,17 @@ struct Candidate {
     uint32_t layerCount = 1u;
     uint32_t headMove = 0u;
     uint32_t ffnMove = 0u;
+};
+
+class PpLayoutGuard {
+private:
+    bool layoutChanged_ = false;
+    std::set<std::string> issuedKeys_;
+    static std::string candidateKey(const Candidate &candidate);
+public:
+    Candidate filter(const Candidate &candidate) const;
+    void markIssued(const Candidate &candidate);
+    void markRolledBack(const Candidate &candidate);
 };
 
 double clampTrendPenalty(double recentAvgMs, double previousAvgMs);

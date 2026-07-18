@@ -132,6 +132,16 @@ int main() {
     const tpot::Candidate allowedAfterRollback = tpot::filterPpCandidateForStaticLayout(layoutCandidate, false);
     require(allowedAfterRollback.valid, "successful rollback restores PP candidate eligibility");
 
+    tpot::PpLayoutGuard ppLayoutGuard;
+    require(ppLayoutGuard.filter(layoutCandidate).valid,
+        "PP boundary is initially eligible");
+    ppLayoutGuard.markIssued(layoutCandidate);
+    require(!ppLayoutGuard.filter(layoutCandidate).valid,
+        "issued PP boundary is suppressed while migration is pending");
+    ppLayoutGuard.markRolledBack(layoutCandidate);
+    require(ppLayoutGuard.filter(layoutCandidate).valid,
+        "rolled-back PP boundary becomes eligible again");
+
     cfg = tpot::SchedulerConfig();
     cfg.minPpGainMs = 5.0;
     cfg.minTpGainMs = 2.0;

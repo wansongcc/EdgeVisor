@@ -123,6 +123,11 @@ bool resolvePpMigrationLayers(
     const RuntimeStageLayerPlan *runtimePlan,
     std::vector<NnUint> &layers,
     std::string *reason = nullptr);
+NnUint ppStartLayerSwitchFlag(
+    const RuntimeStageLayerPlan *runtimePlan,
+    NnUint fromStageIndex,
+    NnUint toStageIndex,
+    NnUint boundaryLayer);
 
 typedef struct {
     NnUint position;
@@ -201,6 +206,7 @@ typedef struct {
 enum LlmLayerSwitchFlags : NnUint {
     LLM_LAYER_SWITCH_STAGE_BYPASS = 1u << 0,
     LLM_LAYER_SWITCH_NEW_PP_START = 1u << 1,
+    LLM_LAYER_SWITCH_RESTORE_PP_START = 1u << 2,
 };
 
 typedef struct {
@@ -472,11 +478,12 @@ private:
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     void resetPendingKvMigrationState(const char *reason);
     bool sendPendingLayerSwitchControlOnly();
-    void maybeEnableShiftedPpStartForSourceStage(
+    void maybeApplyShiftedPpStartForStageMove(
         const std::vector<NnUint> &switchLayers,
         NnUint sourceNodeIndex,
         NnUint targetNodeIndex,
-        bool selfIsSource);
+        bool selfIsSource,
+        bool selfIsTarget);
     void collectProfilePackets();
     bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
     bool replayHistoryForHeadMigrationRecompute(const PlanCommand &cmd, NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);

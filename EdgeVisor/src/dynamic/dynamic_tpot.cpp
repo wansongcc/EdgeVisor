@@ -114,8 +114,7 @@ struct ControllerRuntime {
     std::map<uint32_t, uint32_t> softCapacityByStage;
     std::map<uint32_t, double> riskPenaltyByStage;
     PendingAction pending;
-    std::set<std::string> issuedPpKeys;
-    bool ppLayoutChanged = false;
+    tpot::PpLayoutGuard ppLayoutGuard;
     SchedulerMetrics metrics;
 };
 
@@ -576,12 +575,6 @@ static bool tpotJitterStable(const std::vector<double> &recent) {
     return ((maxV - minV) / avg) <= 0.03;
 }
 
-static std::string ppCandidateKey(const tpot::Candidate &c) {
-    std::ostringstream oss;
-    oss << c.fromStageIndex << ":" << c.toStageIndex << ":" << c.layerIndex;
-    return oss.str();
-}
-
 static json makeTpCommand(uint32_t seq, const tpot::Candidate &c) {
     uint32_t kind = PLAN_CMD_KIND_HEAD;
     if (c.headMove != 0u && c.ffnMove != 0u) kind = PLAN_CMD_KIND_BOTH;
@@ -852,11 +845,7 @@ void DynamicTpotController::run() {
             std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status);
             tpot::Candidate bestTp = tpot::bestTpCandidate(stages, rt.cfg);
             tpot::Candidate bestPp = tpot::bestPpCandidate(stages, window.tpotMs, rt.cfg);
-            bestPp = tpot::filterPpCandidateForStaticLayout(bestPp, rt.ppLayoutChanged);
-            if (bestPp.valid && rt.issuedPpKeys.count(ppCandidateKey(bestPp)) != 0u) {
-                bestPp.valid = false;
-                bestPp.reason = "pp boundary already issued";
-            }
+            bestPp = rt.ppLayoutGuard.filter(bestPp);
             tpot::Candidate best = tpot::betterCandidate(bestTp, bestPp);
 
             bool issued = false;
@@ -875,7 +864,7 @@ void DynamicTpotController::run() {
                             rt.metrics.rollbackCount += 1u;
                             rt.cooldownUntilPos = window.posEnd + (uint32_t)std::max(64, rt.cfg.cooldownTokens);
                             if (rt.pending.candidate.kind == tpot::CandidateKind::PP_MOVE) {
-                                rt.ppLayoutChanged = false;
+                                rt.ppLayoutGuard.markRolledBack(rt.pending.candidate);
                                 rt.riskPenaltyByStage[rt.pending.candidate.toStageIndex] += 0.1;
                                 const NnStageConfig *target = findStageByIndex(plan, rt.pending.candidate.toStageIndex);
                                 if (target != nullptr) {
@@ -921,8 +910,7 @@ void DynamicTpotController::run() {
                 if (issued) {
                     rt.metrics.migrationCount += 1u;
                     if (best.kind == tpot::CandidateKind::PP_MOVE) {
-                        rt.issuedPpKeys.insert(ppCandidateKey(best));
-                        rt.ppLayoutChanged = true;
+                        rt.ppLayoutGuard.markIssued(best);
                     }
                     rt.pending.active = true;
                     rt.pending.candidate = best;

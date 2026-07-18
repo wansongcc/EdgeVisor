@@ -1070,7 +1070,8 @@ void NnVulkanDevice::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
 NnUint NnVulkanDevice::maxNThreads() {
     // Segment compute stays on thread 0; additional threads parallelize the
     // per-peer socket exchanges in sync steps.
-    return std::thread::hardware_concurrency();
+    const NnUint nThreads = std::thread::hardware_concurrency();
+    return nThreads == 0u ? 1u : nThreads;
 }
 
 NnDeviceSegment *NnVulkanDevice::createSegment(NnUint segmentIndex) {

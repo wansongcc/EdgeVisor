@@ -1456,10 +1456,12 @@ struct ArgsRestoreGuard {
     char *ratios;
     bool benchmark;
     NnUint nWorkers;
+    NnUint nThreads;
     ~ArgsRestoreGuard() {
         args->ratiosStr = ratios;
         args->benchmark = benchmark;
         args->nWorkers = nWorkers;
+        args->nThreads = nThreads;
     }
 };
 
@@ -1796,6 +1798,13 @@ static WarmupCandidateResult probeWarmupCandidate(
     result.nWorkers = candidate.nWorkers;
     result.workerIndices = candidate.workerIndices;
     try {
+        ArgsRestoreGuard argsGuard{
+            args,
+            args->ratiosStr,
+            args->benchmark,
+            args->nWorkers,
+            args->nThreads,
+        };
         const NnUint nWorkers = candidate.nWorkers;
         const NnUint nNodes = nWorkers + 1u;
         const bool distributed = nWorkers > 0u;
@@ -1835,7 +1844,6 @@ static WarmupCandidateResult probeWarmupCandidate(
         char *savedRatios = args->ratiosStr;
         const bool savedBenchmark = args->benchmark;
         const NnUint savedWorkers = args->nWorkers;
-        ArgsRestoreGuard argsGuard{args, savedRatios, savedBenchmark, savedWorkers};
         std::string probeRatios = candidate.ratios;
         args->nWorkers = nWorkers;
         args->ratiosStr = uneven ? const_cast<char*>(probeRatios.c_str()) : nullptr;
@@ -5198,8 +5206,6 @@ void runWorkerApp(AppCliArgs *args) {
         printNodeRequiredMemory(&netConfig, &nodeConfig);
         validateStaticMemoryBudget(args->memoryLimitBytes, &netConfig, &nodeConfig);
 
-        NnNetExecution execution(args->nThreads, &netConfig);
-
            // 1. Initialize Plan Pointer (Worker Side)
            std::unique_ptr<NnUnevenPartitionPlan> planPtr;
         
@@ -5227,6 +5233,7 @@ void runWorkerApp(AppCliArgs *args) {
         dllamaIoProbeSetNode(nodeConfig.nodeIndex, getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex));
 
         autoTuneThreads(args, planPtr.get(), nodeConfig.nodeIndex, netConfig.nNodes);
+        NnNetExecution execution(args->nThreads, &netConfig);
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
         // Initialize Synchronizer with Plan

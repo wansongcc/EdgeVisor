@@ -51,6 +51,7 @@ int main() {
     tpot::SchedulerConfig cfg;
     require(near(cfg.loadPenaltyBeta, 0.0), "load penalty defaults to zero");
     require(near(cfg.ppGainRatio, 0.03), "PP gain ratio defaults to three percent");
+    require(cfg.maxPpLayerMove == 1u, "PP batch size defaults to one layer");
     cfg.minPpGainMs = 5.0;
     cfg.minTpGainMs = 2.0;
     cfg.ppRiskMarginMs = 0.0;
@@ -165,6 +166,61 @@ int main() {
     const tpot::Candidate singleStagePp = tpot::bestPpCandidate(singleStage, 40.0, cfg);
     require(!singleStagePp.valid && singleStagePp.reason == "no eligible pp candidate",
         "single-stage PP rejection uses the canonical reason");
+
+    cfg.maxPpLayerMove = 4u;
+    cfg.loadPenaltyBeta = 0.5;
+    cfg.minPpGainMs = 0.0;
+    cfg.ppGainRatio = 0.0;
+    std::vector<tpot::StageSnapshot> multi;
+    multi.push_back(stage(0, 0, 0, 6, 20.0));
+    multi.push_back(stage(1, 1, 6, 2, 5.0));
+    multi[0].rightBoundaryLayerMs = 20.0;
+    const std::vector<tpot::StageSnapshot> originalMulti = multi;
+    const tpot::Candidate multiMove = tpot::bestPpCandidate(multi, 130.0, cfg);
+    require(multiMove.valid && multiMove.layerCount == 2u,
+        "scheduler selects the interior optimum instead of the largest allowed batch");
+    require(multiMove.layerIndex == multi[0].endLayer - multiMove.layerCount,
+        "forward candidate identifies the first layer in the contiguous range");
+
+    tpot::Candidate predicted = multiMove;
+    tpot::applyPpMove(multi, predicted);
+    require(multi[0].nLayers == 6u - predicted.layerCount &&
+            multi[1].nLayers == 2u + predicted.layerCount,
+        "predicted stage counts move the selected layer batch");
+
+    const tpot::Candidate reverse = tpot::reversePpCandidate(predicted);
+    require(reverse.layerCount == predicted.layerCount,
+        "rollback preserves the selected PP layer count");
+    require(tpot::ppCommandLayerCount(predicted) == predicted.layerCount,
+        "PP command count uses the selected candidate count");
+
+    cfg.ppMigrationCostMs = 384.0; // 3 ms per layer at 128 remaining tokens
+    const tpot::Candidate costLimited = tpot::bestPpCandidate(originalMulti, 130.0, cfg);
+    require(costLimited.layerCount == 1u,
+        "per-layer migration cost can make a smaller batch optimal");
+
+    std::vector<tpot::StageSnapshot> reverseStages;
+    reverseStages.push_back(stage(0, 0, 0, 2, 5.0));
+    reverseStages.push_back(stage(1, 1, 2, 6, 20.0));
+    reverseStages[1].leftBoundaryLayerMs = 20.0;
+    cfg.ppMigrationCostMs = 0.0;
+    const tpot::Candidate reverseMove = tpot::bestPpCandidate(reverseStages, 130.0, cfg);
+    require(reverseMove.fromStageIndex == 1u && reverseMove.toStageIndex == 0u &&
+            reverseMove.layerIndex == reverseStages[1].startLayer,
+        "reverse candidate begins at the source left boundary");
+
+    std::vector<tpot::StageSnapshot> twoLayerSource;
+    twoLayerSource.push_back(stage(0, 0, 0, 2, 20.0));
+    twoLayerSource.push_back(stage(1, 1, 2, 2, 5.0));
+    const tpot::Candidate leavesOne = tpot::bestPpCandidate(twoLayerSource, 50.0, cfg);
+    require(leavesOne.layerCount <= 1u,
+        "configured K never empties a two-layer source stage");
+
+    cfg.maxPpLayerMove = 1u;
+    cfg.loadPenaltyBeta = 0.0;
+    cfg.ppMigrationCostMs = 0.0;
+    cfg.minPpGainMs = 5.0;
+    cfg.ppGainRatio = 0.03;
 
     std::vector<tpot::StageSnapshot> tp;
     tpot::StageSnapshot ts = stage(0, 0, 0, 2, 10.0);

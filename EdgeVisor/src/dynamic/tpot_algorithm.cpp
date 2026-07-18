@@ -107,37 +107,48 @@ Candidate bestPpCandidate(const std::vector<StageSnapshot> &stages, double curre
             const StageSnapshot &source = *sources[d];
             const StageSnapshot &target = *targets[d];
             const uint32_t sourceLayers = stageLayerCount(source);
-            if (sourceLayers <= cfg.maxPpLayerMove) continue;
             if (!target.hasFullWeights) continue;
+            if (sourceLayers <= 1u) continue;
 
-            const double gain =
-                ppBoundaryDeltaOutMs(source, target, cfg) -
-                ppDeltaInMs(target, cfg) -
-                migCost -
-                cfg.ppRiskMarginMs -
-                target.riskPenalty * maxDouble(1.0, target.avgLayerMs);
+            const uint32_t targetLayers = stageLayerCount(target);
+            const uint32_t maxMove = std::min(cfg.maxPpLayerMove, sourceLayers - 1u);
+            for (uint32_t k = 1u; k <= maxMove; ++k) {
+                const double firstOut = ppBoundaryDeltaOutMs(source, target, cfg);
+                const double remainingOut = k > 1u
+                    ? stageCostMs(source, sourceLayers - 1u, cfg) -
+                      stageCostMs(source, sourceLayers - k, cfg)
+                    : 0.0;
+                const double targetIn =
+                    stageCostMs(target, targetLayers + k, cfg) -
+                    stageCostMs(target, targetLayers, cfg);
+                const double scaledRisk = (double)k *
+                    (cfg.ppRiskMarginMs + target.riskPenalty * maxDouble(1.0, target.avgLayerMs));
+                const double gain = firstOut + remainingOut - targetIn -
+                    (double)k * migCost - scaledRisk;
 
-            const double threshold = ppLocalGainThresholdMs(source, target, cfg);
-            Candidate c;
-            c.kind = CandidateKind::PP_MOVE;
-            c.valid = gain > threshold;
-            c.reason = c.valid ? "" : "gain below threshold";
-            c.gainMs = gain;
-            c.thresholdMs = threshold;
-            c.fromStageIndex = source.stageIndex;
-            c.toStageIndex = target.stageIndex;
-            c.fromNodeIndex = source.rootNodeIndex;
-            c.toNodeIndex = target.rootNodeIndex;
-            if (target.stageIndex > source.stageIndex) {
-                c.layerIndex = source.endLayer > source.startLayer ? source.endLayer - 1u : source.startLayer;
-            } else {
-                c.layerIndex = source.startLayer;
-            }
-            if (c.valid) {
-                considerBest(best, c);
-            } else if (!best.valid && (!haveRejected || c.gainMs > best.gainMs)) {
-                best = c;
-                haveRejected = true;
+                const double threshold = ppLocalGainThresholdMs(source, target, cfg);
+                Candidate c;
+                c.kind = CandidateKind::PP_MOVE;
+                c.valid = gain > threshold;
+                c.reason = c.valid ? "" : "gain below threshold";
+                c.gainMs = gain;
+                c.thresholdMs = threshold;
+                c.fromStageIndex = source.stageIndex;
+                c.toStageIndex = target.stageIndex;
+                c.fromNodeIndex = source.rootNodeIndex;
+                c.toNodeIndex = target.rootNodeIndex;
+                c.layerCount = k;
+                if (target.stageIndex > source.stageIndex) {
+                    c.layerIndex = source.endLayer - k;
+                } else {
+                    c.layerIndex = source.startLayer;
+                }
+                if (c.valid) {
+                    considerBest(best, c);
+                } else if (!best.valid && (!haveRejected || c.gainMs > best.gainMs)) {
+                    best = c;
+                    haveRejected = true;
+                }
             }
         }
     }
@@ -262,6 +273,17 @@ Candidate betterCandidate(const Candidate &a, const Candidate &b) {
     return b.gainMs > a.gainMs ? b : a;
 }
 
+Candidate reversePpCandidate(const Candidate &candidate) {
+    Candidate reverse = candidate;
+    std::swap(reverse.fromStageIndex, reverse.toStageIndex);
+    std::swap(reverse.fromNodeIndex, reverse.toNodeIndex);
+    return reverse;
+}
+
+uint32_t ppCommandLayerCount(const Candidate &candidate) {
+    return std::max<uint32_t>(1u, candidate.layerCount);
+}
+
 void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate) {
     if (candidate.kind != CandidateKind::PP_MOVE || !candidate.valid) return;
     StageSnapshot *from = nullptr;
@@ -273,15 +295,16 @@ void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate)
     if (from == nullptr || to == nullptr) return;
     if (from->nLayers == 0u) from->nLayers = stageLayerCount(*from);
     if (to->nLayers == 0u) to->nLayers = stageLayerCount(*to);
-    if (from->nLayers <= 1u) return;
-    from->nLayers -= 1u;
-    to->nLayers += 1u;
+    const uint32_t k = candidate.layerCount;
+    if (k == 0u || from->nLayers <= k) return;
+    from->nLayers -= k;
+    to->nLayers += k;
     if (to->stageIndex > from->stageIndex) {
-        if (from->endLayer > from->startLayer) from->endLayer -= 1u;
-        if (to->startLayer > 0u) to->startLayer -= 1u;
+        if (from->endLayer >= from->startLayer + k) from->endLayer -= k;
+        if (to->startLayer >= k) to->startLayer -= k;
     } else {
-        from->startLayer += 1u;
-        to->endLayer += 1u;
+        from->startLayer += k;
+        to->endLayer += k;
     }
 }
 

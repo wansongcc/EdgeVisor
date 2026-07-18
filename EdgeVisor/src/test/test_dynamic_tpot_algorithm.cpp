@@ -47,6 +47,38 @@ static tpot::NodeSnapshot node(uint32_t idx, double ms, uint32_t heads, uint32_t
     return n;
 }
 
+static bool sameNode(const tpot::NodeSnapshot &a, const tpot::NodeSnapshot &b) {
+    return a.nodeIndex == b.nodeIndex && near(a.timeMs, b.timeMs) && near(a.attnMs, b.attnMs) &&
+        near(a.ffnMs, b.ffnMs) && a.kvHeads == b.kvHeads && a.ffnUnits == b.ffnUnits &&
+        a.canMoveHeadLeft == b.canMoveHeadLeft && a.canMoveHeadRight == b.canMoveHeadRight;
+}
+
+static bool sameStage(const tpot::StageSnapshot &a, const tpot::StageSnapshot &b) {
+    if (a.stageIndex != b.stageIndex || a.rootNodeIndex != b.rootNodeIndex ||
+            a.startLayer != b.startLayer || a.endLayer != b.endLayer || a.nLayers != b.nLayers ||
+            a.softCapacity != b.softCapacity || a.hasFullWeights != b.hasFullWeights ||
+            !near(a.avgLayerMs, b.avgLayerMs) || !near(a.recentAvgMs, b.recentAvgMs) ||
+            !near(a.previousAvgMs, b.previousAvgMs) || !near(a.stageTimeMs, b.stageTimeMs) ||
+            !near(a.boundaryCommMs, b.boundaryCommMs) ||
+            !near(a.leftBoundaryLayerMs, b.leftBoundaryLayerMs) ||
+            !near(a.rightBoundaryLayerMs, b.rightBoundaryLayerMs) ||
+            !near(a.riskPenalty, b.riskPenalty) || a.nodes.size() != b.nodes.size()) {
+        return false;
+    }
+    for (size_t i = 0u; i < a.nodes.size(); ++i) {
+        if (!sameNode(a.nodes[i], b.nodes[i])) return false;
+    }
+    return true;
+}
+
+static bool sameStages(const std::vector<tpot::StageSnapshot> &a, const std::vector<tpot::StageSnapshot> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0u; i < a.size(); ++i) {
+        if (!sameStage(a[i], b[i])) return false;
+    }
+    return true;
+}
+
 int main() {
     tpot::SchedulerConfig cfg;
     require(near(cfg.loadPenaltyBeta, 0.0), "load penalty defaults to zero");
@@ -187,6 +219,39 @@ int main() {
     require(multi[0].nLayers == 6u - predicted.layerCount &&
             multi[1].nLayers == 2u + predicted.layerCount,
         "predicted stage counts move the selected layer batch");
+
+    std::vector<tpot::StageSnapshot> invalidPrediction;
+    invalidPrediction.push_back(stage(0, 0, 0, 2, 20.0));
+    invalidPrediction.push_back(stage(1, 1, 2, 2, 10.0));
+    invalidPrediction.push_back(stage(2, 2, 4, 2, 5.0));
+    tpot::Candidate nonAdjacentPrediction;
+    nonAdjacentPrediction.kind = tpot::CandidateKind::PP_MOVE;
+    nonAdjacentPrediction.valid = true;
+    nonAdjacentPrediction.fromStageIndex = 0u;
+    nonAdjacentPrediction.toStageIndex = 2u;
+    nonAdjacentPrediction.layerIndex = 1u;
+    nonAdjacentPrediction.layerCount = 1u;
+    const std::vector<tpot::StageSnapshot> originalInvalidPrediction = invalidPrediction;
+    tpot::applyPpMove(invalidPrediction, nonAdjacentPrediction);
+    require(sameStages(invalidPrediction, originalInvalidPrediction),
+        "prediction rejects non-adjacent PP stages");
+
+    tpot::Candidate interiorForwardPrediction = nonAdjacentPrediction;
+    interiorForwardPrediction.toStageIndex = 1u;
+    interiorForwardPrediction.layerIndex = 0u;
+    invalidPrediction = originalInvalidPrediction;
+    tpot::applyPpMove(invalidPrediction, interiorForwardPrediction);
+    require(sameStages(invalidPrediction, originalInvalidPrediction),
+        "prediction rejects forward PP ranges away from the source boundary");
+
+    tpot::Candidate interiorReversePrediction = nonAdjacentPrediction;
+    interiorReversePrediction.fromStageIndex = 1u;
+    interiorReversePrediction.toStageIndex = 0u;
+    interiorReversePrediction.layerIndex = 3u;
+    invalidPrediction = originalInvalidPrediction;
+    tpot::applyPpMove(invalidPrediction, interiorReversePrediction);
+    require(sameStages(invalidPrediction, originalInvalidPrediction),
+        "prediction rejects reverse PP ranges away from the source boundary");
 
     const tpot::Candidate reverse = tpot::reversePpCandidate(predicted);
     require(reverse.layerCount == predicted.layerCount,

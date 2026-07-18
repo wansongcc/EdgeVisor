@@ -288,20 +288,42 @@ void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate)
     if (candidate.kind != CandidateKind::PP_MOVE || !candidate.valid) return;
     StageSnapshot *from = nullptr;
     StageSnapshot *to = nullptr;
+    size_t fromPosition = stages.size();
+    size_t toPosition = stages.size();
     for (size_t i = 0u; i < stages.size(); ++i) {
-        if (stages[i].stageIndex == candidate.fromStageIndex) from = &stages[i];
-        if (stages[i].stageIndex == candidate.toStageIndex) to = &stages[i];
+        if (stages[i].stageIndex == candidate.fromStageIndex) {
+            from = &stages[i];
+            fromPosition = i;
+        }
+        if (stages[i].stageIndex == candidate.toStageIndex) {
+            to = &stages[i];
+            toPosition = i;
+        }
     }
     if (from == nullptr || to == nullptr) return;
-    if (from->nLayers == 0u) from->nLayers = stageLayerCount(*from);
-    if (to->nLayers == 0u) to->nLayers = stageLayerCount(*to);
     const uint32_t k = candidate.layerCount;
-    if (k == 0u || from->nLayers <= k) return;
-    from->nLayers -= k;
-    to->nLayers += k;
-    if (to->stageIndex > from->stageIndex) {
-        if (from->endLayer >= from->startLayer + k) from->endLayer -= k;
-        if (to->startLayer >= k) to->startLayer -= k;
+    if (k == 0u || fromPosition == stages.size() || toPosition == stages.size()) return;
+
+    const bool forward = fromPosition + 1u == toPosition;
+    const bool reverse = toPosition + 1u == fromPosition;
+    if (!forward && !reverse) return;
+    if (forward != (candidate.toStageIndex > candidate.fromStageIndex)) return;
+
+    if (from->endLayer < from->startLayer || k > from->endLayer - from->startLayer) return;
+    if (forward) {
+        if (candidate.layerIndex != from->endLayer - k || to->startLayer < k) return;
+    } else {
+        if (candidate.layerIndex != from->startLayer) return;
+    }
+
+    const uint32_t fromLayers = stageLayerCount(*from);
+    const uint32_t toLayers = stageLayerCount(*to);
+    if (fromLayers <= k) return;
+    from->nLayers = fromLayers - k;
+    to->nLayers = toLayers + k;
+    if (forward) {
+        from->endLayer -= k;
+        to->startLayer -= k;
     } else {
         from->startLayer += k;
         to->endLayer += k;

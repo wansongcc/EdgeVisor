@@ -46,7 +46,7 @@
 | Other CUDA operators | N/A | N/A | Not implemented |
 
 Current milestone: PR 12 CUDA static distribution, dynamic plan refresh, and KV migration
-coverage. CUDA build defaults to detecting local GPU compute capability via `nvidia-smi` when `CUDA_ARCHS` is not explicitly set; cross-compilation can still pass `CUDA_ARCHS=75 87 ...`. At runtime CUDA detects the selected device compute capability (`sm_xy`), warp size, integrated/discrete type, and max block size, then chooses launch parameters for elementwise, reduction, attention, Q80xQ40 matmul, softmax, and MoE gate kernels. CUDA can allocate pipe and buffer
+coverage. CUDA build defaults to detecting local GPU compute capability via `nvidia-smi` when `CUDA_ARCHS` is not explicitly set. On Jetson, when `nvidia-smi` does not provide `compute_cap`, the Makefile falls back to `/proc/device-tree/compatible` (`tegra234` → `87`, `tegra194` → `72`, `tegra186` → `62`, `tegra210` → `53`). Cross-compilation can still pass `CUDA_ARCHS=75 87 ...`. At runtime CUDA detects the selected device compute capability (`sm_xy`), warp size, integrated/discrete type, and max block size, then chooses launch parameters for elementwise, reduction, attention, Q80xQ40 matmul, softmax, and MoE gate kernels. CUDA can allocate pipe and buffer
 mirrors with `cudaMalloc`, use pinned host staging plus `cudaMemcpyAsync`, load
 weights by byte offset, synchronize segment inputs/outputs at the segment
 boundary, execute the PR4 elementwise/cast/aggregate operators, refresh

@@ -62,13 +62,22 @@ endif
 endif
 
 ifdef DLLAMA_CUDA
-CUDA_ARCHS_DETECTED := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/[^0-9.]//g; s/\.//g' | awk 'NF' | sort -u | tr '\n' ' ')
+CUDA_ARCHS_DETECTED := $(shell \
+	detected="`nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/[^0-9.]//g; s/\.//g' | awk 'NF' | sort -u | tr '\n' ' '`"; \
+	if [ -z "$$detected" ] && [ -r /proc/device-tree/compatible ]; then \
+		compatible="`tr '\000' '\n' < /proc/device-tree/compatible 2>/dev/null || true`"; \
+		if printf '%s' "$$compatible" | grep -q 'tegra234'; then detected="87"; \
+		elif printf '%s' "$$compatible" | grep -q 'tegra194'; then detected="72"; \
+		elif printf '%s' "$$compatible" | grep -q 'tegra186'; then detected="62"; \
+		elif printf '%s' "$$compatible" | grep -q 'tegra210'; then detected="53"; fi; \
+	fi; \
+	printf '%s' "$$detected")
 ifneq ($(filter auto native,$(CUDA_ARCHS)),)
 ifneq ($(strip $(CUDA_ARCHS_DETECTED)),)
 CUDA_ARCHS_EFFECTIVE := $(strip $(CUDA_ARCHS_DETECTED))
 else
 CUDA_ARCHS_EFFECTIVE := $(CUDA_ARCHS_FALLBACK)
-$(warning CUDA_ARCHS=$(CUDA_ARCHS) requested but nvidia-smi did not report compute capability; falling back to $(CUDA_ARCHS_EFFECTIVE). Set CUDA_ARCHS manually for cross-compilation.)
+$(warning CUDA_ARCHS=$(CUDA_ARCHS) requested but GPU architecture could not be detected; falling back to $(CUDA_ARCHS_EFFECTIVE). Set CUDA_ARCHS manually for cross-compilation.)
 endif
 else
 CUDA_ARCHS_EFFECTIVE := $(CUDA_ARCHS)

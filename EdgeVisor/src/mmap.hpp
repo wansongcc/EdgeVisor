@@ -2,7 +2,10 @@
 #define MMAP_HPP
 
 #include <cstdio>
+#include <cerrno>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -85,8 +88,15 @@ void openMmapFileRange(MmapFile *file, const char *path, size_t offset, size_t s
 
     file->mappingData = mmap(NULL, file->mappingSize, PROT_READ, MAP_PRIVATE, file->fd, mappingOffset);
     if (file->mappingData == MAP_FAILED) {
+        const int error = errno;
         close(file->fd);
-        throw std::runtime_error("Mmap failed");
+        throw std::runtime_error(
+            std::string("Mmap failed: path=") + path +
+            " offset=" + std::to_string(offset) +
+            " size=" + std::to_string(size) +
+            " mapping_size=" + std::to_string(file->mappingSize) +
+            " errno=" + std::to_string(error) +
+            " (" + std::strerror(error) + ")");
     }
     file->data = (void *)((unsigned char *)file->mappingData + dataOffset);
 #endif

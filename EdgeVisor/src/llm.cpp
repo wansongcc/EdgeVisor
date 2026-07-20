@@ -2605,6 +2605,10 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         if ((NnSize)(b - (NnByte *)weightMappings.back()->data) != embeddingBytes) {
             throw std::runtime_error("Token embedding size mismatch");
         }
+        // The loader has synchronously copied the embedding into its final
+        // host/device buffer. Do not retain the large source mmap while the
+        // remaining stage weights are loaded.
+        weightMappings.back().reset();
     }
     fileOffset += embeddingBytes;
 
@@ -2696,6 +2700,12 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
                 // 校验通过，说明 Skip 逻辑是安全的
                 // printf("✅ Layer %u alignment verified.\n", layerIndex);
             }
+
+            // CUDA weight uploads use a synchronized staging copy, and the
+            // CPU/Vulkan loaders also finish consuming this range before the
+            // next layer. Release the source mapping per layer instead of
+            // retaining every mapped layer until the whole stage is loaded.
+            weightMappings.back().reset();
         }
         fileOffset += layerBytes;
 
@@ -2720,6 +2730,7 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         if ((NnSize)(b - finalStart) != finalBlockBytes) {
              throw std::runtime_error("Final block size mismatch");
         }
+        weightMappings.back().reset();
     }
     fileOffset += finalBlockBytes;
 

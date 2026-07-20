@@ -104,6 +104,33 @@ static NnSize loadRootTokenEmbeddingQ80(Loader *loader, const LlmHeader *h, NnBy
     return srcSize.nBytes;
 }
 
+template <typename Loader>
+static NnSize loadRootTokenEmbeddingQ80Chunk(
+    Loader *loader, const LlmHeader *h, NnUint rowStart, NnUint rowCount, NnByte *weight) {
+    assert(h->dim % Q80_BLOCK_SIZE == 0u);
+    const NnUint blocksPerRow = h->dim / Q80_BLOCK_SIZE;
+    const NnUint rowsPerChunk = 1024u;
+    std::vector<NnBlockQ80> q80Chunk((size_t)rowsPerChunk * (size_t)blocksPerRow);
+    const float *src = (const float *)weight;
+
+    for (NnUint localRowStart = 0u; localRowStart < rowCount; localRowStart += rowsPerChunk) {
+        const NnUint rows = std::min(rowsPerChunk, rowCount - localRowStart);
+        const NnUint n = rows * h->dim;
+        quantizeF32toQ80Chunk(
+            src + (NnSize)localRowStart * h->dim,
+            q80Chunk.data(),
+            n);
+        loader->loadRootChunk(
+            "embedding",
+            0u,
+            (NnSize)(rowStart + localRowStart) * blocksPerRow * sizeof(NnBlockQ80),
+            (NnSize)rows * blocksPerRow * sizeof(NnBlockQ80),
+            (NnByte *)q80Chunk.data());
+    }
+
+    return (NnSize)rowCount * h->dim * sizeof(float);
+}
+
 static bool lastStageSamplingPlanSupportedLlm(const NnUnevenPartitionPlan *plan) {
     if (!envFlagEnabledDefaultLlm("DLLAMA_LAST_STAGE_SAMPLING", false)) return false;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
@@ -2600,15 +2627,18 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         : (nodeIndex == myStage->rootNodeIndex);
     const NnSize embeddingBytes = tokenEmbeddingFileSize(h).nBytes;
     if (isFirstStage && isStageRoot) {
-        NnByte *b = mapWeightRange(fileOffset, embeddingBytes);
-        b += loadRootTokenEmbeddingQ80(loader, h, b);
-        if ((NnSize)(b - (NnByte *)weightMappings.back()->data) != embeddingBytes) {
-            throw std::runtime_error("Token embedding size mismatch");
+        const NnUint rowsPerMap = 1024u;
+        for (NnUint rowStart = 0u; rowStart < h->vocabSize; rowStart += rowsPerMap) {
+            const NnUint rows = std::min(rowsPerMap, h->vocabSize - rowStart);
+            const NnSize chunkOffset = (NnSize)rowStart * h->dim * sizeof(float);
+            const NnSize chunkBytes = (NnSize)rows * h->dim * sizeof(float);
+            NnByte *b = mapWeightRange(fileOffset + chunkOffset, chunkBytes);
+            const NnSize loadedBytes = loadRootTokenEmbeddingQ80Chunk(loader, h, rowStart, rows, b);
+            if (loadedBytes != chunkBytes) {
+                throw std::runtime_error("Token embedding chunk size mismatch");
+            }
+            weightMappings.back().reset();
         }
-        // The loader has synchronously copied the embedding into its final
-        // host/device buffer. Do not retain the large source mmap while the
-        // remaining stage weights are loaded.
-        weightMappings.back().reset();
     }
     fileOffset += embeddingBytes;
 

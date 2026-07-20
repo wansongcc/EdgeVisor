@@ -1,6 +1,7 @@
 #include "nn-network-local.hpp"
 #include "nn-executor.hpp" // 需要 NnExecutor 的完整定义 (loadWeight)
 #include "nn-core.hpp"     // 需要 split...Uneven 函数
+#include "weight-chunking.hpp"
 #include <cstring>
 
 NnLocalWeightLoader::NnLocalWeightLoader(NnExecutor *executor, NnUint nodeIndex) {
@@ -55,7 +56,7 @@ NnSize NnLocalWeightLoader::loadRowMatmulSlicesUneven(const char *opName, const 
     NnRowMatmulSliceUneven slice = slicer(myNodeIndex);
     
     // offset: 设备内存中的偏移 (用于 MoE 的 expert 偏移，非 MoE 通常为 0)
-    NnUint deviceOffset = expertIndex * slice.sliceSize.nBytes;
+    NnSize expertDeviceOffset = (NnSize)expertIndex * slice.sliceSize.nBytes;
 
     // [优化] Row Parallel (按行/Head 切分) 的数据在文件中是连续存储的。
     // 我们不需要 allocate temp 和 memcpy，直接计算文件内的偏移量即可。
@@ -75,12 +76,23 @@ NnSize NnLocalWeightLoader::loadRowMatmulSlicesUneven(const char *opName, const 
     NnSize bytesPerRow = (slice.n / blockSize) * blockBytes;
 
     // slice.inStart 是本节点的起始行号
-    NnSize fileByteOffset = slice.inStart * bytesPerRow;
+    const NnSize fileByteOffset = (NnSize)slice.inStart * bytesPerRow;
 
-    // 3. 直接加载 (Zero-Copy)
-    // weight 是当前 Tensor 的全局起始位置，weight + fileByteOffset 是本节点数据的起始位置
-    // printf("DEBUG: loadRowMatmulSlicesUneven op=%s node=%d offset=%lu size=%lu\n", opName, myNodeIndex, fileByteOffset, slice.sliceSize.nBytes);
-    executor->loadWeight(opName, opIndex, deviceOffset, slice.sliceSize.nBytes, weight + fileByteOffset);
+    // 3. 分块加载连续行，限制 CUDA pinned staging 的峰值。
+    NnSize rowOffset = 0u;
+    while (rowOffset < slice.d0) {
+        const NnSize remainingRows = (NnSize)slice.d0 - rowOffset;
+        const NnSize chunkRows = nnWeightChunkRows(
+            remainingRows, bytesPerRow, NN_WEIGHT_UPLOAD_CHUNK_BYTES);
+        const NnSize chunkBytes = chunkRows * bytesPerRow;
+        executor->loadWeight(
+            opName,
+            opIndex,
+            expertDeviceOffset + rowOffset * bytesPerRow,
+            chunkBytes,
+            weight + fileByteOffset + rowOffset * bytesPerRow);
+        rowOffset += chunkRows;
+    }
 
     // 4. 关键：返回 Tensor 的【全局大小】，让主循环的 b 指针正确跳过整个 Tensor
     return slice.size.nBytes;

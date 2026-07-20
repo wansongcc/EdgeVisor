@@ -203,6 +203,9 @@ token-timing-test: src/test/test_token_timing.cpp token-timing.o
 mmap-range-test: src/test/test_mmap_range.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
+weight-chunking-test: src/test/test_weight_chunking.cpp
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
 app-cli-test: src/test/test_app_cli.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 

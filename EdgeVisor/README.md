@@ -40,6 +40,25 @@ bounds and 3D scaling state after normal completion, Ctrl+C, or SIGTERM.
 Hardware thermal, electrical, and power-mode limits can still throttle the
 observed clock.
 
+### Jetson Orin Combined Frequency Disturbance (GPU + CPU + EMC)
+
+For stronger disturbance that also throttles CPU and memory bandwidth (EMC),
+use the combined injector. LLM inference is memory-bandwidth bound, so
+throttling EMC alongside GPU produces a much larger effect:
+
+```bash
+scripts/jetson_freq_inject.sh --list
+sudo scripts/jetson_freq_inject.sh --level 20
+sudo scripts/jetson_freq_inject.sh --level 20 --duration 30
+sudo scripts/jetson_freq_inject.sh --level 10 --target gpu,cpu
+```
+
+`--target` selects which subsystems to throttle: `gpu`, `cpu`, `emc`, any
+comma-separated combination, or `all` (the default). EMC control is
+best-effort: if the memory controller sysfs interface is not available, the
+script warns and continues with the remaining subsystems. All subsystems are
+restored after normal completion, Ctrl+C, or SIGTERM.
+
 **News**
 - 16 Sep 2025 - Qwen 3 MoE models are now supported on Vulkan.
 - 5 Sep 2025 - Qwen 3 MoE models are now supported on CPU.

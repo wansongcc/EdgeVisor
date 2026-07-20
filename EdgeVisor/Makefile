@@ -77,6 +77,10 @@ $(info CUDA_ARCHS=$(CUDA_ARCHS_EFFECTIVE) requested=$(CUDA_ARCHS))
 	CXXFLAGS += -DDLLAMA_CUDA -I$(CUDA_HOME)/include
 	LIBS += -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 	NVCCFLAGS += -std=c++11 -Isrc -DDLLAMA_CUDA
+	# nvcc's ARM device front-end cannot parse GCC's arm_neon.h built-ins.
+	# The CUDA translation unit does not execute the CPU NEON paths; keep NEON
+	# enabled for normal C++ objects, but hide it while compiling .cu files.
+	NVCCFLAGS += -U__ARM_NEON
 	NVCCFLAGS += $(foreach arch,$(CUDA_ARCHS_EFFECTIVE),-gencode arch=compute_$(arch),code=sm_$(arch))
 	DEPS += nn-cuda.o
 endif

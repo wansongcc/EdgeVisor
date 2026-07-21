@@ -1147,15 +1147,6 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                     unsigned long long count = 0;
                 };
 
-                const NnUint beforeStart = (migrationPivotPos >= migrationWindowTokens)
-                    ? (migrationPivotPos - migrationWindowTokens)
-                    : 0u;
-                // Clip before window to pred-phase tokens only (eval tokens have different batching).
-                const NnUint effectiveBeforeStart = std::max(beforeStart, predPhaseStartPos);
-                const NnUint beforeEnd = migrationPivotPos;
-                const NnUint afterStart = migrationPivotPos + 1u;
-                const NnUint afterEnd = migrationPivotPos + 1u + migrationWindowTokens;
-
                 struct TpotWindowAgg {
                     double totalMs = 0.0;
                     double computeMs = 0.0;
@@ -1186,6 +1177,72 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                     dst.computeMs += tokenComputeMs;
                     dst.count += 1ull;
                 };
+
+                // Compute single-token TPOT (stage-sum) for one sample.
+                auto singleTokenTpotMs = [&accumulateStageTpot](const TokenPerfSample &s) -> double {
+                    TpotWindowAgg tmp;
+                    accumulateStageTpot(s, tmp);
+                    return tmp.count > 0 ? tmp.totalMs : 0.0;
+                };
+
+                // --- Degradation onset detection (Solution A) ---
+                // Scan backwards from the pivot to find where TPOT jumped,
+                // so the before window only contains truly degraded tokens.
+                static const NnUint kOnsetSlideWindow = 3u;   // sliding window size for onset scan
+                static const double kOnsetJumpRatio = 1.15;    // 15% jump threshold
+                static const NnUint kOnsetScanRange = 40u;     // max tokens to scan backwards
+
+                const NnUint scanFloor = std::max(predPhaseStartPos,
+                    migrationPivotPos >= kOnsetScanRange ? migrationPivotPos - kOnsetScanRange : predPhaseStartPos);
+
+                // Collect per-token TPOT in [scanFloor, pivotPos) from history.
+                struct PosTpot { NnUint pos; double ms; };
+                std::vector<PosTpot> tokenTpots;
+                for (const TokenPerfSample &s : predPerfHistory) {
+                    if (s.pos >= scanFloor && s.pos < migrationPivotPos) {
+                        const double ms = singleTokenTpotMs(s);
+                        if (ms > 0.0) tokenTpots.push_back({s.pos, ms});
+                    }
+                }
+
+                NnUint detectedOnset = (migrationPivotPos >= migrationWindowTokens)
+                    ? (migrationPivotPos - migrationWindowTokens)
+                    : predPhaseStartPos;
+
+                if (tokenTpots.size() >= kOnsetSlideWindow * 2u) {
+                    // Sort by position (history should already be ordered, but be safe).
+                    std::sort(tokenTpots.begin(), tokenTpots.end(),
+                        [](const PosTpot &a, const PosTpot &b) { return a.pos < b.pos; });
+
+                    // Scan backwards: compare sliding window [i, i+k) with [i-k, i).
+                    // The onset is the earliest position where the TPOT jumped and stayed high.
+                    const size_t n = tokenTpots.size();
+                    for (size_t i = n - kOnsetSlideWindow; i >= kOnsetSlideWindow; --i) {
+                        double recentSum = 0.0;
+                        for (size_t j = i; j < i + kOnsetSlideWindow; ++j) recentSum += tokenTpots[j].ms;
+                        const double recentAvg = recentSum / (double)kOnsetSlideWindow;
+
+                        double baselineSum = 0.0;
+                        for (size_t j = i - kOnsetSlideWindow; j < i; ++j) baselineSum += tokenTpots[j].ms;
+                        const double baselineAvg = baselineSum / (double)kOnsetSlideWindow;
+
+                        if (baselineAvg > 0.0 && recentAvg > baselineAvg * kOnsetJumpRatio) {
+                            // Jump detected: tokens [i, i+k) are degraded, [i-k, i) are not.
+                            detectedOnset = tokenTpots[i].pos;
+                            // Keep scanning further back to find the earliest sustained onset.
+                        } else if (detectedOnset != ((migrationPivotPos >= migrationWindowTokens)
+                                    ? (migrationPivotPos - migrationWindowTokens) : predPhaseStartPos)) {
+                            // We already found an onset and the TPOT is no longer jumping;
+                            // stop — we have the earliest sustained onset.
+                            break;
+                        }
+                    }
+                }
+
+                const NnUint effectiveBeforeStart = std::max(detectedOnset, predPhaseStartPos);
+                const NnUint beforeEnd = migrationPivotPos;
+                const NnUint afterStart = migrationPivotPos + 1u;
+                const NnUint afterEnd = migrationPivotPos + 1u + migrationWindowTokens;
 
                 std::vector<WindowAgg> beforeAgg(nNodes);
                 std::vector<WindowAgg> afterAgg(nNodes);
@@ -1232,14 +1289,18 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                     const double computeDeltaMs = afterComputeTpotMs - beforeComputeTpotMs;
                     const double computeImprovePct = beforeComputeTpotMs > 0.0 ? ((beforeComputeTpotMs - afterComputeTpotMs) / beforeComputeTpotMs) * 100.0 : 0.0;
 
-                    std::printf("\n⏱️  [Migration TPOT %u-token Avg] anchor(layer=%u pos=%u) before=[%u,%u) after=[%u,%u)\n",
-                        (unsigned)migrationWindowTokens,
+                    std::printf("\n⏱️  [Migration TPOT] anchor(layer=%u pos=%u) before=[%u,%u)(%llu tokens) after=[%u,%u)(%llu tokens) onset_detected=%s\n",
                         (unsigned)migrationPivotLayer,
                         (unsigned)migrationPivotPos,
                         (unsigned)effectiveBeforeStart,
                         (unsigned)beforeEnd,
+                        beforeTpot.count,
                         (unsigned)afterStart,
-                        (unsigned)afterEnd);
+                        (unsigned)afterEnd,
+                        afterTpot.count,
+                        detectedOnset != ((migrationPivotPos >= migrationWindowTokens)
+                            ? (migrationPivotPos - migrationWindowTokens) : predPhaseStartPos)
+                            ? "yes" : "no(fixed-window)");
                     std::printf("  • TPOT(stage-sum): before=%6.2f ms after=%6.2f ms delta=%+6.2f ms improve=%+6.2f%% | compute-only before=%6.2f ms after=%6.2f ms delta=%+6.2f ms improve=%+6.2f%% | samples=%llu/%llu\n",
                         beforeTpotMs,
                         afterTpotMs,
@@ -1287,7 +1348,10 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                                << " compute_tpot_delta_ms=" << computeDeltaMs
                                << " compute_tpot_improve_pct=" << computeImprovePct
                                << " before_samples=" << beforeTpot.count
-                               << " after_samples=" << afterTpot.count;
+                               << " after_samples=" << afterTpot.count
+                               << " onset_detected=" << (detectedOnset != ((migrationPivotPos >= migrationWindowTokens)
+                                    ? (migrationPivotPos - migrationWindowTokens) : predPhaseStartPos) ? 1 : 0)
+                               << " onset_pos=" << detectedOnset;
                         appendMigrationTpotLog(migLog.str());
                     }
                     for (NnUint node = 0; node < nNodes; ++node) {

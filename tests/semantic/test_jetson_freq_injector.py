@@ -192,6 +192,16 @@ def test_emc_only_inject_and_restore() -> None:
         require(fake.emc_read("max_rate") == "2133000000", "EMC max not restored")
 
 
+def test_bpmp_emc_uses_rate_not_read_only_bounds() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = FakeSysfs(Path(tmp))
+        result = run(fake, "--level", "0", "--target", "emc")
+        require(result.returncode == 0, result.stderr)
+        writes = fake.write_log.read_text(encoding="utf-8").splitlines()
+        require(writes == ["rate=204000000", "rate=2133000000"],
+                f"BPMP EMC must write rate only, got: {writes}")
+
+
 def test_all_combined_inject_and_restore() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         fake = FakeSysfs(Path(tmp))
@@ -370,6 +380,7 @@ def main() -> int:
     test_gpu_only_inject_and_restore()
     test_cpu_only_inject_and_restore()
     test_emc_only_inject_and_restore()
+    test_bpmp_emc_uses_rate_not_read_only_bounds()
     test_all_combined_inject_and_restore()
     test_level_mapping_per_subsystem()
     test_emc_unavailable_graceful_degradation()

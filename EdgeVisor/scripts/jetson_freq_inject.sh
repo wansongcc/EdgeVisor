@@ -386,6 +386,7 @@ EMC_MAX_FILE=""
 EMC_CUR_FILE=""
 EMC_ORIG_MIN=""
 EMC_ORIG_MAX=""
+EMC_ORIG_RATE=""
 EMC_SINGLE_RATE=0
 declare -a EMC_FREQUENCIES=()
 
@@ -401,6 +402,9 @@ emc_discover() {
     EMC_CUR_FILE="${bpmp_emc}/rate"
     EMC_MIN_FILE="${bpmp_emc}/min_rate"
     EMC_MAX_FILE="${bpmp_emc}/max_rate"
+    # BPMP exposes min_rate/max_rate as read-only limits; rate is the only
+    # writable clock-control node.
+    EMC_SINGLE_RATE=1
     EMC_PRESENT=1
     return 0
   fi
@@ -483,10 +487,17 @@ emc_save_state() {
     EMC_ORIG_MIN=""
   fi
   EMC_ORIG_MAX="$(read_uint "${EMC_MAX_FILE}")"
+  if (( EMC_SINGLE_RATE )); then
+    EMC_ORIG_RATE="$(read_uint "${EMC_CUR_FILE}")"
+  fi
 }
 
 emc_inject() {
   local target="$1"
+  if (( EMC_SINGLE_RATE )); then
+    write_value "${EMC_CUR_FILE}" "${target}" || return 1
+    return 0
+  fi
   if [[ "${EMC_MODE}" == "bwmgr" ]]; then
     write_value "${EMC_MAX_FILE}" "${target}" || return 1
     return 0
@@ -513,7 +524,9 @@ emc_inject() {
 
 emc_restore_state() {
   local failed=0
-  if [[ -n "${EMC_MIN_FILE}" ]]; then
+  if (( EMC_SINGLE_RATE )); then
+    write_value "${EMC_CUR_FILE}" "${EMC_ORIG_RATE}" || failed=1
+  elif [[ -n "${EMC_MIN_FILE}" ]]; then
     local cur_min cur_max
     cur_min="$(try_read_uint "${EMC_MIN_FILE}")" || { failed=1; }
     cur_max="$(try_read_uint "${EMC_MAX_FILE}")" || { failed=1; }

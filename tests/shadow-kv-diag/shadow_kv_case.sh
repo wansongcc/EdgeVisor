@@ -55,7 +55,8 @@ env DLLAMA_DUMP_KV_DIR="$DUMP" DLLAMA_NBATCHES="$NB" "${BUBBLE_ENV[@]}" \
   --enable-pp-migration \
   --runtime-redundant-boundary-layers 1 \
   --runtime-active-seg-enabled 1 \
-  --runtime-redundant-seg-enabled 1 \
+  --runtime-redundant-seg-enabled 0 \
+  ${EXTRA_ARGS:-} \
   --benchmark >"$LOGDIR/root.log" 2>&1
 RC=$?
 

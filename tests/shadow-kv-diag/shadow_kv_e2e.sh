@@ -57,7 +57,7 @@ env "${BUBBLE_ENV[@]}" "${ABLATION_ENV[@]}" \
   --enable-pp-migration \
   --runtime-redundant-boundary-layers 1 \
   --runtime-active-seg-enabled 1 \
-  --runtime-redundant-seg-enabled 1 \
+  --runtime-redundant-seg-enabled 0 \
   --plan-ctrl-socket "$SOCK" \
   --benchmark >"$LOGDIR/root.log" 2>&1 &
 R1=$!

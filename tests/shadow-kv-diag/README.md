@@ -4,7 +4,7 @@
 
 ## 组成
 
-- `run_case.sh <tag> <2pp|3pp> <async|sync|off> <nBatches> [steps]`
+- `shadow_kv_case.sh <tag> <2pp|3pp> <async|sync|off> <nBatches> [steps]`
   在单机起 root + worker(s)（CPU backend），跑 2 级或 3 级 PP 推理，
   设置 `DLLAMA_DUMP_KV_DIR` 让每个节点在每次 forward 后导出所有
   `block_shift_k/block_shift_v`（含主路径 att、takeover、shadow-kv 段）写入的
@@ -15,7 +15,7 @@
   对每个 shadow（`red`）dump，按 (layer, kind, batch, pos) 在**另一个节点**上找
   同一层的 `main` dump（该层在相邻 stage 上是 active 层，其 K/V 为参考真值），
   输出 max/mean abs diff 和 best-matching position（用于识别"上一 token 陈旧输入"）。
-- `run_e2e.sh <tag> <baseline|transfer|recompute|shadow> [triggerPos] [layerCount] [prompt] [steps]`
+- `shadow_kv_e2e.sh <tag> <baseline|transfer|recompute|shadow> [triggerPos] [layerCount] [prompt] [steps]`
   端到端迁移一致性测试：2 级 PP，经 UDS `set_pp_migration`（exact 模式）在
   指定 position 把 stage1 的边界层迁到 stage0，对比四种恢复路径的生成 token：
   - `baseline`：不迁移；

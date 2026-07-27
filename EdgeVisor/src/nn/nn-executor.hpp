@@ -208,6 +208,11 @@ private:
     NnUint bubbleShadowDrainUs;
     std::vector<NnUint> bubbleShadowStepIndices;
     std::vector<NnByte> segmentSyncProfileKinds;
+    // Per-segment ready-point gating for right-boundary shadow KV segments:
+    // the segment may only execute after the main path passed this step index
+    // (the pp_send segment's pp_stage_cache CAST writing pp_stage_out).
+    // 0 means "no gating".
+    std::vector<NnUint> segmentReadyAfterStep;
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
     NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning);
     bool isRedundantLayerActive(NnUint layerIndex) const;

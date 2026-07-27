@@ -645,6 +645,40 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     }
     bubbleShadowStepIndices.shrink_to_fit();
 
+    // Ready-point gating for right-boundary shadow KV segments. Their input is
+    // the pp_stage_out snapshot written by the pp_send segment's pp_stage_cache
+    // CAST; such a segment must not execute before the main path completed
+    // that step. Drain (post-forward) always satisfies the gate because
+    // currentStepIndex == nSteps then.
+    segmentReadyAfterStep.assign(nodeConfig ? nodeConfig->nSegments : 0u, 0u);
+    if (nodeConfig != nullptr) {
+        NnUint stepBase = 0u;
+        NnUint ppStageCacheStep = (NnUint)-1;
+        for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+            const NnSegmentConfig *seg = &nodeConfig->segments[s];
+            if (ppStageCacheStep == (NnUint)-1 &&
+                s < segmentSyncProfileKinds.size() &&
+                segmentSyncProfileKinds[s] == SEG_SYNC_PP_SEND) {
+                for (NnUint i = 0; i < seg->nOps; ++i) {
+                    if (nameHas(seg->ops[i].name, "pp_stage_cache")) {
+                        ppStageCacheStep = stepBase + i;
+                        break;
+                    }
+                }
+            }
+            stepBase += seg->nOps + ((useSynchronizer && seg->nSyncs > 0u) ? 1u : 0u);
+        }
+        if (ppStageCacheStep != (NnUint)-1) {
+            for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+                if (s >= segmentRuntimeRoles.size() || segmentRuntimeRoles[s] != SEG_ROLE_SHADOW_KV) continue;
+                const NnSegmentConfig *seg = &nodeConfig->segments[s];
+                if (seg->nOps > 0u && nameHas(seg->ops[0].name, "runtime_shadow_kv_att_in_right")) {
+                    segmentReadyAfterStep[s] = ppStageCacheStep;
+                }
+            }
+        }
+    }
+
     context.nThreads = netExecution->nThreads;
     context.synchronizer = synchronizer;
     context.nSteps = (NnUint)steps.size();
@@ -973,6 +1007,16 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, b
                 continue;
             }
             segmentIndex = steps[firstStepIndex].segmentIndex;
+            if (segmentIndex < segmentReadyAfterStep.size()) {
+                const NnUint readyAfter = segmentReadyAfterStep[segmentIndex];
+                if (readyAfter > 0u &&
+                    context.currentStepIndex.load(std::memory_order_relaxed) <= readyAfter) {
+                    // Right-boundary shadow inputs (pp_stage_out snapshot) are
+                    // not ready yet; leave the cursor in place and retry in a
+                    // later window (drain at the end of forward always runs it).
+                    break;
+                }
+            }
             segmentEndCursor = segmentStartCursor;
             while (segmentEndCursor < (NnUint)bubbleShadowStepIndices.size()) {
                 const NnUint idx = bubbleShadowStepIndices[segmentEndCursor];

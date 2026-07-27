@@ -1480,6 +1480,17 @@ static NnNodeConfig buildLlmNodeInternal(
         addSegmentLogged(ppRecvSeg, "pp_recv", startLayer);
     }
 
+    // Shadow-KV private work buffers (allocated lazily on first shadow segment).
+    // Shadow segments run strictly serially on the single shadow worker, so one
+    // private set per node is enough, and the main path's shared buffers
+    // (x/invRms/y/yq/kTemp/vTemp) are never touched by shadow execution.
+    NnUint shadowXBufferIndex = (NnUint)-1;
+    NnUint shadowInvRmsBufferIndex = (NnUint)-1;
+    NnUint shadowYBufferIndex = (NnUint)-1;
+    NnUint shadowYqBufferIndex = (NnUint)-1;
+    NnUint shadowKTempBufferIndex = (NnUint)-1;
+    NnUint shadowVTempBufferIndex = (NnUint)-1;
+
     auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromXPipe, bool writeBackToXPipe) {
         const NnUint redundantKBufferIndex = nodeBuilder.addBuffer(
             "red_k",
@@ -1494,96 +1505,126 @@ static NnNodeConfig buildLlmNodeInternal(
             (*layerVRegistry)[layerIndex] = redundantVBufferIndex;
         }
 
-        NnSegmentConfigBuilder redAtt;
-        if (readFromXPipe) {
-            redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_left", layerIndex,
-                pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-                size0(), NnCastOpCodeConfig{});
-        } else if (std::getenv("DLLAMA_SHADOW_RIGHT_PP_CACHE") != nullptr &&
-                   ppStageOutCacheBufferIndex != (NnUint)-1) {
-            // Diagnostic-only path (DLLAMA_SHADOW_RIGHT_PP_CACHE): feed the right
-            // boundary shadow from the post-merge PP stage snapshot instead of
-            // re-applying zqPipe onto xBuffer. Used to isolate the suspected
-            // double-add of the last layer's FFN output in the shadow input.
-            redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_right_ppcache", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-                size0(), NnCastOpCodeConfig{});
-        } else {
-            redAtt.addOp(OP_MERGE_ADD, "runtime_shadow_kv_att_in_right", layerIndex,
-                pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-                size0(), NnMergeAddOpCodeConfig{});
+        // Left-boundary shadow KV is disabled by default: its only available
+        // input (xPipe at this stage) is the previous stage's final output,
+        // i.e. the *output* of layer (startLayer-1), not its input, so the
+        // produced K/V history is wrong by construction. The PP-migration
+        // consumption path does not use left-boundary shadow state either
+        // (migration to a later stage goes through the real KV transfer).
+        // DLLAMA_SHADOW_LEFT_ENABLE=1 restores the old behavior for
+        // comparison experiments.
+        const bool buildShadowKvSegment = !readFromXPipe ||
+            std::getenv("DLLAMA_SHADOW_LEFT_ENABLE") != nullptr;
+        if (buildShadowKvSegment && !readFromXPipe && ppStageOutCacheBufferIndex == (NnUint)-1) {
+            // Right-boundary shadow requires the pp_stage_out snapshot buffer,
+            // which only exists on non-last stages (i.e. when a pp_send
+            // segment exists). Right-boundary layers themselves only exist on
+            // such stages, so this is a defensive guard.
+            printf("⚠️ [seg-build] skip right-boundary shadow_kv for layer %u: no pp_stage_out buffer\n",
+                (unsigned)layerIndex);
         }
-        redAtt.addOp(OP_INV_RMS, "block_norm_pre_0", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
-            size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
-        redAtt.addOp(OP_RMS_NORM, "block_norm_0", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-            n->rmsNormSize,
-            NnRmsNormOpConfig{invRmsBufferIndex, 1});
-        if (yBufferIndex != yqBufferIndex) {
-            redAtt.addOp(OP_CAST, "block_cast_y", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
-                size0(), NnCastOpCodeConfig{});
-        }
+        if (buildShadowKvSegment && (readFromXPipe || ppStageOutCacheBufferIndex != (NnUint)-1)) {
+            if (shadowXBufferIndex == (NnUint)-1) {
+                shadowXBufferIndex = nodeBuilder.addBuffer("shadow_x", size2D(F_32, nBatches, h->dim));
+                shadowInvRmsBufferIndex = nodeBuilder.addBuffer("shadow_inv_rms", size2D(F_32, nBatches, nInvBufferColumns));
+                shadowYBufferIndex = nodeBuilder.addBuffer("shadow_y", size2D(F_32, nBatches, h->dim));
+                shadowYqBufferIndex = (h->syncType == F_32)
+                    ? shadowYBufferIndex
+                    : nodeBuilder.addBuffer("shadow_q_y", size2D(h->syncType, nBatches, h->dim));
+                shadowKTempBufferIndex = nodeBuilder.addBuffer(
+                    "shadow_k_temp",
+                    size2D(F_32, nBatches, (fullAttBuffers && enableKvRedundancy) ? kSlice.inLen : (fullAttBuffers ? h->kvDim : kSlice.inLen)));
+                shadowVTempBufferIndex = nodeBuilder.addBuffer(
+                    "shadow_v_temp",
+                    size2D(F_32, nBatches, (fullAttBuffers && enableKvRedundancy) ? vSlice.inLen : (fullAttBuffers ? h->kvDim : vSlice.inLen)));
+            }
 
-        const NnPointerConfig kTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, kTempBufferIndex, NN_SLICE_KV_HEAD)
-            : pointerBatchConfig(SRC_BUFFER, kTempBufferIndex);
-        const NnPointerConfig vTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, vTempBufferIndex, NN_SLICE_KV_HEAD)
-            : pointerBatchConfig(SRC_BUFFER, vTempBufferIndex);
+            NnSegmentConfigBuilder redAtt;
+            if (readFromXPipe) {
+                redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_left", layerIndex,
+                    pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowXBufferIndex),
+                    size0(), NnCastOpCodeConfig{});
+            } else {
+                // Right-boundary shadow input: the post-merge PP stage output
+                // snapshot (written by pp_stage_cache in the pp_send segment).
+                // The old OP_MERGE_ADD(zqPipe -> xBuffer) input double-added
+                // the last layer's FFN output whenever the shadow ran after
+                // the main path's own pp_stage_merge.
+                redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_right", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowXBufferIndex),
+                    size0(), NnCastOpCodeConfig{});
+            }
+            redAtt.addOp(OP_INV_RMS, "block_norm_pre_0", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, shadowXBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowInvRmsBufferIndex),
+                size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
+            redAtt.addOp(OP_RMS_NORM, "block_norm_0", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, shadowXBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowYBufferIndex),
+                n->rmsNormSize,
+                NnRmsNormOpConfig{shadowInvRmsBufferIndex, 1});
+            if (shadowYBufferIndex != shadowYqBufferIndex) {
+                redAtt.addOp(OP_CAST, "block_cast_y", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, shadowYBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowYqBufferIndex),
+                    size0(), NnCastOpCodeConfig{});
+            }
 
-        NnMatmulOpConfig kCfg = enableKvRedundancy
-            ? makeRowMatmulCfg(kSlice.n, kSlice.inLen, kSlice.inStart, kResidentSlice.inStart, stageFullWeights)
-            : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, kSlice.n, kSlice.inLen, kSlice.inStart, kResidentSlice.inStart, stageFullWeights);
-        NnMatmulOpConfig vCfg = enableKvRedundancy
-            ? makeRowMatmulCfg(vSlice.n, vSlice.inLen, vSlice.inStart, vResidentSlice.inStart, stageFullWeights)
-            : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, vSlice.n, vSlice.inLen, vSlice.inStart, vResidentSlice.inStart, stageFullWeights);
-        if (enableKvRedundancy) {
-            kCfg.outStartUnit = h->headDim;
-            vCfg.outStartUnit = h->headDim;
-        }
-        redAtt.addOp(OP_MATMUL, "block_matmul_k", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), kTempSlicePtr,
-            stageFullWeights ? kResidentSlice.sliceSize : kSlice.sliceSize, kCfg);
-        redAtt.addOp(OP_MATMUL, "block_matmul_v", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), vTempSlicePtr,
-            stageFullWeights ? vResidentSlice.sliceSize : vSlice.sliceSize, vCfg);
+            const NnPointerConfig kTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowKTempBufferIndex, NN_SLICE_KV_HEAD)
+                : pointerBatchConfig(SRC_BUFFER, shadowKTempBufferIndex);
+            const NnPointerConfig vTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowVTempBufferIndex, NN_SLICE_KV_HEAD)
+                : pointerBatchConfig(SRC_BUFFER, shadowVTempBufferIndex);
 
-        if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
-            redAtt.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex,
-                kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
-                size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
-            redAtt.addOp(OP_RMS_NORM, "block_norm_k", layerIndex,
+            NnMatmulOpConfig kCfg = enableKvRedundancy
+                ? makeRowMatmulCfg(kSlice.n, kSlice.inLen, kSlice.inStart, kResidentSlice.inStart, stageFullWeights)
+                : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, kSlice.n, kSlice.inLen, kSlice.inStart, kResidentSlice.inStart, stageFullWeights);
+            NnMatmulOpConfig vCfg = enableKvRedundancy
+                ? makeRowMatmulCfg(vSlice.n, vSlice.inLen, vSlice.inStart, vResidentSlice.inStart, stageFullWeights)
+                : makeRowMatmulCfgTagged(NN_SLICE_KV_HEAD, h->headDim, vSlice.n, vSlice.inLen, vSlice.inStart, vResidentSlice.inStart, stageFullWeights);
+            if (enableKvRedundancy) {
+                kCfg.outStartUnit = h->headDim;
+                vCfg.outStartUnit = h->headDim;
+            }
+            redAtt.addOp(OP_MATMUL, "block_matmul_k", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, shadowYqBufferIndex), kTempSlicePtr,
+                stageFullWeights ? kResidentSlice.sliceSize : kSlice.sliceSize, kCfg);
+            redAtt.addOp(OP_MATMUL, "block_matmul_v", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, shadowYqBufferIndex), vTempSlicePtr,
+                stageFullWeights ? vResidentSlice.sliceSize : vSlice.sliceSize, vCfg);
+
+            if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
+                redAtt.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex,
+                    kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, shadowInvRmsBufferIndex),
+                    size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
+                redAtt.addOp(OP_RMS_NORM, "block_norm_k", layerIndex,
+                    kTempSlicePtr, kTempSlicePtr,
+                    size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{shadowInvRmsBufferIndex, nKNormColumns});
+            }
+
+            redAtt.addOp(OP_ROPE, "block_rope_k", layerIndex,
                 kTempSlicePtr, kTempSlicePtr,
-                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
+                size0(),
+                NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheKBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceK});
+
+            const NnShiftOpCodeConfig redShiftKCfg = fullAttBuffers
+                ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+                : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
+            const NnShiftOpCodeConfig redShiftVCfg = fullAttBuffers
+                ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+                : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
+            redAtt.addOp(OP_SHIFT, "block_shift_k", layerIndex,
+                kTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantKBufferIndex),
+                size0(), redShiftKCfg);
+            redAtt.addOp(OP_SHIFT, "block_shift_v", layerIndex,
+                vTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantVBufferIndex),
+                size0(), redShiftVCfg);
+
+            addSegmentLogged(redAtt, "shadow_kv", layerIndex);
         }
-
-        redAtt.addOp(OP_ROPE, "block_rope_k", layerIndex,
-            kTempSlicePtr, kTempSlicePtr,
-            size0(),
-            NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheKBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceK});
-
-        const NnShiftOpCodeConfig redShiftKCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
-            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
-        const NnShiftOpCodeConfig redShiftVCfg = fullAttBuffers
-            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
-            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
-        redAtt.addOp(OP_SHIFT, "block_shift_k", layerIndex,
-            kTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantKBufferIndex),
-            size0(), redShiftKCfg);
-        redAtt.addOp(OP_SHIFT, "block_shift_v", layerIndex,
-            vTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantVBufferIndex),
-            size0(), redShiftVCfg);
-
-        addSegmentLogged(redAtt, "shadow_kv", layerIndex);
 
         NnSegmentConfigBuilder takeoverAtt;
         if (readFromXPipe) {

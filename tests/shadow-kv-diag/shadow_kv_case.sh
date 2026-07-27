@@ -2,7 +2,7 @@
 # Shadow KV numerical-diagnosis runner (CPU only).
 # usage: run_case.sh <tag> <2pp|3pp> <async|sync|off> <nbatches> [steps]
 set -u
-TAG="${1:?tag}"; TOPO="${2:?2pp|3pp}"; MODE="${3:?async|sync|off}"; NB="${4:-1}"; STEPS="${5:-8}"
+TAG="${1:?tag}"; TOPO="${2:?2pp|3pp}"; MODE="${3:?async|sync|off}"; NB="${4:-1}"; STEPS="${5:-8}"; PROMPT="${6:-Write a comma-separated list of the numbers from 1 to 20.}"
 
 ROOT="$HOME/B01/EdgeVisor"
 BIN="$ROOT/EdgeVisor/dllama"
@@ -42,7 +42,7 @@ sleep 3
 
 env DLLAMA_DUMP_KV_DIR="$DUMP" DLLAMA_NBATCHES="$NB" "${BUBBLE_ENV[@]}" \
   "$BIN" inference \
-  --prompt "Write a comma-separated list of the numbers from 1 to 20." \
+  --prompt "$PROMPT" \
   --steps "$STEPS" \
   --model "$MODEL" --tokenizer "$TOK" \
   --buffer-float-type q80 --nthreads 1 --max-seq-len 512 \

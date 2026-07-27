@@ -1138,6 +1138,110 @@ NnExecutorSyncProfile NnExecutor::getLastSyncProfile() const {
     return lastSyncProfile;
 }
 
+// Debug-only helper for numerical verification of bubble shadow KV.
+// Dumps, for every OP_SHIFT named block_shift_k/block_shift_v (main att and
+// shadow-kv segments alike), the destination buffer row(s) written for the
+// current forward, keyed by (segment, layer, kind, role, batch row, position).
+void NnExecutor::dumpKvShiftDebug(const char *dir, NnUint batchSize) {
+    if (dir == nullptr || dir[0] == '\0') return;
+    if (nodeConfig == nullptr || netExecution == nullptr || netExecution->pipes == nullptr) return;
+    if (batchSize == 0u) batchSize = 1u;
+
+    NnCpuDevice *cpuDevice = nullptr;
+    for (NnUint s = 0; s < (NnUint)segments.size(); ++s) {
+        auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(segments[s].get());
+        if (cpuSeg != nullptr && cpuSeg->device != nullptr) {
+            cpuDevice = cpuSeg->device;
+            break;
+        }
+    }
+    if (cpuDevice == nullptr) return;
+
+    char path[1200];
+    for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
+        NnSegmentConfig *seg = &nodeConfig->segments[s];
+        const bool isShadow = s < segmentRuntimeRoles.size() && segmentRuntimeRoles[s] == SEG_ROLE_SHADOW_KV;
+        const bool isTakeover = s < segmentRuntimeRoles.size() && segmentRuntimeRoles[s] == SEG_ROLE_REDUNDANT;
+        const char *roleTag = isShadow ? "red" : (isTakeover ? "tak" : "main");
+        for (NnUint i = 0; i < seg->nOps; ++i) {
+            NnOpConfig *op = &seg->ops[i];
+            if (op->code != OP_SHIFT || op->name == nullptr) continue;
+            const bool isK = nameHas(op->name, "block_shift_k");
+            const bool isV = nameHas(op->name, "block_shift_v");
+            if (!isK && !isV) continue;
+            if (op->output.source != SRC_BUFFER) continue;
+            const NnUint bufIdx = op->output.pointerIndex;
+            if (bufIdx >= nodeConfig->nBuffers || bufIdx >= cpuDevice->getBufferCount()) continue;
+            const NnSize3D &bs = nodeConfig->buffers[bufIdx].size;
+            if (bs.floatType != F_32 || bs.x == 0u || bs.y == 0u) continue;
+            const auto *cfg = (const NnShiftOpCodeConfig *)op->config;
+            if (cfg == nullptr) continue;
+            if (cfg->indexPipeIndex >= netExecution->nPipes) continue;
+            if (cfg->kvSlotStride != 0u && cfg->slotPipeIndex >= netExecution->nPipes) continue;
+            const float *buf = (const float *)cpuDevice->buffers[bufIdx];
+            const float *posPipe = (const float *)netExecution->pipes[cfg->indexPipeIndex];
+            const float *slotPipe = (cfg->kvSlotStride != 0u)
+                ? (const float *)netExecution->pipes[cfg->slotPipeIndex]
+                : nullptr;
+            const NnUint rowWidth = (cfg->dstRowStride != 0u) ? cfg->dstRowStride : bs.x;
+            for (NnUint b = 0u; b < batchSize; ++b) {
+                const float posF = posPipe[b];
+                if (!(posF >= 0.0f)) continue;
+                const NnUint pos = (NnUint)posF;
+                const NnUint slot = (slotPipe != nullptr) ? (NnUint)slotPipe[b] : 0u;
+                const NnSize rowStart = (NnSize)slot * (NnSize)cfg->kvSlotStride + (NnSize)pos * (NnSize)rowWidth;
+                if (rowStart + (NnSize)rowWidth > (NnSize)bs.x * (NnSize)bs.y) continue;
+                std::snprintf(path, sizeof(path),
+                    "%s/kv_n%u_s%u_l%u_%s_%s_b%u_p%u.f32",
+                    dir,
+                    (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+                    (unsigned)s,
+                    (unsigned)op->index,
+                    isK ? "k" : "v",
+                    roleTag,
+                    (unsigned)b,
+                    (unsigned)pos);
+                FILE *f = std::fopen(path, "wb");
+                if (f == nullptr) continue;
+                std::fwrite(buf + rowStart, sizeof(float), rowWidth, f);
+                std::fclose(f);
+                std::snprintf(path, sizeof(path),
+                    "%s/kv_n%u_s%u_l%u_%s_%s_b%u_p%u.meta",
+                    dir,
+                    (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+                    (unsigned)s,
+                    (unsigned)op->index,
+                    isK ? "k" : "v",
+                    roleTag,
+                    (unsigned)b,
+                    (unsigned)pos);
+                FILE *m = std::fopen(path, "w");
+                if (m != nullptr) {
+                    std::fprintf(m,
+                        "node=%u seg=%u layer=%u kind=%s role=%s batch=%u pos=%u slot=%u "
+                        "rowStart=%llu rowWidth=%u dstColStart=%u dstRowStride=%u kvSlotStride=%u bufX=%u bufY=%u\n",
+                        (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+                        (unsigned)s,
+                        (unsigned)op->index,
+                        isK ? "k" : "v",
+                        roleTag,
+                        (unsigned)b,
+                        (unsigned)pos,
+                        (unsigned)slot,
+                        (unsigned long long)rowStart,
+                        (unsigned)rowWidth,
+                        (unsigned)cfg->dstColStart,
+                        (unsigned)cfg->dstRowStride,
+                        (unsigned)cfg->kvSlotStride,
+                        (unsigned)bs.x,
+                        (unsigned)bs.y);
+                    std::fclose(m);
+                }
+            }
+        }
+    }
+}
+
 void NnExecutor::refreshPointers() {
     if (context.isAlive.load()) {
         throw std::runtime_error("Cannot refresh pointers while executor is running");

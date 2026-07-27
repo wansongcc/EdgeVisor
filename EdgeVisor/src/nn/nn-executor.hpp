@@ -255,6 +255,10 @@ public:
         NnUint rangeStart = 0u,
         NnUint rangeLen = 0u);
     NnUint getTotalTime(NnExecutorStepType type);
+    // Debug-only (DLLAMA_DUMP_KV_DIR): dump the destination row written by every
+    // OP_SHIFT (block_shift_k/block_shift_v) in both main att segments and
+    // shadow-kv segments, for numerical verification of redundant KV.
+    void dumpKvShiftDebug(const char *dir, NnUint batchSize);
 };
 
 #endif

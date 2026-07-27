@@ -229,9 +229,21 @@ static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name
 
 static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
     NnBubbleShadowStats stats{};
-    if (!bubbleShadowKvEnabled() || executor == nullptr) return stats;
+    if (executor == nullptr) return stats;
+    const char *dumpDir = std::getenv("DLLAMA_DUMP_KV_DIR");
+    const bool dumpEnabled = dumpDir != nullptr && dumpDir[0] != '\0';
+    if (!bubbleShadowKvEnabled()) {
+        // Debug-only KV dump (works without bubble shadow, e.g. baseline runs).
+        if (dumpEnabled) executor->dumpKvShiftDebug(dumpDir, batchSize);
+        return stats;
+    }
     const bool asyncMode = executor->isBubbleShadowAsyncModeEnabled();
     stats = asyncMode ? executor->getLastBubbleShadowStats() : executor->runBubbleShadowRedundant(0u);
+    // Debug-only KV dump (after shadow run so red_k/red_v are final for this
+    // forward) for numerical verification of shadow KV vs main KV cache.
+    if (dumpEnabled) {
+        executor->dumpKvShiftDebug(dumpDir, batchSize);
+    }
     if (bubbleShadowKvLogEnabled()) {
         std::printf(
             "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u mode=%s segments=%u attn=%u ffn=%u other=%u layers=%u ops=%u skipped_sync=%u budget_hit=%u completed=%u drain_us=%u elapsed_us=%llu\n",

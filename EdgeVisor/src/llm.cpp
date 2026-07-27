@@ -1505,6 +1505,13 @@ static NnNodeConfig buildLlmNodeInternal(
             (*layerVRegistry)[layerIndex] = redundantVBufferIndex;
         }
 
+        const NnShiftOpCodeConfig redShiftKCfg = fullAttBuffers
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
+        const NnShiftOpCodeConfig redShiftVCfg = fullAttBuffers
+            ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
+            : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
+
         // Left-boundary shadow KV is disabled by default: its only available
         // input (xPipe at this stage) is the previous stage's final output,
         // i.e. the *output* of layer (startLayer-1), not its input, so the
@@ -1610,12 +1617,6 @@ static NnNodeConfig buildLlmNodeInternal(
                 size0(),
                 NnRopeOpConfig{h->ropeType, 0, n->positionPipeIndex, ropeCacheKBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSliceK});
 
-            const NnShiftOpCodeConfig redShiftKCfg = fullAttBuffers
-                ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? kSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
-                : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
-            const NnShiftOpCodeConfig redShiftVCfg = fullAttBuffers
-                ? NnShiftOpCodeConfig{n->positionPipeIndex, enableKvRedundancy ? vSlice.inStart : kvCacheSlice.kvStart, h->kvDim, enableKvRedundancy ? 0u : h->headDim, n->slotPipeIndex, fullKvSlotStride}
-                : NnShiftOpCodeConfig{n->positionPipeIndex, 0u, 0u, 0u, n->slotPipeIndex, localKvSlotStride};
             redAtt.addOp(OP_SHIFT, "block_shift_k", layerIndex,
                 kTempSlicePtr, pointerRawConfig(SRC_BUFFER, redundantKBufferIndex),
                 size0(), redShiftKCfg);

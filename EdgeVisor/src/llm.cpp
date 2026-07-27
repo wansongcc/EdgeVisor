@@ -1500,6 +1500,16 @@ static NnNodeConfig buildLlmNodeInternal(
                 pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, xBufferIndex),
                 size0(), NnCastOpCodeConfig{});
+        } else if (std::getenv("DLLAMA_SHADOW_RIGHT_PP_CACHE") != nullptr &&
+                   ppStageOutCacheBufferIndex != (NnUint)-1) {
+            // Diagnostic-only path (DLLAMA_SHADOW_RIGHT_PP_CACHE): feed the right
+            // boundary shadow from the post-merge PP stage snapshot instead of
+            // re-applying zqPipe onto xBuffer. Used to isolate the suspected
+            // double-add of the last layer's FFN output in the shadow input.
+            redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_right_ppcache", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(), NnCastOpCodeConfig{});
         } else {
             redAtt.addOp(OP_MERGE_ADD, "runtime_shadow_kv_att_in_right", layerIndex,
                 pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),

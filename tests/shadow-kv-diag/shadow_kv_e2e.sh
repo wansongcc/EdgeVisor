@@ -29,6 +29,9 @@ case "$MODE" in
     BUBBLE_ENV=(DLLAMA_BUBBLE_SHADOW_KV=1 DLLAMA_BUBBLE_SHADOW_KV_ASYNC=1 DLLAMA_BUBBLE_SHADOW_KV_LOG=1)
     ABLATION_ENV=(EDGEVISOR_SHADOW_KV_MODE=enabled)
     ;;
+  bubbleonly)
+    BUBBLE_ENV=(DLLAMA_BUBBLE_SHADOW_KV=1 DLLAMA_BUBBLE_SHADOW_KV_ASYNC=1 DLLAMA_BUBBLE_SHADOW_KV_LOG=1)
+    ;;
   transfer) ABLATION_ENV=(EDGEVISOR_SHADOW_KV_MODE=disabled_transfer) ;;
   recompute) ABLATION_ENV=(EDGEVISOR_SHADOW_KV_MODE=disabled_recompute) ;;
   baseline) ;;
@@ -59,7 +62,7 @@ env "${BUBBLE_ENV[@]}" "${ABLATION_ENV[@]}" \
   --benchmark >"$LOGDIR/root.log" 2>&1 &
 R1=$!
 
-if [ "$MODE" != "baseline" ]; then
+if [ "$MODE" != "baseline" ] && [ "$MODE" != "bubbleonly" ]; then
   # wait for UDS to come up, then arm an exact-trigger migration at pos 32
   for i in $(seq 1 60); do
     [ -S "$SOCK" ] && break

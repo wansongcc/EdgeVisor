@@ -3611,17 +3611,27 @@ bool RootLlmInference::beginShadowCatchupWindow() {
     shadowCatchupStop.store(false);
     shadowCatchupRunning.store(true);
     shadowCatchupThread = std::thread([this]() {
-        try {
-            const NnUint done = this->executor->runShadowCatchup([this]() -> bool {
-                return this->shadowCatchupStop.load(std::memory_order_relaxed);
-            });
-            if (done > 0u) {
-                std::printf("🫧 [shadow-l2] root catch-up completed=%u\n", (unsigned)done);
-                std::fflush(stdout);
+        // The window may begin while the API server is still draining the
+        // previous request's forward (the response is already on the wire).
+        // Retry briefly instead of giving up: the isAlive guard is re-checked
+        // on every attempt, so catch-up only runs once the engine is idle.
+        for (int attempt = 0; attempt < 20 && !this->shadowCatchupStop.load(std::memory_order_relaxed); ++attempt) {
+            try {
+                const NnUint done = this->executor->runShadowCatchup([this]() -> bool {
+                    return this->shadowCatchupStop.load(std::memory_order_relaxed);
+                });
+                if (done > 0u) {
+                    std::printf("🫧 [shadow-l2] root catch-up completed=%u\n", (unsigned)done);
+                    std::fflush(stdout);
+                }
+                break;
+            } catch (const std::exception &e) {
+                if (attempt + 1 >= 20) {
+                    std::printf("⚠️ [shadow-l2] root catch-up error: %s\n", e.what());
+                    std::fflush(stdout);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-        } catch (const std::exception &e) {
-            std::printf("⚠️ [shadow-l2] root catch-up error: %s\n", e.what());
-            std::fflush(stdout);
         }
         this->shadowCatchupRunning.store(false);
     });

@@ -4,7 +4,7 @@
 # without extra stall, and a later window repays the rest. CPU only.
 # usage: run_l2_interrupt.sh <tag> [steps]
 set -u
-TAG="${1:?tag}"; STEPS="${2:-320}"
+TAG="${1:?tag}"; STEPS="${2:-10}"
 
 ROOT="$HOME/B01/EdgeVisor"
 BIN="$ROOT/EdgeVisor/dllama"
@@ -27,7 +27,7 @@ env "${BUBBLE_ENV[@]}" \
 W1=$!
 sleep 3
 
-( exec 3>"$FIFO"; printf '\n' >&3; echo "Write a comma-separated list of the numbers from 1 to 20." >&3; sleep 1800 ) &
+( exec 3>"$FIFO"; printf '\n' >&3; python3 -c "print('Please summarize the following text. ' + 'The quick brown fox jumps over the lazy dog near the river bank. ' * 25)" >&3; sleep 1800 ) &
 FHOLD=$!
 
 env DLLAMA_NBATCHES=32 "${BUBBLE_ENV[@]}" \
@@ -64,7 +64,7 @@ debt_field | tee -a "$LOGDIR/summary.txt"
 
 python3 "$CLIENT" "$SOCK" tool_window_begin >/dev/null
 T0=$(date +%s)
-sleep 0.3
+sleep 0.15
 echo "Write a comma-separated list of the numbers from 21 to 40." >"$FIFO"
 
 # poll until turn-2 forwards start producing new debt (catch-up interrupted)

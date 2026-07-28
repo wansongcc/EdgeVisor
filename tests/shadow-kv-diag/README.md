@@ -126,8 +126,51 @@ DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2on_l1disable_2p
   `tool_window_begin` 后 `debtEntries=0 catchupEntries=60 catchupUs=420667`；
   补算出的 L14 red_k/red_v 与参考值**逐位为 0**（含 prefill batch=23 与全部
   decode position）。
-- 中断：见 `l2_interrupt/interrupt_latency.txt`。
+- 中断：见 `l2_interrupt/summary.txt`（中断→首笔新债务的 resume latency；
+  数值见下方 2026-07-28 补跑）。
 - L2 关等价性：`l2off_2pp_async_b1`/`l2off_2pp_sync_b1` 与 L1 修复后结果一致
   （L14 全 0，L15 为已知结构问题）。
 
+### 验证结果（2026-07-28 补跑，two-level-slack @ 58ec57b）
+
+- L2 开启回归（正常 L1 窗口，steps=48）：`l2_reg_b1`/`l2_reg_b2`/`l2_reg_b4`
+  （batchSize 1/2/4）三者 debtEntries 均为 0（L1 窗口全部覆盖，无债务产生），
+  L14 red_k/red_v 与参考值**逐位为 0**（各 164 对 = 82 position × k/v），
+  L15 仍为已知结构问题（328 对 mismatch，不在本次范围）。
+- 中断（`l2_interrupt`，L1 禁用）：turn 1 结束 debt=60；`tool_window_begin`
+  后补算约 0.3s 内完成（catchupEntries=60），新请求到达时补算已结束
+  （本轮未压到"中途打断"路径）；interrupt→首笔新债务 resume latency=15s
+  （含 ~8s prefill）；turn 2 新增 debt=60，第二个 window 后 debt=0、
+  累计 catchupEntries=120。详见 `l2_interrupt/summary.txt`。
+- 关键路径对照（2pp async，L1 禁用强制全部 shadow 工作落关键路径或 stash）：
+  - L2 关（`l2off_l1disable_2pp`）：root `bubbleDrain/fwd=2.78ms`，
+    `complete=48/48`（每次 forward 末尾 drain，在关键路径上）；
+    decode 733.4 ms/tok。
+  - L2 开（`l2on_l1disable_2pp`）：root `bubbleDrain/fwd=0.00ms`
+    （`segments=0 ops=0`，全部 stash 为债务，drain 移出关键路径）；
+    decode 754.7 ms/tok（与 L2 关的差异在 rootWait 抖动量级，
+    单机 CPU pp 同步等待主导端到端耗时）。
+- L2 关默认回归：`l2off_2pp_async_b1`/`l2off_2pp_sync_b1` L14 red_k/red_v
+  逐位为 0（各 96 对 = 48 position × k/v），与 L1 修复后结果一致；
+  L15 为已知结构问题。
+
 详见主代理报告。日志：`~/B01/EdgeVisor/runtime_logs/shadow_kv_diag/`。
+
+### L2 竞态修复与复测（two-level-slack @ 8d9730c）
+
+- 竞态（复现于 `l2dbg_v3`–`l2dbg_v9`）：root 的 catch-up 线程被下一次 forward
+  中途 join 时，其收尾的 `batchSize = savedBatchSize` 可能落在 handler 已为**新**
+  forward 设好 batchSize 之后 → executor 用陈旧 batchSize=1 跑 batch=23 的
+  prefill（pp_send 只发 1 行，控制包声明 23 行）→ 管线死锁（worker 等 xPipe
+  剩余 22 行，root 等 logits gather）。定位证据：gdb backtrace（root 卡在
+  `NnNetworkNodeSynchronizer::sync → syncNodeSlices → readMany`）、双侧 strace
+  （root 只 `sendto` 了 12288B=1 行）。
+- 修复（`8d9730c`）：`RootLlmInference::forward()` 在 join catch-up 线程后重新
+  断言 `execution->batchSize/position` 与 POS/SLT 管道内容。
+- 复测：
+  - `l2_int_fixed`（原挂死场景：大债务 110 entries、0.15s 后新请求打断）：
+    catch-up 补算 2/110 后停止，resume latency 0s，turn 2 正常跑完（pos 463→511），
+    不再死锁。
+  - `l2_unit_fixed`（L1 禁用）：debt 60 → tool window 后 debt 0、
+    catchupEntries=60；L14 red_k/red_v 逐位为 0。
+  - `l2fix_regress_2pp`（L2 关）与 `l2fix_reg_b2`（L2 开 NB=2）：L14 全部逐位为 0。

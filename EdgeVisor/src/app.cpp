@@ -3677,31 +3677,50 @@ bool RootLlmInference::verifyStageBypassAcks(
     NnUint targetStage,
     const std::vector<NnUint> &layers) {
     if (network == nullptr || generation == 0u || layers.empty()) return false;
-    NnUint roles = 0u;
+    const NnStageConfig *ejected = findStageByIndexLocal(plan, ejectedStage);
+    const NnStageConfig *target = findStageByIndexLocal(plan, targetStage);
+    const NnUint previous = getPpPrevStageIndex(plan, ejectedStage);
+    const NnStageConfig *previousStage = findStageByIndexLocal(plan, previous);
+    if (ejected == nullptr || target == nullptr || previousStage == nullptr) return false;
+    stageBypassExpectedAckNodes.clear();
+    stageBypassExpectedAckNodes.push_back(previousStage->rootNodeIndex);
+    stageBypassExpectedAckNodes.push_back(ejected->rootNodeIndex);
+    stageBypassExpectedAckNodes.push_back(target->rootNodeIndex);
+    stageBypassReceivedAckNodes.clear();
     const int timeoutMs = kvAckWaitTimeoutMs();
-    for (NnUint socket = 0u; socket < network->nSockets; ++socket) {
+    for (size_t expected = 0u; expected < stageBypassExpectedAckNodes.size(); ++expected) {
+        const NnUint node = stageBypassExpectedAckNodes[expected];
+        const int socket = network->getSocketIndexForNode(node, 0u);
+        if (socket < 0) { stageBypassFailureReason = "missing expected bypass ACK socket"; return false; }
         LlmStageBypassAckPacket ack{};
-        if (!tryReadKvAckWithDeadline(network, socket, &ack, sizeof(ack), timeoutMs) ||
+        if (!tryReadKvAckWithDeadline(network, (NnUint)socket, &ack, sizeof(ack), timeoutMs) ||
                 ack.magic != LLM_STAGE_BYPASS_ACK_MAGIC || ack.version != LLM_STAGE_BYPASS_ACK_VERSION ||
                 ack.bypassGeneration != generation || ack.ejectedStage != ejectedStage ||
                 ack.targetStage != targetStage) {
             stageBypassFailureReason = "missing or mismatched worker bypass ACK";
             return false;
         }
+        std::vector<NnUint> chain(ack.activeChainCount);
+        if (ack.activeChainCount == 0u || !network->tryReadWithMaxAttempts((NnUint)socket, chain.data(), chain.size() * sizeof(NnUint), 1000ul) ||
+                chain != stageBypassActiveChain) { stageBypassFailureReason = "worker ACK active chain mismatch"; return false; }
+        const NnUint expectedRole = node == previousStage->rootNodeIndex ? LLM_STAGE_BYPASS_ACK_NEXT_REROUTED :
+            (node == ejected->rootNodeIndex ? (LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED) : LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE);
+        const NnUint expectedStage = node == previousStage->rootNodeIndex ? previous : (node == ejected->rootNodeIndex ? ejectedStage : targetStage);
+        if (ack.fromNodeIndex != node || ack.stageIndex != expectedStage || ack.roleFlags != expectedRole ||
+                (node == target->rootNodeIndex && (ack.startLayer > layers.front() || ack.endLayer < layers.back() + 1u))) {
+            stageBypassFailureReason = "worker bypass ACK participant or role mismatch";
+            return false;
+        }
+        if (std::find(stageBypassReceivedAckNodes.begin(), stageBypassReceivedAckNodes.end(), node) != stageBypassReceivedAckNodes.end()) {
+            stageBypassFailureReason = "duplicate worker bypass ACK";
+            return false;
+        }
+        stageBypassReceivedAckNodes.push_back(node);
         if (ack.stageIndex == targetStage &&
                 (ack.startLayer > layers.front() || ack.endLayer < layers.back() + 1u)) {
             stageBypassFailureReason = "target worker ACK does not own bypass layer range";
             return false;
         }
-        roles |= ack.roleFlags;
-    }
-    const NnUint required = LLM_STAGE_BYPASS_ACK_NEXT_REROUTED |
-        LLM_STAGE_BYPASS_ACK_EJECTED_EXITED |
-        LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE |
-        LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED;
-    if ((roles & required) != required) {
-        stageBypassFailureReason = "incomplete worker bypass role ACKs";
-        return false;
     }
     stageBypassVerifiedGeneration = generation;
     return true;
@@ -5669,6 +5688,7 @@ void runWorkerApp(AppCliArgs *args) {
                     if (localStage != nullptr) {
                         ack.startLayer = localStage->startLayer;
                         ack.endLayer = localStage->endLayer;
+                        ack.layerCount = ack.endLayer - ack.startLayer;
                     }
                     if (ack.stageIndex == bypassEjectedStage) {
                         ack.roleFlags |= LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED;
@@ -5677,7 +5697,16 @@ void runWorkerApp(AppCliArgs *args) {
                     } else if (getPpNextStageIndex(planPtr.get(), ack.stageIndex) == bypassTargetStage) {
                         ack.roleFlags |= LLM_STAGE_BYPASS_ACK_NEXT_REROUTED;
                     }
+                    std::vector<NnUint> activeChain;
+                    for (NnUint si = 0u; si < planPtr->nStages; ++si) {
+                        const NnStageConfig &stage = planPtr->stages[si];
+                        if (stage.stageIndex == bypassEjectedStage) continue;
+                        if (stage.stageIndex == 0u || getPpPrevStageIndex(planPtr.get(), stage.stageIndex) != (NnUint)-1 ||
+                                getPpNextStageIndex(planPtr.get(), stage.stageIndex) != (NnUint)-1) activeChain.push_back(stage.stageIndex);
+                    }
+                    ack.activeChainCount = (NnUint)activeChain.size();
                     network->write(ROOT_SOCKET_INDEX, &ack, sizeof(ack));
+                    if (!activeChain.empty()) network->write(ROOT_SOCKET_INDEX, activeChain.data(), activeChain.size() * sizeof(NnUint));
                 }
 
                 LlmKvExportRequestHeader exportReq{};

@@ -1017,6 +1017,17 @@ void DynamicTpotController::run() {
                 if (rt.pending.candidate.kind == tpot::CandidateKind::PP_MOVE && !rt.pending.ppApplied) {
                     unsigned long long appliedGeneration = 0ull;
                     if (!appliedPpMatches(status, rt.pending, &appliedGeneration)) {
+                        const json &bypass = status.contains("stageBypass") ? status.at("stageBypass") : json();
+                        const unsigned long long bypassGeneration = bypass.is_object()
+                            ? bypass.value("rootApplyGeneration", bypass.value("appliedGeneration", 0ull)) : 0ull;
+                        const uint32_t pendingElapsed = window.posEnd >= rt.pending.startPos
+                            ? window.posEnd - rt.pending.startPos : 0u;
+                        if (pendingElapsed >= rt.topologyFenceTimeoutTokens) {
+                            appendLog(rt.logPath, "tpot_sched control_plane_failed reason=" +
+                                std::string(bypassGeneration > rt.lastObservedStageBypassGeneration
+                                    ? "pending_pp_cancelled_by_bypass_timeout" : "pending_pp_apply_timeout"));
+                            return;
+                        }
                         note = "pp_apply_wait";
                         logDecision(rt, window, pendingForLog.candidate, bestPp, false, note, &pendingForLog, 0u);
                         std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));

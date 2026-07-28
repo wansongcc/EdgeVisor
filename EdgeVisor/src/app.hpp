@@ -222,6 +222,8 @@ typedef struct {
     NnUint roleFlags;
     NnUint startLayer;
     NnUint endLayer;
+    NnUint layerCount;
+    NnUint activeChainCount;
 } LlmStageBypassAckPacket;
 
 enum LlmLayerSwitchFlags : NnUint {
@@ -423,6 +425,8 @@ public:
     unsigned long long getStageBypassVerifiedGeneration() const { return stageBypassVerifiedGeneration; }
     const std::vector<NnUint>& getStageBypassActiveChain() const { return stageBypassActiveChain; }
     const std::string& getStageBypassFailureReason() const { return stageBypassFailureReason; }
+    const std::vector<NnUint>& getStageBypassExpectedAckNodes() const { return stageBypassExpectedAckNodes; }
+    const std::vector<NnUint>& getStageBypassReceivedAckNodes() const { return stageBypassReceivedAckNodes; }
     bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
@@ -504,6 +508,8 @@ private:
     unsigned long long stageBypassVerifiedGeneration = 0ull;
     std::vector<NnUint> stageBypassActiveChain;
     std::string stageBypassFailureReason;
+    std::vector<NnUint> stageBypassExpectedAckNodes;
+    std::vector<NnUint> stageBypassReceivedAckNodes;
     bool pendingStageBypass = false;
     NnUint pendingBypassEjectedStage = 0xFFFFFFFFu;
     NnUint pendingBypassTargetStage = 0xFFFFFFFFu;

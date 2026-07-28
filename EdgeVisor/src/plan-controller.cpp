@@ -799,6 +799,12 @@ void PlanUdsController::run() {
                     for (NnUint stage : inference_->getStageBypassActiveChain()) activeChain.push_back(stage);
                     bypass["activeStageChain"] = activeChain;
                     bypass["failureReason"] = inference_->getStageBypassFailureReason();
+                    json expectedAcks = json::array();
+                    for (NnUint node : inference_->getStageBypassExpectedAckNodes()) expectedAcks.push_back(node);
+                    json receivedAcks = json::array();
+                    for (NnUint node : inference_->getStageBypassReceivedAckNodes()) receivedAcks.push_back(node);
+                    bypass["expectedAckNodes"] = expectedAcks;
+                    bypass["receivedAckNodes"] = receivedAcks;
                     resp["stageBypass"] = bypass;
                     resp["ppMigration"] = pp;
                 }

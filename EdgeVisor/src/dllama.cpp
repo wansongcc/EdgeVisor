@@ -1985,6 +1985,14 @@ static void chat(AppInferenceContext *context) {
 
             context->inference->forward();
 
+            // LSS protocol: drain the last stage's sampled-token packet for
+            // batchSize==1 prefill forwards too, or it misaligns the
+            // perf/token packet sequence for later decode tokens.
+            if (context->args->lastStageSampling && context->network != nullptr && batchSize == 1u) {
+                NnUint discardToken = 0u;
+                context->inference->tryReceiveLastStageSampledToken(discardToken, nullptr);
+            }
+
             i += batchSize;
             pos += batchSize;
             // 这里同 inference()：prompt eval 只跑到最后一个 token 的前一位，

@@ -348,3 +348,53 @@ GPU 与 cyx vLLM 共享（~3.8GB/卡余量）。日志 `~/B01/EdgeVisor/runtime_
   benchmark_docs_20260728_171214/）。
 - CB 槽位级 shadow KV 正确性（多槽 KV 与 red_k/red_v 的 slot 语义）：未深验证，
   建议单列一阶段。
+
+## GPU agentic 端到端演示（4×T4 CUDA，two-level-slack @ 6281cf8）
+
+完整故事：真实 web search 工具 + tool-wait 窗口 L2 补算，在 4 节点 PP
+（`1@7*1@7*1@7*1@7`，3B q40，CUDA backend，`--last-stage-sampling`）上跑通。
+日志 `~/B01/EdgeVisor/runtime_logs/agentic_gpu{,_main,_l2,_l2b,_l2c,_control}.out` 与
+`agentic_gpu/agentic_search_smoke_loop_*/`。
+
+### 验证命令
+
+```bash
+cd ~/B01/EdgeVisor && DLLAMA_SHADOW_L1_DISABLE=1 \
+  /home/byh/B01/agent_langgraph_venv/bin/python -m agent_bench.run_loop_episode \
+  --backend edgevisor_ablation \
+  --episode agent_bench/episodes/agentic_search_smoke_episode.json \
+  --out-root ~/B01/EdgeVisor/runtime_logs/agentic_gpu \
+  --cuda-visible 0,1,2,3 --edge-backend cuda \
+  --edge-worker-gpus 1,2,3 --edge-ratios "1@7*1@7*1@7*1@7" \
+  --bubble-shadow-kv --shadow-l2 --enable-pp-migration \
+  --edge-last-stage-sampling --edge-steps 256 --edge-timeout-s 600 \
+  --disable-episode-dynamic-plan
+```
+
+（对照组去掉 --shadow-l2 即可。）
+
+### 结果
+
+- 主 episode（L2 开）：gen1 rc=0（18.7s，真实模型 action JSON web_search）；
+  web_search 走 bing 模式（真实检索），延迟 **511ms**；gen2 rc=0（25.8s）+ 
+  calculator；final answer 引用检索结果；total_tool_time_ms=511.5。
+- 债务放大（`DLLAMA_SHADOW_L1_DISABLE=1`）shadow_debt 留档（debtEntries,
+  catchupEntries）：
+  `11→47 0`（gen1 各 forward 持续累积）→ `0 48`（**web_search 窗口内全部补算
+  48 笔**，`catch-up completed=48 remaining=0 elapsed_us=148997`）→ `1→4 48`
+  （gen2 继续累积）。
+- 对照组（无 --shadow-l2）：RC=0，gen 全 rc=0，web_search 507ms，行为与 L2 组
+  一致（L2 是调度侧优化，不改输出）。
+- 生成速度：GPU 上每 generation ~12-26s（CPU 共享机上为 333-600s）。
+
+### 发现与修复
+
+1. **Vulkan 路径缺 L2 buffer 访问**：agent_bench 默认 `--gpu-index`（BACKEND_AUTO
+   →vulkan），`readNodeBuffer/writeNodeBuffer` 只在 CPU/CUDA device segment 实现，
+   Vulkan 下 stash 全部落 "cannot snapshot pp_stage_out; dropping debt"（优雅降级
+   不崩）。新增 `--edge-backend {auto,cuda,vulkan}`（`6281cf8`）显式选 cuda；
+   Vulkan 的 L2 buffer 访问列为后续跟进项。
+2. **CUDA_VISIBLE_DEVICES 掩码**：agent_bench `base_env` 默认
+   `CUDA_VISIBLE_DEVICES="0,1,2"`，worker3(gpu-index 3) 被掩 →
+   `cudaSetDevice failed: invalid device ordinal (101)`（101 是 cudaError_t 值非
+   设备号）。用 `--cuda-visible 0,1,2,3` 解决，无需改码。

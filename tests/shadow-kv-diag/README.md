@@ -142,6 +142,13 @@ DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2on_l1disable_2p
   （本轮未压到"中途打断"路径）；interrupt→首笔新债务 resume latency=15s
   （含 ~8s prefill）；turn 2 新增 debt=60，第二个 window 后 debt=0、
   累计 catchupEntries=120。详见 `l2_interrupt/summary.txt`。
+- 中途打断补跑（`l2_interrupt_mid`，window_begin 后 0.15s 注入新请求）：
+  补算在中途被打断（60 笔已补 42 笔），推理立即继续；turn 2 结束
+  debt=78（18 遗留 + 60 新增）、catchupEntries=42；第二个 window 后
+  debt=0、累计 catchupEntries=120，无债务丢失。
+  注：脚本的 resume latency 用 `debtEntries>0` 判定，有遗留债务时读数
+  恒为 0s，不能区分新旧债务，该指标仅在补算先于中断完成时（如
+  `l2_interrupt` 的 15s）有意义。
 - 关键路径对照（2pp async，L1 禁用强制全部 shadow 工作落关键路径或 stash）：
   - L2 关（`l2off_l1disable_2pp`）：root `bubbleDrain/fwd=2.78ms`，
     `complete=48/48`（每次 forward 末尾 drain，在关键路径上）；

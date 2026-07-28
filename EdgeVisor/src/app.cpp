@@ -3541,6 +3541,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     bool stageBypass = false;
     NnUint bypassEjectedStage = 0xFFFFFFFFu;
     NnUint bypassTargetStage = 0xFFFFFFFFu;
+    NnUint bypassGeneration = 0u;
     {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
         if (pendingLayerSwitchLayers.empty()) return false;
@@ -3580,6 +3581,11 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         }
     }
 
+    if (stageBypass) {
+        bypassGeneration = (NnUint)nextStageBypassGeneration++;
+        stageBypassPendingGeneration = bypassGeneration;
+        stageBypassFailureReason.clear();
+    }
     LlmControlPacket out = controlPacket;
     out.flags = LLM_CTRL_HAS_LAYER_SWITCH | LLM_CTRL_CONTROL_ONLY;
     out.batchSize = 1u;
@@ -3618,13 +3624,20 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         if (layer == ppStartBoundaryLayer) switchPkt.reserved0 |= ppStartFlag;
         switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
         switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
+        switchPkt.bypassGeneration = bypassGeneration;
         stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
         network->writeAll(&switchPkt, sizeof(switchPkt));
     }
     if (stageBypass) {
         NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
         const bool ok = applyPpStageBypass(mutablePlan, bypassEjectedStage, bypassTargetStage);
-        if (ok) recordStageBypassApplied(bypassEjectedStage, bypassTargetStage, switchLayers);
+        if (ok) {
+            recordStageBypassApplied(bypassEjectedStage, bypassTargetStage, switchLayers);
+            if (!verifyStageBypassAcks(stageBypassAppliedGeneration, bypassEjectedStage, bypassTargetStage, switchLayers)) {
+                std::printf("⚠️  [stage-bypass] verification failed generation=%llu reason=%s\n",
+                    stageBypassAppliedGeneration, stageBypassFailureReason.c_str());
+            }
+        }
         std::printf("🔁 [stage-bypass] root apply ejectedStage=%u targetStage=%u status=%s\n",
             (unsigned)bypassEjectedStage,
             (unsigned)bypassTargetStage,
@@ -3643,10 +3656,55 @@ void RootLlmInference::recordPpMigrationApplied() {
 
 void RootLlmInference::recordStageBypassApplied(
     NnUint ejectedStage, NnUint targetStage, const std::vector<NnUint> &layers) {
-    ++stageBypassAppliedGeneration;
+    stageBypassAppliedGeneration = stageBypassPendingGeneration;
     stageBypassAppliedEjectedStage = ejectedStage;
     stageBypassAppliedTargetStage = targetStage;
     stageBypassAppliedLayers = layers;
+    stageBypassActiveChain.clear();
+    for (NnUint si = 0u; plan != nullptr && si < plan->nStages; ++si) {
+        const NnStageConfig &stage = plan->stages[si];
+        if (stage.stageIndex == ejectedStage) continue;
+        if (stage.stageIndex == 0u || getPpPrevStageIndex(plan, stage.stageIndex) != (NnUint)-1 ||
+                getPpNextStageIndex(plan, stage.stageIndex) != (NnUint)-1) {
+            stageBypassActiveChain.push_back(stage.stageIndex);
+        }
+    }
+}
+
+bool RootLlmInference::verifyStageBypassAcks(
+    unsigned long long generation,
+    NnUint ejectedStage,
+    NnUint targetStage,
+    const std::vector<NnUint> &layers) {
+    if (network == nullptr || generation == 0u || layers.empty()) return false;
+    NnUint roles = 0u;
+    const int timeoutMs = kvAckWaitTimeoutMs();
+    for (NnUint socket = 0u; socket < network->nSockets; ++socket) {
+        LlmStageBypassAckPacket ack{};
+        if (!tryReadKvAckWithDeadline(network, socket, &ack, sizeof(ack), timeoutMs) ||
+                ack.magic != LLM_STAGE_BYPASS_ACK_MAGIC || ack.version != LLM_STAGE_BYPASS_ACK_VERSION ||
+                ack.bypassGeneration != generation || ack.ejectedStage != ejectedStage ||
+                ack.targetStage != targetStage) {
+            stageBypassFailureReason = "missing or mismatched worker bypass ACK";
+            return false;
+        }
+        if (ack.stageIndex == targetStage &&
+                (ack.startLayer > layers.front() || ack.endLayer < layers.back() + 1u)) {
+            stageBypassFailureReason = "target worker ACK does not own bypass layer range";
+            return false;
+        }
+        roles |= ack.roleFlags;
+    }
+    const NnUint required = LLM_STAGE_BYPASS_ACK_NEXT_REROUTED |
+        LLM_STAGE_BYPASS_ACK_EJECTED_EXITED |
+        LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE |
+        LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED;
+    if ((roles & required) != required) {
+        stageBypassFailureReason = "incomplete worker bypass role ACKs";
+        return false;
+    }
+    stageBypassVerifiedGeneration = generation;
+    return true;
 }
 
 LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
@@ -5504,6 +5562,10 @@ void runWorkerApp(AppCliArgs *args) {
                 }
 
                 LlmLayerSwitchPacket switchPkt{};
+                bool sawStageBypass = false;
+                NnUint bypassGeneration = 0u;
+                NnUint bypassEjectedStage = 0xFFFFFFFFu;
+                NnUint bypassTargetStage = 0xFFFFFFFFu;
                 while (inference.consumeLayerSwitch(switchPkt)) {
                     bool localIsSourceStage = (switchPkt.fromNodeIndex == nodeConfig.nodeIndex);
                     bool localIsTargetStage = (switchPkt.toNodeIndex == nodeConfig.nodeIndex);
@@ -5580,6 +5642,10 @@ void runWorkerApp(AppCliArgs *args) {
                             }
                         }
                         if ((switchPkt.reserved0 & LLM_LAYER_SWITCH_STAGE_BYPASS) != 0u) {
+                            sawStageBypass = true;
+                            bypassGeneration = switchPkt.bypassGeneration;
+                            bypassEjectedStage = switchPkt.reserved1;
+                            bypassTargetStage = switchPkt.reserved2;
                             const bool ok = applyPpStageBypass(planPtr.get(), switchPkt.reserved1, switchPkt.reserved2);
                             std::printf("🔁 [worker-bypass] node=%u ejectedStage=%u targetStage=%u status=%s\n",
                                 (unsigned)nodeConfig.nodeIndex,
@@ -5589,6 +5655,29 @@ void runWorkerApp(AppCliArgs *args) {
                             std::fflush(stdout);
                         }
                     }
+                }
+                if (sawStageBypass && network != nullptr && planPtr != nullptr) {
+                    LlmStageBypassAckPacket ack{};
+                    ack.magic = LLM_STAGE_BYPASS_ACK_MAGIC;
+                    ack.version = LLM_STAGE_BYPASS_ACK_VERSION;
+                    ack.bypassGeneration = bypassGeneration;
+                    ack.fromNodeIndex = nodeConfig.nodeIndex;
+                    ack.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
+                    ack.ejectedStage = bypassEjectedStage;
+                    ack.targetStage = bypassTargetStage;
+                    const NnStageConfig *localStage = findStageForNodeLocal(planPtr.get(), nodeConfig.nodeIndex);
+                    if (localStage != nullptr) {
+                        ack.startLayer = localStage->startLayer;
+                        ack.endLayer = localStage->endLayer;
+                    }
+                    if (ack.stageIndex == bypassEjectedStage) {
+                        ack.roleFlags |= LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED;
+                    } else if (ack.stageIndex == bypassTargetStage) {
+                        ack.roleFlags |= LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE;
+                    } else if (getPpNextStageIndex(planPtr.get(), ack.stageIndex) == bypassTargetStage) {
+                        ack.roleFlags |= LLM_STAGE_BYPASS_ACK_NEXT_REROUTED;
+                    }
+                    network->write(ROOT_SOCKET_INDEX, &ack, sizeof(ack));
                 }
 
                 LlmKvExportRequestHeader exportReq{};

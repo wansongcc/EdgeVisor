@@ -666,12 +666,12 @@ class ExperimentRecorder:
 
         # Orchestrator events are authoritative for multi-fault action windows.
         # Each event records root_token_pos, so no cross-host wall clock is used.
-        action_windows = []
+        action_events = []
         for event in self.timeline:
             pos = event.get("root_token_pos")
             if pos is None: continue
             detail = event.get("details") or {}
-            action_windows.append({"event_id": event.get("event_id"), "position": pos,
+            action_events.append({"event_id": event.get("event_id"), "position": pos,
                                    "phase": event.get("phase"), "status": event.get("status")})
             for row in token_rows:
                 if row["pos"] < pos: continue
@@ -684,6 +684,42 @@ class ExperimentRecorder:
                     row["bypass_applied_generation"] = detail.get("appliedGeneration")
                 if event.get("event_id") in ("pp1_apply", "pp2_apply"):
                     row["pp_applied_generation"] = detail.get("appliedGeneration")
+
+        def action_window(name, ids):
+            selected = [e for e in action_events if e["event_id"] in ids]
+            by_id = {e["event_id"]: e for e in selected}
+            issue = by_id.get(name + "_issue")
+            apply = by_id.get(name + "_apply")
+            verify = by_id.get(name + "_verify")
+            if name in ("pp1", "pp2"):
+                apply = by_id.get(name + "_apply")
+                verify = apply
+            anchor = (issue or apply or verify or {}).get("position")
+            baseline = None
+            onset = None
+            recovery = None
+            metrics = None
+            if anchor is not None:
+                baseline_rows = [r for r in token_rows if anchor - args.baseline_tokens <= r["pos"] < anchor]
+                observed_rows = [r for r in token_rows if anchor <= r["pos"] <= end_pos]
+                baseline = {"start_pos": anchor - args.baseline_tokens, "end_pos": anchor,
+                            "tokens": len(baseline_rows)}
+                onset = {"pos": anchor}
+                recovery = {"pos": (verify or apply or issue or {}).get("position")}
+                walls = [r["e2e_wall_ms"] for r in observed_rows if r["e2e_wall_ms"] is not None]
+                if walls:
+                    ordered = sorted(walls)
+                    metrics = {"tokens": len(observed_rows), "mean_wall_ms": sum(walls) / len(walls),
+                               "p50_wall_ms": ordered[len(ordered) // 2],
+                               "p95_wall_ms": ordered[min(len(ordered) - 1, int(len(ordered) * .95))]}
+            return {"baseline": baseline, "onset": onset, "issue": issue, "apply": apply,
+                    "verify": verify, "recovery": recovery, "metrics": metrics}
+
+        action_windows = {
+            "pp1": action_window("pp1", ("pp1_issue", "pp1_apply")),
+            "bypass": action_window("bypass", ("bypass_issue", "bypass_apply", "bypass_verify")),
+            "pp2": action_window("pp2", ("pp2_issue", "pp2_apply")),
+        }
 
         # ---- node->stage 映射（CSV 列注释用）----
         node_stage = {}

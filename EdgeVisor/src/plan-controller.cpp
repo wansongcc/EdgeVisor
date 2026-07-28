@@ -788,11 +788,17 @@ void PlanUdsController::run() {
                     pp["appliedLayers"] = appliedLayers;
                     json bypass = json::object();
                     bypass["appliedGeneration"] = inference_->getStageBypassAppliedGeneration();
+                    bypass["rootApplyGeneration"] = inference_->getStageBypassAppliedGeneration();
+                    bypass["verifiedGeneration"] = inference_->getStageBypassVerifiedGeneration();
                     bypass["ejectedStage"] = inference_->getStageBypassAppliedEjectedStage();
                     bypass["targetStage"] = inference_->getStageBypassAppliedTargetStage();
                     json bypassLayers = json::array();
                     for (NnUint layer : inference_->getStageBypassAppliedLayers()) bypassLayers.push_back(layer);
                     bypass["appliedLayers"] = bypassLayers;
+                    json activeChain = json::array();
+                    for (NnUint stage : inference_->getStageBypassActiveChain()) activeChain.push_back(stage);
+                    bypass["activeStageChain"] = activeChain;
+                    bypass["failureReason"] = inference_->getStageBypassFailureReason();
                     resp["stageBypass"] = bypass;
                     resp["ppMigration"] = pp;
                 }

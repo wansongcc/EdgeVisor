@@ -201,7 +201,28 @@ typedef struct {
     NnUint reserved0;      // flags
     NnUint reserved1;      // optional ejected stage index
     NnUint reserved2;      // optional target stage index
+    NnUint bypassGeneration; // non-zero for every packet in one bypass transition
 } LlmLayerSwitchPacket;
+
+enum LlmStageBypassAckFlags : NnUint {
+    LLM_STAGE_BYPASS_ACK_NEXT_REROUTED = 1u << 0,
+    LLM_STAGE_BYPASS_ACK_EJECTED_EXITED = 1u << 1,
+    LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE = 1u << 2,
+    LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED = 1u << 3,
+};
+
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint bypassGeneration;
+    NnUint fromNodeIndex;
+    NnUint stageIndex;
+    NnUint ejectedStage;
+    NnUint targetStage;
+    NnUint roleFlags;
+    NnUint startLayer;
+    NnUint endLayer;
+} LlmStageBypassAckPacket;
 
 enum LlmLayerSwitchFlags : NnUint {
     LLM_LAYER_SWITCH_STAGE_BYPASS = 1u << 0,
@@ -246,6 +267,7 @@ static constexpr NnUint LLM_LAYER_SWITCH_MAGIC = 0x5753564cu; // 'LVSW'
 static constexpr NnUint LLM_KV_TRANSFER_BATCH_MAGIC = 0x4254564bu; // 'KVTB'
 static constexpr NnUint LLM_KV_ACK_BATCH_MAGIC = 0x5442414bu; // 'KABT'
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_MAGIC = 0x4257534cu; // 'LSWB'
+static constexpr NnUint LLM_STAGE_BYPASS_ACK_MAGIC = 0x4b415342u; // 'BSAK'
 static constexpr NnUint LLM_KV_EXPORT_REQUEST_MAGIC = 0x5254584bu; // 'KXTR'
 static constexpr NnUint LLM_KV_EXPORT_RESPONSE_MAGIC = 0x5352584bu; // 'KXRS'
 static constexpr NnUint LLM_KV_TRANSFER_VERSION = 1u;
@@ -255,6 +277,7 @@ static constexpr NnUint LLM_LAYER_SWITCH_STAGE_BYPASS_VERSION = 2u;
 static constexpr NnUint LLM_KV_TRANSFER_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_VERSION = 1u;
+static constexpr NnUint LLM_STAGE_BYPASS_ACK_VERSION = 1u;
 static constexpr NnUint LLM_KV_EXPORT_REQUEST_VERSION = 1u;
 static constexpr NnUint LLM_KV_EXPORT_RESPONSE_VERSION = 1u;
 
@@ -397,6 +420,9 @@ public:
     NnUint getStageBypassAppliedEjectedStage() const { return stageBypassAppliedEjectedStage; }
     NnUint getStageBypassAppliedTargetStage() const { return stageBypassAppliedTargetStage; }
     const std::vector<NnUint>& getStageBypassAppliedLayers() const { return stageBypassAppliedLayers; }
+    unsigned long long getStageBypassVerifiedGeneration() const { return stageBypassVerifiedGeneration; }
+    const std::vector<NnUint>& getStageBypassActiveChain() const { return stageBypassActiveChain; }
+    const std::string& getStageBypassFailureReason() const { return stageBypassFailureReason; }
     bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
@@ -414,6 +440,8 @@ public:
 private:
     void recordPpMigrationApplied();
     void recordStageBypassApplied(NnUint ejectedStage, NnUint targetStage, const std::vector<NnUint> &layers);
+    bool verifyStageBypassAcks(unsigned long long generation, NnUint ejectedStage, NnUint targetStage,
+        const std::vector<NnUint> &layers);
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
@@ -471,6 +499,11 @@ private:
     NnUint stageBypassAppliedEjectedStage = 0xFFFFFFFFu;
     NnUint stageBypassAppliedTargetStage = 0xFFFFFFFFu;
     std::vector<NnUint> stageBypassAppliedLayers;
+    unsigned long long nextStageBypassGeneration = 1ull;
+    unsigned long long stageBypassPendingGeneration = 0ull;
+    unsigned long long stageBypassVerifiedGeneration = 0ull;
+    std::vector<NnUint> stageBypassActiveChain;
+    std::string stageBypassFailureReason;
     bool pendingStageBypass = false;
     NnUint pendingBypassEjectedStage = 0xFFFFFFFFu;
     NnUint pendingBypassTargetStage = 0xFFFFFFFFu;

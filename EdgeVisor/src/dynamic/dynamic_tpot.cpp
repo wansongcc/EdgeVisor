@@ -120,6 +120,10 @@ struct ControllerRuntime {
     bool hasCommittedPpLayout = false;
     unsigned long long lastObservedAppliedGeneration = 0ull;
     unsigned long long lastObservedStageBypassGeneration = 0ull;
+    unsigned long long topologyFenceGeneration = 0ull;
+    uint32_t topologyFenceStartPos = 0u;
+    uint32_t topologyFenceTimeoutTokens = 0u;
+    bool controlPlaneFailed = false;
     std::vector<uint32_t> activeStageChain;
     PendingAction pending;
     tpot::PpLayoutGuard ppLayoutGuard;
@@ -608,6 +612,8 @@ static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) 
     rt.activeStageChain.swap(mergedChain);
     rt.ppLayoutGuard = tpot::PpLayoutGuard();
     rt.lastObservedStageBypassGeneration = generation;
+    rt.topologyFenceGeneration = generation;
+    rt.topologyFenceStartPos = rt.haveObservedPos ? rt.lastObservedPos : 0u;
     return true;
 }
 
@@ -904,6 +910,8 @@ void DynamicTpotController::run() {
     rt.cfg = config_;
     rt.pollMs = std::max(10, parseEnvInt("DLLAMA_TPOT_POLL_MS", 200));
     rt.timeoutMs = std::max(100, parseEnvInt("DLLAMA_TPOT_UDS_TIMEOUT_MS", 2000));
+    rt.topologyFenceTimeoutTokens = (uint32_t)std::max(1,
+        parseEnvInt("DLLAMA_TPOT_TOPOLOGY_TIMEOUT_TOKENS", std::max(32, rt.cfg.rollbackWindow * 2)));
     const char *logEnv = std::getenv("DLLAMA_TPOT_LOG");
     rt.logPath = (logEnv != nullptr && logEnv[0] != '\0') ? std::string(logEnv) : std::string("/tmp/dllama_tpot_scheduler.log");
 
@@ -970,6 +978,26 @@ void DynamicTpotController::run() {
                     topology << rt.activeStageChain[i];
                 }
                 appendLog(rt.logPath, topology.str());
+            }
+            if (rt.topologyFenceGeneration != 0ull) {
+                const json &bypass = status.contains("stageBypass") ? status.at("stageBypass") : json();
+                const unsigned long long verified = bypass.is_object() ? bypass.value("verifiedGeneration", 0ull) : 0ull;
+                const std::string failure = bypass.is_object() ? bypass.value("failureReason", std::string()) : std::string();
+                const uint32_t elapsed = window.posEnd >= rt.topologyFenceStartPos
+                    ? window.posEnd - rt.topologyFenceStartPos : 0u;
+                if (!failure.empty() || elapsed >= rt.topologyFenceTimeoutTokens) {
+                    rt.controlPlaneFailed = true;
+                    appendLog(rt.logPath, "tpot_sched control_plane_failed reason=" +
+                        (!failure.empty() ? failure : std::string("stage_bypass_verification_timeout")));
+                    return;
+                }
+                if (verified < rt.topologyFenceGeneration) {
+                    appendLog(rt.logPath, "tpot_sched topology_fence_wait generation=" +
+                        std::to_string(rt.topologyFenceGeneration));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
+                    continue;
+                }
+                rt.topologyFenceGeneration = 0ull;
             }
             tpot::Candidate bestTp = tpot::bestTpCandidate(stages, rt.cfg);
             tpot::Candidate bestPp = tpot::bestPpCandidate(stages, window.tpotMs, rt.cfg);

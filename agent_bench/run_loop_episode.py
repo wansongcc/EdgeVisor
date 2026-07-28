@@ -123,6 +123,7 @@ def main() -> int:
     parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=1)
     parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
     parser.add_argument("--edge-cpu", action="store_true", help="Run the EdgeVisor ablation backend on CPU (--backend cpu, no GPU) for small-scale verification.")
+    parser.add_argument("--edge-backend", choices=["auto", "cuda", "vulkan"], default="auto", help="Explicit engine backend for launched processes (auto = historical --gpu-index behavior; Shadow L2 buffer access requires cpu or cuda).")
     parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
     parser.add_argument(
         "--disable-episode-dynamic-plan",
@@ -236,6 +237,7 @@ def main() -> int:
             "extra_env": extra_env,
             "last_stage_sampling": args.edge_last_stage_sampling,
             "cpu": args.edge_cpu,
+            "backend": args.edge_backend,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

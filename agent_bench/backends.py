@@ -1646,6 +1646,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         extra_env: Optional[Dict[str, str]] = None,
         last_stage_sampling: bool = False,
         cpu: bool = False,
+        backend: str = "auto",
     ):
         config = dict(ablation_config or {})
         runtime_boundary_layers = max(0, int(config.get("runtime_redundant_boundary_layers", 0) or 0))
@@ -1675,6 +1676,11 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         )
         self.persistent = persistent
         self.cpu = cpu
+        # Effective engine backend for launched processes. "auto" keeps the
+        # historical behavior (--gpu-index with BACKEND_AUTO, resolves to
+        # vulkan when built); "cuda"/"vulkan" pass --backend explicitly
+        # (Shadow L2's buffer access is implemented on CPU and CUDA only).
+        self.engine_backend = "cpu" if cpu else str(backend)
         self.api_port = api_port
         self._persistent_started = False
         self._persistent_procs: List[subprocess.Popen[Any]] = []
@@ -1801,8 +1807,12 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
                     "--nthreads",
                     "1",
                 ]
-                # CPU mode (small-model verification): --backend cpu instead of --gpu-index.
-                worker_cmd.extend(["--backend", "cpu"] if self.cpu else ["--gpu-index", str(gpu)])
+                if self.engine_backend == "cpu":
+                    worker_cmd.extend(["--backend", "cpu"])
+                elif self.engine_backend != "auto":
+                    worker_cmd.extend(["--backend", self.engine_backend, "--gpu-index", str(gpu)])
+                else:
+                    worker_cmd.extend(["--gpu-index", str(gpu)])
                 worker_cmds.append(worker_cmd)
                 procs.append(self._launch_worker(worker_cmd, self._persistent_logs[f"worker{idx}"], env))
                 if launch_stagger_s > 0.0 and idx + 1 < len(self.worker_gpus):
@@ -1829,8 +1839,10 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
                 "--seed",
                 "1",
             ]
-            if self.cpu:
+            if self.engine_backend == "cpu":
                 root_cmd.extend(["--backend", "cpu"])
+            elif self.engine_backend != "auto":
+                root_cmd.extend(["--backend", self.engine_backend, "--gpu-index", str(self.root_gpu)])
             else:
                 root_cmd.extend(["--gpu-index", str(self.root_gpu)])
             if self.enable_benchmark:

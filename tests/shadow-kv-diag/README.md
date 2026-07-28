@@ -196,3 +196,39 @@ DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2on_l1disable_2p
   调 `NnDevice::setCurrentThreadDevice()`（CPU 空实现；CUDA 为
   `cudaSetDevice(gpuIndex)`），避免 gpuIndex≠0 时 kernel launch 落到错误
   context。CPU 构建无 CUDA 依赖；`nn-cuda.cu` 已过 nvcc 12.8 编译检查（未上机跑）。
+
+## GPU 冒烟（4×Tesla T4，CUDA backend，two-level-slack @ c61265d+）
+
+### 构建
+
+```bash
+cd ~/B01/EdgeVisor/EdgeVisor && make clean && make DLLAMA_VULKAN= DLLAMA_CUDA=1 -j8 dllama dllama-api
+```
+
+`CUDA_ARCHS=auto` 自动探测为 75（sm_75，覆盖 T4）。注意：此前用 CPU-only flag
+构建过的话必须 `make clean`——Makefile 不跟踪 flag 变化，旧 .o（无
+-DDLLAMA_CUDA）会被误复用导致 `--backend cuda` 报 "not compiled"。
+worker 进程也要显式 `--backend cuda`（BACKEND_AUTO 会落到 vulkan）。
+
+### 冒烟命令与结果（日志 `~/B01/EdgeVisor/runtime_logs/gpu_smoke/`）
+
+测试时 4 卡被他人 vLLM 任务占用（每卡 ~11.5/15.3GB），以下均在每卡
+~1.3-2GB 的小余量内完成（3B q40，PP 分片）。
+
+- 小规模（2 节点 PP，gpu0+gpu1）：`small_root.log`。RC=0，28.3 tok/s，
+  无 CUDA error。
+- (a) bubble 窗口执行（`run_gpu_l2_interrupt.sh gpu4_interrupt`）：
+  `segments=2 attn=2 layers=2 ops=18 completed=1 drain_us=0`（每个 forward
+  两个右边界 shadow 段全部在 L1 窗口内完成）。
+- (b) L2 债务/补算（`run_gpu_l2_smoke.sh gpu4_bubble bubble`，L1-disable
+  强制债务）：`debtEntries=60 debtBytes=1008272` → `tool_window_begin` →
+  `debtEntries=0 catchupEntries=60 catchupUs=46106`。root(gpu0) 46ms、
+  worker1(gpu1, inline catch-up) 46ms、worker2(gpu2) 558ms 各自完成 60 笔，
+  证明 `setCurrentThreadDevice` 在多 gpu-index 下工作正常。
+- (c) 中断：tool window 中插入新一轮对话，turn 2 正常完成，无 hang
+  （`interrupt_latency.txt`，数值为正常生成耗时而非阻塞）。
+- (d) e2e 数值（`run_gpu_e2e_consistency.sh`）：bubble+L2 开 vs 全关，同
+  prompt/seed 生成 token 逐 token 一致（双方都于 pos=31 停）：
+  `23:1 24:, 25:  26:2 27:, 28:  29:3 30:, 31:`。
+- 风险点：全部进程 `--nthreads 1`（GPU 下 bubble shadow 的硬门控）；stash
+  D2H 开销 60 笔 46ms（GPU 上可忽略）；无任何 CUDA error / 异常吞没迹象。

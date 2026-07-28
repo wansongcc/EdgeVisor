@@ -3624,6 +3624,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     if (stageBypass) {
         NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
         const bool ok = applyPpStageBypass(mutablePlan, bypassEjectedStage, bypassTargetStage);
+        if (ok) recordStageBypassApplied(bypassEjectedStage, bypassTargetStage, switchLayers);
         std::printf("🔁 [stage-bypass] root apply ejectedStage=%u targetStage=%u status=%s\n",
             (unsigned)bypassEjectedStage,
             (unsigned)bypassTargetStage,
@@ -3638,6 +3639,14 @@ void RootLlmInference::recordPpMigrationApplied() {
     ppMigrationAppliedFromNodeIndex = migrationFromNodeIndex;
     ppMigrationAppliedToNodeIndex = nextStageRootNode;
     ppMigrationAppliedLayers = migrationLayers;
+}
+
+void RootLlmInference::recordStageBypassApplied(
+    NnUint ejectedStage, NnUint targetStage, const std::vector<NnUint> &layers) {
+    ++stageBypassAppliedGeneration;
+    stageBypassAppliedEjectedStage = ejectedStage;
+    stageBypassAppliedTargetStage = targetStage;
+    stageBypassAppliedLayers = layers;
 }
 
 LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
@@ -4128,6 +4137,7 @@ void RootLlmInference::forward(bool collectProfile) {
             if (stageBypass) {
                 NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
                 const bool ok = applyPpStageBypass(mutablePlan, bypassEjectedStage, bypassTargetStage);
+                if (ok) recordStageBypassApplied(bypassEjectedStage, bypassTargetStage, switchLayers);
                 std::printf("🔁 [stage-bypass] root apply ejectedStage=%u targetStage=%u status=%s\n",
                     (unsigned)bypassEjectedStage,
                     (unsigned)bypassTargetStage,

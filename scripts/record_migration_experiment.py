@@ -68,6 +68,8 @@ RE_APPLY = re.compile(
 
 RE_REJECT = re.compile(
     r"\[kv-migrate\] reject pp command route=(\d+)->(\d+) reason=(.*)$")
+RE_STAGE_BYPASS = re.compile(
+    r"\[stage-bypass\] root apply ejectedStage=(\d+) targetStage=(\d+) status=(\S+)")
 
 RE_ARMED = re.compile(
     r"\[kv-migrate\] auto collect armed layer=(-?\d+) pos=(-?\d+) mode=(\d+) "
@@ -164,6 +166,7 @@ class ExperimentRecorder:
         self.tokens = {}          # pos -> record dict
         self.migrations = []      # 迁移事件（按发生顺序）
         self.rejected_commands = []
+        self.stage_bypasses = []
 
         # 尾部总数据
         self.sections = {}        # evaluation / prediction / ...
@@ -263,6 +266,13 @@ class ExperimentRecorder:
                 "route_to": _i(m.group(2)),
                 "reason": m.group(3).strip(),
             })
+            return
+
+        m = RE_STAGE_BYPASS.search(line)
+        if m:
+            self.stage_bypasses.append({"ejected_stage": _i(m.group(1)),
+                                        "target_stage": _i(m.group(2)),
+                                        "status": m.group(3)})
             return
 
         m = RE_ARMED.search(line)
@@ -693,6 +703,7 @@ class ExperimentRecorder:
             "warnings": self.warnings,
             "window": window,
             "migrations": self.migrations,
+            "stage_bypasses": self.stage_bypasses,
             "rejected_commands": self.rejected_commands,
             "columns": {
                 "nodes": all_nodes,

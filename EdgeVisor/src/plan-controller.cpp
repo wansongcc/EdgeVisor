@@ -786,6 +786,14 @@ void PlanUdsController::run() {
                         appliedLayers.push_back(layer);
                     }
                     pp["appliedLayers"] = appliedLayers;
+                    json bypass = json::object();
+                    bypass["appliedGeneration"] = inference_->getStageBypassAppliedGeneration();
+                    bypass["ejectedStage"] = inference_->getStageBypassAppliedEjectedStage();
+                    bypass["targetStage"] = inference_->getStageBypassAppliedTargetStage();
+                    json bypassLayers = json::array();
+                    for (NnUint layer : inference_->getStageBypassAppliedLayers()) bypassLayers.push_back(layer);
+                    bypass["appliedLayers"] = bypassLayers;
+                    resp["stageBypass"] = bypass;
                     resp["ppMigration"] = pp;
                 }
             } else if (op == "perf") {

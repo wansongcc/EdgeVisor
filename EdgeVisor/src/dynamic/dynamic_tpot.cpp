@@ -119,6 +119,8 @@ struct ControllerRuntime {
     std::vector<tpot::StageSnapshot> committedPpLayout;
     bool hasCommittedPpLayout = false;
     unsigned long long lastObservedAppliedGeneration = 0ull;
+    unsigned long long lastObservedStageBypassGeneration = 0ull;
+    std::vector<uint32_t> activeStageChain;
     PendingAction pending;
     tpot::PpLayoutGuard ppLayoutGuard;
     SchedulerMetrics metrics;
@@ -505,6 +507,9 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
 
     for (NnUint si = 0u; si < plan->nStages; ++si) {
         const NnStageConfig &stageCfg = plan->stages[si];
+        if (stageCfg.stageIndex != 0u &&
+            getPpPrevStageIndex(plan, stageCfg.stageIndex) == (NnUint)-1 &&
+            getPpNextStageIndex(plan, stageCfg.stageIndex) == (NnUint)-1) continue;
         tpot::StageSnapshot stage;
         stage.stageIndex = stageCfg.stageIndex;
         stage.rootNodeIndex = stageCfg.rootNodeIndex;
@@ -564,6 +569,40 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
         out.push_back(stage);
     }
     return out;
+}
+
+static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) {
+    if (!status.contains("stageBypass") || !status.at("stageBypass").is_object()) return false;
+    const json &bypass = status.at("stageBypass");
+    const unsigned long long generation = bypass.value("appliedGeneration", 0ull);
+    if (generation <= rt.lastObservedStageBypassGeneration || !rt.hasCommittedPpLayout) return false;
+    const uint32_t ejected = bypass.value("ejectedStage", 0xFFFFFFFFu);
+    const uint32_t target = bypass.value("targetStage", 0xFFFFFFFFu);
+    size_t ejectedPos = rt.committedPpLayout.size();
+    size_t targetPos = rt.committedPpLayout.size();
+    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
+        if (rt.committedPpLayout[i].stageIndex == ejected) ejectedPos = i;
+        if (rt.committedPpLayout[i].stageIndex == target) targetPos = i;
+    }
+    if (ejectedPos == rt.committedPpLayout.size() || targetPos == rt.committedPpLayout.size()) return false;
+    tpot::StageSnapshot &from = rt.committedPpLayout[ejectedPos];
+    tpot::StageSnapshot &to = rt.committedPpLayout[targetPos];
+    const uint32_t targetOldLayers = to.nLayers;
+    if (targetPos > ejectedPos) to.startLayer = std::min(to.startLayer, from.startLayer);
+    else to.endLayer = std::max(to.endLayer, from.endLayer);
+    to.nLayers += from.nLayers;
+    tpot::rebasePpSoftCapacity(to, targetOldLayers);
+    rt.softCapacityByStage[target] = to.softCapacity;
+    rt.ewmaByStage.erase(ejected);
+    rt.softCapacityByStage.erase(ejected);
+    rt.riskPenaltyByStage.erase(ejected);
+    rt.committedPpLayout.erase(rt.committedPpLayout.begin() + (std::ptrdiff_t)ejectedPos);
+    rt.activeStageChain.clear();
+    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) rt.activeStageChain.push_back(rt.committedPpLayout[i].stageIndex);
+    rt.pending.active = false;
+    rt.ppLayoutGuard = tpot::PpLayoutGuard();
+    rt.lastObservedStageBypassGeneration = generation;
+    return true;
 }
 
 static void overlayCommittedPpLayout(
@@ -908,12 +947,24 @@ void DynamicTpotController::run() {
             recentTpotWindows.push_back(window.tpotMs);
             if (recentTpotWindows.size() > 3u) recentTpotWindows.erase(recentTpotWindows.begin());
 
+            const bool bypassCommitted = commitAppliedStageBypass(rt, status);
             std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status);
             if (!rt.hasCommittedPpLayout) {
                 rt.committedPpLayout = stages;
                 rt.hasCommittedPpLayout = true;
+                for (size_t i = 0u; i < stages.size(); ++i) rt.activeStageChain.push_back(stages[i].stageIndex);
             }
             overlayCommittedPpLayout(rt, stages);
+            if (bypassCommitted) {
+                std::ostringstream topology;
+                topology << "tpot_sched topology_generation=" << rt.lastObservedStageBypassGeneration
+                    << " active_stage_chain=";
+                for (size_t i = 0u; i < rt.activeStageChain.size(); ++i) {
+                    if (i != 0u) topology << ",";
+                    topology << rt.activeStageChain[i];
+                }
+                appendLog(rt.logPath, topology.str());
+            }
             tpot::Candidate bestTp = tpot::bestTpCandidate(stages, rt.cfg);
             tpot::Candidate bestPp = tpot::bestPpCandidate(stages, window.tpotMs, rt.cfg);
             bestPp = rt.ppLayoutGuard.filter(bestPp);

@@ -279,6 +279,9 @@ typedef struct {
     NnUint bubbleSkippedSyncs;
     NnUint bubbleDrainUs;
     NnUint bubbleCompleted;
+    NnUint bubbleStashEntries;
+    NnUint bubbleCatchupEntries;
+    NnUint bubbleCatchupUs;
     NnUint leftBoundaryLayerUs;
     NnUint rightBoundaryLayerUs;
 } LlmPerfPacket;

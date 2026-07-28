@@ -295,6 +295,9 @@ static json perfPacketToJson(const LlmPerfPacket &p) {
         {"bubbleSkippedSyncs", p.bubbleSkippedSyncs},
         {"bubbleDrainUs", p.bubbleDrainUs},
         {"bubbleCompleted", p.bubbleCompleted},
+        {"bubbleStashEntries", p.bubbleStashEntries},
+        {"bubbleCatchupEntries", p.bubbleCatchupEntries},
+        {"bubbleCatchupUs", p.bubbleCatchupUs},
         {"leftBoundaryLayerUs", p.leftBoundaryLayerUs},
         {"rightBoundaryLayerUs", p.rightBoundaryLayerUs}
     };

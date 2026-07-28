@@ -3774,6 +3774,9 @@ LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
     rootPacket.bubbleSkippedSyncs = lastBubbleShadowStats.skippedSyncSteps;
     rootPacket.bubbleDrainUs = lastBubbleShadowStats.drainUs;
     rootPacket.bubbleCompleted = lastBubbleShadowStats.completed;
+    rootPacket.bubbleStashEntries = lastBubbleShadowStats.stashEntries;
+    rootPacket.bubbleCatchupEntries = lastBubbleShadowStats.catchupEntries;
+    rootPacket.bubbleCatchupUs = (NnUint)std::min<unsigned long long>(lastBubbleShadowStats.catchupUs, (unsigned long long)UINT32_MAX);
     fillBoundaryLayerPerfPacket(rootPacket, plan, 0u, execution);
     return rootPacket;
 }
@@ -5785,6 +5788,9 @@ void runWorkerApp(AppCliArgs *args) {
                     p.bubbleSkippedSyncs = bubbleStats.skippedSyncSteps;
                     p.bubbleDrainUs = bubbleStats.drainUs;
                     p.bubbleCompleted = bubbleStats.completed;
+                    p.bubbleStashEntries = bubbleStats.stashEntries;
+                    p.bubbleCatchupEntries = bubbleStats.catchupEntries;
+                    p.bubbleCatchupUs = (NnUint)std::min<unsigned long long>(bubbleStats.catchupUs, (unsigned long long)UINT32_MAX);
                     fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                     network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
                 }

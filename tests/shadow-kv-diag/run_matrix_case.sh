@@ -6,8 +6,8 @@ TAG="${1:?tag}"; BATCH="${2:?batch}"; MODE="${3:?off|l1|l2}"
 
 ROOT="$HOME/B01/EdgeVisor"
 BIN="$ROOT/EdgeVisor/dllama"
-MODEL="/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m"
-TOK="/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
+MODEL="${SPOT_MODEL:-/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m}"
+TOK="${SPOT_TOKENIZER:-/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t}"
 LOGDIR="$ROOT/runtime_logs/gpu_batch_matrix/$TAG"
 rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
 
@@ -20,8 +20,8 @@ esac
 
 # memory guard: refuse to run when free VRAM is too small
 FREE_MIN=$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits | awk '{print $2-$4}' | sort -n | head -1)
-if [ "$FREE_MIN" -lt 2500 ]; then
-  echo "SKIP: min free VRAM ${FREE_MIN} MiB < 2500 MiB" | tee "$LOGDIR/SKIPPED.txt"
+if [ "$FREE_MIN" -lt "${SPOT_MIN_FREE_MB:-2500}" ]; then
+  echo "SKIP: min free VRAM ${FREE_MIN} MiB < ${SPOT_MIN_FREE_MB:-2500} MiB" | tee "$LOGDIR/SKIPPED.txt"
   exit 3
 fi
 
@@ -44,7 +44,7 @@ env DLLAMA_NBATCHES="$BATCH" "${BUBBLE_ENV[@]}" \
   --temperature 0 --seed 1 \
   --backend cuda --gpu-index 0 \
   --workers "127.0.0.1:$P1" "127.0.0.1:$P2" "127.0.0.1:$P3" \
-  --ratios "1@7*1@7*1@7*1@7" \
+  --ratios "${SPOT_RATIOS:-1@7*1@7*1@7*1@7}" \
   --enable-plan-barrier \
   --enable-pp-migration \
   --runtime-redundant-boundary-layers 1 \

@@ -163,7 +163,7 @@ _BING_UA = (
 )
 
 _BING_ALGO_RE = re.compile(r'<li class="b_algo".*?</li>', re.DOTALL)
-_BING_TITLE_RE = re.compile(r"<h2>.*?<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", re.DOTALL)
+_BING_TITLE_RE = re.compile(r"<h2[^>]*>.*?<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", re.DOTALL)
 _BING_SNIPPET_RE = re.compile(r'<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>(.*?)</p>', re.DOTALL)
 _BING_SNIPPET_FALLBACK_RE = re.compile(r"<p>(.*?)</p>", re.DOTALL)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")

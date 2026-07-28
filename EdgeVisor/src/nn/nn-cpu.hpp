@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <atomic>
+#include <cstring>
 #include "nn-executor.hpp"
 #include "nn-cpu-ops.hpp"
 #include "nn-core.hpp"
@@ -90,6 +91,18 @@ public:
 
     // Re-resolve PNTR_* pointers/sizes after partition plan updates.
     void refreshPointers() override;
+
+    // Raw node-buffer access for shadow L2 stash snapshot/restore (memcpy).
+    bool readNodeBuffer(NnUint bufferIndex, NnByte *dst, NnSize nBytes) override {
+        if (device == nullptr || bufferIndex >= device->getBufferCount() || dst == nullptr) return false;
+        std::memcpy(dst, device->buffers[bufferIndex], (size_t)nBytes);
+        return true;
+    }
+    bool writeNodeBuffer(NnUint bufferIndex, const NnByte *src, NnSize nBytes) override {
+        if (device == nullptr || bufferIndex >= device->getBufferCount() || src == nullptr) return false;
+        std::memcpy(device->buffers[bufferIndex], src, (size_t)nBytes);
+        return true;
+    }
 };
 
 #endif

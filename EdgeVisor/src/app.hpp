@@ -4,6 +4,8 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <atomic>
+#include <thread>
 #include <chrono>
 #include <string>
 #include <utility>
@@ -145,6 +147,7 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_CONTROL_ONLY = 1u << 5,
     LLM_CTRL_HAS_BATCH_META = 1u << 6,
     LLM_CTRL_SKIP_LOGITS = 1u << 7, // non-final prefill chunk: skip end-segment logits compute+gather
+    LLM_CTRL_SHADOW_CATCHUP = 1u << 8, // tool-wait window: workers repay shadow L2 debt (fire-and-forget)
 };
 
 static constexpr NnUint LLM_BATCH_META_MAGIC = 0x4d54424du; // 'MBTM' little-endian
@@ -300,6 +303,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC = 1u << 9,
     LLM_BOOTSTRAP_LAST_STAGE_SAMPLING = 1u << 10,
     LLM_BOOTSTRAP_HAS_IO_PROFILE_LOG = 1u << 11,
+    LLM_BOOTSTRAP_ENABLE_SHADOW_L2 = 1u << 12,
 };
 
 typedef struct {
@@ -403,6 +407,18 @@ public:
         NnUint rangeStart = 0u,
         NnUint rangeLen = 0u);
     bool submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
+    // Shadow L2 tool-wait window control (used by plan-controller UDS ops).
+    // begin: broadcast LLM_CTRL_SHADOW_CATCHUP to workers (fire-and-forget) and
+    // repay the local executor's debt on a background thread.
+    // end: request stop and join the local catch-up thread. Also called at the
+    // start of forward() so catch-up never runs concurrently with inference.
+    bool beginShadowCatchupWindow();
+    void endShadowCatchupWindow();
+    bool isShadowL2Active() const;
+    NnUint getShadowL2DebtEntries();
+    NnSize getShadowL2DebtBytes();
+    NnUint getShadowL2CatchupEntries();
+    unsigned long long getShadowL2CatchupUs();
 private:
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
@@ -473,6 +489,10 @@ private:
     uint64_t lastMigrationStateTransferBytes = 0u;
     uint64_t lastMigrationExportedRows = 0u;
     bool batchMetadataDirty = false;
+    // Shadow L2 local catch-up thread state (root side).
+    std::thread shadowCatchupThread;
+    std::atomic<bool> shadowCatchupStop{false};
+    std::atomic<bool> shadowCatchupRunning{false};
     bool collectSourceStageKvTransfers(NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
@@ -498,6 +518,7 @@ private:
         const std::string &fallbackReason);
 public:
     RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled);
+    ~RootLlmInference() { endShadowCatchupWindow(); }
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
     void setPosition(NnUint batchIndex, NnUint position);

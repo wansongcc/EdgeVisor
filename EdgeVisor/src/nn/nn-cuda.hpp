@@ -157,6 +157,9 @@ public:
         NnUint rangeStart = 0u,
         NnUint rangeLen = 0u) override;
     void readWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *out);
+    // Raw node-buffer access for shadow L2 stash snapshot/restore (D2H/H2D).
+    bool readNodeBuffer(NnUint bufferIndex, NnByte *dst, NnSize nBytes) override;
+    bool writeNodeBuffer(NnUint bufferIndex, const NnByte *src, NnSize nBytes) override;
 };
 
 #endif

@@ -4,6 +4,8 @@
 #include "nn-core.hpp"
 #include <atomic>
 #include <algorithm>
+#include <deque>
+#include <functional>
 #include <vector>
 #include <stdexcept>
 #include <mutex>
@@ -34,6 +36,9 @@ public:
         const std::vector<float> & /*vRow*/,
         NnUint /*rangeStart*/ = 0u,
         NnUint /*rangeLen*/ = 0u) { return false; }
+    // Backend-agnostic raw node-buffer access (shadow L2 stash snapshot/restore).
+    virtual bool readNodeBuffer(NnUint /*bufferIndex*/, NnByte * /*dst*/, NnSize /*nBytes*/) { return false; }
+    virtual bool writeNodeBuffer(NnUint /*bufferIndex*/, const NnByte * /*src*/, NnSize /*nBytes*/) { return false; }
 };
 
 class NnDevice {
@@ -174,6 +179,12 @@ typedef struct {
     NnUint completed;
     NnUint drainUs;
     unsigned long long elapsedUs;
+    // Shadow L2 (tool-wait catch-up) counters.
+    NnUint stashEntries;        // current stash (debt) depth
+    NnUint stashForcedDrains;   // entries force-drained on the critical path (stash cap)
+    NnUint catchupEntries;      // entries completed in tool-wait catch-up windows (cumulative)
+    NnUint catchupOps;          // op steps executed during catch-up (cumulative)
+    unsigned long long catchupUs; // wall time spent in catch-up (cumulative)
 } NnBubbleShadowStats;
 
 class NnExecutorException : public std::runtime_error {
@@ -213,8 +224,45 @@ private:
     // (the pp_send segment's pp_stage_cache CAST writing pp_stage_out).
     // 0 means "no gating".
     std::vector<NnUint> segmentReadyAfterStep;
+
+    // ---- Shadow L2: tool-wait catch-up (debt stash) ----
+    // When enabled (setShadowL2Config with a valid pp_stage_out buffer), an
+    // unfinished shadow pass at the end of forward is stashed as a "debt"
+    // entry (input snapshot + POS/SLT + progress cursor) instead of being
+    // drained on the critical path. Debt is repaid later via
+    // runShadowCatchup() during tool-wait windows; when the stash byte cap is
+    // exceeded, the oldest entries are force-drained at the forward end
+    // (bounded-memory fallback).
+    struct ShadowL2StashEntry {
+        NnUint batchSize;
+        std::vector<float> act;  // batchSize * dim, snapshot of pp_stage_out
+        std::vector<float> pos;  // batchSize
+        std::vector<float> slot; // batchSize (empty when no slot pipe)
+        NnUint cursor;           // progress within bubbleShadowStepIndices
+    };
+    bool shadowL2Enabled;
+    NnUint shadowL2PpStageOutBufferIndex;
+    NnUint shadowL2PosPipeIndex;
+    NnUint shadowL2SlotPipeIndex;
+    NnSize shadowL2StashCapBytes;
+    std::deque<ShadowL2StashEntry> shadowL2Stash;
+    NnSize shadowL2StashBytes;
+    NnUint shadowL2ForcedDrains;
+    NnUint shadowL2CatchupEntries;
+    NnUint shadowL2CatchupOps;
+    unsigned long long shadowL2CatchupUs;
+    bool readShadowL2NodeBuffer(NnUint bufferIndex, NnByte *dst, NnSize nBytes);
+    bool writeShadowL2NodeBuffer(NnUint bufferIndex, const NnByte *src, NnSize nBytes);
+    NnSize shadowL2EntryBytes(const ShadowL2StashEntry &entry) const;
+    void stashShadowL2Debt();
+    void enforceShadowL2StashCap();
+    bool restoreShadowL2Entry(const ShadowL2StashEntry &entry);
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
-    NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning);
+    NnBubbleShadowStats runBubbleShadowRedundantChunk(
+        NnUint budgetUs,
+        bool stopOnRequest,
+        bool allowWhileRunning,
+        const std::function<bool()> &externalStop = nullptr);
     bool isRedundantLayerActive(NnUint layerIndex) const;
     void resetBubbleShadowStateForForward();
 public:
@@ -264,6 +312,16 @@ public:
     // OP_SHIFT (block_shift_k/block_shift_v) in both main att segments and
     // shadow-kv segments, for numerical verification of redundant KV.
     void dumpKvShiftDebug(const char *dir, NnUint batchSize);
+    // Shadow L2 (tool-wait catch-up) public API.
+    void setShadowL2Config(NnUint ppStageOutBufferIndex, NnUint posPipeIndex, NnUint slotPipeIndex, NnSize stashCapBytes);
+    bool isShadowL2Enabled() const { return shadowL2Enabled; }
+    NnUint getShadowL2DebtEntries();
+    NnSize getShadowL2DebtBytes();
+    // Repay stashed shadow debt (FIFO). shouldStop (optional) is polled at
+    // segment/entry boundaries; when it returns true, the current entry keeps
+    // its progress and is retried in a later window. Returns completed entries.
+    // Must not run concurrently with forward().
+    NnUint runShadowCatchup(const std::function<bool()> &shouldStop);
 };
 
 #endif

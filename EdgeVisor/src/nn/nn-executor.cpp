@@ -514,6 +514,7 @@ NnExecutorException::NnExecutorException(const std::string message)
 NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *devices, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark)
     : netExecution(netExecution), nodeConfig(nodeConfig), segments(nodeConfig->nSegments), steps(), segmentKinds(), segmentRuntimeRoles(), segmentLayerIndex(), segmentHasExecOps(), segmentEnabled(nullptr), threads(nullptr)
     , bubbleShadowThread(), bubbleShadowMutex(), lastBubbleShadowStats{}, lastSyncProfile{}, bubbleShadowAsyncRunning(false), bubbleShadowAsyncStarted(false), bubbleShadowStopRequested(false), bubbleShadowComplete(false), bubbleShadowCursor(0u), bubbleShadowDrainUs(0u), bubbleShadowStepIndices(), segmentSyncProfileKinds()
+    , shadowL2Enabled(false), shadowL2PpStageOutBufferIndex((NnUint)-1), shadowL2PosPipeIndex((NnUint)-1), shadowL2SlotPipeIndex((NnUint)-1), shadowL2StashCapBytes(0u), shadowL2Stash(), shadowL2StashBytes(0u), shadowL2ForcedDrains(0u), shadowL2CatchupEntries(0u), shadowL2CatchupOps(0u), shadowL2CatchupUs(0ull)
 {
     NnUint maxNThreads = 0;
     for (NnExecutorDevice &d : *devices) {
@@ -959,7 +960,7 @@ bool NnExecutor::isRedundantLayerActive(NnUint layerIndex) const {
     return false;
 }
 
-NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning) {
+NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning, const std::function<bool()> &externalStop) {
     NnBubbleShadowStats stats{};
     if (!allowWhileRunning && context.isAlive.load()) {
         throw std::runtime_error("Cannot run bubble shadow work while executor is running");
@@ -993,6 +994,12 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, b
                 break;
             }
             if (stopOnRequest && bubbleShadowStopRequested) {
+                break;
+            }
+            if (externalStop && externalStop()) {
+                // Shadow L2 catch-up interrupt (e.g. new control packet arrived
+                // on the worker, or the root's tool window ended). Leave the
+                // cursor in place; the entry keeps its progress.
                 break;
             }
             if (budgetUs > 0u && elapsedUs() >= (unsigned long long)budgetUs) {
@@ -1155,6 +1162,16 @@ void NnExecutor::drainBubbleShadowAsync() {
     }
     if (!needsDrain) return;
 
+    if (shadowL2Enabled) {
+        // Shadow L2: do not drain on the critical path. Stash this forward's
+        // shadow inputs + progress as a debt entry for later tool-wait
+        // catch-up; force-drain the oldest entries only when the stash byte
+        // cap is exceeded (bounded-memory fallback).
+        stashShadowL2Debt();
+        enforceShadowL2StashCap();
+        return;
+    }
+
     const auto start = std::chrono::high_resolution_clock::now();
     (void)runBubbleShadowRedundantChunk(0u, false, true);
     const unsigned long long drainUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1162,6 +1179,200 @@ void NnExecutor::drainBubbleShadowAsync() {
     std::lock_guard<std::mutex> lock(bubbleShadowMutex);
     bubbleShadowDrainUs += (NnUint)std::min<unsigned long long>(drainUs, (unsigned long long)UINT32_MAX);
     lastBubbleShadowStats.drainUs = bubbleShadowDrainUs;
+}
+
+// ---- Shadow L2: tool-wait catch-up ----
+
+void NnExecutor::setShadowL2Config(NnUint ppStageOutBufferIndex, NnUint posPipeIndex, NnUint slotPipeIndex, NnSize stashCapBytes) {
+    shadowL2PpStageOutBufferIndex = ppStageOutBufferIndex;
+    shadowL2PosPipeIndex = posPipeIndex;
+    shadowL2SlotPipeIndex = slotPipeIndex;
+    shadowL2StashCapBytes = stashCapBytes;
+    shadowL2Enabled = ppStageOutBufferIndex != (NnUint)-1 && posPipeIndex != (NnUint)-1;
+}
+
+NnUint NnExecutor::getShadowL2DebtEntries() {
+    std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+    return (NnUint)shadowL2Stash.size();
+}
+
+NnSize NnExecutor::getShadowL2DebtBytes() {
+    std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+    return shadowL2StashBytes;
+}
+
+bool NnExecutor::readShadowL2NodeBuffer(NnUint bufferIndex, NnByte *dst, NnSize nBytes) {
+    for (NnUint s = 0; s < (NnUint)segments.size(); ++s) {
+        if (segments[s] != nullptr && segments[s]->readNodeBuffer(bufferIndex, dst, nBytes)) return true;
+    }
+    return false;
+}
+
+bool NnExecutor::writeShadowL2NodeBuffer(NnUint bufferIndex, const NnByte *src, NnSize nBytes) {
+    for (NnUint s = 0; s < (NnUint)segments.size(); ++s) {
+        if (segments[s] != nullptr && segments[s]->writeNodeBuffer(bufferIndex, src, nBytes)) return true;
+    }
+    return false;
+}
+
+NnSize NnExecutor::shadowL2EntryBytes(const ShadowL2StashEntry &entry) const {
+    return (NnSize)(entry.act.size() + entry.pos.size() + entry.slot.size()) * sizeof(float);
+}
+
+void NnExecutor::stashShadowL2Debt() {
+    if (nodeConfig == nullptr || netExecution == nullptr) return;
+    if (shadowL2PpStageOutBufferIndex >= nodeConfig->nBuffers) return;
+    const NnSize3D &bs = nodeConfig->buffers[shadowL2PpStageOutBufferIndex].size;
+    if (bs.floatType != F_32 || bs.x == 0u || bs.y == 0u) return;
+    const NnUint batchSize = netExecution->batchSize;
+    if (batchSize == 0u || batchSize > bs.y) return;
+    if (shadowL2PosPipeIndex >= netExecution->nPipes) return;
+
+    ShadowL2StashEntry entry{};
+    entry.batchSize = batchSize;
+    entry.act.resize((NnSize)batchSize * (NnSize)bs.x);
+    if (!readShadowL2NodeBuffer(shadowL2PpStageOutBufferIndex, (NnByte *)entry.act.data(), (NnSize)entry.act.size() * sizeof(float))) {
+        std::printf("⚠️ [shadow-l2] cannot snapshot pp_stage_out buffer %u; dropping debt\n",
+            (unsigned)shadowL2PpStageOutBufferIndex);
+        std::fflush(stdout);
+        return;
+    }
+    entry.pos.resize(batchSize);
+    std::memcpy(entry.pos.data(), netExecution->pipes[shadowL2PosPipeIndex], (NnSize)batchSize * sizeof(float));
+    if (shadowL2SlotPipeIndex != (NnUint)-1 && shadowL2SlotPipeIndex < netExecution->nPipes) {
+        entry.slot.resize(batchSize);
+        std::memcpy(entry.slot.data(), netExecution->pipes[shadowL2SlotPipeIndex], (NnSize)batchSize * sizeof(float));
+    }
+    {
+        std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+        entry.cursor = bubbleShadowCursor;
+        shadowL2StashBytes += shadowL2EntryBytes(entry);
+        shadowL2Stash.push_back(std::move(entry));
+    }
+}
+
+bool NnExecutor::restoreShadowL2Entry(const ShadowL2StashEntry &entry) {
+    if (nodeConfig == nullptr || netExecution == nullptr) return false;
+    if (!writeShadowL2NodeBuffer(shadowL2PpStageOutBufferIndex, (const NnByte *)entry.act.data(), (NnSize)entry.act.size() * sizeof(float))) {
+        return false;
+    }
+    std::memcpy(netExecution->pipes[shadowL2PosPipeIndex], entry.pos.data(), (NnSize)entry.pos.size() * sizeof(float));
+    if (!entry.slot.empty() && shadowL2SlotPipeIndex != (NnUint)-1 && shadowL2SlotPipeIndex < netExecution->nPipes) {
+        std::memcpy(netExecution->pipes[shadowL2SlotPipeIndex], entry.slot.data(), (NnSize)entry.slot.size() * sizeof(float));
+    }
+    netExecution->batchSize = entry.batchSize;
+    return true;
+}
+
+void NnExecutor::enforceShadowL2StashCap() {
+    // Force-drain oldest entries on the critical path when over the byte cap.
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            if (shadowL2Stash.empty() || shadowL2StashBytes <= shadowL2StashCapBytes) break;
+        }
+        ShadowL2StashEntry entry;
+        {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            entry = shadowL2Stash.front();
+        }
+        if (!restoreShadowL2Entry(entry)) {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            shadowL2StashBytes -= shadowL2EntryBytes(shadowL2Stash.front());
+            shadowL2Stash.pop_front();
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            bubbleShadowCursor = entry.cursor;
+            bubbleShadowComplete = false;
+        }
+        (void)runBubbleShadowRedundantChunk(0u, false, true);
+        {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            shadowL2StashBytes -= shadowL2EntryBytes(shadowL2Stash.front());
+            shadowL2Stash.pop_front();
+            shadowL2ForcedDrains += 1u;
+        }
+        std::printf("⚠️ [shadow-l2] stash cap exceeded; force-drained oldest debt on critical path\n");
+        std::fflush(stdout);
+    }
+}
+
+NnUint NnExecutor::runShadowCatchup(const std::function<bool()> &shouldStop) {
+    if (context.isAlive.load()) {
+        throw std::runtime_error("Cannot run shadow catch-up while executor is running");
+    }
+    if (!shadowL2Enabled) return 0u;
+    if (netExecution == nullptr || netExecution->nThreads != 1u) return 0u;
+
+    const NnUint savedBatchSize = netExecution->batchSize;
+    NnUint completed = 0u;
+    const auto start = std::chrono::high_resolution_clock::now();
+
+    while (true) {
+        if (shouldStop && shouldStop()) break;
+        ShadowL2StashEntry entry;
+        {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            if (shadowL2Stash.empty()) break;
+            entry = shadowL2Stash.front();
+        }
+        if (!restoreShadowL2Entry(entry)) {
+            std::printf("⚠️ [shadow-l2] cannot restore pp_stage_out buffer %u; dropping debt\n",
+                (unsigned)shadowL2PpStageOutBufferIndex);
+            std::fflush(stdout);
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            shadowL2StashBytes -= shadowL2EntryBytes(shadowL2Stash.front());
+            shadowL2Stash.pop_front();
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            bubbleShadowCursor = entry.cursor;
+            bubbleShadowComplete = false;
+        }
+        const NnBubbleShadowStats stats = runBubbleShadowRedundantChunk(0u, false, true, shouldStop);
+        bool complete = false;
+        {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            complete = bubbleShadowComplete;
+            shadowL2CatchupOps += stats.opStepsExecuted;
+        }
+        if (complete) {
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            shadowL2StashBytes -= shadowL2EntryBytes(shadowL2Stash.front());
+            shadowL2Stash.pop_front();
+            shadowL2CatchupEntries += 1u;
+            completed += 1u;
+            // Debug KV dump for this entry's positions (same env as the app hook).
+            const char *dumpDir = std::getenv("DLLAMA_DUMP_KV_DIR");
+            if (dumpDir != nullptr && dumpDir[0] != '\0') {
+                dumpKvShiftDebug(dumpDir, entry.batchSize);
+            }
+        } else {
+            // Interrupted mid-entry: keep progress for the next window.
+            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            if (!shadowL2Stash.empty()) shadowL2Stash.front().cursor = bubbleShadowCursor;
+            break;
+        }
+    }
+
+    netExecution->batchSize = savedBatchSize;
+    const unsigned long long elapsedUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now() - start).count();
+    {
+        std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+        shadowL2CatchupUs += elapsedUs;
+    }
+    if (completed > 0u) {
+        std::printf("🫧 [shadow-l2] catch-up completed=%u remaining=%zu elapsed_us=%llu\n",
+            (unsigned)completed,
+            shadowL2Stash.size(),
+            elapsedUs);
+        std::fflush(stdout);
+    }
+    return completed;
 }
 
 void NnExecutor::joinBubbleShadowAsync() {
@@ -1175,7 +1386,13 @@ void NnExecutor::joinBubbleShadowAsync() {
 
 NnBubbleShadowStats NnExecutor::getLastBubbleShadowStats() const {
     std::lock_guard<std::mutex> lock(bubbleShadowMutex);
-    return lastBubbleShadowStats;
+    NnBubbleShadowStats stats = lastBubbleShadowStats;
+    stats.stashEntries = (NnUint)shadowL2Stash.size();
+    stats.stashForcedDrains = shadowL2ForcedDrains;
+    stats.catchupEntries = shadowL2CatchupEntries;
+    stats.catchupOps = shadowL2CatchupOps;
+    stats.catchupUs = shadowL2CatchupUs;
+    return stats;
 }
 
 NnExecutorSyncProfile NnExecutor::getLastSyncProfile() const {

@@ -1624,6 +1624,26 @@ void NnCudaDeviceSegment::readWeight(NnUint opIndex, NnSize offset, NnSize nByte
     weightBuffers[opIndex]->read(out, offset, nBytes, device->getStream(), &device->staging);
 }
 
+bool NnCudaDeviceSegment::readNodeBuffer(NnUint bufferIndex, NnByte *dst, NnSize nBytes) {
+    if (device == nullptr || dst == nullptr || nBytes == 0u) return false;
+    try {
+        device->readBuffer(bufferIndex, dst, 0u, nBytes);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+bool NnCudaDeviceSegment::writeNodeBuffer(NnUint bufferIndex, const NnByte *src, NnSize nBytes) {
+    if (device == nullptr || src == nullptr || nBytes == 0u) return false;
+    try {
+        device->writeBuffer(bufferIndex, src, 0u, nBytes);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
 void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
     if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
     NnNetConfig *netConfig = device->getNetConfig();

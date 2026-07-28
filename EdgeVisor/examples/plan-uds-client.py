@@ -203,6 +203,10 @@ def main() -> int:
     raw = sub.add_parser("raw")
     raw.add_argument("json", help='raw request JSON, e.g. {"op":"ping"}')
 
+    sub.add_parser("tool_window_begin", help="begin a tool-wait window: broadcast shadow catch-up to workers + repay root debt")
+    sub.add_parser("tool_window_end", help="end a tool-wait window: stop and join the root catch-up thread")
+    sub.add_parser("shadow_debt", help="query shadow L2 debt/catch-up stats")
+
     args = p.parse_args()
 
     if args.op == "watch_layer_prof":

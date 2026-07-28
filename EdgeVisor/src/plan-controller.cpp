@@ -750,6 +750,26 @@ void PlanUdsController::run() {
                 const bool enabled = parseBool(req, "enabled", true);
                 inference_->setPrimaryLayerEnabled(layerIndex, enabled);
                 resp = json{{"ok", true}, {"layerIndex", layerIndex}, {"enabled", enabled}};
+            } else if (op == "tool_window_begin") {
+                if (inference_ == nullptr) throw std::runtime_error("inference not available");
+                const bool started = inference_->beginShadowCatchupWindow();
+                resp = json{{"ok", started}};
+                if (!started) resp["reason"] = "shadow L2 not enabled (set DLLAMA_SHADOW_L2=1)";
+            } else if (op == "tool_window_end") {
+                if (inference_ == nullptr) throw std::runtime_error("inference not available");
+                inference_->endShadowCatchupWindow();
+                resp = json{{"ok", true}};
+            } else if (op == "shadow_debt") {
+                resp = json{{"ok", true}};
+                if (inference_ != nullptr) {
+                    resp["l2Enabled"] = inference_->isShadowL2Active();
+                    resp["root"] = json{
+                        {"debtEntries", (uint64_t)inference_->getShadowL2DebtEntries()},
+                        {"debtBytes", (uint64_t)inference_->getShadowL2DebtBytes()},
+                        {"catchupEntries", (uint64_t)inference_->getShadowL2CatchupEntries()},
+                        {"catchupUs", (uint64_t)inference_->getShadowL2CatchupUs()},
+                    };
+                }
             } else if (op == "clear") {
                 const uint64_t cacheSeq = planCommandCache().clear();
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}};

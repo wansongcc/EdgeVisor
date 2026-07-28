@@ -207,6 +207,46 @@ static bool bubbleShadowKvLogEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_LOG", false);
 }
 
+// Shadow L2: tool-wait catch-up (debt stash instead of forward-end drain).
+static bool shadowL2Enabled() {
+    return bubbleShadowKvEnabled() && envFlagEnabledDefault("DLLAMA_SHADOW_L2", false);
+}
+
+static NnSize shadowL2StashCapBytes() {
+    long mb = 512;
+    const char *v = std::getenv("DLLAMA_SHADOW_L2_STASH_MB");
+    if (v != nullptr && v[0] != '\0') {
+        char *end = nullptr;
+        const long x = std::strtol(v, &end, 10);
+        if (end != v) mb = x;
+    }
+    if (mb < 0) mb = 0;
+    return (NnSize)mb * 1024u * 1024u;
+}
+
+static NnUint findBufferIndexByName(const NnNodeConfig *nodeConfig, const char *name) {
+    if (nodeConfig == nullptr || name == nullptr) return (NnUint)-1;
+    for (NnUint i = 0u; i < nodeConfig->nBuffers; ++i) {
+        const char *bufName = nodeConfig->buffers[i].name;
+        if (bufName != nullptr && std::strcmp(bufName, name) == 0) return i;
+    }
+    return (NnUint)-1;
+}
+
+static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name);
+
+// Wire shadow L2 into an executor (root and worker alike): pass the
+// pp_stage_out buffer and POS/SLT pipe indices. No-op when L2 is disabled or
+// when this node has no pp_stage_out buffer (last stage / no right shadows).
+static void configureExecutorShadowL2(NnExecutor *executor, const NnNetConfig *netConfig, const NnNodeConfig *nodeConfig) {
+    if (executor == nullptr || !shadowL2Enabled()) return;
+    executor->setShadowL2Config(
+        findBufferIndexByName(nodeConfig, "pp_stage_out"),
+        findPipeIndexByName(netConfig, "POS"),
+        findPipeIndexByName(netConfig, "SLT"),
+        shadowL2StashCapBytes());
+}
+
 static bool lastStageSamplingEnabled() {
     return envFlagEnabledDefault("DLLAMA_LAST_STAGE_SAMPLING", false);
 }
@@ -408,6 +448,9 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
         p.flags |= LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV;
         if (!bubbleShadowKvAsyncEnabled()) {
             p.flags |= LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC;
+        }
+        if (shadowL2Enabled()) {
+            p.flags |= LLM_BOOTSTRAP_ENABLE_SHADOW_L2;
         }
     }
     if (args->lastStageSampling) {
@@ -1920,6 +1963,7 @@ static WarmupCandidateResult probeWarmupCandidate(
         }
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
         NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), true);
+        configureExecutorShadowL2(&executor, &net.netConfig, rootNodeConfig);
 
         if (uneven) {
             NnLocalWeightLoader localLoader(&executor, 0);
@@ -3547,6 +3591,71 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
     return true;
 }
 
+bool RootLlmInference::beginShadowCatchupWindow() {
+    if (executor == nullptr || !executor->isShadowL2Enabled()) return false;
+
+    // Fire-and-forget: workers repay their shadow L2 debt on receipt and
+    // interrupt themselves when the next control packet arrives. No ACK.
+    if (network != nullptr) {
+        LlmControlPacket out = controlPacket;
+        out.flags = LLM_CTRL_SHADOW_CATCHUP | LLM_CTRL_CONTROL_ONLY;
+        out.batchSize = 1u;
+        out.planCmdSeq = 0u;
+        logRootControlSend(out);
+        network->writeAll(&out, sizeof(LlmControlPacket));
+    }
+
+    // Repay the local (root) executor's debt on a background thread. Joined by
+    // endShadowCatchupWindow(), which is also called at the start of forward().
+    endShadowCatchupWindow();
+    shadowCatchupStop.store(false);
+    shadowCatchupRunning.store(true);
+    shadowCatchupThread = std::thread([this]() {
+        try {
+            const NnUint done = this->executor->runShadowCatchup([this]() -> bool {
+                return this->shadowCatchupStop.load(std::memory_order_relaxed);
+            });
+            if (done > 0u) {
+                std::printf("🫧 [shadow-l2] root catch-up completed=%u\n", (unsigned)done);
+                std::fflush(stdout);
+            }
+        } catch (const std::exception &e) {
+            std::printf("⚠️ [shadow-l2] root catch-up error: %s\n", e.what());
+            std::fflush(stdout);
+        }
+        this->shadowCatchupRunning.store(false);
+    });
+    return true;
+}
+
+void RootLlmInference::endShadowCatchupWindow() {
+    shadowCatchupStop.store(true);
+    if (shadowCatchupThread.joinable()) {
+        shadowCatchupThread.join();
+    }
+    shadowCatchupRunning.store(false);
+}
+
+bool RootLlmInference::isShadowL2Active() const {
+    return executor != nullptr && executor->isShadowL2Enabled();
+}
+
+NnUint RootLlmInference::getShadowL2DebtEntries() {
+    return executor != nullptr ? executor->getShadowL2DebtEntries() : 0u;
+}
+
+NnSize RootLlmInference::getShadowL2DebtBytes() {
+    return executor != nullptr ? executor->getShadowL2DebtBytes() : 0u;
+}
+
+NnUint RootLlmInference::getShadowL2CatchupEntries() {
+    return executor != nullptr ? executor->getLastBubbleShadowStats().catchupEntries : 0u;
+}
+
+unsigned long long RootLlmInference::getShadowL2CatchupUs() {
+    return executor != nullptr ? executor->getLastBubbleShadowStats().catchupUs : 0ull;
+}
+
 bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     if (network == nullptr) return false;
     std::vector<NnUint> switchLayers;
@@ -3972,6 +4081,11 @@ bool RootLlmInference::recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUi
 }
 
 void RootLlmInference::forward(bool collectProfile) {
+    // Shadow L2: a local catch-up (tool-wait window) must never overlap a
+    // forward. If a window was left open, stop and join it first.
+    if (shadowCatchupRunning.load(std::memory_order_relaxed) || shadowCatchupThread.joinable()) {
+        endShadowCatchupWindow();
+    }
     lastBubbleShadowStats = {};
     bool sendKvTransfer = false;
     bool sendLayerSwitch = false;
@@ -5329,9 +5443,15 @@ void runWorkerApp(AppCliArgs *args) {
             } else {
                 unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
             }
+            if ((boot.flags & LLM_BOOTSTRAP_ENABLE_SHADOW_L2) != 0u) {
+                setenv("DLLAMA_SHADOW_L2", "1", 1);
+            } else {
+                unsetenv("DLLAMA_SHADOW_L2");
+            }
         } else {
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+            unsetenv("DLLAMA_SHADOW_L2");
         }
         if (bootLastStageSamplingEnabled) {
             setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
@@ -5403,6 +5523,7 @@ void runWorkerApp(AppCliArgs *args) {
         // Worker CLI --benchmark is no longer required.
         const bool profileEnabled = bootBenchmarkEnabled;
         NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, profileEnabled);
+        configureExecutorShadowL2(&executor, &netConfig, &nodeConfig);
 
         if (useLocalLoading) {
             // [Local Loading Mode]
@@ -5592,6 +5713,24 @@ void runWorkerApp(AppCliArgs *args) {
                 }
 
                 if ((inference.flags() & LLM_CTRL_CONTROL_ONLY) != 0u) {
+                    if ((inference.flags() & LLM_CTRL_SHADOW_CATCHUP) != 0u) {
+                        // Shadow L2 tool-wait window: repay stashed shadow debt.
+                        // Interrupt granularity = shadow segment boundary; the
+                        // stop predicate peeks the root socket (non-blocking,
+                        // no consumption) so a new control packet (next token,
+                        // window end follow-up traffic) resumes the main loop
+                        // immediately. Fire-and-forget: no ACK is sent.
+                        const NnUint catchupDone = executor.runShadowCatchup([&]() -> bool {
+                            LlmControlPacket probe{};
+                            return network->tryPeekWithMaxAttempts(ROOT_SOCKET_INDEX, &probe, sizeof(probe), 1ul);
+                        });
+                        if (catchupDone > 0u) {
+                            std::printf("🫧 [shadow-l2] worker node=%u catch-up completed=%u\n",
+                                (unsigned)nodeConfig.nodeIndex,
+                                (unsigned)catchupDone);
+                            std::fflush(stdout);
+                        }
+                    }
                     inference.flushPendingKvAck();
                     if ((inference.flags() & LLM_CTRL_PROFILE) != 0u) {
                         LlmPerfPacket p{};

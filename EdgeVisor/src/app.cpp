@@ -4922,20 +4922,41 @@ WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *net
 }
 
 void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionPlan *plan) {
-    if (!lastStageSamplingPlanSupported(plan)) return;
-    if (network == nullptr || execution == nullptr || logitsPipe == nullptr || lastStageSampler == nullptr) return;
-    if (controlPacket.batchSize != 1u) return;
+    static NnUint dbgSkipped = 0u;
+    const bool dbg = std::getenv("DLLAMA_LSS_DEBUG") != nullptr;
+    auto dbgSkip = [&](const char *reason) {
+        if (dbg && dbgSkipped < 8u) {
+            dbgSkipped += 1u;
+            std::printf("⚠️ [lss-debug] node=%u skip send token: %s (batch=%u pos=%u)\n",
+                (unsigned)localNodeIndex, reason,
+                (unsigned)controlPacket.batchSize, (unsigned)controlPacket.position);
+            std::fflush(stdout);
+        }
+    };
+    if (!lastStageSamplingPlanSupported(plan)) { dbgSkip("plan-not-supported"); return; }
+    if (network == nullptr || execution == nullptr || logitsPipe == nullptr) { dbgSkip("null-net-exec-logits"); return; }
+    if (lastStageSampler == nullptr) { dbgSkip("null-sampler"); return; }
+    if (controlPacket.batchSize != 1u) { dbgSkip("batch-not-1"); return; }
     const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-    if (last.rootNodeIndex != localNodeIndex) return;
+    if (last.rootNodeIndex != localNodeIndex) { dbgSkip("not-last-stage-root"); return; }
 
     NnUint vocabSize = 0u;
     if (plan->vocabSplit.lengths != nullptr) {
         for (NnUint node = 0u; node < plan->nNodes; ++node) vocabSize += plan->vocabSplit.lengths[node];
     }
-    if (vocabSize == 0u) return;
+    if (vocabSize == 0u) { dbgSkip("vocabSize-0"); return; }
 
     const int localToken = lastStageSampler->sample(logitsPipe);
-    if (localToken < 0) return;
+    if (dbg && dbgSkipped < 8u) {
+        dbgSkipped += 1u;
+        float lgMin = 1e30f, lgMax = -1e30f;
+        for (NnUint q = 0u; q < 128u; ++q) { lgMin = std::min(lgMin, logitsPipe[q]); lgMax = std::max(lgMax, logitsPipe[q]); }
+        std::printf("⚠️ [lss-debug] node=%u send token=%d pos=%u vocab=%u logits[0..128)=[%.3f,%.3f]\n",
+            (unsigned)localNodeIndex, localToken, (unsigned)controlPacket.position,
+            (unsigned)vocabSize, (double)lgMin, (double)lgMax);
+        std::fflush(stdout);
+    }
+    if (localToken < 0) { dbgSkip("sample-neg"); return; }
     const NnUint token = (NnUint)localToken;
     const float sampledLogit = ((NnUint)localToken < vocabSize) ? logitsPipe[localToken] : 0.0f;
 
@@ -5611,6 +5632,17 @@ void runWorkerApp(AppCliArgs *args) {
         }
         if (bootLastStageSamplingEnabled && samplerVocabSize > 0u) {
             lastStageSampler.reset(new Sampler((int)samplerVocabSize, boot.samplerTemperature, boot.samplerTopP, boot.samplerSeed));
+            if (std::getenv("DLLAMA_LSS_DEBUG") != nullptr) {
+                std::printf("⚠️ [lss-debug] node=%u lastStageSampler created vocab=%u\n",
+                    (unsigned)nodeConfig.nodeIndex, (unsigned)samplerVocabSize);
+                std::fflush(stdout);
+            }
+        } else if (std::getenv("DLLAMA_LSS_DEBUG") != nullptr) {
+            std::printf("⚠️ [lss-debug] node=%u lastStageSampler NOT created (bootLSS=%u vocab=%u)\n",
+                (unsigned)nodeConfig.nodeIndex,
+                bootLastStageSamplingEnabled ? 1u : 0u,
+                (unsigned)samplerVocabSize);
+            std::fflush(stdout);
         }
         WorkerLlmInference inference(&execution, network, nodeConfig.nodeIndex, logitsPipeIndex, lastStageSampler.get());
         const std::vector<NnUint> logitsSegmentIndices = findLogitsSegmentIndices(&nodeConfig);

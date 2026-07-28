@@ -128,3 +128,73 @@ policy before launching `dllama`:
 - `vg_mode=flat`, `random`, `pure_pp`, and `no_elastic_vg` produce legal
   effective worker/ratio mappings and attach before/after VG mapping metadata
   to the UDS command and trace.
+
+## Real web_search tool + Shadow L2 tool windows
+
+### web_search tool
+
+`tools.py` provides a real `web_search(query, max_results)` tool:
+
+- Online path: Bing CN HTML endpoint (`https://cn.bing.com/search`), parsed with
+  regexes (no extra dependency beyond `requests`). Host probing (2026-07):
+  duckduckgo.com and wikipedia.org time out; cn.bing.com is reachable (~0.5s).
+  Latency is the natural network latency (~0.5-3s), which makes it a realistic
+  tool-wait window driver.
+- Offline fallback (explicitly marked in code): if the request fails or parses
+  empty, a bundled mini corpus (`_CORPUS` in `tools.py`) is searched with
+  keyword-overlap scoring and a realistic latency drawn from uniform(0.5s, 3s).
+  Results carry `"mode": "bing"` or `"mode": "corpus_fallback"` so traces show
+  which path was taken.
+
+The episode `episodes/agentic_search_smoke_episode.json` requires
+`web_search(query="president of France")` + `calculator`, so the agent always
+produces a search tool call.
+
+### Shadow L2 tool windows
+
+With Shadow L2 enabled on the engine (`DLLAMA_SHADOW_L2=1`), every agent tool
+call is bracketed by UDS `tool_window_begin` / `tool_window_end`
+(`runtime_loop.execute_tool` → `Backend.tool_window_begin/end`; base class
+no-op; `EdgeVisorAblationBackend` implements them via the persistent
+plan-control socket, fire-and-forget with silent degradation). During the
+window the engine repays stashed shadow-KV debt (root catch-up thread +
+workers via `LLM_CTRL_SHADOW_CATCHUP` broadcast).
+
+Switches:
+
+- `agent_bench/run_loop_episode.py --shadow-l2`: sets `DLLAMA_SHADOW_L2=1` in
+  the persistent session env (workers get it via bootstrap).
+- `agent_bench/run_loop_episode.py --edge-cpu`: run the ablation backend on CPU
+  (`--backend cpu`, no GPU) for small-scale verification.
+- `scripts/run_real_ablation_suite.py --shadow-l2`: passthrough.
+
+### Verification commands (CPU)
+
+```bash
+cd ~/B01/EdgeVisor
+DLLAMA_SHADOW_L1_DISABLE=1 /home/byh/B01/agent_langgraph_venv/bin/python \
+  -m agent_bench.run_loop_episode \
+  --backend edgevisor_ablation \
+  --episode agent_bench/episodes/agentic_search_smoke_episode.json \
+  --out-root ~/B01/EdgeVisor/runtime_logs/agentic_l2_clean \
+  --edge-cpu --edge-worker-gpus 0 --edge-ratios "1@14*1@14" \
+  --bubble-shadow-kv --shadow-l2 --enable-pp-migration \
+  --edge-steps 256 --edge-timeout-s 600 --disable-episode-dynamic-plan
+```
+
+`DLLAMA_SHADOW_L1_DISABLE=1` (test knob) disables L1 bubble windows so every
+forward produces stash debt, making the effect easy to observe. While the
+episode runs, poll the session UDS (`/tmp/edgevisor_agent_persistent_*.sock`)
+with `shadow_debt` to watch debt grow during generation and drop inside tool
+windows; the persistent root log prints
+`🫧 [shadow-l2] root catch-up completed=N` per repaid batch.
+
+### Verified results (2026-07-28, two-level-slack @ 402808d)
+
+- gen1 rc=0 (real model action JSON), web_search mode=bing latency ~0.5s.
+- During the web_search window: `catch-up completed=7 remaining=73
+  elapsed_us=516157` (7 debt entries repaid in ~0.5s; debt 80→73 live via
+  `shadow_debt`).
+- Note: the API server keeps executing a request's forwards for the full
+  generation; the catch-up thread retries (100ms) if a window opens while a
+  forward is still running (`8d9730c`+`402808d`).

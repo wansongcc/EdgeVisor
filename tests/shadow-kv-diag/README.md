@@ -181,3 +181,18 @@ DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2on_l1disable_2p
   - `l2_unit_fixed`（L1 禁用）：debt 60 → tool window 后 debt 0、
     catchupEntries=60；L14 red_k/red_v 逐位为 0。
   - `l2fix_regress_2pp`（L2 关）与 `l2fix_reg_b2`（L2 开 NB=2）：L14 全部逐位为 0。
+
+### 基于 8d9730c（+0b5106c）的中断复测
+
+- `l2_interrupt_racefix`（@ 8d9730c 重建 CPU 二进制）：debt=110 的窗口中
+  catch-up 被新请求打断（补算 2/110 即停），resume latency 0s，turn 2 正常跑完
+  （pos 463→511，Network closed），无 hang；债务无丢失（剩余 108 由后续窗口
+  偿还，机制同 `l2_unit_fixed` 的 debt 60→0、补算 L14 逐位为 0）。
+- `l2dbg_racefix`（hang repro，gdb/strace harness）：turn 2 越过原死锁点
+  （pos 462）跑到 pos=511 正常结束。
+- `l2fix2_reg_b1`（@ 0b5106c）：L14 red_k/red_v 逐位为 0（164 对），L15 仍为
+  已知结构问题 —— 设备线程修复无回归。
+- `0b5106c`（上 GPU 前的高危修复）：bubble shadow 线程与 L2 catch-up 线程入口
+  调 `NnDevice::setCurrentThreadDevice()`（CPU 空实现；CUDA 为
+  `cudaSetDevice(gpuIndex)`），避免 gpuIndex≠0 时 kernel launch 落到错误
+  context。CPU 构建无 CUDA 依赖；`nn-cuda.cu` 已过 nvcc 12.8 编译检查（未上机跑）。

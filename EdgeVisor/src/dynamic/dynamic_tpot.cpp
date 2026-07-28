@@ -580,6 +580,10 @@ static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) 
     const json &bypass = status.at("stageBypass");
     const unsigned long long generation = bypass.value("appliedGeneration", 0ull);
     if (generation <= rt.lastObservedStageBypassGeneration || !rt.hasCommittedPpLayout) return false;
+    // A root-side bypass may arrive while an earlier PP command is still in
+    // flight. Retain this generation in status and commit it only after the
+    // pending command reaches its explicit terminal path below.
+    if (rt.pending.active) return false;
     const uint32_t ejected = bypass.value("ejectedStage", 0xFFFFFFFFu);
     const uint32_t target = bypass.value("targetStage", 0xFFFFFFFFu);
     if (!bypass.contains("appliedLayers") || !bypass.at("appliedLayers").is_array()) return false;

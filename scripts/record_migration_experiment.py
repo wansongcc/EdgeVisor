@@ -167,6 +167,7 @@ class ExperimentRecorder:
         self.migrations = []      # 迁移事件（按发生顺序）
         self.rejected_commands = []
         self.stage_bypasses = []
+        self.timeline = getattr(args, "events", [])
 
         # 尾部总数据
         self.sections = {}        # evaluation / prediction / ...
@@ -658,7 +659,31 @@ class ExperimentRecorder:
                 "stages": [rec["stages"][n] for n in sorted(rec["stages"])],
                 "bubble_shadow": rec["bubble_shadow"],
                 "events": events,
+                "fault_ids": [], "active_stage_chain": None,
+                "topology_generation": None, "pp_applied_generation": None,
+                "bypass_applied_generation": None,
             })
+
+        # Orchestrator events are authoritative for multi-fault action windows.
+        # Each event records root_token_pos, so no cross-host wall clock is used.
+        action_windows = []
+        for event in self.timeline:
+            pos = event.get("root_token_pos")
+            if pos is None: continue
+            detail = event.get("details") or {}
+            action_windows.append({"event_id": event.get("event_id"), "position": pos,
+                                   "phase": event.get("phase"), "status": event.get("status")})
+            for row in token_rows:
+                if row["pos"] < pos: continue
+                row["events"].append(event.get("event_id", "event"))
+                if event.get("event_id", "").startswith(("compute", "network")):
+                    row["fault_ids"].append(event.get("event_id"))
+                if event.get("event_id") == "bypass_apply":
+                    row["active_stage_chain"] = "0,1,3"
+                    row["topology_generation"] = detail.get("appliedGeneration")
+                    row["bypass_applied_generation"] = detail.get("appliedGeneration")
+                if event.get("event_id") in ("pp1_apply", "pp2_apply"):
+                    row["pp_applied_generation"] = detail.get("appliedGeneration")
 
         # ---- node->stage 映射（CSV 列注释用）----
         node_stage = {}
@@ -704,6 +729,7 @@ class ExperimentRecorder:
             "window": window,
             "migrations": self.migrations,
             "stage_bypasses": self.stage_bypasses,
+            "action_windows": action_windows,
             "rejected_commands": self.rejected_commands,
             "columns": {
                 "nodes": all_nodes,
@@ -730,7 +756,7 @@ def write_outputs(result, outdir, name):
 
     nodes = result["columns"]["nodes"]
     node_stage = result["columns"]["node_stage"]
-    header = ["pos", "rel_pos", "phase", "e2e_wall_ms"]
+    header = ["pos", "rel_pos", "phase", "active_stage_chain", "topology_generation", "pp_applied_generation", "bypass_applied_generation", "fault_ids", "e2e_wall_ms"]
     for n in nodes:
         s = node_stage.get(str(n))
         header.append("node%d_exec_ms%s" % (
@@ -742,7 +768,7 @@ def write_outputs(result, outdir, name):
         writer.writerow(header)
         for t in result["tokens"]:
             exec_by_node = {s["node"]: s["exec_ms"] for s in t["stages"]}
-            row = [t["pos"], t["rel_pos"], t["phase"],
+            row = [t["pos"], t["rel_pos"], t["phase"], t["active_stage_chain"], t["topology_generation"], t["pp_applied_generation"], t["bypass_applied_generation"], ";".join(t["fault_ids"]),
                    "" if t["e2e_wall_ms"] is None else ("%.2f" % t["e2e_wall_ms"])]
             for n in nodes:
                 v = exec_by_node.get(n)
@@ -839,6 +865,7 @@ def build_arg_parser():
                    metavar="KEY=VALUE",
                    help="实验元数据（扰动类型/强度/机器等），可重复")
     p.add_argument("--quiet", action="store_true", help="不打印人类可读报告")
+    p.add_argument("--events-jsonl", default=None, help="编排器 events.jsonl；按 root token position 标注多 fault/action 窗口")
     return p
 
 
@@ -849,6 +876,13 @@ def main(argv=None):
         args.meta = parse_meta(args.meta)
     except argparse.ArgumentTypeError as e:
         parser.error(str(e))
+    args.events = []
+    if args.events_jsonl:
+        try:
+            with open(args.events_jsonl, "r", encoding="utf-8") as f:
+                args.events = [json.loads(line) for line in f if line.strip()]
+        except (OSError, ValueError) as e:
+            parser.error("invalid --events-jsonl: %s" % e)
 
     recorder = ExperimentRecorder(args)
 

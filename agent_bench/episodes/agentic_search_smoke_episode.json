@@ -1,8 +1,8 @@
 {
   "id": "agentic_search_smoke_loop",
   "description": "Agent episode with a real web_search tool call (Shadow L2 tool-window smoke).",
-  "max_llm_turns": 6,
-  "max_tokens": 64,
+  "max_llm_turns": 5,
+  "max_tokens": 32,
   "min_tool_calls": 2,
   "required_tools": [
     "web_search",

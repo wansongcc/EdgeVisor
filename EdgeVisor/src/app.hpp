@@ -513,6 +513,8 @@ private:
     bool pendingStageBypass = false;
     NnUint pendingBypassEjectedStage = 0xFFFFFFFFu;
     NnUint pendingBypassTargetStage = 0xFFFFFFFFu;
+    NnUint pendingBypassPreviousStage = 0xFFFFFFFFu;
+    NnUint pendingBypassPreviousNode = 0xFFFFFFFFu;
     unsigned long long lastPpPlanCacheSeqApplied = 0ull;
     unsigned long long lastHeadRecoveryPlanCacheSeqApplied = 0ull;
     unsigned long long headRecoveryRangeCacheSeq = 0ull;

@@ -5598,8 +5598,13 @@ void runWorkerApp(AppCliArgs *args) {
         if (bootLastStageSamplingEnabled && lastStageSamplingPlanSupported(planPtr.get())) {
             const NnStageConfig &last = planPtr->stages[planPtr->nStages - 1u];
             if (last.rootNodeIndex == nodeConfig.nodeIndex && planPtr->vocabSplit.lengths != nullptr) {
+                // Vocab is split within the LAST stage only. Summing over ALL
+                // plan nodes multiplies the size by nStages on single-node
+                // stages and makes the sampler read past the logits pipe.
                 samplerVocabSize = 0u;
-                for (NnUint node = 0u; node < planPtr->nNodes; ++node) samplerVocabSize += planPtr->vocabSplit.lengths[node];
+                for (NnUint i = 0u; i < last.nNodes; ++i) {
+                    samplerVocabSize += planPtr->vocabSplit.lengths[last.nodeIndices[i]];
+                }
             } else {
                 samplerVocabSize = 0u;
             }

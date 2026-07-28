@@ -428,6 +428,14 @@ public:
 
             inference->forward();
 
+            // LSS protocol: drain the last stage's sampled-token packet for
+            // batchSize==1 prefill forwards too, or it misaligns the
+            // perf/token packet sequence for later decode tokens.
+            if (args->lastStageSampling && network != nullptr && batchSize == 1u) {
+                NnUint discardToken = 0u;
+                inference->tryReceiveLastStageSampledToken(discardToken, nullptr);
+            }
+
             i += batchSize;
             pos += batchSize;
             token = promptTokens[i + 1];

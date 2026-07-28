@@ -927,6 +927,15 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         context->inference->setSkipLogits(!context->args->lastStageSampling && !isFinalChunk);
         context->inference->forward();
 
+        // LSS protocol: the last stage sends one sampled-token packet for every
+        // batchSize==1 forward. Prefill forwards at batchSize==1 must also
+        // drain that packet, otherwise it stays in the stream and misaligns
+        // the perf/token packet sequence for all later decode tokens.
+        if (context->args->lastStageSampling && context->network != nullptr && batchSize == 1u) {
+            NnUint discardToken = 0u;
+            context->inference->tryReceiveLastStageSampledToken(discardToken, nullptr);
+        }
+
         NnUint evalBubbleTime = 0;
         if (context->args->benchmark) {
             const std::vector<LlmPerfPacket>& perf = context->inference->getLastPerf();

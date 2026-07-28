@@ -389,6 +389,10 @@ public:
     bool hasMigrationAck() const { return migrationAckSeen; }
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
+    unsigned long long getPpMigrationAppliedGeneration() const { return ppMigrationAppliedGeneration; }
+    NnUint getPpMigrationAppliedFromNodeIndex() const { return ppMigrationAppliedFromNodeIndex; }
+    NnUint getPpMigrationAppliedToNodeIndex() const { return ppMigrationAppliedToNodeIndex; }
+    const std::vector<NnUint>& getPpMigrationAppliedLayers() const { return ppMigrationAppliedLayers; }
     bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
@@ -404,6 +408,7 @@ public:
         NnUint rangeLen = 0u);
     bool submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
 private:
+    void recordPpMigrationApplied();
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
@@ -453,6 +458,10 @@ private:
     bool migrationAckSeen = false;
     int migrationAckPos = -1;
     int migrationAckLayer = -1;
+    unsigned long long ppMigrationAppliedGeneration = 0ull;
+    NnUint ppMigrationAppliedFromNodeIndex = 0u;
+    NnUint ppMigrationAppliedToNodeIndex = (NnUint)-1;
+    std::vector<NnUint> ppMigrationAppliedLayers;
     bool pendingStageBypass = false;
     NnUint pendingBypassEjectedStage = 0xFFFFFFFFu;
     NnUint pendingBypassTargetStage = 0xFFFFFFFFu;

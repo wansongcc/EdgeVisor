@@ -323,6 +323,12 @@ void PpLayoutGuard::markIssued(const Candidate &candidate) {
     layoutChanged_ = true;
 }
 
+void PpLayoutGuard::markCommitted(const Candidate &candidate) {
+    if (candidate.kind != CandidateKind::PP_MOVE) return;
+    issuedKeys_.erase(candidateKey(candidate));
+    layoutChanged_ = false;
+}
+
 void PpLayoutGuard::markRolledBack(const Candidate &candidate) {
     if (candidate.kind != CandidateKind::PP_MOVE) return;
     issuedKeys_.erase(candidateKey(candidate));
@@ -333,8 +339,8 @@ uint32_t ppCommandLayerCount(const Candidate &candidate) {
     return std::max<uint32_t>(1u, candidate.layerCount);
 }
 
-void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate) {
-    if (candidate.kind != CandidateKind::PP_MOVE || !candidate.valid) return;
+bool applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate) {
+    if (candidate.kind != CandidateKind::PP_MOVE || !candidate.valid) return false;
     StageSnapshot *from = nullptr;
     StageSnapshot *to = nullptr;
     size_t fromPosition = stages.size();
@@ -349,25 +355,25 @@ void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate)
             toPosition = i;
         }
     }
-    if (from == nullptr || to == nullptr) return;
+    if (from == nullptr || to == nullptr) return false;
     const uint32_t k = candidate.layerCount;
-    if (k == 0u || fromPosition == stages.size() || toPosition == stages.size()) return;
+    if (k == 0u || fromPosition == stages.size() || toPosition == stages.size()) return false;
 
     const bool forward = fromPosition + 1u == toPosition;
     const bool reverse = toPosition + 1u == fromPosition;
-    if (!forward && !reverse) return;
-    if (forward != (candidate.toStageIndex > candidate.fromStageIndex)) return;
+    if (!forward && !reverse) return false;
+    if (forward != (candidate.toStageIndex > candidate.fromStageIndex)) return false;
 
-    if (from->endLayer < from->startLayer || k > from->endLayer - from->startLayer) return;
+    if (from->endLayer < from->startLayer || k > from->endLayer - from->startLayer) return false;
     if (forward) {
-        if (candidate.layerIndex != from->endLayer - k || to->startLayer < k) return;
+        if (candidate.layerIndex != from->endLayer - k || to->startLayer < k) return false;
     } else {
-        if (candidate.layerIndex != from->startLayer) return;
+        if (candidate.layerIndex != from->startLayer) return false;
     }
 
     const uint32_t fromLayers = stageLayerCount(*from);
     const uint32_t toLayers = stageLayerCount(*to);
-    if (fromLayers <= k) return;
+    if (fromLayers <= k) return false;
     from->nLayers = fromLayers - k;
     to->nLayers = toLayers + k;
     if (forward) {
@@ -376,6 +382,16 @@ void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate)
     } else {
         from->startLayer += k;
         to->endLayer += k;
+    }
+    return true;
+}
+
+void rebasePpSoftCapacity(StageSnapshot &stage, uint32_t previousLayerCount) {
+    const uint32_t currentLayerCount = stageLayerCount(stage);
+    if (stage.softCapacity == 0u || stage.softCapacity >= previousLayerCount) {
+        stage.softCapacity = currentLayerCount;
+    } else {
+        stage.softCapacity = std::min(stage.softCapacity, currentLayerCount);
     }
 }
 

@@ -91,6 +91,7 @@ private:
 public:
     Candidate filter(const Candidate &candidate) const;
     void markIssued(const Candidate &candidate);
+    void markCommitted(const Candidate &candidate);
     void markRolledBack(const Candidate &candidate);
 };
 
@@ -113,7 +114,8 @@ Candidate reversePpCandidate(const Candidate &candidate);
 Candidate filterPpCandidateForStaticLayout(const Candidate &candidate, bool layoutChanged);
 uint32_t ppCommandLayerCount(const Candidate &candidate);
 
-void applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate);
+bool applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate);
+void rebasePpSoftCapacity(StageSnapshot &stage, uint32_t previousLayerCount);
 void applyRollbackPenalty(StageSnapshot &target);
 const char *candidateKindName(CandidateKind kind);
 

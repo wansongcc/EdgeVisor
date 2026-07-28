@@ -94,6 +94,9 @@ struct PendingAction {
     uint32_t beforePosBegin = 0u;
     uint32_t beforePosEnd = 0u;
     uint32_t startPos = 0u;
+    unsigned long long appliedGenerationBaseline = 0ull;
+    bool ppApplied = false;
+    bool rollback = false;
 };
 
 struct ControllerRuntime {
@@ -113,6 +116,9 @@ struct ControllerRuntime {
     std::map<uint32_t, StageEwma> ewmaByStage;
     std::map<uint32_t, uint32_t> softCapacityByStage;
     std::map<uint32_t, double> riskPenaltyByStage;
+    std::vector<tpot::StageSnapshot> committedPpLayout;
+    bool hasCommittedPpLayout = false;
+    unsigned long long lastObservedAppliedGeneration = 0ull;
     PendingAction pending;
     tpot::PpLayoutGuard ppLayoutGuard;
     SchedulerMetrics metrics;
@@ -560,6 +566,66 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
     return out;
 }
 
+static void overlayCommittedPpLayout(
+    ControllerRuntime &rt,
+    std::vector<tpot::StageSnapshot> &stages) {
+    if (!rt.hasCommittedPpLayout) return;
+    for (size_t i = 0u; i < stages.size(); ++i) {
+        for (size_t j = 0u; j < rt.committedPpLayout.size(); ++j) {
+            if (stages[i].stageIndex != rt.committedPpLayout[j].stageIndex) continue;
+            const uint32_t measuredLayers = stages[i].nLayers > 0u ? stages[i].nLayers : 1u;
+            stages[i].startLayer = rt.committedPpLayout[j].startLayer;
+            stages[i].endLayer = rt.committedPpLayout[j].endLayer;
+            stages[i].nLayers = rt.committedPpLayout[j].nLayers;
+            stages[i].softCapacity = rt.softCapacityByStage.count(stages[i].stageIndex) != 0u
+                ? rt.softCapacityByStage[stages[i].stageIndex]
+                : stages[i].nLayers;
+            const double layerDiv = stages[i].nLayers > 0u ? (double)stages[i].nLayers : 1.0;
+            stages[i].avgLayerMs = stages[i].stageTimeMs / layerDiv;
+            stages[i].recentAvgMs = stages[i].recentAvgMs * (double)measuredLayers / layerDiv;
+            stages[i].previousAvgMs = stages[i].previousAvgMs * (double)measuredLayers / layerDiv;
+            break;
+        }
+    }
+}
+
+static bool appliedPpMatches(const json &status, const PendingAction &pending, unsigned long long *generation) {
+    if (pending.candidate.kind != tpot::CandidateKind::PP_MOVE || !status.contains("ppMigration")) return false;
+    const json &pp = status.at("ppMigration");
+    if (!pp.is_object()) return false;
+    const unsigned long long applied = pp.value("appliedGeneration", 0ull);
+    if (generation != nullptr) *generation = applied;
+    if (applied <= pending.appliedGenerationBaseline) return false;
+    if (pp.value("appliedFromNodeIndex", 0xFFFFFFFFu) != pending.candidate.fromNodeIndex ||
+        pp.value("appliedToNodeIndex", 0xFFFFFFFFu) != pending.candidate.toNodeIndex) return false;
+    if (!pp.contains("appliedLayers") || !pp.at("appliedLayers").is_array() ||
+        pp.at("appliedLayers").size() != pending.candidate.layerCount) return false;
+    for (uint32_t i = 0u; i < pending.candidate.layerCount; ++i) {
+        if (pp.at("appliedLayers").at(i).get<uint32_t>() != pending.candidate.layerIndex + i) return false;
+    }
+    return true;
+}
+
+static bool commitAppliedPpMove(ControllerRuntime &rt, const tpot::Candidate &candidate) {
+    uint32_t fromOld = 0u;
+    uint32_t toOld = 0u;
+    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
+        if (rt.committedPpLayout[i].stageIndex == candidate.fromStageIndex) fromOld = rt.committedPpLayout[i].nLayers;
+        if (rt.committedPpLayout[i].stageIndex == candidate.toStageIndex) toOld = rt.committedPpLayout[i].nLayers;
+    }
+    if (!tpot::applyPpMove(rt.committedPpLayout, candidate)) return false;
+    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
+        tpot::StageSnapshot &stage = rt.committedPpLayout[i];
+        if (stage.stageIndex == candidate.fromStageIndex) tpot::rebasePpSoftCapacity(stage, fromOld);
+        if (stage.stageIndex == candidate.toStageIndex) tpot::rebasePpSoftCapacity(stage, toOld);
+        if (stage.stageIndex == candidate.fromStageIndex || stage.stageIndex == candidate.toStageIndex) {
+            rt.softCapacityByStage[stage.stageIndex] = stage.softCapacity;
+        }
+    }
+    rt.ppLayoutGuard.markCommitted(candidate);
+    return true;
+}
+
 static bool tpotJitterStable(const std::vector<double> &recent) {
     if (recent.size() < 3u) return false;
     double minV = recent[0];
@@ -843,6 +909,11 @@ void DynamicTpotController::run() {
             if (recentTpotWindows.size() > 3u) recentTpotWindows.erase(recentTpotWindows.begin());
 
             std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status);
+            if (!rt.hasCommittedPpLayout) {
+                rt.committedPpLayout = stages;
+                rt.hasCommittedPpLayout = true;
+            }
+            overlayCommittedPpLayout(rt, stages);
             tpot::Candidate bestTp = tpot::bestTpCandidate(stages, rt.cfg);
             tpot::Candidate bestPp = tpot::bestPpCandidate(stages, window.tpotMs, rt.cfg);
             bestPp = rt.ppLayoutGuard.filter(bestPp);
@@ -854,6 +925,39 @@ void DynamicTpotController::run() {
             if (rt.pending.active) {
                 const PendingAction pendingForLog = rt.pending;
                 bool verifyIssued = false;
+                if (rt.pending.candidate.kind == tpot::CandidateKind::PP_MOVE && !rt.pending.ppApplied) {
+                    unsigned long long appliedGeneration = 0ull;
+                    if (!appliedPpMatches(status, rt.pending, &appliedGeneration)) {
+                        note = "pp_apply_wait";
+                        logDecision(rt, window, pendingForLog.candidate, bestPp, false, note, &pendingForLog, 0u);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
+                        continue;
+                    }
+                    if (!commitAppliedPpMove(rt, rt.pending.candidate)) {
+                        note = "pp_apply_commit_failed";
+                        logDecision(rt, window, pendingForLog.candidate, bestPp, false, note, &pendingForLog, 0u);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
+                        continue;
+                    }
+                    rt.lastObservedAppliedGeneration = appliedGeneration;
+                    rt.pending.ppApplied = true;
+                    if (rt.pending.rollback) {
+                        const uint32_t penalizedStage = rt.pending.candidate.fromStageIndex;
+                        rt.riskPenaltyByStage[penalizedStage] += 0.1;
+                        for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
+                            if (rt.committedPpLayout[i].stageIndex != penalizedStage) continue;
+                            tpot::applyRollbackPenalty(rt.committedPpLayout[i]);
+                            rt.softCapacityByStage[penalizedStage] = rt.committedPpLayout[i].softCapacity;
+                            break;
+                        }
+                        rt.pending.active = false;
+                        rt.state = ControllerState::OBSERVE;
+                        note = "rollback_applied";
+                        logDecision(rt, window, pendingForLog.candidate, bestPp, false, note, &pendingForLog, 0u);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
+                        continue;
+                    }
+                }
                 const uint32_t elapsed = window.posEnd >= rt.pending.startPos ? window.posEnd - rt.pending.startPos : 0u;
                 if (elapsed >= (uint32_t)rt.cfg.rollbackWindow) {
                     const bool degraded = window.tpotMs > rt.pending.beforeTpotMs * 1.05;
@@ -864,14 +968,17 @@ void DynamicTpotController::run() {
                             rt.metrics.rollbackCount += 1u;
                             rt.cooldownUntilPos = window.posEnd + (uint32_t)std::max(64, rt.cfg.cooldownTokens);
                             if (rt.pending.candidate.kind == tpot::CandidateKind::PP_MOVE) {
-                                rt.ppLayoutGuard.markRolledBack(rt.pending.candidate);
-                                rt.riskPenaltyByStage[rt.pending.candidate.toStageIndex] += 0.1;
-                                const NnStageConfig *target = findStageByIndex(plan, rt.pending.candidate.toStageIndex);
-                                if (target != nullptr) {
-                                    const uint32_t currentLayers = target->nLayers != 0u ? target->nLayers : (target->endLayer - target->startLayer);
-                                    rt.softCapacityByStage[rt.pending.candidate.toStageIndex] =
-                                        currentLayers > 1u ? currentLayers - 1u : 1u;
-                                }
+                                rt.ppLayoutGuard.markIssued(reverse);
+                                rt.pending.candidate = reverse;
+                                rt.pending.appliedGenerationBaseline = rt.lastObservedAppliedGeneration;
+                                rt.pending.ppApplied = false;
+                                rt.pending.rollback = true;
+                                rt.pending.startPos = window.posEnd;
+                                verifyIssued = true;
+                                note = "rollback_issued";
+                                logDecision(rt, window, pendingForLog.candidate, bestPp, verifyIssued, note, &pendingForLog, elapsed);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
+                                continue;
                             }
                             verifyIssued = true;
                             note = "rollback_issued";
@@ -911,6 +1018,10 @@ void DynamicTpotController::run() {
                     rt.metrics.migrationCount += 1u;
                     if (best.kind == tpot::CandidateKind::PP_MOVE) {
                         rt.ppLayoutGuard.markIssued(best);
+                        const json pp = status.value("ppMigration", json::object());
+                        rt.pending.appliedGenerationBaseline = pp.value("appliedGeneration", 0ull);
+                        rt.pending.ppApplied = false;
+                        rt.pending.rollback = false;
                     }
                     rt.pending.active = true;
                     rt.pending.candidate = best;

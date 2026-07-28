@@ -773,11 +773,19 @@ void PlanUdsController::run() {
                     pp["ackSeen"] = inference_->hasMigrationAck();
                     pp["ackPos"] = inference_->getMigrationAckPos();
                     pp["ackLayer"] = inference_->getMigrationAckLayer();
+                    pp["appliedGeneration"] = inference_->getPpMigrationAppliedGeneration();
+                    pp["appliedFromNodeIndex"] = inference_->getPpMigrationAppliedFromNodeIndex();
+                    pp["appliedToNodeIndex"] = inference_->getPpMigrationAppliedToNodeIndex();
                     json layers = json::array();
                     for (NnUint layer : inference_->getMigrationLayers()) {
                         layers.push_back(layer);
                     }
                     pp["layers"] = layers;
+                    json appliedLayers = json::array();
+                    for (NnUint layer : inference_->getPpMigrationAppliedLayers()) {
+                        appliedLayers.push_back(layer);
+                    }
+                    pp["appliedLayers"] = appliedLayers;
                     resp["ppMigration"] = pp;
                 }
             } else if (op == "perf") {

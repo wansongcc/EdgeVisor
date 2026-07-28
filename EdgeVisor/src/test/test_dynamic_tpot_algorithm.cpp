@@ -142,6 +142,47 @@ int main() {
     require(ppLayoutGuard.filter(layoutCandidate).valid,
         "rolled-back PP boundary becomes eligible again");
 
+    std::vector<tpot::StageSnapshot> committedLayout;
+    committedLayout.push_back(stage(0, 0, 0, 4, 10.0));
+    committedLayout.push_back(stage(1, 1, 4, 3, 8.0));
+    tpot::Candidate committedMove;
+    committedMove.kind = tpot::CandidateKind::PP_MOVE;
+    committedMove.valid = true;
+    committedMove.fromStageIndex = 0u;
+    committedMove.toStageIndex = 1u;
+    committedMove.fromNodeIndex = 0u;
+    committedMove.toNodeIndex = 1u;
+    committedMove.layerIndex = 3u;
+    committedMove.layerCount = 1u;
+    tpot::PpLayoutGuard committedGuard;
+    committedGuard.markIssued(committedMove);
+    require(tpot::applyPpMove(committedLayout, committedMove),
+        "committed PP move updates the logical layout");
+    require(committedLayout[0].endLayer == 3u && committedLayout[0].nLayers == 3u &&
+            committedLayout[1].startLayer == 3u && committedLayout[1].nLayers == 4u,
+        "committed PP move shifts the next scheduler boundary");
+    committedGuard.markCommitted(committedMove);
+    require(committedGuard.filter(committedMove).valid,
+        "committed PP move releases the guard for a later rebalance");
+
+    const std::vector<tpot::StageSnapshot> beforeInvalidMove = committedLayout;
+    tpot::Candidate invalidMove = committedMove;
+    invalidMove.layerIndex = 0u;
+    require(!tpot::applyPpMove(committedLayout, invalidMove) && sameStages(committedLayout, beforeInvalidMove),
+        "invalid PP move cannot partially mutate the committed layout");
+
+    tpot::StageSnapshot fullCapacity = stage(2, 2, 7, 4, 6.0);
+    fullCapacity.nLayers = 3u;
+    tpot::rebasePpSoftCapacity(fullCapacity, 4u);
+    require(fullCapacity.softCapacity == 3u,
+        "full soft capacity follows a committed layer-count change");
+    tpot::StageSnapshot conservativeCapacity = stage(3, 3, 10, 4, 6.0);
+    conservativeCapacity.softCapacity = 2u;
+    conservativeCapacity.nLayers = 3u;
+    tpot::rebasePpSoftCapacity(conservativeCapacity, 4u);
+    require(conservativeCapacity.softCapacity == 2u,
+        "conservative soft capacity survives a committed layout change");
+
     cfg = tpot::SchedulerConfig();
     cfg.minPpGainMs = 5.0;
     cfg.minTpGainMs = 2.0;

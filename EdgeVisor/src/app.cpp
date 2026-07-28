@@ -3633,6 +3633,13 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     return true;
 }
 
+void RootLlmInference::recordPpMigrationApplied() {
+    ++ppMigrationAppliedGeneration;
+    ppMigrationAppliedFromNodeIndex = migrationFromNodeIndex;
+    ppMigrationAppliedToNodeIndex = nextStageRootNode;
+    ppMigrationAppliedLayers = migrationLayers;
+}
+
 LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
     LlmPerfPacket rootPacket{};
     rootPacket.position = controlPacket.position;
@@ -4676,6 +4683,7 @@ void RootLlmInference::forward(bool collectProfile) {
             migrationAckSeen = true;
             migrationAckPos = (int)endPos;
             migrationAckLayer = !migrationLayers.empty() ? (int)migrationLayers.back() : migrationAckLayer;
+            recordPpMigrationApplied();
         }
         std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu layers=%u posRange=[0,%u]\n",
             toString(ablationCfg.shadowKvMode),

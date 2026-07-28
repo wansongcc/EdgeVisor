@@ -1103,6 +1103,9 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, b
 void NnExecutor::maybeStartBubbleShadowAsyncBeforeSync() {
     if (!isBubbleShadowAsyncModeEnabled()) return;
     if (netExecution == nullptr || netExecution->batchSize == 0u || netExecution->nThreads != 1u) return;
+    // Test knob (shadow L2 validation): disable L1 bubble windows so all shadow
+    // work becomes stash debt at the forward end.
+    if (std::getenv("DLLAMA_SHADOW_L1_DISABLE") != nullptr) return;
 
     {
         std::lock_guard<std::mutex> lock(bubbleShadowMutex);

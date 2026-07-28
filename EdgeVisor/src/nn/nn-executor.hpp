@@ -46,6 +46,10 @@ public:
     virtual NnUint maxNThreads() = 0;
     virtual ~NnDevice() {}
     virtual NnDeviceSegment *createSegment(NnUint segmentIndex) = 0;
+    // Ensure this thread targets the right compute device (no-op on CPU).
+    // Must be called at the entry of any thread that launches device work
+    // (e.g. CUDA kernels) outside the executor's own worker threads.
+    virtual void setCurrentThreadDevice() {}
 };
 
 class NnNodeSynchronizer {
@@ -206,6 +210,11 @@ private:
     std::vector<NnByte> segmentHasExecOps;
     std::unique_ptr<std::atomic_uint8_t[]> segmentEnabled;
     NnExecutorThread *threads;
+    // Raw device pointers (owned by the caller's NnExecutorDevice list) used to
+    // route spawned execution threads (bubble shadow, shadow L2 catch-up) to
+    // the correct compute device at thread entry.
+    std::vector<NnDevice *> executorDevices;
+    void applyCurrentThreadDevice();
     NnExecutorContext context;
     std::thread bubbleShadowThread;
     mutable std::mutex bubbleShadowMutex;

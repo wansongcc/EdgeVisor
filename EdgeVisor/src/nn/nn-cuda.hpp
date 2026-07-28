@@ -104,6 +104,8 @@ public:
     void setLastPlanCmdSeqEmitted(unsigned int s) { lastPlanCmdSeqEmitted.store(s, std::memory_order_release); }
     NnUint getNodeIndex() const { return nodeConfig ? nodeConfig->nodeIndex : 0u; }
     NnUint getGpuIndex() const { return gpuIndex; }
+    // Route this thread's CUDA runtime context to this node's GPU.
+    void setCurrentThreadDevice() override;
     void *getStream() const { return stream; }
     void *getBlasHandle() const { return blasHandle; }
     const NnCudaLaunchConfig &getLaunchConfig() const { return launchConfig; }

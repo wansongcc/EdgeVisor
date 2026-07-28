@@ -520,6 +520,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     for (NnExecutorDevice &d : *devices) {
         if (d.device->maxNThreads() > maxNThreads)
             maxNThreads = d.device->maxNThreads();
+        executorDevices.push_back(d.device.get());
     }
     if (netExecution->nThreads > maxNThreads)
         throw std::invalid_argument("This configuration supports max " + std::to_string(maxNThreads) + " threads");
@@ -718,6 +719,14 @@ NnExecutor::~NnExecutor() {
     if (context.timer != nullptr)
         delete context.timer;
     delete[] threads;
+}
+
+void NnExecutor::applyCurrentThreadDevice() {
+    // Route this thread to the executor's compute device(s). No-op on CPU;
+    // on CUDA this pins the thread's runtime context to the node's gpuIndex.
+    for (NnDevice *device : executorDevices) {
+        if (device != nullptr) device->setCurrentThreadDevice();
+    }
 }
 
 void NnExecutor::loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) {
@@ -1116,6 +1125,7 @@ void NnExecutor::maybeStartBubbleShadowAsyncBeforeSync() {
     }
 
     bubbleShadowThread = std::thread([this]() {
+        this->applyCurrentThreadDevice();
         bool ok = true;
         try {
             (void)this->runBubbleShadowRedundantChunk(0u, true, true);
@@ -1308,6 +1318,9 @@ NnUint NnExecutor::runShadowCatchup(const std::function<bool()> &shouldStop) {
     }
     if (!shadowL2Enabled) return 0u;
     if (netExecution == nullptr || netExecution->nThreads != 1u) return 0u;
+    // This may run on a freshly spawned thread (root tool-wait window): pin the
+    // thread to this node's compute device before launching any device work.
+    applyCurrentThreadDevice();
 
     const NnUint savedBatchSize = netExecution->batchSize;
     NnUint completed = 0u;

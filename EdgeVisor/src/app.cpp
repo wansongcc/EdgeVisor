@@ -4088,6 +4088,23 @@ void RootLlmInference::forward(bool collectProfile) {
     // forward. If a window was left open, stop and join it first.
     if (shadowCatchupRunning.load(std::memory_order_relaxed) || shadowCatchupThread.joinable()) {
         endShadowCatchupWindow();
+        // The joined catch-up thread restored old stash-entry state into the
+        // shared execution (batchSize / POS / SLT pipes), possibly *after* the
+        // caller already prepared this forward's state (the handler sets
+        // batchSize/position before calling forward()). Re-assert this
+        // forward's state so the executor and the workers see the correct
+        // batch size and positions (a stale batchSize=1 here deadlocked PP:
+        // pp_send sent 1 row while the control packet said batch=N).
+        if (execution != nullptr && executor != nullptr && executor->isShadowL2Enabled()) {
+            execution->setBatchSize(controlPacket.batchSize);
+            execution->setPosition(controlPacket.position);
+            if (!batchMetadataDirty && positionPipe != nullptr) {
+                for (NnUint i = 0; i < controlPacket.batchSize; i++) {
+                    positionPipe[i] = (float)(controlPacket.position + i);
+                    if (slotPipe != nullptr) slotPipe[i] = 0.0f;
+                }
+            }
+        }
     }
     lastBubbleShadowStats = {};
     bool sendKvTransfer = false;

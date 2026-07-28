@@ -232,3 +232,76 @@ worker 进程也要显式 `--backend cuda`（BACKEND_AUTO 会落到 vulkan）。
   `23:1 24:, 25:  26:2 27:, 28:  29:3 30:, 31:`。
 - 风险点：全部进程 `--nthreads 1`（GPU 下 bubble shadow 的硬门控）；stash
   D2H 开销 60 笔 46ms（GPU 上可忽略）；无任何 CUDA error / 异常吞没迹象。
+
+## 4×T4 batchsize 矩阵（LSS 开启，two-level-slack @ 69b4b5d）
+
+拓扑 `1@7*1@7*1@7*1@7`（4 节点 PP，每节点一卡），3B q40，`--last-stage-sampling`
+开启，全程 `--nthreads 1`。测试期间 4 卡与他人 vLLM 任务共享（~90% util，
+余量 ~3.8GB/卡），端到端 tok/s 噪声大，仅作参考；设计故事以
+bubbleDrain/fwd 与债务统计为准。日志 `~/B01/EdgeVisor/runtime_logs/gpu_batch_matrix/`。
+
+### LSS 兼容性结论
+
+LSS 在与本拓扑（单节点 stage × 4）组合下原本**完全不可用**，发现并修复三个
+pre-existing bug：
+
+1. `27ce884`：LSS 采样器 vocabSize 误按全部节点求和（单节点 stage 时 =
+   nStages × vocabSize），argmax 越界读 logits pipe → 产生越 vocab 的 token
+   id → root tokenizer decode assert 崩溃。修为只按末 stage 节点求和。
+2. `9bd0f8c`：末 stage 对每个 batchSize==1 的 forward 都发 sampled-token 包，
+   而 root 只在 decode 阶段消费；prefill 批为 1（DLLAMA_NBATCHES=1 或尾部
+   chunk）时包积压错位 perf/token 序列 → root 读到 magic=0 的错位数据，全部
+   回落到全零 logits pipe 采样（输出全 "!"）。修为 inference/API prefill 循环
+   对 batchSize==1 的 forward 同步 drain 丢弃该包。
+3. `69b4b5d`：chat 模式 prefill 循环同样的漏 drain，补齐。
+
+修复后 12 个矩阵 case（batch 1/2/4/8 × off/L1/L2）全部 LSS 正常工作，
+生成内容与无 LSS 时一致。
+
+### 矩阵结果（per-forward 均值，ms；bubbleDrain/fwd 括注）
+
+Stage 0（root）：
+
+| batch | off | L1（drain） | L2（drain） |
+|---|---|---|---|
+| 1 | 30.01 | 50.53（0.85） | 48.84（0.00） |
+| 2 | 54.66 | 47.03（0.99） | 50.76（0.00） |
+| 4 | 58.92 | 60.76（0.66） | 59.72（0.00） |
+| 8 | 70.02 | 62.65（1.23） | 90.81（0.00） |
+
+Stage 1（含右边界 shadow 的中间 stage，故事主战场）：
+
+| batch | off | L1（drain） | L2（drain） |
+|---|---|---|---|
+| 1 | 87.57 | 87.36（0.75） | 91.92（0.00） |
+| 2 | 118.33 | 86.34（0.95） | 83.29（0.00） |
+| 4 | 97.27 | 114.14（0.60） | 99.40（0.00） |
+| 8 | 125.42 | 183.80（2.15） | 161.02（0.00） |
+
+- L1 bubble 完成率 100%（各 case complete=fwd 数），但 drain 落在关键路径，
+  且随 batch 增大总体变大（stage 1：0.75→2.15 ms/fwd；b8 时 stage1 比 off
+  慢 47%）。
+- L2 全 case `bubbleDrain/fwd=0.00`（drain 移出关键路径进 stash）；
+  b8 时 stage1 比 L1 快 12%（161.0 vs 183.8 ms/fwd）。
+- 端到端 wall tok/s 因共享 GPU 噪声过大（±50%），不采信。
+
+### L2 补算验证（L1-disable 强制债务，UDS tool_window_begin）
+
+| batch | 窗口前债务 | 窗口后 | catchupEntries | 补算耗时 |
+|---|---|---|---|---|
+| 1 | 82（1.0MB） | 0 | 82 | 585ms |
+| 2 | 71 | 0 | 71 | 43ms |
+| 4 | 65 | 0 | 65 | 21ms |
+| 8 | 62 | 0 | 62 | 47ms |
+
+### 一致性 guard
+
+12 个矩阵 case（off/L1/L2 × batch 1/2/4/8）生成 token 的 md5 全部一致
+（`b*/tokens.txt`），argmax 级无分叉。
+
+### 复现命令
+
+```bash
+bash tests/shadow-kv-diag/run_matrix_case.sh b8_l2 8 l2       # 矩阵单 case（off|l1|l2）
+bash tests/shadow-kv-diag/run_matrix_l2_catchup.sh b8_catchup 8  # L2 债务/补算
+```

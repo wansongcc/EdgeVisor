@@ -5324,6 +5324,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
     NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), profileEnabled);
+    configureExecutorShadowL2(&executor, &net.netConfig, rootNodeConfig);
 
     // Load weights
     if (args->ratiosStr != nullptr) {

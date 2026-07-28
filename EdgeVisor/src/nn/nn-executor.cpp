@@ -889,6 +889,13 @@ void NnExecutor::forward() {
     context.doneThreadCount.exchange(0);
     context.batchSize = netExecution->batchSize;
     context.position = netExecution->position;
+    if (std::getenv("DLLAMA_SHADOW_L2_DEBUG") != nullptr) {
+        std::printf("🫧 [shadow-l2-dbg] fwd enter node=%u pos=%u batch=%u\n",
+            (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+            (unsigned)netExecution->position,
+            (unsigned)netExecution->batchSize);
+        std::fflush(stdout);
+    }
 
     joinBubbleShadowAsync();
     resetBubbleShadowStateForForward();
@@ -916,6 +923,14 @@ void NnExecutor::forward() {
     drainBubbleShadowAsync();
     const bool completed = context.isAlive.load();
     context.isAlive.store(false);
+    if (std::getenv("DLLAMA_SHADOW_L2_DEBUG") != nullptr) {
+        std::printf("🫧 [shadow-l2-dbg] fwd exit node=%u pos=%u batch=%u completed=%u\n",
+            (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
+            (unsigned)context.position,
+            (unsigned)context.batchSize,
+            (unsigned)completed);
+        std::fflush(stdout);
+    }
     if (!completed)
         throw NnExecutorException("Execution failed in one of the threads");
 }

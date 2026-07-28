@@ -578,28 +578,34 @@ static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) 
     if (generation <= rt.lastObservedStageBypassGeneration || !rt.hasCommittedPpLayout) return false;
     const uint32_t ejected = bypass.value("ejectedStage", 0xFFFFFFFFu);
     const uint32_t target = bypass.value("targetStage", 0xFFFFFFFFu);
-    size_t ejectedPos = rt.committedPpLayout.size();
-    size_t targetPos = rt.committedPpLayout.size();
-    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
-        if (rt.committedPpLayout[i].stageIndex == ejected) ejectedPos = i;
-        if (rt.committedPpLayout[i].stageIndex == target) targetPos = i;
+    if (!bypass.contains("appliedLayers") || !bypass.at("appliedLayers").is_array()) return false;
+    std::vector<uint32_t> appliedLayers;
+    for (size_t i = 0u; i < bypass.at("appliedLayers").size(); ++i) {
+        if (!bypass.at("appliedLayers").at(i).is_number_unsigned()) return false;
+        appliedLayers.push_back(bypass.at("appliedLayers").at(i).get<uint32_t>());
     }
-    if (ejectedPos == rt.committedPpLayout.size() || targetPos == rt.committedPpLayout.size()) return false;
-    tpot::StageSnapshot &from = rt.committedPpLayout[ejectedPos];
-    tpot::StageSnapshot &to = rt.committedPpLayout[targetPos];
-    const uint32_t targetOldLayers = to.nLayers;
-    if (targetPos > ejectedPos) to.startLayer = std::min(to.startLayer, from.startLayer);
-    else to.endLayer = std::max(to.endLayer, from.endLayer);
-    to.nLayers += from.nLayers;
-    tpot::rebasePpSoftCapacity(to, targetOldLayers);
-    rt.softCapacityByStage[target] = to.softCapacity;
+    uint32_t targetOldLayers = 0u;
+    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
+        if (rt.committedPpLayout[i].stageIndex == target) targetOldLayers = rt.committedPpLayout[i].nLayers;
+    }
+    std::vector<tpot::StageSnapshot> mergedLayout = rt.committedPpLayout;
+    std::vector<uint32_t> mergedChain;
+    if (!tpot::commitStageBypassLayout(mergedLayout, ejected, target, appliedLayers, &mergedChain)) return false;
+    rt.committedPpLayout.swap(mergedLayout);
+    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
+        if (rt.committedPpLayout[i].stageIndex == target) {
+            tpot::rebasePpSoftCapacity(rt.committedPpLayout[i], targetOldLayers);
+            break;
+        }
+    }
+    rt.softCapacityByStage[target] = 0u;
+    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
+        if (rt.committedPpLayout[i].stageIndex == target) rt.softCapacityByStage[target] = rt.committedPpLayout[i].softCapacity;
+    }
     rt.ewmaByStage.erase(ejected);
     rt.softCapacityByStage.erase(ejected);
     rt.riskPenaltyByStage.erase(ejected);
-    rt.committedPpLayout.erase(rt.committedPpLayout.begin() + (std::ptrdiff_t)ejectedPos);
-    rt.activeStageChain.clear();
-    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) rt.activeStageChain.push_back(rt.committedPpLayout[i].stageIndex);
-    rt.pending.active = false;
+    rt.activeStageChain.swap(mergedChain);
     rt.ppLayoutGuard = tpot::PpLayoutGuard();
     rt.lastObservedStageBypassGeneration = generation;
     return true;

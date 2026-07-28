@@ -305,3 +305,46 @@ Stage 1（含右边界 shadow 的中间 stage，故事主战场）：
 bash tests/shadow-kv-diag/run_matrix_case.sh b8_l2 8 l2       # 矩阵单 case（off|l1|l2）
 bash tests/shadow-kv-diag/run_matrix_l2_catchup.sh b8_catchup 8  # L2 债务/补算
 ```
+
+## 全量回归（two-level-slack @ 6930c22，默认配置 + 新开关组合）
+
+构建：CPU-only（`make DLLAMA_VULKAN= DLLAMA_CUDA= -j8`）用于 CPU 用例；
+Vulkan+CUDA 双后端（`make clean && make DLLAMA_VULKAN=1 DLLAMA_CUDA=1 -j8`）用于
+GPU 用例（semantic GPU 脚本依赖 BACKEND_AUTO→vulkan；注意 Makefile 不跟踪 flag
+变化，改 flag 必须 `make clean`）。main 对照用 `git worktree add /tmp/edgevisor_main main`。
+模型 env 覆盖：`EDGEVISOR_MODEL3/EDGEVISOR_TOKENIZER` → `/home/byh/B01/models/`。
+GPU 与 cyx vLLM 共享（~3.8GB/卡余量）。日志 `~/B01/EdgeVisor/runtime_logs/full_regression/`。
+
+### 回归矩阵
+
+| 用例 | 结果 | 判定 |
+|---|---|---|
+| scripts/semantic CPU：tp_static / even2_tp_static / uneven2_tp_static / uneven2_full / uneven2_linebuf / dynamic_heads | RC=0（6/8） | ✅ 无回归 |
+| scripts/semantic CPU：even_tp_static | RC=134（`sliceKvCache: kvDim(1024)%3≠0` assert） | pre-existing（main 同败 RC=134；模型 kvDim 与 3 节点拓扑不匹配） |
+| scripts/semantic CPU：uneven2_tp_static_f32 | RC=1（`Unsupported CPU op MATMUL F32_Q40_F32`） | pre-existing（main 同败 RC=1；F32 激活×Q40 权重 CPU 无内核，脚本需 f32 模型） |
+| scripts/semantic GPU：tp_static / full_static / full_static_224 / dynamic_heads | RC=0（4/5） | ✅ 无回归 |
+| scripts/semantic GPU：tp_static_f32 | RC=1（`Unsupported shader: MATMUL/F32_Q40_F32`） | pre-existing（main 同败 RC=1；vulkan 无该 shader，仓库从未存在） |
+| scripts/gpu：pp_static / pp_migration / patch_regression / patch_gdb_dynamic | RC=0（4/4） | ✅ 无回归 |
+| 组合：semantic GPU（2:3:3）+ `--last-stage-sampling` | RC=0，回答 "4"+EOS 正确 | ✅ |
+| 组合：run_gpu_pp_migration + `DLLAMA_BUBBLE_SHADOW_KV=1` + `DLLAMA_SHADOW_L2=1` | RC=0 | ✅ |
+| 组合：CB（`--continuous-batching --max-active-seqs 2`，CPU，默认） | RC=0，干净退出 | ✅ |
+| 组合：CB + bubble + L2 | RC=0，0 错误行，bubbleDrain=0 | ✅ 不炸（CB 槽位级 shadow KV 语义未深验证，见遗留） |
+| tests/semantic 六测 benchmark（缩减候选 EDGEVISOR_GPU_PP/HYBRID_RATIO_CANDIDATES） | 总体 RC=0（06_GPU_UNEVEN_DYNAMIC RC=0） | ✅；强制候选 "1@14*1@14" 因 harness 的 ratio 语法期望不同报 "Stage-weights segment must not specify layers"（脚本自动回退 2:3:2 完成；非产品回归） |
+
+### pre-existing 问题（与 two-level-slack 无关）
+
+1. `even_tp_static`：kvDim=1024 不可被 3 节点整除（even 路径硬 assert；main 同败）。
+2. `uneven2_tp_static_f32`（CPU）与 `gpu_tp_static_f32`（Vulkan）：F32 激活 × Q40
+   权重无内核/shader（main 同败）；这两个脚本需要 f32 模型才能跑。
+3. Makefile 不跟踪编译 flag 变化：切换 `DLLAMA_VULKAN/DLLAMA_CUDA` 必须
+   `make clean`，否则旧 .o 复用导致后端宏检查失败（多次踩坑，建议后续修）。
+4. semantic GPU 脚本依赖 BACKEND_AUTO→vulkan；纯 CUDA 构建下全部报
+   "not compiled with DLLAMA_VULKAN"（构建配置问题，非代码回归）。
+
+### 未覆盖
+
+- 六测 benchmark 全量候选（3 PP + 6 hybrid 拓扑）：共享 GPU 时间预算不足，
+  以缩减候选跑通总体 RC=0（结果见 six_benchmark.out /
+  benchmark_docs_20260728_171214/）。
+- CB 槽位级 shadow KV 正确性（多槽 KV 与 red_k/red_v 的 slot 语义）：未深验证，
+  建议单列一阶段。

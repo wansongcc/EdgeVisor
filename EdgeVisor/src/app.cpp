@@ -3620,12 +3620,16 @@ bool RootLlmInference::beginShadowCatchupWindow() {
                 const NnUint done = this->executor->runShadowCatchup([this]() -> bool {
                     return this->shadowCatchupStop.load(std::memory_order_relaxed);
                 });
+                std::printf("🫧 [shadow-l2-dbg] attempt=%d done=%u\n", attempt, (unsigned)done);
+                std::fflush(stdout);
                 if (done > 0u) {
                     std::printf("🫧 [shadow-l2] root catch-up completed=%u\n", (unsigned)done);
                     std::fflush(stdout);
                 }
                 break;
             } catch (const std::exception &e) {
+                std::printf("🫧 [shadow-l2-dbg] attempt=%d error: %s\n", attempt, e.what());
+                std::fflush(stdout);
                 if (attempt + 1 >= 20) {
                     std::printf("⚠️ [shadow-l2] root catch-up error: %s\n", e.what());
                     std::fflush(stdout);

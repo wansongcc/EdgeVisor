@@ -183,6 +183,18 @@ int main() {
     require(conservativeCapacity.softCapacity == 2u,
         "conservative soft capacity survives a committed layout change");
 
+    std::vector<tpot::StageSnapshot> bypassChain;
+    bypassChain.push_back(stage(0, 0, 0, 8, 5.0));
+    bypassChain.push_back(stage(1, 1, 8, 8, 5.0));
+    bypassChain.push_back(stage(3, 3, 16, 4, 20.0));
+    bypassChain[2].leftBoundaryLayerMs = 20.0;
+    cfg.minPpGainMs = 0.0;
+    cfg.ppGainRatio = 0.0;
+    const tpot::Candidate afterBypass = tpot::bestPpCandidate(bypassChain, 100.0, cfg);
+    require(afterBypass.valid && afterBypass.fromStageIndex == 3u && afterBypass.toStageIndex == 1u &&
+            afterBypass.layerIndex == 16u,
+        "active chain 0,1,3 selects legal reverse PP2 without ejected stage 2");
+
     cfg = tpot::SchedulerConfig();
     cfg.minPpGainMs = 5.0;
     cfg.minTpGainMs = 2.0;

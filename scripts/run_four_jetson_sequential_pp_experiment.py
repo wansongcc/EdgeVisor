@@ -39,7 +39,7 @@ class Run:
         argv=["ssh", self.a.ssh_options, host, command] if self.a.ssh_options else ["ssh",host,command]
         if self.a.dry_run: self.event("ssh", "DRY_RUN", "issued", {"host":host,"command":command}); return
         p=subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        (self.dir/log).write_text(p.stdout); 
+        (self.dir/log).write_text(p.stdout)
         if p.returncode: raise RuntimeError("SSH failed: %s" % host)
     def status(self):
         s=uds(self.a.socket,{"op":"status"});

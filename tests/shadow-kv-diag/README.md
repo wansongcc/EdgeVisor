@@ -398,3 +398,33 @@ cd ~/B01/EdgeVisor && DLLAMA_SHADOW_L1_DISABLE=1 \
    `CUDA_VISIBLE_DEVICES="0,1,2"`，worker3(gpu-index 3) 被掩 →
    `cudaSetDevice failed: invalid device ordinal (101)`（101 是 cudaError_t 值非
    设备号）。用 `--cuda-visible 0,1,2,3` 解决，无需改码。
+
+## 8B 模型抽查（llama3.1-8b q40，two-level-slack @ ed86511+）
+
+显存估算：8B q40 文件 6.32GB，拓扑 `1@8*1@8*1@8*1@8`（32 层，4 节点 PP），
+每卡：stage 权重 ~1.6GB + 边界 shadow ~0.4GB + KV ~0.13GB + workspace ~0.4GB
+≈ 2.4-2.5GB < 余量 ~3.7GB（4 卡仍与 cyx vLLM 共享）→ 可跑，未挤占他人任务。
+配置同矩阵（`--backend cuda --nthreads 1 --last-stage-sampling
+--runtime-redundant-seg-enabled 0 --enable-plan-barrier --enable-pp-migration`）。
+日志 `~/B01/EdgeVisor/runtime_logs/gpu_batch_matrix/b{1,8}_{off,l1,l2}/`
+（8B 与 3B 矩阵共用 run_matrix_case.sh + SPOT_* env 覆盖）。
+
+### batch=1
+
+| mode | stage0 ms/fwd | stage1 ms/fwd | bubbleDrain/fwd | 判定 |
+|---|---|---|---|---|
+| off | 42.69 | 84.22 | 0.00 | ✅ |
+| L1+L2 | 80.00 | 199.94 | **0.00**（bubble 1.48/2.27） | ✅ token 与 off 一致 |
+
+### batch=8（two-level 故事在 8B 复现）
+
+| mode | stage1 ms/fwd | bubbleDrain/fwd | stage1 对比 |
+|---|---|---|---|
+| off | 298.85 | 0.00 | 基准 |
+| L1 | 319.51 | **4.05**（bubble 7.64，complete=26/26） | +7%（drain 在关键路径） |
+| L2 | **173.36** | **0.00**（bubble 0.75） | **比 L1 快 46%、比 off 快 42%** |
+
+- token 一致性：b1（off=L2）、b8（off=L1=L2）全部 md5 一致。
+- 结论：8B + batch=8 时 L1 的 bubble 装不下（drain 4.05ms/fwd 上关键路径），
+  L2 把 drain 挪进 stash，瓶颈 stage 显著变快——two-level Slack 设计故事在
+  8B 上成立。

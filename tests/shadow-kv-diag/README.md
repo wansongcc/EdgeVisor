@@ -75,3 +75,59 @@
   baseline 三条路径生成 token 完全一致。
 
 详见主代理报告。日志：`~/B01/EdgeVisor/runtime_logs/shadow_kv_diag/`。
+
+## L2：tool-wait 窗口的 Shadow KV 补算（DLLAMA_SHADOW_L2）
+
+L1 修复后，右边界 shadow 只在 pp_send 快照（pp_stage_cache）之后的 sync 窗口
+执行，算不完的部分原本全部走 forward 末尾 drain（关键路径）。L2 把 drain 挪到
+tool-wait 空闲窗口：forward 末尾没算完的 shadow 不再 drain，而是把该次 forward
+的输入（pp_stage_out 快照 + POS/SLT + batchSize + 进度 cursor）作为一笔**债务**
+存进 stash；tool-wait 窗口内逐笔**补算**（恢复输入后跑剩余 shadow steps）。
+
+### 开关与配置
+
+- `DLLAMA_SHADOW_L2=1`（默认关；关时行为与 L1 完全一致：bubble + drain）。
+  经 bootstrap（`LLM_BOOTSTRAP_ENABLE_SHADOW_L2`）自动下发 worker。
+- `DLLAMA_SHADOW_L2_STASH_MB`（默认 512）：stash 字节上限；超限在 forward 末尾
+  强制 drain 最老 entry（内存有界兜底，会打 `⚠️ [shadow-l2] stash cap exceeded`）。
+- `DLLAMA_SHADOW_L1_DISABLE=1`（**仅测试旋钮**）：禁用 L1 bubble 窗口，让全部
+  shadow 工作变成债务，用于验证补算链路。
+
+### UDS ops（plan-ctrl-socket）
+
+```bash
+python3 examples/plan-uds-client.py $SOCK tool_window_begin   # 广播 LLM_CTRL_SHADOW_CATCHUP 给所有 worker（fire-and-forget），root 后台线程补算本地债务
+python3 examples/plan-uds-client.py $SOCK tool_window_end     # root 侧 stop+join（下一次 forward 被调用时也会自动 stop+join）
+python3 examples/plan-uds-client.py $SOCK shadow_debt         # 查询 root 债务/补算统计（worker 侧经 perf 包 bubbleStashEntries/bubbleCatchupEntries/bubbleCatchupUs 上报）
+```
+
+worker 在主循环 CONTROL_ONLY 分支收到 catch-up 包后执行补算；entry 边界对
+root socket 做非阻塞 peek，发现新控制包立即中断回主循环（无 ACK、不会阻塞推理）。
+
+### 验证命令（CPU）
+
+```bash
+# 单测场景（chat 模式构造真实 tool-wait 窗口；L1 禁用旋钮强制产生债务）
+DLLAMA_SHADOW_L1_DISABLE=1 bash run_l2_case.sh l2_unit_l1off
+# 中断测试（catch-up 中途来新请求，推理应立即继续）
+bash run_l2_interrupt.sh l2_interrupt
+# L2 开启回归（正常 L1 窗口；债务≈0，数值仍逐位为 0）
+bash run_l2_case.sh l2_reg_b1 1 48
+bash run_l2_case.sh l2_reg_b2 2 48
+bash run_l2_case.sh l2_reg_b4 4 48
+# 关键路径对照：L2 关 + L1 禁用（全部 drain）vs L2 开 + L1 禁用（debt stash）
+DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2off_l1disable_2pp 2pp async 1 48
+DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2on_l1disable_2pp 2pp async 1 48
+```
+
+### 验证结果（2026-07-27，two-level-slack）
+
+- l2_unit_l1off：tool window 前 `debtEntries=60 debtBytes=1008272`；
+  `tool_window_begin` 后 `debtEntries=0 catchupEntries=60 catchupUs=420667`；
+  补算出的 L14 red_k/red_v 与参考值**逐位为 0**（含 prefill batch=23 与全部
+  decode position）。
+- 中断：见 `l2_interrupt/interrupt_latency.txt`。
+- L2 关等价性：`l2off_2pp_async_b1`/`l2off_2pp_sync_b1` 与 L1 修复后结果一致
+  （L14 全 0，L15 为已知结构问题）。
+
+详见主代理报告。日志：`~/B01/EdgeVisor/runtime_logs/shadow_kv_diag/`。

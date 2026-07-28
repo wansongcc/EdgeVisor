@@ -466,6 +466,16 @@ class Backend:
     def close(self) -> None:
         return None
 
+    # Tool-wait window hooks (Shadow L2). No-op by default; backends with a
+    # plan-control UDS override these to bracket tool execution with
+    # tool_window_begin/tool_window_end so the engine can repay shadow debt
+    # while the agent waits on the tool. Must never raise.
+    def tool_window_begin(self) -> None:
+        return None
+
+    def tool_window_end(self) -> None:
+        return None
+
 
 class MockBackend(Backend):
     name = "mock"
@@ -1635,6 +1645,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         virtual_topology: Optional[Dict[str, Any]] = None,
         extra_env: Optional[Dict[str, str]] = None,
         last_stage_sampling: bool = False,
+        cpu: bool = False,
     ):
         config = dict(ablation_config or {})
         runtime_boundary_layers = max(0, int(config.get("runtime_redundant_boundary_layers", 0) or 0))
@@ -1663,6 +1674,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             last_stage_sampling=bool(last_stage_sampling or config.get("last_stage_sampling", False)),
         )
         self.persistent = persistent
+        self.cpu = cpu
         self.api_port = api_port
         self._persistent_started = False
         self._persistent_procs: List[subprocess.Popen[Any]] = []
@@ -1788,9 +1800,9 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
                     str(worker_ports[idx]),
                     "--nthreads",
                     "1",
-                    "--gpu-index",
-                    str(gpu),
                 ]
+                # CPU mode (small-model verification): --backend cpu instead of --gpu-index.
+                worker_cmd.extend(["--backend", "cpu"] if self.cpu else ["--gpu-index", str(gpu)])
                 worker_cmds.append(worker_cmd)
                 procs.append(self._launch_worker(worker_cmd, self._persistent_logs[f"worker{idx}"], env))
                 if launch_stagger_s > 0.0 and idx + 1 < len(self.worker_gpus):
@@ -1816,9 +1828,11 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
                 "0",
                 "--seed",
                 "1",
-                "--gpu-index",
-                str(self.root_gpu),
             ]
+            if self.cpu:
+                root_cmd.extend(["--backend", "cpu"])
+            else:
+                root_cmd.extend(["--gpu-index", str(self.root_gpu)])
             if self.enable_benchmark:
                 root_cmd.append("--benchmark")
             if self.last_stage_sampling:
@@ -1984,6 +1998,23 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             result.metrics["persistent_session"] = False
             return result
         return self._generate_persistent(messages, max_tokens, generation_name, out_dir, dynamic_plan=dynamic_plan)
+
+    def _tool_window_uds(self, op: str) -> None:
+        # Shadow L2 tool-wait window control. Fire-and-forget with silent
+        # degradation: a broken UDS must never kill an episode.
+        socket_path = self._persistent_socket_path
+        if not socket_path:
+            return
+        try:
+            uds_request(socket_path, {"op": op}, timeout_s=2.0)
+        except Exception:
+            pass
+
+    def tool_window_begin(self) -> None:
+        self._tool_window_uds("tool_window_begin")
+
+    def tool_window_end(self) -> None:
+        self._tool_window_uds("tool_window_end")
 
 
 def make_backend(name: str, **kwargs: Any) -> Backend:

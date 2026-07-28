@@ -117,10 +117,12 @@ def main() -> int:
     parser.add_argument("--edge-fixed-port-base", type=int, default=0, help="Use a fixed worker port base for tc-based loopback shaping.")
     parser.add_argument("--enable-pp-migration", action="store_true", help="Enable EdgeVisor PP layer migration control path.")
     parser.add_argument("--bubble-shadow-kv", action="store_true", help="Compute runtime redundant Shadow KV segments after the primary forward path.")
+    parser.add_argument("--shadow-l2", action="store_true", help="Enable Shadow L2 (DLLAMA_SHADOW_L2): stash unfinished shadow KV work as debt and repay it during tool-wait windows via UDS tool_window_begin/end.")
     parser.add_argument("--edge-benchmark", action="store_true", help="Enable EdgeVisor --benchmark for agentic TPOT/profile runs.")
     parser.add_argument("--edge-last-stage-sampling", action="store_true", help="Let the last PP stage sample locally and return only token ids.")
     parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=1)
     parser.add_argument("--edge-cold-start", action="store_true", help="Disable persistent EdgeVisor API session for cold-start comparison.")
+    parser.add_argument("--edge-cpu", action="store_true", help="Run the EdgeVisor ablation backend on CPU (--backend cpu, no GPU) for small-scale verification.")
     parser.add_argument("--edge-api-port", type=int, default=0, help="Optional fixed port for the persistent EdgeVisor API session.")
     parser.add_argument(
         "--disable-episode-dynamic-plan",
@@ -197,6 +199,8 @@ def main() -> int:
             extra_env["EDGEVISOR_FIXED_PORT_BASE"] = str(args.edge_fixed_port_base)
         if args.bubble_shadow_kv:
             extra_env["DLLAMA_BUBBLE_SHADOW_KV"] = "1"
+        if args.shadow_l2:
+            extra_env["DLLAMA_SHADOW_L2"] = "1"
         ablation_config = load_ablation_config(args.edgevisor_ablation_config)
         ablation_config.update(
             {
@@ -211,6 +215,7 @@ def main() -> int:
                 "enable_pp_migration": args.enable_pp_migration,
                 "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
                 "bubble_shadow_kv": args.bubble_shadow_kv,
+                "shadow_l2": args.shadow_l2,
                 "enable_benchmark": args.edge_benchmark,
                 "last_stage_sampling": args.edge_last_stage_sampling,
                 "experiment_id": args.experiment_id or f"{episode['id']}_{args.backend}",
@@ -230,6 +235,7 @@ def main() -> int:
             "virtual_topology": virtual_topology,
             "extra_env": extra_env,
             "last_stage_sampling": args.edge_last_stage_sampling,
+            "cpu": args.edge_cpu,
         }
     backend = make_backend(args.backend, **backend_kwargs)
     trace = run_loop_episode(episode, backend, out_dir)

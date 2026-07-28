@@ -526,6 +526,8 @@ def build_episode_command(
         cmd.extend(["--kv-ack-timeout-ms", str(args.kv_ack_timeout_ms)])
     if getattr(args, "bubble_shadow_kv", False):
         cmd.append("--bubble-shadow-kv")
+    if getattr(args, "shadow_l2", False):
+        cmd.append("--shadow-l2")
     if getattr(args, "edge_benchmark", False):
         cmd.append("--edge-benchmark")
     if args.shadow_scope == "inter_stage_layers":
@@ -826,6 +828,7 @@ def main() -> int:
     parser.add_argument("--edge-virtual-launch-stagger-s", type=float, default=2.0)
     parser.add_argument("--runtime-redundant-boundary-layers", type=int, default=0)
     parser.add_argument("--bubble-shadow-kv", action="store_true", default=os.environ.get("BUBBLE_SHADOW_KV", "0") == "1")
+    parser.add_argument("--shadow-l2", action="store_true", default=os.environ.get("SHADOW_L2", "0") == "1", help="Enable Shadow L2 (DLLAMA_SHADOW_L2) for tool-wait shadow KV catch-up; also brackets agent tool calls with UDS tool_window_begin/end.")
     parser.add_argument("--edge-benchmark", action="store_true", default=os.environ.get("EDGE_BENCHMARK", "0") == "1")
     parser.add_argument(
         "--migration-layer-count",
@@ -946,6 +949,7 @@ def main() -> int:
             "prefill_tokens": args.prefill_tokens,
             "runtime_redundant_boundary_layers": args.runtime_redundant_boundary_layers,
             "bubble_shadow_kv": bool(args.bubble_shadow_kv),
+            "shadow_l2": bool(args.shadow_l2),
             "edge_benchmark": bool(args.edge_benchmark),
             "edge_request_timeout_s": int(args.edge_request_timeout_s),
             "kv_ack_timeout_ms": int(args.kv_ack_timeout_ms),

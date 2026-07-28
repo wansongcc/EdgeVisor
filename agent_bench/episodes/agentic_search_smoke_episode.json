@@ -1,0 +1,21 @@
+{
+  "id": "agentic_search_smoke_loop",
+  "description": "Agent episode with a real web_search tool call (Shadow L2 tool-window smoke).",
+  "max_llm_turns": 6,
+  "max_tokens": 64,
+  "min_tool_calls": 2,
+  "required_tools": [
+    "web_search",
+    "calculator"
+  ],
+  "required_tool_arguments": {
+    "web_search": {
+      "query": "president of France"
+    },
+    "calculator": {
+      "expression": "12345*6789"
+    }
+  },
+  "reject_duplicate_required_tools": true,
+  "task": "Run a short agent workflow. Use one tool per turn and gather observations before final_answer: search the web for \"president of France\" and calculate 12345 * 6789. After both observations, return one concise final report."
+}

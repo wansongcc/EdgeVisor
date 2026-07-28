@@ -591,42 +591,59 @@ def build_loop_graph():
         messages = list(state.get("messages", []))
         tool_name = action["tool"]
         arguments = dict(action.get("arguments", {}))
+        backend = state["backend"]
+        # Shadow L2 tool-wait window: let the engine repay shadow debt while the
+        # agent waits on the tool. No-op for backends without a plan-control UDS
+        # and silently degrades on any failure.
+        window_started = False
         try:
-            result = run_tool(tool_name, arguments)
-            observation = {
-                "tool": result.name,
-                "arguments": result.arguments,
-                "result": result.result,
-            }
-            events.append(
-                {
-                    "type": "tool_call",
-                    "tool_call_id": int(state.get("tool_count", 0)) + 1,
-                    "turn": turn,
-                    "name": result.name,
+            backend.tool_window_begin()
+            window_started = True
+        except Exception:
+            window_started = False
+        try:
+            try:
+                result = run_tool(tool_name, arguments)
+                observation = {
+                    "tool": result.name,
                     "arguments": result.arguments,
                     "result": result.result,
-                    "latency_ms": result.latency_ms,
                 }
-            )
-            tool_count = int(state.get("tool_count", 0)) + 1
-            used_tools = list(state.get("used_tools", []))
-            if result.name not in used_tools:
-                used_tools.append(result.name)
-        except (KeyError, TypeError, ToolError) as exc:
-            observation = {"tool": tool_name, "arguments": arguments, "error": str(exc)}
-            events.append(
-                {
-                    "type": "tool_error",
-                    "tool_call_id": int(state.get("tool_count", 0)) + 1,
-                    "turn": turn,
-                    "name": tool_name,
-                    "arguments": arguments,
-                    "error": str(exc),
-                }
-            )
-            tool_count = int(state.get("tool_count", 0))
-            used_tools = list(state.get("used_tools", []))
+                events.append(
+                    {
+                        "type": "tool_call",
+                        "tool_call_id": int(state.get("tool_count", 0)) + 1,
+                        "turn": turn,
+                        "name": result.name,
+                        "arguments": result.arguments,
+                        "result": result.result,
+                        "latency_ms": result.latency_ms,
+                    }
+                )
+                tool_count = int(state.get("tool_count", 0)) + 1
+                used_tools = list(state.get("used_tools", []))
+                if result.name not in used_tools:
+                    used_tools.append(result.name)
+            except (KeyError, TypeError, ToolError) as exc:
+                observation = {"tool": tool_name, "arguments": arguments, "error": str(exc)}
+                events.append(
+                    {
+                        "type": "tool_error",
+                        "tool_call_id": int(state.get("tool_count", 0)) + 1,
+                        "turn": turn,
+                        "name": tool_name,
+                        "arguments": arguments,
+                        "error": str(exc),
+                    }
+                )
+                tool_count = int(state.get("tool_count", 0))
+                used_tools = list(state.get("used_tools", []))
+        finally:
+            if window_started:
+                try:
+                    backend.tool_window_end()
+                except Exception:
+                    pass
 
         messages.append({"role": "tool", "content": json.dumps(observation, ensure_ascii=False)})
         messages.append({"role": "user", "content": _final_observation_prompt(state["episode"], events, used_tools)})

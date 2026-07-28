@@ -115,6 +115,12 @@ Candidate filterPpCandidateForStaticLayout(const Candidate &candidate, bool layo
 uint32_t ppCommandLayerCount(const Candidate &candidate);
 
 bool applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate);
+bool commitStageBypassLayout(
+    std::vector<StageSnapshot> &stages,
+    uint32_t ejectedStageIndex,
+    uint32_t targetStageIndex,
+    const std::vector<uint32_t> &appliedLayers,
+    std::vector<uint32_t> *activeStageChain);
 void rebasePpSoftCapacity(StageSnapshot &stage, uint32_t previousLayerCount);
 void applyRollbackPenalty(StageSnapshot &target);
 const char *candidateKindName(CandidateKind kind);

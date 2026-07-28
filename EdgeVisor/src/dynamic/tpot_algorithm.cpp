@@ -386,6 +386,60 @@ bool applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate)
     return true;
 }
 
+bool commitStageBypassLayout(
+    std::vector<StageSnapshot> &stages,
+    uint32_t ejectedStageIndex,
+    uint32_t targetStageIndex,
+    const std::vector<uint32_t> &appliedLayers,
+    std::vector<uint32_t> *activeStageChain) {
+    if (ejectedStageIndex == targetStageIndex) return false;
+
+    size_t ejectedPos = stages.size();
+    size_t targetPos = stages.size();
+    for (size_t i = 0u; i < stages.size(); ++i) {
+        if (stages[i].stageIndex == ejectedStageIndex) {
+            if (ejectedPos != stages.size()) return false;
+            ejectedPos = i;
+        }
+        if (stages[i].stageIndex == targetStageIndex) {
+            if (targetPos != stages.size()) return false;
+            targetPos = i;
+        }
+    }
+    if (ejectedPos == stages.size() || targetPos == stages.size()) return false;
+    if (ejectedPos + 1u != targetPos && targetPos + 1u != ejectedPos) return false;
+
+    const StageSnapshot &from = stages[ejectedPos];
+    const StageSnapshot &to = stages[targetPos];
+    if (from.endLayer < from.startLayer || to.endLayer < to.startLayer) return false;
+    const uint32_t fromLayers = from.endLayer - from.startLayer;
+    if (from.nLayers != fromLayers || appliedLayers.size() != fromLayers) return false;
+    for (uint32_t i = 0u; i < fromLayers; ++i) {
+        if (appliedLayers[i] != from.startLayer + i) return false;
+    }
+
+    const bool forward = targetPos > ejectedPos;
+    if (forward) {
+        if (targetStageIndex <= ejectedStageIndex || from.endLayer != to.startLayer) return false;
+    } else {
+        if (targetStageIndex >= ejectedStageIndex || to.endLayer != from.startLayer) return false;
+    }
+
+    StageSnapshot merged = to;
+    merged.startLayer = std::min(from.startLayer, to.startLayer);
+    merged.endLayer = std::max(from.endLayer, to.endLayer);
+    merged.nLayers = merged.endLayer - merged.startLayer;
+    if (merged.nLayers != fromLayers + (to.endLayer - to.startLayer)) return false;
+
+    stages[targetPos] = merged;
+    stages.erase(stages.begin() + (std::ptrdiff_t)ejectedPos);
+    if (activeStageChain != nullptr) {
+        activeStageChain->clear();
+        for (size_t i = 0u; i < stages.size(); ++i) activeStageChain->push_back(stages[i].stageIndex);
+    }
+    return true;
+}
+
 void rebasePpSoftCapacity(StageSnapshot &stage, uint32_t previousLayerCount) {
     const uint32_t currentLayerCount = stageLayerCount(stage);
     if (stage.softCapacity == 0u || stage.softCapacity >= previousLayerCount) {

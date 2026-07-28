@@ -165,6 +165,33 @@ int main() {
     require(committedGuard.filter(committedMove).valid,
         "committed PP move releases the guard for a later rebalance");
 
+    std::vector<tpot::StageSnapshot> bypassLayout;
+    bypassLayout.push_back(stage(0, 0, 0, 4, 5.0));
+    bypassLayout.push_back(stage(1, 1, 4, 4, 5.0));
+    bypassLayout.push_back(stage(2, 2, 8, 4, 5.0));
+    bypassLayout.push_back(stage(3, 3, 12, 4, 20.0));
+    std::vector<uint32_t> bypassActiveChain;
+    const std::vector<uint32_t> bypassLayers = {8u, 9u, 10u, 11u};
+    require(tpot::commitStageBypassLayout(bypassLayout, 2u, 3u, bypassLayers, &bypassActiveChain),
+        "complete adjacent bypass commits its logical layout");
+    require(bypassActiveChain == std::vector<uint32_t>({0u, 1u, 3u}),
+        "bypass rebuilds active chain without ejected stage");
+    require(bypassLayout[2].startLayer == 8u && bypassLayout[2].endLayer == 16u && bypassLayout[2].nLayers == 8u,
+        "bypass merge derives range and count from endpoints");
+
+    std::vector<tpot::StageSnapshot> rejectedBypassLayout;
+    rejectedBypassLayout.push_back(stage(0, 0, 0, 4, 5.0));
+    rejectedBypassLayout.push_back(stage(1, 1, 4, 4, 5.0));
+    rejectedBypassLayout.push_back(stage(2, 2, 8, 4, 5.0));
+    rejectedBypassLayout.push_back(stage(3, 3, 12, 4, 20.0));
+    const std::vector<tpot::StageSnapshot> beforeRejectedBypass = rejectedBypassLayout;
+    require(!tpot::commitStageBypassLayout(rejectedBypassLayout, 1u, 3u, std::vector<uint32_t>({4u, 5u, 6u, 7u}), nullptr) &&
+            sameStages(rejectedBypassLayout, beforeRejectedBypass),
+        "non-adjacent bypass telemetry cannot mutate layout");
+    require(!tpot::commitStageBypassLayout(rejectedBypassLayout, 2u, 3u, std::vector<uint32_t>({8u, 10u}), nullptr) &&
+            sameStages(rejectedBypassLayout, beforeRejectedBypass),
+        "incomplete bypass layer telemetry cannot mutate layout");
+
     const std::vector<tpot::StageSnapshot> beforeInvalidMove = committedLayout;
     tpot::Candidate invalidMove = committedMove;
     invalidMove.layerIndex = 0u;

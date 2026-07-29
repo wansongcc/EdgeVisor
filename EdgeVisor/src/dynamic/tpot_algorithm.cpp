@@ -440,6 +440,24 @@ bool commitStageBypassLayout(
     return true;
 }
 
+bool rebaseStageBypassLayout(
+    std::vector<StageSnapshot> &committedStages,
+    const std::vector<StageSnapshot> &authoritativeStages,
+    uint32_t ejectedStageIndex,
+    uint32_t targetStageIndex,
+    const std::vector<uint32_t> &appliedLayers,
+    std::vector<uint32_t> *activeStageChain) {
+    std::vector<StageSnapshot> rebased = authoritativeStages;
+    std::vector<uint32_t> rebasedChain;
+    if (!commitStageBypassLayout(
+            rebased, ejectedStageIndex, targetStageIndex, appliedLayers, &rebasedChain)) {
+        return false;
+    }
+    committedStages.swap(rebased);
+    if (activeStageChain != nullptr) activeStageChain->swap(rebasedChain);
+    return true;
+}
+
 void rebasePpSoftCapacity(StageSnapshot &stage, uint32_t previousLayerCount) {
     const uint32_t currentLayerCount = stageLayerCount(stage);
     if (stage.softCapacity == 0u || stage.softCapacity >= previousLayerCount) {

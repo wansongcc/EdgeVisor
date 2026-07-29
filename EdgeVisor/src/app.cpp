@@ -2205,6 +2205,23 @@ static bool areNodesInSameStageLocal(const NnUnevenPartitionPlan *plan, NnUint n
     return stageContainsNodeLocal(stageA, nodeB);
 }
 
+static bool areStagesAdjacentOnActivePpChain(
+    const NnUnevenPartitionPlan *plan,
+    NnUint fromStageIndex,
+    NnUint toStageIndex) {
+    if (plan == nullptr || fromStageIndex >= plan->nStages || toStageIndex >= plan->nStages ||
+            fromStageIndex == toStageIndex) {
+        return false;
+    }
+    const bool forward =
+        getPpNextStageIndex(plan, fromStageIndex) == toStageIndex &&
+        getPpPrevStageIndex(plan, toStageIndex) == fromStageIndex;
+    const bool reverse =
+        getPpPrevStageIndex(plan, fromStageIndex) == toStageIndex &&
+        getPpNextStageIndex(plan, toStageIndex) == fromStageIndex;
+    return forward || reverse;
+}
+
 bool resolvePpMigrationLayers(
     const PlanCommand &command,
     const NnUnevenPartitionPlan *plan,
@@ -2233,10 +2250,9 @@ bool resolvePpMigrationLayers(
     if (fromStage == nullptr || toStage == nullptr || fromStage->stageIndex == toStage->stageIndex) {
         return reject("invalid PP stage route");
     }
-    const NnUint stageDistance = fromStage->stageIndex > toStage->stageIndex
-        ? fromStage->stageIndex - toStage->stageIndex
-        : toStage->stageIndex - fromStage->stageIndex;
-    if (stageDistance != 1u) return reject("PP stages must be adjacent");
+    if (!areStagesAdjacentOnActivePpChain(plan, fromStage->stageIndex, toStage->stageIndex)) {
+        return reject("PP stages must be adjacent on the active chain");
+    }
     if (fromStage->stageIndex >= runtimePlan->nStages || toStage->stageIndex >= runtimePlan->nStages) {
         return reject("runtime plan does not cover PP route");
     }

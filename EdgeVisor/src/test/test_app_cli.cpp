@@ -320,6 +320,51 @@ int main() {
     assert(!resolvePpMigrationLayers(forward, &rangePlan, &runtimePlan, unsafeLayers, &rangeReason));
     assert(unsafeLayers.empty());
     assert(rangeReason.find("target") != std::string::npos);
+
+    NnUnevenPartitionPlan bypassPlan{};
+    bypassPlan.nStages = 4u;
+    bypassPlan.stages = new NnStageConfig[4]{};
+    bypassPlan.ppPrevStageIndex = new NnUint[4]{(NnUint)-1, 0u, 1u, 2u};
+    bypassPlan.ppNextStageIndex = new NnUint[4]{1u, 2u, 3u, (NnUint)-1};
+    for (NnUint stageIndex = 0u; stageIndex < bypassPlan.nStages; ++stageIndex) {
+        NnStageConfig &stage = bypassPlan.stages[stageIndex];
+        stage.stageIndex = stageIndex;
+        stage.startLayer = stageIndex * 4u;
+        stage.endLayer = stage.startLayer + 4u;
+        stage.nLayers = 4u;
+        stage.rootNodeIndex = stageIndex;
+        stage.nNodes = 1u;
+        stage.nodeIndices = new NnUint[1]{stageIndex};
+    }
+    assert(applyPpStageBypass(&bypassPlan, 2u, 3u));
+    assert(getPpNextStageIndex(&bypassPlan, 1u) == 3u);
+    assert(getPpPrevStageIndex(&bypassPlan, 3u) == 1u);
+
+    RuntimeStageLayerPlan bypassRuntimePlan = buildRuntimeStageLayerPlan(&bypassPlan, 16u);
+    bypassRuntimePlan.setRole(3u, 10u, RUNTIME_LAYER_PRIMARY);
+    bypassRuntimePlan.setRole(1u, 10u, RUNTIME_LAYER_REDUNDANT);
+    PlanCommand bypassAdjacent{};
+    bypassAdjacent.mode = PLAN_CMD_MODE_NEXT_BARRIER;
+    bypassAdjacent.fromNodeIndex = 3u;
+    bypassAdjacent.toNodeIndex = 1u;
+    bypassAdjacent.triggerLayer = 10u;
+    bypassAdjacent.reserved0 = 1u;
+    std::vector<NnUint> bypassAdjacentLayers;
+    assert(resolvePpMigrationLayers(
+        bypassAdjacent, &bypassPlan, &bypassRuntimePlan, bypassAdjacentLayers, &rangeReason));
+    assert((bypassAdjacentLayers == std::vector<NnUint>{10u}));
+
+    PlanCommand bypassNonAdjacent = bypassAdjacent;
+    bypassNonAdjacent.fromNodeIndex = 0u;
+    bypassNonAdjacent.toNodeIndex = 3u;
+    std::vector<NnUint> bypassNonAdjacentLayers;
+    assert(!resolvePpMigrationLayers(
+        bypassNonAdjacent, &bypassPlan, &bypassRuntimePlan, bypassNonAdjacentLayers, &rangeReason));
+    assert(rangeReason == "PP stages must be adjacent on the active chain");
+    delete[] bypassPlan.ppPrevStageIndex;
+    bypassPlan.ppPrevStageIndex = nullptr;
+    delete[] bypassPlan.ppNextStageIndex;
+    bypassPlan.ppNextStageIndex = nullptr;
     clearTpotEnvironment();
 
     {

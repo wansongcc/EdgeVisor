@@ -9,18 +9,6 @@
 
 namespace tpot = dllama::dynamic_tpot;
 
-namespace dllama {
-namespace dynamic_tpot {
-bool rebaseStageBypassLayout(
-    std::vector<StageSnapshot> &committedStages,
-    const std::vector<StageSnapshot> &authoritativeStages,
-    uint32_t ejectedStageIndex,
-    uint32_t targetStageIndex,
-    const std::vector<uint32_t> &appliedLayers,
-    std::vector<uint32_t> *activeStageChain);
-} // namespace dynamic_tpot
-} // namespace dllama
-
 static void require(bool cond, const char *msg) {
     if (!cond) {
         std::fprintf(stderr, "FAIL: %s\n", msg);

@@ -205,17 +205,17 @@ int main() {
         "verified bypass rebases a prior PP layout to the root-authoritative generation");
     require(rebasedBypassChain == std::vector<uint32_t>({0u, 1u, 3u}) &&
             ppThenBypassLayout.size() == 3u && ppThenBypassLayout[1].endLayer == 27u &&
-            ppThenBypassLayout[2].startLayer == 27u,
-        "bypass discards PP1's stale boundary before the merge");
+            ppThenBypassLayout[2].startLayer == 29u,
+        "bypass discards PP1's stale boundary without exposing its owned range to PP2");
     tpot::Candidate pp2 = pp1;
     pp2.fromStageIndex = 3u;
     pp2.toStageIndex = 1u;
     pp2.fromNodeIndex = 3u;
     pp2.toNodeIndex = 1u;
-    pp2.layerIndex = 27u;
+    pp2.layerIndex = 29u;
     require(tpot::applyPpMove(ppThenBypassLayout, pp2),
         "PP2 commits after a verified bypass generation");
-    require(ppThenBypassLayout[1].endLayer == 28u && ppThenBypassLayout[2].startLayer == 28u,
+    require(ppThenBypassLayout[1].endLayer == 28u && ppThenBypassLayout[2].startLayer == 30u,
         "PP2 advances the rebased active-chain boundary");
 
     std::vector<tpot::StageSnapshot> rejectedBypassLayout;

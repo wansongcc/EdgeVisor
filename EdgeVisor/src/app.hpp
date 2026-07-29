@@ -464,6 +464,7 @@ private:
     void consumeStageBypassAckFrame(NnUint socketIndex, const std::vector<char> &payload);
     void tryVerifyStageBypassAcks();
     void pollStageBypassAckFrames();
+    void pumpWorkerFrames(NnUint socketIndex);
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
@@ -529,6 +530,8 @@ private:
     std::vector<NnUint> stageBypassExpectedAckNodes;
     std::vector<NnUint> stageBypassReceivedAckNodes;
     std::map<NnUint, std::pair<LlmStageBypassAckPacket, std::vector<NnUint>>> stageBypassAckCache;
+    std::map<NnUint, std::deque<LlmPerfPacket>> workerProfileFrameCache;
+    std::map<NnUint, std::deque<LlmSampledTokenPacket>> workerSampleFrameCache;
     bool pendingStageBypass = false;
     NnUint pendingBypassEjectedStage = 0xFFFFFFFFu;
     NnUint pendingBypassTargetStage = 0xFFFFFFFFu;

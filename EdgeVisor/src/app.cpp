@@ -3709,7 +3709,8 @@ bool RootLlmInference::verifyStageBypassAcks(
             (node == ejected->rootNodeIndex ? (LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED) : LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE);
         const NnUint expectedStage = node == pendingBypassPreviousNode ? previous : (node == ejected->rootNodeIndex ? ejectedStage : targetStage);
         if (ack.fromNodeIndex != node || ack.stageIndex != expectedStage || ack.roleFlags != expectedRole ||
-                (node == target->rootNodeIndex && (ack.startLayer > layers.front() || ack.endLayer < layers.back() + 1u))) {
+                (node == target->rootNodeIndex && (ack.startLayer != layers.front() || ack.endLayer != layers.back() + 1u ||
+                    ack.layerCount != layers.size()))) {
             stageBypassFailureReason = "worker bypass ACK participant or role mismatch";
             return false;
         }
@@ -3718,11 +3719,6 @@ bool RootLlmInference::verifyStageBypassAcks(
             return false;
         }
         stageBypassReceivedAckNodes.push_back(node);
-        if (ack.stageIndex == targetStage &&
-                (ack.startLayer > layers.front() || ack.endLayer < layers.back() + 1u)) {
-            stageBypassFailureReason = "target worker ACK does not own bypass layer range";
-            return false;
-        }
     }
     stageBypassVerifiedGeneration = generation;
     return true;
@@ -5588,6 +5584,7 @@ void runWorkerApp(AppCliArgs *args) {
                 NnUint bypassGeneration = 0u;
                 NnUint bypassEjectedStage = 0xFFFFFFFFu;
                 NnUint bypassTargetStage = 0xFFFFFFFFu;
+                std::vector<NnUint> bypassLayers;
                 while (inference.consumeLayerSwitch(switchPkt)) {
                     bool localIsSourceStage = (switchPkt.fromNodeIndex == nodeConfig.nodeIndex);
                     bool localIsTargetStage = (switchPkt.toNodeIndex == nodeConfig.nodeIndex);
@@ -5677,6 +5674,7 @@ void runWorkerApp(AppCliArgs *args) {
                             std::fflush(stdout);
                         }
                     }
+                    if (sawStageBypass) bypassLayers.push_back(switchPkt.boundaryLayer);
                 }
                 if (sawStageBypass && network != nullptr && planPtr != nullptr) {
                     LlmStageBypassAckPacket ack{};
@@ -5692,6 +5690,12 @@ void runWorkerApp(AppCliArgs *args) {
                         ack.startLayer = localStage->startLayer;
                         ack.endLayer = localStage->endLayer;
                         ack.layerCount = ack.endLayer - ack.startLayer;
+                    }
+                    if (!bypassLayers.empty() && ack.stageIndex == bypassTargetStage) {
+                        std::sort(bypassLayers.begin(), bypassLayers.end());
+                        ack.startLayer = bypassLayers.front();
+                        ack.endLayer = bypassLayers.back() + 1u;
+                        ack.layerCount = (NnUint)bypassLayers.size();
                     }
                     if (ack.stageIndex == bypassEjectedStage) {
                         ack.roleFlags |= LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED;

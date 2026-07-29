@@ -448,11 +448,28 @@ bool rebaseStageBypassLayout(
     const std::vector<uint32_t> &appliedLayers,
     std::vector<uint32_t> *activeStageChain) {
     std::vector<StageSnapshot> rebased = authoritativeStages;
-    std::vector<uint32_t> rebasedChain;
-    if (!commitStageBypassLayout(
-            rebased, ejectedStageIndex, targetStageIndex, appliedLayers, &rebasedChain)) {
-        return false;
+    size_t ejectedPos = rebased.size();
+    size_t targetPos = rebased.size();
+    for (size_t i = 0u; i < rebased.size(); ++i) {
+        if (rebased[i].stageIndex == ejectedStageIndex) ejectedPos = i;
+        if (rebased[i].stageIndex == targetStageIndex) targetPos = i;
     }
+    if (ejectedPos == rebased.size() || targetPos == rebased.size() ||
+            (ejectedPos + 1u != targetPos && targetPos + 1u != ejectedPos)) return false;
+    const StageSnapshot &ejected = rebased[ejectedPos];
+    if (ejected.endLayer < ejected.startLayer || ejected.nLayers != ejected.endLayer - ejected.startLayer ||
+            appliedLayers.size() != ejected.nLayers) return false;
+    for (uint32_t i = 0u; i < ejected.nLayers; ++i) {
+        if (appliedLayers[i] != ejected.startLayer + i) return false;
+    }
+
+    // The bypass target takes responsibility for this range at runtime, but
+    // its static PP boundary remains unchanged.  Keeping that boundary avoids
+    // proposing a later PP move for a bypass-owned layer whose role is no
+    // longer complementary at the previous active stage.
+    rebased.erase(rebased.begin() + (std::ptrdiff_t)ejectedPos);
+    std::vector<uint32_t> rebasedChain;
+    for (size_t i = 0u; i < rebased.size(); ++i) rebasedChain.push_back(rebased[i].stageIndex);
     committedStages.swap(rebased);
     if (activeStageChain != nullptr) activeStageChain->swap(rebasedChain);
     return true;

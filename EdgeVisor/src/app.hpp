@@ -281,6 +281,20 @@ static constexpr NnUint LLM_KV_TRANSFER_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_KV_ACK_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_STAGE_BYPASS_ACK_VERSION = 1u;
+
+static constexpr NnUint LLM_WORKER_FRAME_MAGIC = 0x4d465756u; // 'VWFM'
+static constexpr NnUint LLM_WORKER_FRAME_VERSION = 1u;
+enum LlmWorkerFrameKind : NnUint {
+    LLM_WORKER_FRAME_PROFILE = 1u,
+    LLM_WORKER_FRAME_SAMPLED_TOKEN = 2u,
+    LLM_WORKER_FRAME_STAGE_BYPASS_ACK = 3u,
+};
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint kind;
+    NnUint payloadBytes;
+} LlmWorkerFrameHeader;
 static constexpr NnUint LLM_KV_EXPORT_REQUEST_VERSION = 1u;
 static constexpr NnUint LLM_KV_EXPORT_RESPONSE_VERSION = 1u;
 
@@ -445,8 +459,10 @@ public:
 private:
     void recordPpMigrationApplied();
     void recordStageBypassApplied(NnUint ejectedStage, NnUint targetStage, const std::vector<NnUint> &layers);
-    bool verifyStageBypassAcks(unsigned long long generation, NnUint ejectedStage, NnUint targetStage,
+    void beginStageBypassAckVerification(unsigned long long generation, NnUint ejectedStage, NnUint targetStage,
         const std::vector<NnUint> &layers);
+    void consumeStageBypassAckFrame(NnUint socketIndex, const std::vector<char> &payload);
+    void tryVerifyStageBypassAcks();
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
@@ -511,6 +527,7 @@ private:
     std::string stageBypassFailureReason;
     std::vector<NnUint> stageBypassExpectedAckNodes;
     std::vector<NnUint> stageBypassReceivedAckNodes;
+    std::map<NnUint, std::pair<LlmStageBypassAckPacket, std::vector<NnUint>>> stageBypassAckCache;
     bool pendingStageBypass = false;
     NnUint pendingBypassEjectedStage = 0xFFFFFFFFu;
     NnUint pendingBypassTargetStage = 0xFFFFFFFFu;

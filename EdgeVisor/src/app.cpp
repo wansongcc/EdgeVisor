@@ -316,6 +316,26 @@ static void appendUniqueLayer(std::vector<NnUint> &layers, NnUint layer) {
     }
 }
 
+static void writeWorkerFrame(NnNetwork *network, NnUint kind, const void *payload, NnSize payloadBytes) {
+    if (network == nullptr) return;
+    LlmWorkerFrameHeader header{};
+    header.magic = LLM_WORKER_FRAME_MAGIC;
+    header.version = LLM_WORKER_FRAME_VERSION;
+    header.kind = kind;
+    header.payloadBytes = (NnUint)payloadBytes;
+    network->write(ROOT_SOCKET_INDEX, &header, sizeof(header));
+    if (payloadBytes != 0u) network->write(ROOT_SOCKET_INDEX, payload, payloadBytes);
+}
+
+static bool readWorkerFrame(NnNetwork *network, NnUint socketIndex, LlmWorkerFrameHeader &header, std::vector<char> &payload, int timeoutMs) {
+    if (!tryReadKvAckWithDeadline(network, socketIndex, &header, sizeof(header), timeoutMs) ||
+            header.magic != LLM_WORKER_FRAME_MAGIC || header.version != LLM_WORKER_FRAME_VERSION ||
+            header.payloadBytes > 1024u * 1024u) return false;
+    payload.resize(header.payloadBytes);
+    if (!payload.empty() && !tryReadKvAckWithDeadline(network, socketIndex, payload.data(), payload.size(), timeoutMs)) return false;
+    return true;
+}
+
 static void setRuntimeRedundantEnv(NnUint boundaryLayers, bool activeSegEnabled, bool redundantSegEnabled, const char *primarySkipLayersStr) {
     std::string boundary = std::to_string((unsigned)boundaryLayers);
     std::string active = activeSegEnabled ? "1" : "0";
@@ -2613,8 +2633,15 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
     const int socketIndex = network->getSocketIndexForNode(sourceNode, 0u);
     if (socketIndex < 0) return false;
 
+    LlmWorkerFrameHeader frame{};
+    std::vector<char> payload;
+    do {
+        if (!readWorkerFrame(network, (NnUint)socketIndex, frame, payload, kvAckWaitTimeoutMs())) return false;
+        if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) consumeStageBypassAckFrame((NnUint)socketIndex, payload);
+    } while (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK);
+    if (frame.kind != LLM_WORKER_FRAME_SAMPLED_TOKEN || payload.size() != sizeof(LlmSampledTokenPacket)) return false;
     LlmSampledTokenPacket packet{};
-    network->read((NnUint)socketIndex, &packet, sizeof(packet));
+    std::memcpy(&packet, payload.data(), sizeof(packet));
     if (packet.magic != LLM_SAMPLED_TOKEN_MAGIC || packet.version != LLM_SAMPLED_TOKEN_VERSION) {
         std::printf("⚠️  [last-stage-sampling] unexpected packet magic=0x%08x version=%u fromNode=%u\n",
             (unsigned)packet.magic,
@@ -3635,10 +3662,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         const bool ok = applyPpStageBypass(mutablePlan, bypassEjectedStage, bypassTargetStage);
         if (ok) {
             recordStageBypassApplied(bypassEjectedStage, bypassTargetStage, switchLayers);
-            if (!verifyStageBypassAcks(stageBypassAppliedGeneration, bypassEjectedStage, bypassTargetStage, switchLayers)) {
-                std::printf("⚠️  [stage-bypass] verification failed generation=%llu reason=%s\n",
-                    stageBypassAppliedGeneration, stageBypassFailureReason.c_str());
-            }
+            beginStageBypassAckVerification(stageBypassAppliedGeneration, bypassEjectedStage, bypassTargetStage, switchLayers);
         }
         std::printf("🔁 [stage-bypass] root apply ejectedStage=%u targetStage=%u status=%s\n",
             (unsigned)bypassEjectedStage,
@@ -3673,55 +3697,64 @@ void RootLlmInference::recordStageBypassApplied(
     }
 }
 
-bool RootLlmInference::verifyStageBypassAcks(
+void RootLlmInference::beginStageBypassAckVerification(
     unsigned long long generation,
     NnUint ejectedStage,
     NnUint targetStage,
     const std::vector<NnUint> &layers) {
-    if (network == nullptr || generation == 0u || layers.empty()) return false;
+    if (generation == 0u || layers.empty()) return;
     const NnStageConfig *target = findStageByIndexLocal(plan, targetStage);
     const NnUint previous = pendingBypassPreviousStage;
-    if (target == nullptr || previous == (NnUint)-1 || pendingBypassPreviousNode == 0xFFFFFFFFu) return false;
+    if (target == nullptr || previous == (NnUint)-1 || pendingBypassPreviousNode == 0xFFFFFFFFu) { stageBypassFailureReason = "invalid bypass ACK participants"; return; }
     stageBypassExpectedAckNodes.clear();
     stageBypassExpectedAckNodes.push_back(pendingBypassPreviousNode);
     const NnStageConfig *ejected = findStageByIndexLocal(plan, ejectedStage);
-    if (ejected == nullptr) return false;
+    if (ejected == nullptr) { stageBypassFailureReason = "missing ejected bypass stage"; return; }
     stageBypassExpectedAckNodes.push_back(ejected->rootNodeIndex);
     stageBypassExpectedAckNodes.push_back(target->rootNodeIndex);
     stageBypassReceivedAckNodes.clear();
-    const int timeoutMs = kvAckWaitTimeoutMs();
-    for (size_t expected = 0u; expected < stageBypassExpectedAckNodes.size(); ++expected) {
-        const NnUint node = stageBypassExpectedAckNodes[expected];
-        const int socket = network->getSocketIndexForNode(node, 0u);
-        if (socket < 0) { stageBypassFailureReason = "missing expected bypass ACK socket"; return false; }
-        LlmStageBypassAckPacket ack{};
-        if (!tryReadKvAckWithDeadline(network, (NnUint)socket, &ack, sizeof(ack), timeoutMs) ||
-                ack.magic != LLM_STAGE_BYPASS_ACK_MAGIC || ack.version != LLM_STAGE_BYPASS_ACK_VERSION ||
-                ack.bypassGeneration != generation || ack.ejectedStage != ejectedStage ||
-                ack.targetStage != targetStage) {
-            stageBypassFailureReason = "missing or mismatched worker bypass ACK";
-            return false;
-        }
-        std::vector<NnUint> chain(ack.activeChainCount);
-        if (ack.activeChainCount == 0u || !network->tryReadWithMaxAttempts((NnUint)socket, chain.data(), chain.size() * sizeof(NnUint), 1000ul) ||
-                chain != stageBypassActiveChain) { stageBypassFailureReason = "worker ACK active chain mismatch"; return false; }
-        const NnUint expectedRole = node == pendingBypassPreviousNode ? LLM_STAGE_BYPASS_ACK_NEXT_REROUTED :
-            (node == ejected->rootNodeIndex ? (LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED) : LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE);
-        const NnUint expectedStage = node == pendingBypassPreviousNode ? previous : (node == ejected->rootNodeIndex ? ejectedStage : targetStage);
-        if (ack.fromNodeIndex != node || ack.stageIndex != expectedStage || ack.roleFlags != expectedRole ||
-                (node == target->rootNodeIndex && (ack.startLayer != layers.front() || ack.endLayer != layers.back() + 1u ||
-                    ack.layerCount != layers.size()))) {
-            stageBypassFailureReason = "worker bypass ACK participant or role mismatch";
-            return false;
-        }
-        if (std::find(stageBypassReceivedAckNodes.begin(), stageBypassReceivedAckNodes.end(), node) != stageBypassReceivedAckNodes.end()) {
-            stageBypassFailureReason = "duplicate worker bypass ACK";
-            return false;
-        }
-        stageBypassReceivedAckNodes.push_back(node);
+    stageBypassAckCache.clear();
+}
+
+void RootLlmInference::consumeStageBypassAckFrame(NnUint socketIndex, const std::vector<char> &payload) {
+    if (payload.size() < sizeof(LlmStageBypassAckPacket)) return;
+    LlmStageBypassAckPacket ack{};
+    std::memcpy(&ack, payload.data(), sizeof(ack));
+    if (ack.magic != LLM_STAGE_BYPASS_ACK_MAGIC || ack.version != LLM_STAGE_BYPASS_ACK_VERSION ||
+            payload.size() != sizeof(ack) + (size_t)ack.activeChainCount * sizeof(NnUint)) return;
+    std::vector<NnUint> chain(ack.activeChainCount);
+    if (!chain.empty()) std::memcpy(chain.data(), payload.data() + sizeof(ack), chain.size() * sizeof(NnUint));
+    if (ack.bypassGeneration != stageBypassPendingGeneration || ack.ejectedStage != stageBypassAppliedEjectedStage ||
+            ack.targetStage != stageBypassAppliedTargetStage || chain != stageBypassActiveChain ||
+            std::find(stageBypassExpectedAckNodes.begin(), stageBypassExpectedAckNodes.end(), ack.fromNodeIndex) == stageBypassExpectedAckNodes.end()) {
+        stageBypassFailureReason = "stale or mismatched worker bypass ACK";
+        return;
     }
-    stageBypassVerifiedGeneration = generation;
-    return true;
+    const NnStageConfig *ejected = findStageByIndexLocal(plan, stageBypassAppliedEjectedStage);
+    const NnStageConfig *target = findStageByIndexLocal(plan, stageBypassAppliedTargetStage);
+    if (ejected == nullptr || target == nullptr) { stageBypassFailureReason = "missing bypass ACK stage"; return; }
+    const NnUint expectedRole = ack.fromNodeIndex == pendingBypassPreviousNode ? LLM_STAGE_BYPASS_ACK_NEXT_REROUTED :
+        (ack.fromNodeIndex == ejected->rootNodeIndex ? (LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED) : LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE);
+    const NnUint expectedStage = ack.fromNodeIndex == pendingBypassPreviousNode ? pendingBypassPreviousStage :
+        (ack.fromNodeIndex == ejected->rootNodeIndex ? stageBypassAppliedEjectedStage : stageBypassAppliedTargetStage);
+    if (ack.stageIndex != expectedStage || ack.roleFlags != expectedRole ||
+            (ack.fromNodeIndex == target->rootNodeIndex &&
+             (ack.startLayer != stageBypassAppliedLayers.front() || ack.endLayer != stageBypassAppliedLayers.back() + 1u ||
+              ack.layerCount != stageBypassAppliedLayers.size()))) {
+        stageBypassFailureReason = "worker bypass ACK participant or role mismatch";
+        return;
+    }
+    if (stageBypassAckCache.count(ack.fromNodeIndex) != 0u) { stageBypassFailureReason = "duplicate worker bypass ACK"; return; }
+    stageBypassAckCache[ack.fromNodeIndex] = std::make_pair(ack, chain);
+    (void)socketIndex;
+    tryVerifyStageBypassAcks();
+}
+
+void RootLlmInference::tryVerifyStageBypassAcks() {
+    if (stageBypassPendingGeneration == 0u || stageBypassExpectedAckNodes.empty()) return;
+    for (NnUint node : stageBypassExpectedAckNodes) if (stageBypassAckCache.count(node) == 0u) return;
+    stageBypassReceivedAckNodes = stageBypassExpectedAckNodes;
+    stageBypassVerifiedGeneration = stageBypassPendingGeneration;
 }
 
 LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
@@ -3755,15 +3788,18 @@ void RootLlmInference::collectDeferredProfile(const LlmPerfPacket &rootPacket, s
     out.push_back(rootPacket);
     if (network != nullptr && network->nSockets > 0) {
         const NnUint nWorkers = network->nSockets;
-        const size_t base = out.size();
-        out.resize(base + nWorkers);
-        std::vector<NnSocketIo> ios(nWorkers);
         for (NnUint i = 0; i < nWorkers; ++i) {
-            ios[i].socketIndex = i;
-            ios[i].data = &out[base + i];
-            ios[i].size = sizeof(LlmPerfPacket);
+            LlmWorkerFrameHeader frame{};
+            std::vector<char> payload;
+            do {
+                if (!readWorkerFrame(network, i, frame, payload, kvAckWaitTimeoutMs())) break;
+                if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) consumeStageBypassAckFrame(i, payload);
+            } while (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK);
+            if (frame.kind != LLM_WORKER_FRAME_PROFILE || payload.size() != sizeof(LlmPerfPacket)) continue;
+            LlmPerfPacket packet{};
+            std::memcpy(&packet, payload.data(), sizeof(packet));
+            out.push_back(packet);
         }
-        network->readMany(nWorkers, &ios[0]);
     }
 }
 
@@ -4874,7 +4910,7 @@ void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionP
     packet.position = controlPacket.position;
     packet.token = token;
     packet.logit = sampledLogit;
-    network->write(ROOT_SOCKET_INDEX, &packet, sizeof(packet));
+    writeWorkerFrame(network, LLM_WORKER_FRAME_SAMPLED_TOKEN, &packet, sizeof(packet));
 }
 
 bool WorkerLlmInference::tryReadControlPacket() {
@@ -5712,8 +5748,10 @@ void runWorkerApp(AppCliArgs *args) {
                                 getPpNextStageIndex(planPtr.get(), stage.stageIndex) != (NnUint)-1) activeChain.push_back(stage.stageIndex);
                     }
                     ack.activeChainCount = (NnUint)activeChain.size();
-                    network->write(ROOT_SOCKET_INDEX, &ack, sizeof(ack));
-                    if (!activeChain.empty()) network->write(ROOT_SOCKET_INDEX, activeChain.data(), activeChain.size() * sizeof(NnUint));
+                    std::vector<char> ackPayload(sizeof(ack) + activeChain.size() * sizeof(NnUint));
+                    std::memcpy(ackPayload.data(), &ack, sizeof(ack));
+                    if (!activeChain.empty()) std::memcpy(ackPayload.data() + sizeof(ack), activeChain.data(), activeChain.size() * sizeof(NnUint));
+                    writeWorkerFrame(network, LLM_WORKER_FRAME_STAGE_BYPASS_ACK, ackPayload.data(), ackPayload.size());
                 }
 
                 LlmKvExportRequestHeader exportReq{};
@@ -5733,7 +5771,7 @@ void runWorkerApp(AppCliArgs *args) {
                         p.execUs = 0u;
                         p.syncUs = 0u;
                         fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
-                        network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
+                        writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                     }
                     isFirstAttempt = true;
                     continue;
@@ -5777,7 +5815,7 @@ void runWorkerApp(AppCliArgs *args) {
                     p.bubbleDrainUs = bubbleStats.drainUs;
                     p.bubbleCompleted = bubbleStats.completed;
                     fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
-                    network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
+                    writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                 }
                 inference.maybeSendLastStageSampledToken(planPtr.get());
                 isFirstAttempt = true;

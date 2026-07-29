@@ -20,3 +20,8 @@ EdgeVisor/dllama_gpu_*
 *.d
 reasonix.toml
 .worktrees/
+
+# Auto-optimize benchmark artifacts
+EdgeVisor/pointer-swizzling-microbench
+auto_optimize_bench/logs/
+auto_optimize_bench/summary/

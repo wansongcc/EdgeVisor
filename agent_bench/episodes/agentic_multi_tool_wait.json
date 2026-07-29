@@ -1,0 +1,35 @@
+{
+  "id": "agentic_multi_tool_wait",
+  "description": "Multi-turn continuous tool-wait episode (Shadow L2 catch-up smoke). Five back-to-back tool calls, each with mid-latency mock tools, designed to exercise L2 catch-up under continuous tool-wait windows. No real network dependency; all tools are deterministic mock_* tools.",
+  "max_llm_turns": 12,
+  "max_tokens": 32,
+  "min_tool_calls": 5,
+  "required_tools": [
+    "mock_rest_api",
+    "mock_db_query",
+    "mock_vector_search",
+    "mock_sandbox_exec",
+    "mock_long_task"
+  ],
+  "required_tool_arguments": {
+    "mock_rest_api": {
+      "endpoint": "/api/v1/users/active"
+    },
+    "mock_db_query": {
+      "sql": "SELECT id, name FROM users WHERE active = 1"
+    },
+    "mock_vector_search": {
+      "query": "shadow kv migration tool wait",
+      "top_k": 3
+    },
+    "mock_sandbox_exec": {
+      "code": "echo shadow l2 smoke"
+    },
+    "mock_long_task": {
+      "duration_s": 2.0,
+      "label": "tool_wait_smoke"
+    }
+  },
+  "reject_duplicate_required_tools": true,
+  "task": "Run a five-step agent workflow with one mock_* tool per turn, then return a concise final report. Tools (use exactly one per turn, in any order): call the REST endpoint /api/v1/users/active, run the SQL SELECT id name FROM users WHERE active = 1, vector-search for shadow kv migration tool wait (top_k=3), run the sandbox command echo shadow l2 smoke, and finally the long-task labeled tool_wait_smoke. After all five observations, return one concise final report."
+}

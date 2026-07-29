@@ -4,14 +4,39 @@ import ast
 import hashlib
 import json
 import operator
+import os
+import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 
 class ToolError(RuntimeError):
     pass
+
+
+def _apply_tool_latency(name, default_ms):
+    override = os.environ.get('AGENT_BENCH_TOOL_LATENCY_MS__' + name)
+    if override is not None:
+        try:
+            ms = float(override)
+        except ValueError:
+            ms = default_ms
+    else:
+        g = os.environ.get('AGENT_BENCH_TOOL_LATENCY_MS')
+        if g is not None:
+            try:
+                ms = float(g)
+            except ValueError:
+                ms = default_ms
+        else:
+            ms = default_ms
+    if ms and ms > 0:
+        jittered = ms * (1.0 + random.uniform(-0.05, 0.05))
+        time.sleep(jittered / 1000.0)
+        return jittered
+    return 0.0
 
 
 _BIN_OPS = {
@@ -317,7 +342,91 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "description": "Search the web for a query and return top results (title, url, snippet).",
         "arguments": {"query": "string", "max_results": "number optional"},
     },
+    {
+        "name": "mock_rest_api",
+        "description": "Mock REST API call. Sleeps latency_ms (default 200) and returns a synthetic JSON response.",
+        "arguments": {"endpoint": "string", "params": "object optional", "latency_ms": "number optional"},
+    },
+    {
+        "name": "mock_db_query",
+        "description": "Mock SQL query. Sleeps latency_ms (default 500) and returns a synthetic tabular JSON.",
+        "arguments": {"sql": "string", "latency_ms": "number optional"},
+    },
+    {
+        "name": "mock_vector_search",
+        "description": "Mock vector similarity search. Sleeps latency_ms (default 100) and returns synthetic top-k hits.",
+        "arguments": {"query": "string", "top_k": "number optional", "latency_ms": "number optional"},
+    },
+    {
+        "name": "mock_sandbox_exec",
+        "description": "Mock sandboxed code execution (no actual exec). Sleeps latency_ms (default 1500) and returns synthetic stdout/exit_code.",
+        "arguments": {"code": "string", "latency_ms": "number optional"},
+    },
+    {
+        "name": "mock_long_task",
+        "description": "Block for duration_s seconds (default 5) and return a synthetic completion. For verifying L2 catch-up under very long tool-wait windows.",
+        "arguments": {"duration_s": "number optional", "label": "string optional"},
+    },
 ]
+
+
+def mock_rest_api(endpoint, params=None, latency_ms=200.0):
+    _apply_tool_latency('mock_rest_api', latency_ms)
+    payload = {
+        'endpoint': endpoint,
+        'params': params or {},
+        'status': 200,
+        'body': {'ok': True, 'echo': endpoint,
+                 'fingerprint': hashlib.sha256(
+                     json.dumps([endpoint, params or {}], sort_keys=True).encode()
+                 ).hexdigest()[:12]},
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def mock_db_query(sql, latency_ms=500.0):
+    _apply_tool_latency('mock_db_query', latency_ms)
+    h = hashlib.sha256(sql.encode()).hexdigest()
+    n_rows = 3 + (int(h[:2], 16) % 5)
+    rows = [
+        {'id': i, 'value': h[2 * i:2 * i + 8], 'score': (int(h[3 * i:3 * i + 4], 16) % 1000) / 1000.0}
+        for i in range(n_rows)
+    ]
+    return json.dumps({'sql': sql, 'rows': rows, 'rowcount': n_rows}, ensure_ascii=False)
+
+
+def mock_vector_search(query, top_k=5, latency_ms=100.0):
+    _apply_tool_latency('mock_vector_search', latency_ms)
+    h = hashlib.sha256(query.encode()).hexdigest()
+    hits = [
+        {'id': 'vec_%05d' % (int(h[i:i + 4], 16) % 100000),
+         'score': round(1.0 - i * 0.13 - (int(h[i + 1:i + 3], 16) % 50) / 1000.0, 4)}
+        for i in range(min(max(top_k, 1), 10))
+    ]
+    return json.dumps({'query': query, 'top_k': top_k, 'hits': hits}, ensure_ascii=False)
+
+
+def mock_sandbox_exec(code, latency_ms=1500.0):
+    _apply_tool_latency('mock_sandbox_exec', latency_ms)
+    h = hashlib.sha256(code.encode()).hexdigest()
+    return json.dumps({
+        'exit_code': 0,
+        'stdout': 'mock-stdout:' + h[:16],
+        'stderr': '',
+        'wall_ms': int(latency_ms),
+    }, ensure_ascii=False)
+
+
+def mock_long_task(duration_s=5.0, label='long_task'):
+    duration_s = max(float(duration_s), 0.0)
+    if duration_s > 0:
+        time.sleep(duration_s)
+    return json.dumps({
+        'label': label,
+        'duration_s': duration_s,
+        'status': 'done',
+        'fingerprint': hashlib.sha256(label.encode()).hexdigest()[:12],
+    }, ensure_ascii=False)
 
 
 _TOOL_FUNCS: Dict[str, Callable[..., str]] = {
@@ -332,6 +441,11 @@ _TOOL_FUNCS: Dict[str, Callable[..., str]] = {
     "compare_numbers": compare_numbers,
     "hash_text": hash_text,
     "web_search": web_search,
+    "mock_rest_api": mock_rest_api,
+    "mock_db_query": mock_db_query,
+    "mock_vector_search": mock_vector_search,
+    "mock_sandbox_exec": mock_sandbox_exec,
+    "mock_long_task": mock_long_task,
 }
 
 

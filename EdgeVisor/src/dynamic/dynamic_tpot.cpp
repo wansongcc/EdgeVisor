@@ -580,6 +580,7 @@ static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) 
     const json &bypass = status.at("stageBypass");
     const unsigned long long generation = bypass.value("appliedGeneration", 0ull);
     if (generation <= rt.lastObservedStageBypassGeneration || !rt.hasCommittedPpLayout) return false;
+    if (bypass.value("verifiedGeneration", 0ull) < generation) return false;
     // A root-side bypass may arrive while an earlier PP command is still in
     // flight. Retain this generation in status and commit it only after the
     // pending command reaches its explicit terminal path below.
@@ -966,6 +967,17 @@ void DynamicTpotController::run() {
             if (recentTpotWindows.size() > 3u) recentTpotWindows.erase(recentTpotWindows.begin());
 
             const bool bypassCommitted = commitAppliedStageBypass(rt, status);
+            if (status.contains("stageBypass") && status.at("stageBypass").is_object()) {
+                const json &bypass = status.at("stageBypass");
+                const unsigned long long applied = bypass.value("appliedGeneration", 0ull);
+                const unsigned long long verified = bypass.value("verifiedGeneration", 0ull);
+                if (applied > rt.lastObservedStageBypassGeneration && verified < applied) {
+                    if (rt.topologyFenceGeneration == 0ull) {
+                        rt.topologyFenceGeneration = applied;
+                        rt.topologyFenceStartPos = window.posEnd;
+                    }
+                }
+            }
             std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status);
             if (!rt.hasCommittedPpLayout) {
                 rt.committedPpLayout = stages;

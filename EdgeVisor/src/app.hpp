@@ -463,6 +463,7 @@ private:
         const std::vector<NnUint> &layers);
     void consumeStageBypassAckFrame(NnUint socketIndex, const std::vector<char> &payload);
     void tryVerifyStageBypassAcks();
+    void pollStageBypassAckFrames();
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;

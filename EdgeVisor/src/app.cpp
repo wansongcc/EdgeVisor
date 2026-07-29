@@ -3757,6 +3757,21 @@ void RootLlmInference::tryVerifyStageBypassAcks() {
     stageBypassVerifiedGeneration = stageBypassPendingGeneration;
 }
 
+void RootLlmInference::pollStageBypassAckFrames() {
+    if (network == nullptr || stageBypassPendingGeneration == 0u || stageBypassVerifiedGeneration >= stageBypassPendingGeneration) return;
+    for (NnUint node : stageBypassExpectedAckNodes) {
+        const int socket = network->getSocketIndexForNode(node, 0u);
+        if (socket < 0 || stageBypassAckCache.count(node) != 0u) continue;
+        LlmWorkerFrameHeader peek{};
+        if (!network->tryPeekWithMaxAttempts((NnUint)socket, &peek, sizeof(peek), 1ul) ||
+                peek.magic != LLM_WORKER_FRAME_MAGIC || peek.version != LLM_WORKER_FRAME_VERSION ||
+                peek.kind != LLM_WORKER_FRAME_STAGE_BYPASS_ACK) continue;
+        LlmWorkerFrameHeader frame{};
+        std::vector<char> payload;
+        if (readWorkerFrame(network, (NnUint)socket, frame, payload, 1)) consumeStageBypassAckFrame((NnUint)socket, payload);
+    }
+}
+
 LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
     LlmPerfPacket rootPacket{};
     rootPacket.position = controlPacket.position;
@@ -4087,6 +4102,7 @@ bool RootLlmInference::recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUi
 }
 
 void RootLlmInference::forward(bool collectProfile) {
+    pollStageBypassAckFrames();
     lastBubbleShadowStats = {};
     bool sendKvTransfer = false;
     bool sendLayerSwitch = false;

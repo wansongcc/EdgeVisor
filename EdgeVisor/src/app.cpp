@@ -3597,7 +3597,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     sbh.magic = LLM_LAYER_SWITCH_BATCH_MAGIC;
     sbh.version = LLM_LAYER_SWITCH_BATCH_VERSION;
     sbh.count = (NnUint)switchLayers.size();
-    sbh.reserved = 0u;
+    sbh.reserved = bypassGeneration;
     network->writeAll(&sbh, sizeof(sbh));
     bool stageBypassFlagEmitted = false;
     NnUint ppStartBoundaryLayer = 0xFFFFFFFFu;
@@ -3624,7 +3624,6 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         if (layer == ppStartBoundaryLayer) switchPkt.reserved0 |= ppStartFlag;
         switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
         switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
-        switchPkt.bypassGeneration = bypassGeneration;
         stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
         network->writeAll(&switchPkt, sizeof(switchPkt));
     }
@@ -4952,6 +4951,7 @@ bool WorkerLlmInference::tryReadControlPacket() {
         LlmLayerSwitchBatchHeader sbh{};
         network->read(ROOT_SOCKET_INDEX, &sbh, sizeof(sbh));
         if (sbh.magic == LLM_LAYER_SWITCH_BATCH_MAGIC && sbh.version == LLM_LAYER_SWITCH_BATCH_VERSION) {
+            layerSwitchBypassGeneration_ = sbh.reserved;
             for (NnUint i = 0u; i < sbh.count; ++i) {
                 LlmLayerSwitchPacket pkt{};
                 network->read(ROOT_SOCKET_INDEX, &pkt, sizeof(pkt));
@@ -5665,7 +5665,7 @@ void runWorkerApp(AppCliArgs *args) {
                         }
                         if ((switchPkt.reserved0 & LLM_LAYER_SWITCH_STAGE_BYPASS) != 0u) {
                             sawStageBypass = true;
-                            bypassGeneration = switchPkt.bypassGeneration;
+                            bypassGeneration = inference.layerSwitchBypassGeneration();
                             bypassEjectedStage = switchPkt.reserved1;
                             bypassTargetStage = switchPkt.reserved2;
                             const bool ok = applyPpStageBypass(planPtr.get(), switchPkt.reserved1, switchPkt.reserved2);

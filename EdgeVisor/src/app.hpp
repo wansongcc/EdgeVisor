@@ -201,8 +201,9 @@ typedef struct {
     NnUint reserved0;      // flags
     NnUint reserved1;      // optional ejected stage index
     NnUint reserved2;      // optional target stage index
-    NnUint bypassGeneration; // non-zero for every packet in one bypass transition
 } LlmLayerSwitchPacket;
+static_assert(sizeof(LlmLayerSwitchPacket) == sizeof(NnUint) * 8u,
+    "layer-switch packet is a fixed wire ABI; put transition metadata in the batch header");
 
 enum LlmStageBypassAckFlags : NnUint {
     LLM_STAGE_BYPASS_ACK_NEXT_REROUTED = 1u << 0,
@@ -579,6 +580,7 @@ public:
     NnUint batchSize() const { return controlPacket.batchSize; }
     NnUint flags() const { return controlPacket.flags; }
     bool consumeLayerSwitch(LlmLayerSwitchPacket &packet);
+    NnUint layerSwitchBypassGeneration() const { return layerSwitchBypassGeneration_; }
     void flushPendingKvAck();
     bool consumePendingKvTransfer(LlmKvTransferHeader &hdr, std::vector<float> &kRow, std::vector<float> &vRow);
     bool consumeKvExportRequest(LlmKvExportRequestHeader &hdr, std::vector<NnUint> &layers);
@@ -602,6 +604,7 @@ private:
     std::deque<PendingKvTransferItem> pendingKvTransfers;
     std::vector<LlmKvAckPacket> pendingKvAcks;
     std::deque<LlmLayerSwitchPacket> pendingLayerSwitches;
+    NnUint layerSwitchBypassGeneration_ = 0u;
     std::deque<std::pair<LlmKvExportRequestHeader, std::vector<NnUint>>> pendingKvExportRequests;
 public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex, NnUint logitsPipeIndex, Sampler *lastStageSampler);

@@ -468,3 +468,63 @@ CUDA backend，LSS on，`--last-stage-sampling --enable-pp-migration --enable-pl
 GPU 被挤占 → per-step sync 拉长 → bubble 窗口变长但工作量同步放大 →
 b8 时 bubble 装不下 → drain 落到关键路径。这正是 README 主线的来源。
 
+
+## Shadow L2 多轮连续 tool-wait（GPU 4xT4 CUDA，2026-07-30）
+
+补充 README 之前单窗口 `shadow_l2_case.sh` 数据的多轮版本。Topology
+`1@7*1@7*1@7*1@7`，3B q40，CUDA backend。
+
+**`shadow_l2_multi_window_gpu.sh`** 在单个 chat session 内驱动 5 个连续
+`tool_window_begin → sleep 6s (模拟工具) → tool_window_end` 循环，
+观察 `shadow_debt` / `catchupEntries` / `catchupUs` 在每轮的变化。
+
+### 实测数据（4xT4 空 GPU，NB=8 STEPS=24）
+
+**mode = `l2_l1off`（强制所有 shadow 工作进 debt，最能体现 L2 价值）：**
+
+| window | pre debtEntries | pre debtBytes | mid catchupEntries | mid catchupUs (累计) | post debtEntries |
+|---|---|---|---|---|---|
+| 1 | **62** | **1008272** (1MB) | 62 | 46760 | **0** |
+| 2 | 0 | 0 | 0 | 46761 | 0 |
+| 3 | 0 | 0 | 0 | 46762 | 0 |
+| 4 | 0 | 0 | 0 | 46763 | 0 |
+| 5 | 0 | 0 | 0 | 46764 | 0 |
+
+→ **Window 1：62 entries / 1MB debt 在 46.7ms 内全部清空**；
+→ 后续 4 个 window 无新 debt（tool-wait 间 idle），但 L2 后台线程每轮都被触发
+（catchupUs 递增 1），证明机制持续运行、不死锁、不漏消息。
+
+**Worker / Root 日志确认**：
+- `worker1.log`：`🫧 [shadow-l2] catch-up completed=62 remaining=0 elapsed_us=45250`
+- `root.log`：`🫧 [shadow-l2] catch-up completed=62`（root 后台线程也跑了）
+
+**mode = `l2`（自然 L2，L1 仍在 bubble 内做能塞下的部分）：**
+
+| window | mid catchupEntries | mid catchupUs |
+|---|---|---|
+| 1 | 62 | 23906 |
+
+→ 自然 L2 模式下也有 62 entries 的 debt（说明 L1 bubble 在 GPU async + boundary
+shadow 设置下不能完全装下），同样在 tool-wait 内清完，耗时 23.9ms（比 L1
+disabled 模式还快，因为部分 shadow 工作 L1 已经做了）。
+
+### 复现命令
+
+```bash
+# 强制 debt 模式（最能体现 L2 价值）
+bash tests/shadow-kv-diag/shadow_l2_multi_window_gpu.sh mw_gpu l2_l1off 8 24 5
+# 自然 L2 模式
+bash tests/shadow-kv-diag/shadow_l2_multi_window_gpu.sh mw_gpu l2 8 24 5
+```
+
+每个 mode 约 5–6 分钟（worker init + chat turn 1 + 5 × 8s windows）。
+日志落在 `runtime_logs/shadow_kv_diag/<tag>/`。
+
+### 与单窗口 `shadow_l2_case.sh` 的对照
+
+| 脚本 | window 数 | 数据侧重 | 验证结论 |
+|---|---|---|---|
+| `shadow_l2_case.sh` | 1 | 单一窗口的 debt-clear 时延 | 60 entries / 421ms（已有 README 数据） |
+| `shadow_l2_multi_window_gpu.sh` | 5 | 机制持续运行、无丢消息、不死锁 | 62 entries / 46.7ms + 5 个 window 平稳 |
+| `shadow_l2_multi_window.sh` (CPU) | 5 | 同上但 CPU back-end | 5 个 window 无崩，机制可达（数据受 CPU init 慢拖累） |
+

@@ -428,3 +428,43 @@ cd ~/B01/EdgeVisor && DLLAMA_SHADOW_L1_DISABLE=1 \
 - 结论：8B + batch=8 时 L1 的 bubble 装不下（drain 4.05ms/fwd 上关键路径），
   L2 把 drain 挪进 stash，瓶颈 stage 显著变快——two-level Slack 设计故事在
   8B 上成立。
+
+## 8B 全 batchsize 矩阵（b2/b4/b8，4-GPU PP empty GPU，2026-07-30）
+
+补充 README 之前 8B b1/b8 spot check 缺失的中间 batch。Topology `1@8*1@8*1@8*1@8`，
+CUDA backend，LSS on，`--last-stage-sampling --enable-pp-migration --enable-plan-barrier`。
+
+**Stage 1（右边界 shadow stage，per-fwd）：**
+
+| batch | off | L1 (drain) | L2 (drain) | bubbleOps L1 / L2 |
+|---|---|---|---|---|
+| 2 | 112.69 ms | 117.28 ms (0.48) | **115.65 ms (0.00)** | 882 / 441 |
+| 4 |  98.55 ms | 107.42 ms (0.42) | **104.81 ms (0.00)** | 612 / 306 |
+| 8 |  94.92 ms | 100.86 ms (0.37) | **111.06 ms (0.00)** | 468 / 234 |
+
+**Token 一致性**：9 个 case（b2/b4/b8 × off/L1/L2）md5 全等
+`5f6d3d718645b6dd98321ae8f2ea9348`，无任何语义回归。
+
+**关键观察**：
+- 空 GPU 时 L1 drain 维持在 0.37–0.48 ms/fwd，跨 batch 没有显著放大；之前
+  README 中 b8 drain=4.05 ms/fwd 是在共享 vLLM 卡时测的。
+- L2 bubbleOps 恰好是 L1 的一半（441/882, 306/612, 234/468）：L2 只在 bubble
+  窗口内做能塞下的部分，剩下都进 debt 等 tool-wait 清理。
+- b2/b4/b8 纯 inference（无工具）下 L2 的主路径耗时 vs L1 在噪声量级相当，
+  L2 略慢（+0.5–10 ms），是 debt bookkeeping 的代价 —— 因为没有
+  tool-wait 窗口来清债。这是 **L2 设计假设的反向验证**：L2 仅在 agentic
+  tool-wait 场景下提供收益；在纯 inference（无工具）下是开销不是收益。
+- 复现命令：`bash tests/shadow-kv-diag/matrix_8b_case.sh 2,4,8`，日志
+  落在 `runtime_logs/gpu_8b_matrix/`，summary 自动写到 `summary.md`。
+
+### 8B b8 在共享 GPU vs 空 GPU 的 drain 对比
+
+| 条件 | b8 stage1 L1 drain | 备注 |
+|---|---|---|
+| 共享 vLLM（README 旧数据 @ ed86511+） | **4.05 ms/fwd** | bubble 7.64，L1 drain 在关键路径 |
+| 空 GPU（本批 b8） | 0.37 ms/fwd | bubble 0.78，几乎全部装下 |
+
+→ 验证了"drain 大小随 bubble 时长（=sync 时长）放大"的设计故事：
+GPU 被挤占 → per-step sync 拉长 → bubble 窗口变长但工作量同步放大 →
+b8 时 bubble 装不下 → drain 落到关键路径。这正是 README 主线的来源。
+

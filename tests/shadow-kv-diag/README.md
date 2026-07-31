@@ -528,3 +528,22 @@ bash tests/shadow-kv-diag/shadow_l2_multi_window_gpu.sh mw_gpu l2 8 24 5
 | `shadow_l2_multi_window_gpu.sh` | 5 | 机制持续运行、无丢消息、不死锁 | 62 entries / 46.7ms + 5 个 window 平稳 |
 | `shadow_l2_multi_window.sh` (CPU) | 5 | 同上但 CPU back-end | 5 个 window 无崩，机制可达（数据受 CPU init 慢拖累） |
 
+
+### off 模式对照 + token 一致性（追加，2026-07-31）
+
+跑 `mode=off` 的 multi-window GPU 测试，对照 L2 是否改变生成内容。
+
+**md5 比较（multi-window GPU，4xT4，3B q40，NB=8 STEPS=24，相同 prompt/seed）：**
+
+| mode | raw token md5 | normalized md5 (strip whitespace) | normalized text |
+|---|---|---|---|
+| off | `59d9119baf2b0a1076bb09a0efee79d3` | **`491004f03de80c2c4525364ef8a8c83c`** | `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20` |
+| l2_l1off | `491004f03de80c2c4525364ef8a8c83c` | **`491004f03de80c2c4525364ef8a8c83c`** | `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20` |
+| l2 (natural) | `491004f03de80c2c4525364ef8a8c83c` | **`491004f03de80c2c4525364ef8a8c83c`** | `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20` |
+
+→ 三个模式的 normalized token md5 **完全相同**！raw md5 的差异仅来自 off 模式
+在 chat binary 显示 token 时插入了空格；实际生成的 token 序列是相同的。
+
+**结论**：L2 在多轮 tool-wait 场景下生成内容与 off 一致；多轮窗口不引入任何
+semantic drift。
+

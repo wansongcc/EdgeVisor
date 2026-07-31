@@ -396,7 +396,10 @@ public:
     bool hasMigrationAck() const { return migrationAckSeen; }
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
-    bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
+    // timeoutMs > 0: bounded drain (poll with deadline) instead of a blocking
+    // read; used by the prefill drains where the last stage may legitimately
+    // skip sending (sampler unavailable / sample rejected).
+    bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr, int timeoutMs = 0);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
     void setSkipLogits(bool skip);
@@ -492,10 +495,24 @@ private:
     uint64_t lastMigrationStateTransferBytes = 0u;
     uint64_t lastMigrationExportedRows = 0u;
     bool batchMetadataDirty = false;
-    // Shadow L2 local catch-up thread state (root side).
+    // Shadow L2 local catch-up thread state (root side). All access to
+    // shadowCatchupThread (join/spawn) and the stop flag is serialized under
+    // shadowCatchupMutex: the UDS controller thread (tool_window ops) and the
+    // inference thread (forward entry / destructor) both call
+    // endShadowCatchupWindow(), and std::thread::join() is not safe to call
+    // concurrently.
+    std::mutex shadowCatchupMutex;
     std::thread shadowCatchupThread;
     std::atomic<bool> shadowCatchupStop{false};
     std::atomic<bool> shadowCatchupRunning{false};
+    void endShadowCatchupWindowLocked();
+    // Handler-set per-batch POS/SLT pipe values, recorded by setPosition()/
+    // setSlot() and replayed into the pipes by forward() after a catch-up
+    // join (the catch-up restore clobbers the pipes with the stashed entry's
+    // values; per-batch positions can be non-contiguous / slots non-zero, so
+    // they are not reconstructible from controlPacket.position alone).
+    std::vector<float> lastPosPipeValues;
+    std::vector<float> lastSlotPipeValues;
     bool collectSourceStageKvTransfers(NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);

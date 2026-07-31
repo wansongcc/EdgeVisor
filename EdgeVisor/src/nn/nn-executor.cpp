@@ -1294,6 +1294,11 @@ bool NnExecutor::restoreShadowL2Entry(const ShadowL2StashEntry &entry) {
 
 void NnExecutor::enforceShadowL2StashCap() {
     // Force-drain oldest entries on the critical path when over the byte cap.
+    // restoreShadowL2Entry() mutates shared execution state (batchSize, POS/SLT
+    // pipes) to the entry's values; mirror runShadowCatchup() and restore the
+    // current forward's batchSize afterwards so the next forward does not pick
+    // up a stale entry batch size (a stale batchSize=1 deadlocked PP before).
+    const NnUint savedBatchSize = netExecution != nullptr ? netExecution->batchSize : 0u;
     while (true) {
         {
             std::lock_guard<std::mutex> lock(bubbleShadowMutex);
@@ -1325,6 +1330,7 @@ void NnExecutor::enforceShadowL2StashCap() {
         std::printf("⚠️ [shadow-l2] stash cap exceeded; force-drained oldest debt on critical path\n");
         std::fflush(stdout);
     }
+    if (netExecution != nullptr) netExecution->batchSize = savedBatchSize;
 }
 
 NnUint NnExecutor::runShadowCatchup(const std::function<bool()> &shouldStop) {

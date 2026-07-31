@@ -2623,6 +2623,11 @@ void RootLlmInference::setPosition(NnUint position) {
         positionPipe[i] = (float)(position + i);
         if (slotPipe != nullptr) slotPipe[i] = 0.0f;
     }
+    // Backup for the forward() re-assert after a catch-up join.
+    lastPosPipeValues.resize(execution->batchSize);
+    for (NnUint i = 0; i < execution->batchSize; i++) lastPosPipeValues[i] = (float)(position + i);
+    lastSlotPipeValues.resize(execution->batchSize);
+    std::fill(lastSlotPipeValues.begin(), lastSlotPipeValues.end(), 0.0f);
 }
 
 void RootLlmInference::setPosition(NnUint batchIndex, NnUint position) {
@@ -2633,6 +2638,8 @@ void RootLlmInference::setPosition(NnUint batchIndex, NnUint position) {
         controlPacket.position = position;
     }
     positionPipe[batchIndex] = (float)position;
+    if (lastPosPipeValues.size() < execution->batchSize) lastPosPipeValues.resize(execution->batchSize, 0.0f);
+    lastPosPipeValues[batchIndex] = (float)position;
     if (position != controlPacket.position + batchIndex) batchMetadataDirty = true;
 }
 
@@ -2640,6 +2647,8 @@ void RootLlmInference::setSlot(NnUint batchIndex, NnUint slotId) {
     assert(batchIndex < execution->batchSize);
     if (slotPipe == nullptr) return;
     slotPipe[batchIndex] = (float)slotId;
+    if (lastSlotPipeValues.size() < execution->batchSize) lastSlotPipeValues.resize(execution->batchSize, 0.0f);
+    lastSlotPipeValues[batchIndex] = (float)slotId;
     if (slotId != 0u) batchMetadataDirty = true;
 }
 
@@ -2661,7 +2670,7 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
     }
 }
 
-bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *logit) {
+bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *logit, int timeoutMs) {
     if (!lastStageSamplingPlanSupported(plan) || network == nullptr) return false;
     const NnStageConfig &last = plan->stages[plan->nStages - 1u];
     const NnUint sourceNode = last.rootNodeIndex;
@@ -2670,7 +2679,21 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
     if (socketIndex < 0) return false;
 
     LlmSampledTokenPacket packet{};
-    network->read((NnUint)socketIndex, &packet, sizeof(packet));
+    if (timeoutMs > 0) {
+        // Bounded drain: the last stage may legitimately skip sending this
+        // packet (sampler unavailable, sample rejected with localToken < 0),
+        // while the sender-side plan check is stricter than the root's
+        // lastStageSamplingPlanSupported(). A blocking read here would hang
+        // the prefill path forever; poll with a deadline instead. When the
+        // packet was sent it is already in flight by the time the root's
+        // forward() returns, so a short deadline is a timeout only when the
+        // sender really did not produce one.
+        if (!tryReadKvAckWithDeadline(network, (NnUint)socketIndex, &packet, sizeof(packet), timeoutMs)) {
+            return false;
+        }
+    } else {
+        network->read((NnUint)socketIndex, &packet, sizeof(packet));
+    }
     if (packet.magic != LLM_SAMPLED_TOKEN_MAGIC || packet.version != LLM_SAMPLED_TOKEN_VERSION) {
         std::printf("⚠️  [last-stage-sampling] unexpected packet magic=0x%08x version=%u fromNode=%u\n",
             (unsigned)packet.magic,
@@ -3607,10 +3630,17 @@ bool RootLlmInference::beginShadowCatchupWindow() {
 
     // Repay the local (root) executor's debt on a background thread. Joined by
     // endShadowCatchupWindow(), which is also called at the start of forward().
-    endShadowCatchupWindow();
-    shadowCatchupStop.store(false);
-    shadowCatchupRunning.store(true);
-    shadowCatchupThread = std::thread([this]() {
+    // The join must be serialized: the UDS controller thread (tool_window_end)
+    // and the inference thread (forward entry / destructor) can both race into
+    // endShadowCatchupWindow(), and std::thread::join() is not safe to call
+    // concurrently. All thread mutation (stop flag, join, spawn) happens under
+    // shadowCatchupMutex.
+    {
+        std::lock_guard<std::mutex> lock(shadowCatchupMutex);
+        endShadowCatchupWindowLocked();
+        shadowCatchupStop.store(false);
+        shadowCatchupRunning.store(true);
+        shadowCatchupThread = std::thread([this]() {
         // The window may begin while the API server is still draining the
         // previous request's forward (the response is already on the wire).
         // Retry briefly instead of giving up: the isAlive guard is re-checked
@@ -3644,10 +3674,16 @@ bool RootLlmInference::beginShadowCatchupWindow() {
         }
         this->shadowCatchupRunning.store(false);
     });
+    }
     return true;
 }
 
 void RootLlmInference::endShadowCatchupWindow() {
+    std::lock_guard<std::mutex> lock(shadowCatchupMutex);
+    endShadowCatchupWindowLocked();
+}
+
+void RootLlmInference::endShadowCatchupWindowLocked() {
     shadowCatchupStop.store(true);
     if (shadowCatchupThread.joinable()) {
         shadowCatchupThread.join();
@@ -4117,10 +4153,19 @@ void RootLlmInference::forward(bool collectProfile) {
         if (execution != nullptr && executor != nullptr && executor->isShadowL2Enabled()) {
             execution->setBatchSize(controlPacket.batchSize);
             execution->setPosition(controlPacket.position);
-            if (!batchMetadataDirty && positionPipe != nullptr) {
-                for (NnUint i = 0; i < controlPacket.batchSize; i++) {
-                    positionPipe[i] = (float)(controlPacket.position + i);
-                    if (slotPipe != nullptr) slotPipe[i] = 0.0f;
+            // Replay the handler-set per-batch POS/SLT values recorded in
+            // setPosition()/setSlot(). The catch-up restore may have clobbered
+            // the pipes *after* the handler wrote them, and per-batch positions
+            // can be non-contiguous / slots non-zero (batchMetadataDirty), so
+            // they are not reconstructible from controlPacket.position alone.
+            if (positionPipe != nullptr) {
+                if (lastPosPipeValues.size() >= controlPacket.batchSize) {
+                    std::memcpy(positionPipe, lastPosPipeValues.data(),
+                        (size_t)controlPacket.batchSize * sizeof(float));
+                }
+                if (slotPipe != nullptr && lastSlotPipeValues.size() >= controlPacket.batchSize) {
+                    std::memcpy(slotPipe, lastSlotPipeValues.data(),
+                        (size_t)controlPacket.batchSize * sizeof(float));
                 }
             }
         }

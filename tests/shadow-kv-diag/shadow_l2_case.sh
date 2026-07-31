@@ -2,7 +2,7 @@
 # Shadow L2 (tool-wait catch-up) unit scenario, CPU only.
 # Uses chat mode: after a turn completes, the root idles on stdin => a real
 # tool-wait window. We then drive tool_window_begin/end + shadow_debt via UDS.
-# usage: run_l2_case.sh <tag> [nbatches] [steps]
+# usage: shadow_l2_case.sh <tag> [nbatches] [steps]
 set -u
 TAG="${1:?tag}"; NB="${2:-32}"; STEPS="${3:-48}"
 

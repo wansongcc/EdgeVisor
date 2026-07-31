@@ -17,7 +17,9 @@ rm -f "$SOCK"
 P1=$(( 26200 + BATCH * 10 + 1 )); P2=$(( 26200 + BATCH * 10 + 2 )); P3=$(( 26200 + BATCH * 10 + 3 ))
 BUBBLE_ENV=(DLLAMA_BUBBLE_SHADOW_KV=1 DLLAMA_BUBBLE_SHADOW_KV_ASYNC=1 DLLAMA_BUBBLE_SHADOW_KV_LOG=1 DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1)
 
-FREE_MIN=$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits | awk '{print $2-$4}' | sort -n | head -1)
+# CSV fields are (total, used); the old `$2-$4` computed *used* instead of
+# *free*, so an empty GPU (used=0) was falsely SKIPped and a busy one passed.
+FREE_MIN=$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits | awk -F', ' '{print $1-$2}' | sort -n | head -1)
 if [ "$FREE_MIN" -lt 2500 ]; then
   echo "SKIP: min free VRAM ${FREE_MIN} MiB < 2500 MiB" | tee "$LOGDIR/SKIPPED.txt"
   exit 3

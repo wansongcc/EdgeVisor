@@ -62,7 +62,12 @@ done
 sleep 3
 echo "[$(date +%T)] worker init done. settling 3s."
 
-( printf '\n'; echo "Write a comma-separated list of the numbers from 1 to 20."; sleep 1800 ) | \
+# The stdin keeper runs as a tracked background job writing to a named pipe;
+# a bare `( ... ) | chat &` leaves the keeper's `sleep 1800` as an untracked
+# child, so the shutdown `wait` below would block for 30 minutes.
+mkfifo "$LOGDIR/chat_stdin.pipe" 2>/dev/null || true
+( printf '\n'; echo "Write a comma-separated list of the numbers from 1 to 20."; sleep 1800 ) >"$LOGDIR/chat_stdin.pipe" &
+STDIN_KEEPER=$!
 env DLLAMA_DUMP_KV_DIR="$DUMP" DLLAMA_NBATCHES="$NB" "${MODE_ENV[@]}" \
   "$BIN" chat \
   --steps "$STEPS" \
@@ -80,9 +85,9 @@ env DLLAMA_DUMP_KV_DIR="$DUMP" DLLAMA_NBATCHES="$NB" "${MODE_ENV[@]}" \
   --runtime-redundant-seg-enabled 0 \
   --last-stage-sampling \
   --plan-ctrl-socket "$SOCK" \
-  --benchmark >"$LOGDIR/root.log" 2>&1 &
+  --benchmark <"$LOGDIR/chat_stdin.pipe" >"$LOGDIR/root.log" 2>&1 &
 R1=$!
-echo "root pid=$R1"
+echo "root pid=$R1 stdin_keeper=$STDIN_KEEPER"
 
 # Wait for turn 1 to finish (root prints second "👱 User" while waiting for next input).
 echo "[$(date +%T)] waiting for root turn 1 to complete..."
@@ -101,6 +106,13 @@ for w in $(seq 1 "$NWIN"); do
   DB=$(python3 "$CLIENT" "$SOCK" shadow_debt 2>/dev/null || echo '{"ok":false}')
   echo "  pre:  $DB" | tee -a "$LOGDIR/multi_window.log"
   python3 "$CLIENT" "$SOCK" tool_window_begin >"$LOGDIR/win${w}_begin.json" 2>&1 || true
+  # The begin op is fire-and-forget; a dead socket or disabled L2 would make
+  # the debt assertions below pass vacuously, so require the window to have
+  # actually opened.
+  if ! grep -Eq '"ok": ?true' "$LOGDIR/win${w}_begin.json" 2>/dev/null; then
+    echo "  FAIL: tool_window_begin did not open (see win${w}_begin.json)" | tee -a "$LOGDIR/multi_window.log"
+    PASS=0
+  fi
   sleep 6   # simulate tool call duration (e.g. mock_long_task)
   DA=$(python3 "$CLIENT" "$SOCK" shadow_debt 2>/dev/null || echo '{"ok":false}')
   echo "  mid:  $DA" | tee -a "$LOGDIR/multi_window.log"
@@ -108,12 +120,23 @@ for w in $(seq 1 "$NWIN"); do
   python3 "$CLIENT" "$SOCK" tool_window_end >"$LOGDIR/win${w}_end.json" 2>&1 || true
   DF=$(python3 "$CLIENT" "$SOCK" shadow_debt 2>/dev/null || echo '{"ok":false}')
   echo "  post: $DF" | tee -a "$LOGDIR/multi_window.log"
+  # For l2_l1off we expect debt to drop to 0 in every window (all shadow work
+  # becomes debt, so a non-zero post debt means catch-up did not run).
+  if [ "$MODE" = "l2_l1off" ]; then
+    if echo "$DF" | grep -Eq '"debtEntries": ?0'; then
+      echo "  PASS: debt cleared in window $w" | tee -a "$LOGDIR/multi_window.log"
+    else
+      echo "  WARN: debt not zero after window $w" | tee -a "$LOGDIR/multi_window.log"
+      PASS=0
+    fi
+  fi
 done
 
 sleep 2
 echo "=== shutting down ===" | tee -a "$LOGDIR/multi_window.log"
-kill $R1 $W1 $W2 $W3 2>/dev/null
+kill $R1 $W1 $W2 $W3 "${STDIN_KEEPER:-}" 2>/dev/null
 wait 2>/dev/null
+rm -f "$LOGDIR/chat_stdin.pipe"
 
 # Extract generated tokens.
 python3 - "$LOGDIR/root.log" <<'PYEOF'
@@ -126,4 +149,9 @@ print("md5:", hashlib.md5(text.encode()).hexdigest())
 with open(sys.argv[1] + ".tokens.md5", "w") as f:
     f.write(hashlib.md5(text.encode()).hexdigest() + "\n")
 PYEOF
+
+if [ "${PASS:-1}" -ne 1 ]; then
+  echo "FAIL: not all windows cleared shadow debt (mode=$MODE)" >&2
+  exit 1
+fi
 echo "DONE"

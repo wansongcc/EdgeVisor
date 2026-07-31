@@ -2,7 +2,7 @@
 # Shadow L2 interrupt test (v2): large debt, interrupt catch-up mid-flight with
 # a new chat turn; verify catch-up stops (partial repayment), inference resumes
 # without extra stall, and a later window repays the rest. CPU only.
-# usage: run_l2_interrupt.sh <tag> [steps]
+# usage: shadow_l2_interrupt.sh <tag> [steps]
 set -u
 TAG="${1:?tag}"; STEPS="${2:-10}"
 

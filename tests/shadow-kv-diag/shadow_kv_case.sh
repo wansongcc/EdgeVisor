@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shadow KV numerical-diagnosis runner (CPU only).
-# usage: run_case.sh <tag> <2pp|3pp> <async|sync|off> <nbatches> [steps]
+# usage: shadow_kv_case.sh <tag> <2pp|3pp> <async|sync|off> <nbatches> [steps]
 set -u
 TAG="${1:?tag}"; TOPO="${2:?2pp|3pp}"; MODE="${3:?async|sync|off}"; NB="${4:-1}"; STEPS="${5:-8}"; PROMPT="${6:-Write a comma-separated list of the numbers from 1 to 20.}"
 

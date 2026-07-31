@@ -48,7 +48,12 @@ done
 echo "[$(date +%T)] worker init done (or timeout). lines=$(wc -l <"$LOGDIR/worker1.log")"
 
 # --- Phase 2: launch root chat, hold stdin open ----------------------------
-( printf n; echo "Write a comma-separated list of the numbers from 1 to 20."; sleep 1800 ) | \
+# The stdin keeper runs as a tracked background job writing to a named pipe;
+# a bare `( ... ) | chat &` leaves the keeper's `sleep 1800` as an untracked
+# child, so the shutdown `wait` below would block for 30 minutes.
+mkfifo "$LOGDIR/chat_stdin.pipe" 2>/dev/null || true
+( printf '\n'; echo "Write a comma-separated list of the numbers from 1 to 20."; sleep 1800 ) >"$LOGDIR/chat_stdin.pipe" &
+STDIN_KEEPER=$!
 env DLLAMA_DUMP_KV_DIR="$DUMP" DLLAMA_NBATCHES="$NB" "${MODE_ENV[@]}" \
   "$BIN" chat \
   --steps "$STEPS" \
@@ -65,9 +70,9 @@ env DLLAMA_DUMP_KV_DIR="$DUMP" DLLAMA_NBATCHES="$NB" "${MODE_ENV[@]}" \
   --runtime-active-seg-enabled 1 \
   --runtime-redundant-seg-enabled 0 \
   --plan-ctrl-socket "$SOCK" \
-  --benchmark >"$LOGDIR/root.log" 2>&1 &
+  --benchmark <"$LOGDIR/chat_stdin.pipe" >"$LOGDIR/root.log" 2>&1 &
 R1=$!
-echo "root pid=$R1"
+echo "root pid=$R1 stdin_keeper=$STDIN_KEEPER"
 
 # Wait for turn 1 to finish (root prints second "👱 User" while waiting for next input).
 echo "[$(date +%T)] waiting for root turn 1 to complete..."
@@ -95,19 +100,23 @@ for w in $(seq 1 "$NWIN"); do
   DF=$(python3 "$CLIENT" "$SOCK" shadow_debt 2>/dev/null || echo {ok:false})
   echo "  post: $DF" | tee -a "$LOGDIR/multi_window.log"
   # For l2_l1off we expect debt to drop to 0; for others debt may be 0 throughout.
+  # The client prints json.dump(resp, indent=2), so the field is `"debtEntries": N`
+  # (quoted name); the old `debtEntries: ?0` pattern could never match it.
   if [ "$MODE" = "l2_l1off" ]; then
-    if echo "$DF" | grep -Eq debtEntries: ?0; then
+    if echo "$DF" | grep -Eq '"debtEntries": ?0'; then
       echo "  PASS: debt cleared in window $w" | tee -a "$LOGDIR/multi_window.log"
     else
       echo "  WARN: debt not zero after window $w" | tee -a "$LOGDIR/multi_window.log"
+      PASS=0
     fi
   fi
 done
 
 sleep 2
 echo "=== shutting down ===" | tee -a "$LOGDIR/multi_window.log"
-kill $R1 $W1 2>/dev/null
+kill $R1 $W1 "${STDIN_KEEPER:-}" 2>/dev/null
 wait 2>/dev/null
+rm -f "$LOGDIR/chat_stdin.pipe"
 
 # Extract generated tokens (everything after first "👱 Assistant:" line onwards).
 python3 - "$LOGDIR/root.log" <<PYEOF
@@ -120,4 +129,9 @@ print("md5:", hashlib.md5(text.encode()).hexdigest())
 with open(sys.argv[1] + ".tokens.md5", "w") as f:
     f.write(hashlib.md5(text.encode()).hexdigest() + "\n")
 PYEOF
+
+if [ "${PASS:-1}" -ne 1 ]; then
+  echo "FAIL: not all windows cleared shadow debt (mode=$MODE)" >&2
+  exit 1
+fi
 echo "DONE"

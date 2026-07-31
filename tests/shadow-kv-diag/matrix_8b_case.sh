@@ -5,9 +5,10 @@
 # usage: matrix_8b_case.sh [batch1,batch2,...]
 # default batches: 2,4,8
 #
-# GPU requirement: 4 T4-class GPUs (15 GiB each). This script intentionally
-# uses SPOT_MIN_FREE_MB=-1 to bypass the run_matrix_case.sh VRAM check
-# (the awk in that check returns 0 on empty GPUs and falsely SKIPs).
+# GPU requirement: 4 T4-class GPUs (15 GiB each). The run_matrix_case.sh VRAM
+# guard was previously broken (computed *used* instead of *free*, falsely
+# SKIPping empty GPUs); it is fixed now, so the old SPOT_MIN_FREE_MB=-1 bypass
+# is removed and the default 2500 MiB guard applies again.
 set -u
 
 ROOT="$HOME/B01/EdgeVisor"
@@ -17,7 +18,7 @@ mkdir -p "$LOGDIR"
 export SPOT_MODEL=/home/byh/B01/models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m
 export SPOT_TOKENIZER=/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
 export SPOT_RATIOS="1@8*1@8*1@8*1@8"
-export SPOT_MIN_FREE_MB=-1   # bypass the buggy empty-GPU VRAM check
+# (SPOT_MIN_FREE_MB defaults to 2500 in run_matrix_case.sh; no bypass needed)
 
 BATCHES="${1:-2,4,8}"
 MODES=(off l1 l2)
@@ -35,22 +36,28 @@ for BATCH in "${BARRAY[@]}"; do
     echo "=== running $TAG ==="
     bash "$ROOT/tests/shadow-kv-diag/run_matrix_case.sh" "$TAG" "$BATCH" "$MODE" \
       > "$LOGDIR/${TAG}.log" 2>&1
-    echo "  RC=$? log=$LOGDIR/${TAG}.log"
+    RC=$?
+    echo "  RC=$RC log=$LOGDIR/${TAG}.log"
 
     # Extract Stage 1 line + sync/fwd line for summary.
     LOG="$ROOT/runtime_logs/gpu_batch_matrix/$TAG/root.log"
-    if [ -f "$LOG" ]; then
+    if [ "$RC" -ne 0 ]; then
+      echo "| $BATCH | $MODE | SKIP/FAIL rc=$RC | | | |" >> "$summary"
+    elif [ -f "$LOG" ]; then
       PER_FWD=$(grep -E "Stage 1 Node 1: per-fwd total" "$LOG" | head -1 | grep -oE "per-fwd total=[ ]*[0-9.]+ ms" | head -1)
       DRAIN=$(grep -A1 "Stage 1 Node 1: per-fwd total" "$LOG" | tail -1 | grep -oE "bubbleDrain/fwd=[ 0-9.]+ ms" | head -1)
       SEG_OPS=$(grep -E "Stage 1 Node 1: per-fwd total" "$LOG" | head -1 | grep -oE "bubbleSeg=[0-9]+ bubbleOps=[0-9]+")
       COMPLETE=$(grep -A1 "Stage 1 Node 1: per-fwd total" "$LOG" | tail -1 | grep -oE "complete=[0-9]+/[0-9]+")
       echo "| $BATCH | $MODE | $PER_FWD | $DRAIN | $SEG_OPS | $COMPLETE |" >> "$summary"
 
-      # Token md5
+      # Token md5 (only for successful runs; a failed case's empty tokens.txt
+      # would otherwise md5-"match" every other failure vacuously).
       TOK="$ROOT/runtime_logs/gpu_batch_matrix/$TAG/tokens.txt"
-      if [ -f "$TOK" ]; then
+      if [ -f "$TOK" ] && [ -s "$TOK" ]; then
         MD5=$(md5sum "$TOK" | awk '{print $1}')
         echo "  tokens.md5=$MD5" >> "$LOGDIR/${TAG}.log"
+      else
+        echo "  tokens.md5=SKIPPED (rc=$RC)" >> "$LOGDIR/${TAG}.log"
       fi
     fi
   done
@@ -63,7 +70,7 @@ for BATCH in "${BARRAY[@]}"; do
   for MODE in "${MODES[@]}"; do
     TAG="8b_b${BATCH}_${MODE}"
     TOK="$ROOT/runtime_logs/gpu_batch_matrix/$TAG/tokens.txt"
-    if [ -f "$TOK" ]; then
+    if [ -f "$TOK" ] && [ -s "$TOK" ]; then
       MD5=$(md5sum "$TOK" | awk '{print $1}')
       echo "- $TAG: \`$MD5\`" >> "$summary"
     fi

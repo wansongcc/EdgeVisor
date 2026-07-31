@@ -18,8 +18,10 @@ case "$MODE" in
   *)   BUBBLE_ENV=() ;;
 esac
 
-# memory guard: refuse to run when free VRAM is too small
-FREE_MIN=$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits | awk '{print $2-$4}' | sort -n | head -1)
+# memory guard: refuse to run when free VRAM is too small.
+# CSV fields are (total, used); the old `$2-$4` computed *used* instead of
+# *free*, so an empty GPU (used=0) was falsely SKIPped and a busy one passed.
+FREE_MIN=$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits | awk -F', ' '{print $1-$2}' | sort -n | head -1)
 if [ "$FREE_MIN" -lt "${SPOT_MIN_FREE_MB:-2500}" ]; then
   echo "SKIP: min free VRAM ${FREE_MIN} MiB < ${SPOT_MIN_FREE_MB:-2500} MiB" | tee "$LOGDIR/SKIPPED.txt"
   exit 3

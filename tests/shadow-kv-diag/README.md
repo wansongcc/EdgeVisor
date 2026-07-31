@@ -108,16 +108,16 @@ root socket 做非阻塞 peek，发现新控制包立即中断回主循环（无
 
 ```bash
 # 单测场景（chat 模式构造真实 tool-wait 窗口；L1 禁用旋钮强制产生债务）
-DLLAMA_SHADOW_L1_DISABLE=1 bash run_l2_case.sh l2_unit_l1off
+DLLAMA_SHADOW_L1_DISABLE=1 bash shadow_l2_case.sh l2_unit_l1off
 # 中断测试（catch-up 中途来新请求，推理应立即继续）
-bash run_l2_interrupt.sh l2_interrupt
+bash shadow_l2_interrupt.sh l2_interrupt
 # L2 开启回归（正常 L1 窗口；债务≈0，数值仍逐位为 0）
-bash run_l2_case.sh l2_reg_b1 1 48
-bash run_l2_case.sh l2_reg_b2 2 48
-bash run_l2_case.sh l2_reg_b4 4 48
+bash shadow_l2_case.sh l2_reg_b1 1 48
+bash shadow_l2_case.sh l2_reg_b2 2 48
+bash shadow_l2_case.sh l2_reg_b4 4 48
 # 关键路径对照：L2 关 + L1 禁用（全部 drain）vs L2 开 + L1 禁用（debt stash）
-DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2off_l1disable_2pp 2pp async 1 48
-DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1 bash run_case.sh l2on_l1disable_2pp 2pp async 1 48
+DLLAMA_SHADOW_L1_DISABLE=1 bash shadow_kv_case.sh l2off_l1disable_2pp 2pp async 1 48
+DLLAMA_SHADOW_L2=1 DLLAMA_SHADOW_L1_DISABLE=1 bash shadow_kv_case.sh l2on_l1disable_2pp 2pp async 1 48
 ```
 
 ### 验证结果（2026-07-27，two-level-slack）
@@ -217,7 +217,9 @@ worker 进程也要显式 `--backend cuda`（BACKEND_AUTO 会落到 vulkan）。
 
 - 小规模（2 节点 PP，gpu0+gpu1）：`small_root.log`。RC=0，28.3 tok/s，
   无 CUDA error。
-- (a) bubble 窗口执行（`run_gpu_l2_interrupt.sh gpu4_interrupt`）：
+> 注：以下 (a)-(d) 为开发期 GPU 临时脚本（`run_gpu_*`）的验证记录，这些脚本未入库；
+> 现可用 `shadow_l2_multi_window_gpu.sh <tag> l2_l1off` 复现 (b) 的债务清零验证（含退出码断言）。
+- (a) bubble 窗口执行（`run_gpu_l2_interrupt.sh gpu4_interrupt`，未入库）：
   `segments=2 attn=2 layers=2 ops=18 completed=1 drain_us=0`（每个 forward
   两个右边界 shadow 段全部在 L1 窗口内完成）。
 - (b) L2 债务/补算（`run_gpu_l2_smoke.sh gpu4_bubble bubble`，L1-disable

@@ -21,6 +21,7 @@ META_RE = re.compile(r"(\w+)=([^\s]+)")
 
 def load_entries(dump_dir):
     entries = []
+    skipped = 0
     for meta_path in glob.glob(os.path.join(dump_dir, "*.meta")):
         meta = {}
         with open(meta_path) as f:
@@ -30,18 +31,27 @@ def load_entries(dump_dir):
         if not os.path.exists(f32_path):
             continue
         meta["path"] = f32_path
+        missing = [key for key in ("node", "seg", "layer", "batch", "pos", "slot",
+                                   "rowWidth", "dstColStart", "dstRowStride", "kvSlotStride")
+                   if key not in meta]
+        if missing:
+            # A dump without the full metadata (e.g. an interrupted run) used to
+            # abort the whole comparison with a KeyError; skip it and report.
+            skipped += 1
+            continue
         for key in ("node", "seg", "layer", "batch", "pos", "slot", "rowWidth",
                     "dstColStart", "dstRowStride", "kvSlotStride"):
             meta[key] = int(meta[key])
         entries.append(meta)
-    return entries
+    return entries, skipped
 
 
 def main():
-    dump_dir = sys.argv[1]
-    entries = load_entries(dump_dir)
+    fail_on_mismatch = "--fail-on-mismatch" in sys.argv[1:]
+    dump_dir = [a for a in sys.argv[1:] if not a.startswith("--")][0]
+    entries, skipped_meta = load_entries(dump_dir)
     if not entries:
-        print("no dump entries found")
+        print(f"no dump entries found (skipped {skipped_meta} incomplete metas)")
         return 1
 
     main_idx = defaultdict(list)  # (layer, kind, batch, pos) -> [entry]
@@ -58,17 +68,21 @@ def main():
         for e in es:
             main_by_lkb[(layer, kind, batch)].append(e)
 
-    print(f"total entries={len(entries)} red={len(red_entries)} main={sum(len(v) for v in main_idx.values())}")
+    print(f"total entries={len(entries)} red={len(red_entries)} main={sum(len(v) for v in main_idx.values())} skipped_meta={skipped_meta}")
     print()
     header = f"{'layer':>5} {'kind':>4} {'b':>2} {'pos':>4} {'redNode':>7} {'refNode':>7} {'maxAbsDiff':>12} {'meanAbsDiff':>12} {'refMaxAbs':>10} {'bestPos':>8} {'bestDiff':>12}"
     print(header)
     print("-" * len(header))
     n_ok = n_bad = 0
-    rows = []
+    n_unmatched = 0
     for e in sorted(red_entries, key=lambda x: (x["layer"], x["kind"], x["batch"], x["pos"])):
         key = (e["layer"], e["kind"], e["batch"], e["pos"])
         refs = [r for r in main_idx.get(key, []) if r["node"] != e["node"] and r["rowWidth"] == e["rowWidth"]]
         if not refs:
+            # Red entries without any reference (e.g. a stage that failed to
+            # dump) were silently ignored; count them so a missing dump is
+            # visible in the totals.
+            n_unmatched += 1
             continue
         red = np.fromfile(e["path"], dtype=np.float32)
         for r in refs:
@@ -93,13 +107,14 @@ def main():
             ok = max_d < 1e-3 * max(ref_max, 1.0)
             n_ok += ok
             n_bad += (not ok)
-            rows.append((e["layer"], e["kind"], e["batch"], e["pos"], e["node"], r["node"],
-                         max_d, mean_d, ref_max, best_pos, best_d, ok))
             print(f"{e['layer']:>5} {e['kind']:>4} {e['batch']:>2} {e['pos']:>4} {e['node']:>7} {r['node']:>7} "
                   f"{max_d:>12.6g} {mean_d:>12.6g} {ref_max:>10.4g} {str(best_pos):>8} {best_d:>12.6g}"
                   f"{'' if ok else '  <-- MISMATCH'}")
     print()
-    print(f"pairs compared: {n_ok + n_bad}, ok={n_ok}, mismatch={n_bad}")
+    print(f"pairs compared: {n_ok + n_bad}, ok={n_ok}, mismatch={n_bad}, unmatched_red={n_unmatched}")
+    if n_bad > 0 and fail_on_mismatch:
+        print("mismatches found and --fail-on-mismatch set")
+        return 2
     return 0
 
 

@@ -272,7 +272,13 @@ def _corpus_search(query: str, max_results: int) -> List[Dict[str, Any]]:
 
 
 def web_search(query: str, max_results: Any = 3) -> str:
-    limit = int(max_results)
+    # LLMs routinely emit numeric args as strings ("3" / "3.0" / "three").
+    # A ValueError here would escape run_tool (only KeyError/TypeError/ToolError
+    # are caught upstream) and abort the whole episode; coerce defensively.
+    try:
+        limit = int(max_results)
+    except (TypeError, ValueError):
+        limit = 3
     mode = "bing"
     try:
         results = _bing_search(query, limit)

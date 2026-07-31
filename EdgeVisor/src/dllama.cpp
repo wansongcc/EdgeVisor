@@ -669,7 +669,7 @@ static void inferenceRunContinuousBatching(AppInferenceContext *context, const c
             if (context->args->benchmark) addContinuousPerf(perfAgg, context->inference->getLastPerf());
             if (useRemoteSampling && batchSize == 1u) {
                 NnUint discard = 0u;
-                context->inference->tryReceiveLastStageSampledToken(discard, nullptr);
+                context->inference->tryReceiveLastStageSampledToken(discard, nullptr, 1000);
             }
             pos += batchSize;
         }
@@ -933,7 +933,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         // the perf/token packet sequence for all later decode tokens.
         if (context->args->lastStageSampling && context->network != nullptr && batchSize == 1u) {
             NnUint discardToken = 0u;
-            context->inference->tryReceiveLastStageSampledToken(discardToken, nullptr);
+            context->inference->tryReceiveLastStageSampledToken(discardToken, nullptr, 1000);
         }
 
         NnUint evalBubbleTime = 0;

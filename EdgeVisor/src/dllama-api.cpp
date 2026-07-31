@@ -433,7 +433,7 @@ public:
             // perf/token packet sequence for later decode tokens.
             if (args->lastStageSampling && network != nullptr && batchSize == 1u) {
                 NnUint discardToken = 0u;
-                inference->tryReceiveLastStageSampledToken(discardToken, nullptr);
+                inference->tryReceiveLastStageSampledToken(discardToken, nullptr, 1000);
             }
 
             i += batchSize;

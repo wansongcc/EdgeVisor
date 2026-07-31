@@ -19,7 +19,7 @@ mkdir -p "${SUMMARY_DIR}"
 SUMMARY="${SUMMARY_DIR}/${LABEL}_multi.txt"
 
 run_one() {
-  local NAME="$1" PORT1="$2" PORT2="$3" RATIOS="$4" STEPS="$5" PROMPT="$6" EXTRA="$7" SOCK="${8:-}"
+  local NAME="$1" PORT1="$2" PORT2="$3" RATIOS="$4" STEPS="$5" PROMPT="$6" EXTRA="$7" SOCK="${8:-}" UDS_CMD="${9:-}"
   local LOG="/tmp/bench_${NAME}_$$.log"
   cleanup() {
     if [[ -n "${P1:-}" ]]; then kill "${P1}" 2>/dev/null || true; fi
@@ -53,6 +53,12 @@ run_one() {
       if [[ -S "${SOCK}" ]]; then break; fi
       sleep 0.25
     done
+  fi
+  if [[ -n "${UDS_CMD}" ]]; then
+    # Issue the UDS control command while the root process is still alive
+    # (the socket dies with the root; post-mortem sends hit a dead socket and
+    # measure plain inference instead of the intended migration).
+    bash -c "${UDS_CMD}"
   fi
   wait "${ROOT_PID}"
   local EVAL_MS=$(grep -A4 "Evaluation (root wall-clock)" "${LOG}" | grep "ms/tok" | sed -E "s/.*\(([0-9.]+) ms\/tok\).*/\1/")
@@ -95,9 +101,8 @@ for i in $(seq 1 ${RUNS}); do
   PORT1=$((20100 + i*10)); PORT2=$((20101 + i*10))
   SOCK=/tmp/dllama_bench_dyn_${i}.sock
   R=$(run_one "dynamic" ${PORT1} ${PORT2} "2:3:3" 96 "Write a comma-separated list of the numbers from 1 to 20." \
-    "--enable-stage-full-weights --enable-plan-barrier --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}")
-  python3 "${ROOT}/EdgeVisor/examples/plan-uds-client.py" "${SOCK}" set_plan --seq 501 --mode next_barrier --stage 0 --from 1 --to 2 --kind 1 --heads 1 --ffn 0 >/dev/null 2>&1 || true
-  wait "${ROOT_PID:-}" 2>/dev/null || true
+    "--enable-stage-full-weights --enable-plan-barrier --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}" \
+    "python3 \"${ROOT}/EdgeVisor/examples/plan-uds-client.py\" \"${SOCK}\" set_plan --seq 501 --mode next_barrier --stage 0 --from 1 --to 2 --kind 1 --heads 1 --ffn 0 >/dev/null 2>&1 || true")
   DYNAMIC+=("${R}")
   echo "dynamic_run${i}: ${R}" >> "${SUMMARY}"
 done
@@ -109,9 +114,8 @@ for i in $(seq 1 ${RUNS}); do
   PORT1=$((20200 + i*10)); PORT2=$((20201 + i*10))
   SOCK=/tmp/dllama_bench_pp_${i}.sock
   R=$(run_one "pp" ${PORT1} ${PORT2} "1@8*1@10*1@10" 64 "Tell me a long story about distributed inference systems with multiple GPU nodes." \
-    "--enable-pp-migration --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}")
-  python3 "${ROOT}/EdgeVisor/examples/plan-uds-client.py" "${SOCK}" set_pp_migration --seq 301 --mode next_barrier --from 0 --to 1 --layer-count 1 --trigger-pos 0 >/dev/null 2>&1 || true
-  wait "${ROOT_PID:-}" 2>/dev/null || true
+    "--enable-pp-migration --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}" \
+    "python3 \"${ROOT}/EdgeVisor/examples/plan-uds-client.py\" \"${SOCK}\" set_pp_migration --seq 301 --mode next_barrier --from 0 --to 1 --layer-count 1 --trigger-pos 0 >/dev/null 2>&1 || true")
   PP+=("${R}")
   echo "pp_run${i}: ${R}" >> "${SUMMARY}"
 done

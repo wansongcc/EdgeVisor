@@ -23,7 +23,7 @@ cd "${ENGINE}" || exit 2
 G0=0; G1=1; G2=2
 
 run_test() {
-  local NAME="$1" PORT1="$2" PORT2="$3" RATIOS="$4" STEPS="$5" PROMPT="$6" EXTRA="$7" SOCK="${8:-}"
+  local NAME="$1" PORT1="$2" PORT2="$3" RATIOS="$4" STEPS="$5" PROMPT="$6" EXTRA="$7" SOCK="${8:-}" UDS_CMD="${9:-}"
   local TEST_LOG="${LOG_ROOT}/${NAME}"
   mkdir -p "${TEST_LOG}"
   unset P1 P2 ROOT_PID
@@ -61,6 +61,13 @@ run_test() {
       sleep 0.25
     done
   fi
+  if [[ -n "${UDS_CMD}" ]]; then
+    # Issue the UDS control command while the root process is still alive.
+    # The socket is created by the root and dies with it, so a command sent
+    # after `wait` below can only hit a dead socket (swallowed by `|| true`),
+    # silently measuring plain inference instead of the intended migration.
+    bash -c "${UDS_CMD}"
+  fi
   wait "${ROOT_PID}"
   local RC=$?
   echo "test=${NAME} rc=${RC}" | tee -a "${LOG_ROOT}/meta.txt"
@@ -70,14 +77,12 @@ run_test "static_uneven" 19501 19502 "2:3:3" 128 "Write a clear explanation of d
 SOCK=/tmp/dllama_bench_heads.sock
 run_test "dynamic_heads" 19701 19702 "2:3:3" 96 \
   "Write a comma-separated list of the numbers from 1 to 20." \
-  "--enable-stage-full-weights --enable-plan-barrier --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}"
-python3 "${ROOT}/EdgeVisor/examples/plan-uds-client.py" "${SOCK}" set_plan --seq 501 --mode next_barrier --stage 0 --from 1 --to 2 --kind 1 --heads 1 --ffn 0 >"${LOG_ROOT}/dynamic_heads/uds_set_plan.json" 2>&1 || true
-wait "${ROOT_PID:-}" 2>/dev/null || true
+  "--enable-stage-full-weights --enable-plan-barrier --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}" \
+  "python3 \"${ROOT}/EdgeVisor/examples/plan-uds-client.py\" \"${SOCK}\" set_plan --seq 501 --mode next_barrier --stage 0 --from 1 --to 2 --kind 1 --heads 1 --ffn 0 >\"${LOG_ROOT}/dynamic_heads/uds_set_plan.json\" 2>&1 || true"
 SOCK=/tmp/dllama_bench_pp.sock
 run_test "pp_migration" 19301 19302 "1@8*1@10*1@10" 32 "Hi" \
-  "--enable-pp-migration --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}"
-python3 "${ROOT}/EdgeVisor/examples/plan-uds-client.py" "${SOCK}" set_pp_migration --seq 301 --mode next_barrier --from 0 --to 1 --layer-count 1 --trigger-pos 0 >"${LOG_ROOT}/pp_migration/uds_set_pp_migration.json" 2>&1 || true
-wait "${ROOT_PID:-}" 2>/dev/null || true
+  "--enable-pp-migration --enable-kv-redundancy-during-migration 1 --kv-redundancy 2" "${SOCK}" \
+  "python3 \"${ROOT}/EdgeVisor/examples/plan-uds-client.py\" \"${SOCK}\" set_pp_migration --seq 301 --mode next_barrier --from 0 --to 1 --layer-count 1 --trigger-pos 0 >\"${LOG_ROOT}/pp_migration/uds_set_pp_migration.json\" 2>&1 || true"
 SOCK=""
 run_test "agentic_proxy" 19511 19512 "2:3:3" 256 "You are an agent. Solve: x*x=49. Show steps then answer." "" ""
 

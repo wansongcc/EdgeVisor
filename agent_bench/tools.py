@@ -401,13 +401,24 @@ def mock_db_query(sql, latency_ms=500.0):
     return json.dumps({'sql': sql, 'rows': rows, 'rowcount': n_rows}, ensure_ascii=False)
 
 
+def _coerce_int(value, default):
+    # LLMs routinely emit numeric args as strings ("5" / "5.0"); a TypeError
+    # would escape run_tool (only KeyError/TypeError/ToolError are caught
+    # upstream) and abort the episode. Coerce defensively.
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def mock_vector_search(query, top_k=5, latency_ms=100.0):
     _apply_tool_latency('mock_vector_search', latency_ms)
+    top_k = min(max(_coerce_int(top_k, 5), 1), 10)
     h = hashlib.sha256(query.encode()).hexdigest()
     hits = [
         {'id': 'vec_%05d' % (int(h[i:i + 4], 16) % 100000),
          'score': round(1.0 - i * 0.13 - (int(h[i + 1:i + 3], 16) % 50) / 1000.0, 4)}
-        for i in range(min(max(top_k, 1), 10))
+        for i in range(top_k)
     ]
     return json.dumps({'query': query, 'top_k': top_k, 'hits': hits}, ensure_ascii=False)
 

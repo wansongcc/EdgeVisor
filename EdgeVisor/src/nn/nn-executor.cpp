@@ -1292,13 +1292,48 @@ bool NnExecutor::restoreShadowL2Entry(const ShadowL2StashEntry &entry) {
     return true;
 }
 
+NnExecutor::ShadowL2SharedState NnExecutor::saveShadowL2SharedState() const {
+    ShadowL2SharedState state{};
+    state.batchSize = netExecution != nullptr ? netExecution->batchSize : 0u;
+    if (netExecution == nullptr || netExecution->pipes == nullptr || state.batchSize == 0u) {
+        return state;
+    }
+    if (shadowL2PosPipeIndex < netExecution->nPipes) {
+        state.pos.assign(
+            netExecution->pipes[shadowL2PosPipeIndex],
+            netExecution->pipes[shadowL2PosPipeIndex] + state.batchSize);
+    }
+    if (shadowL2SlotPipeIndex != (NnUint)-1 && shadowL2SlotPipeIndex < netExecution->nPipes) {
+        state.slot.assign(
+            netExecution->pipes[shadowL2SlotPipeIndex],
+            netExecution->pipes[shadowL2SlotPipeIndex] + state.batchSize);
+    }
+    return state;
+}
+
+void NnExecutor::restoreShadowL2SharedState(const ShadowL2SharedState &state) {
+    if (netExecution == nullptr) return;
+    netExecution->batchSize = state.batchSize;
+    if (netExecution->pipes == nullptr || state.batchSize == 0u) {
+        return;
+    }
+    if (!state.pos.empty() && shadowL2PosPipeIndex < netExecution->nPipes) {
+        std::memcpy(netExecution->pipes[shadowL2PosPipeIndex], state.pos.data(),
+            (NnSize)state.pos.size() * sizeof(float));
+    }
+    if (!state.slot.empty() && shadowL2SlotPipeIndex != (NnUint)-1 && shadowL2SlotPipeIndex < netExecution->nPipes) {
+        std::memcpy(netExecution->pipes[shadowL2SlotPipeIndex], state.slot.data(),
+            (NnSize)state.slot.size() * sizeof(float));
+    }
+}
+
 void NnExecutor::enforceShadowL2StashCap() {
     // Force-drain oldest entries on the critical path when over the byte cap.
     // restoreShadowL2Entry() mutates shared execution state (batchSize, POS/SLT
-    // pipes) to the entry's values; mirror runShadowCatchup() and restore the
-    // current forward's batchSize afterwards so the next forward does not pick
-    // up a stale entry batch size (a stale batchSize=1 deadlocked PP before).
-    const NnUint savedBatchSize = netExecution != nullptr ? netExecution->batchSize : 0u;
+    // pipes) to the entry's values; restore the caller's forward state
+    // afterwards so the next forward does not pick up a stale entry batch size
+    // or stale positions (a stale batchSize=1 deadlocked PP before).
+    const ShadowL2SharedState savedState = saveShadowL2SharedState();
     while (true) {
         {
             std::lock_guard<std::mutex> lock(bubbleShadowMutex);
@@ -1323,6 +1358,14 @@ void NnExecutor::enforceShadowL2StashCap() {
         (void)runBubbleShadowRedundantChunk(0u, false, true);
         {
             std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+            if (!bubbleShadowComplete) {
+                // Chunk did not finish (e.g. ready-point gate not satisfied
+                // because the main path has not written pp_stage_out yet). Keep
+                // the entry with its progress for a later drain/catch-up window
+                // instead of silently dropping the debt.
+                if (!shadowL2Stash.empty()) shadowL2Stash.front().cursor = bubbleShadowCursor;
+                break;
+            }
             shadowL2StashBytes -= shadowL2EntryBytes(shadowL2Stash.front());
             shadowL2Stash.pop_front();
             shadowL2ForcedDrains += 1u;
@@ -1330,7 +1373,7 @@ void NnExecutor::enforceShadowL2StashCap() {
         std::printf("⚠️ [shadow-l2] stash cap exceeded; force-drained oldest debt on critical path\n");
         std::fflush(stdout);
     }
-    if (netExecution != nullptr) netExecution->batchSize = savedBatchSize;
+    restoreShadowL2SharedState(savedState);
 }
 
 NnUint NnExecutor::runShadowCatchup(const std::function<bool()> &shouldStop) {
@@ -1343,7 +1386,10 @@ NnUint NnExecutor::runShadowCatchup(const std::function<bool()> &shouldStop) {
     // thread to this node's compute device before launching any device work.
     applyCurrentThreadDevice();
 
-    const NnUint savedBatchSize = netExecution->batchSize;
+    // RestoreShadowL2Entry() clobbers the shared execution state (batchSize,
+    // POS/SLT pipes); snapshot the caller's forward state up front and restore
+    // it below so the caller never observes stale entry state.
+    const ShadowL2SharedState savedState = saveShadowL2SharedState();
     NnUint completed = 0u;
     const auto start = std::chrono::high_resolution_clock::now();
 
@@ -1377,12 +1423,17 @@ NnUint NnExecutor::runShadowCatchup(const std::function<bool()> &shouldStop) {
             shadowL2CatchupOps += stats.opStepsExecuted;
         }
         if (complete) {
-            std::lock_guard<std::mutex> lock(bubbleShadowMutex);
-            shadowL2StashBytes -= shadowL2EntryBytes(shadowL2Stash.front());
-            shadowL2Stash.pop_front();
-            shadowL2CatchupEntries += 1u;
-            completed += 1u;
+            {
+                std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+                shadowL2StashBytes -= shadowL2EntryBytes(shadowL2Stash.front());
+                shadowL2Stash.pop_front();
+                shadowL2CatchupEntries += 1u;
+                completed += 1u;
+            }
             // Debug KV dump for this entry's positions (same env as the app hook).
+            // Outside the lock: dumpKvShiftDebug writes one .f32 + .meta file
+            // per OP_SHIFT row, which must not block stats readers
+            // (getShadowL2DebtEntries / getLastBubbleShadowStats).
             const char *dumpDir = std::getenv("DLLAMA_DUMP_KV_DIR");
             if (dumpDir != nullptr && dumpDir[0] != '\0') {
                 dumpKvShiftDebug(dumpDir, entry.batchSize);
@@ -1395,7 +1446,7 @@ NnUint NnExecutor::runShadowCatchup(const std::function<bool()> &shouldStop) {
         }
     }
 
-    netExecution->batchSize = savedBatchSize;
+    restoreShadowL2SharedState(savedState);
     const unsigned long long elapsedUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - start).count();
     {

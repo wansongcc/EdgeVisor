@@ -266,6 +266,17 @@ private:
     void stashShadowL2Debt();
     void enforceShadowL2StashCap();
     bool restoreShadowL2Entry(const ShadowL2StashEntry &entry);
+    // Snapshot/restore of the shared execution state (batchSize + POS/SLT
+    // pipes) that restoreShadowL2Entry() clobbers with the stashed entry's
+    // values. Brackets a drain/catch-up pass so the caller's forward state
+    // survives untouched (a stale batchSize=1 deadlocked PP before).
+    struct ShadowL2SharedState {
+        NnUint batchSize;
+        std::vector<float> pos;   // first batchSize entries of the POS pipe
+        std::vector<float> slot;  // first batchSize entries of the SLT pipe
+    };
+    ShadowL2SharedState saveShadowL2SharedState() const;
+    void restoreShadowL2SharedState(const ShadowL2SharedState &state);
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
     NnBubbleShadowStats runBubbleShadowRedundantChunk(
         NnUint budgetUs,

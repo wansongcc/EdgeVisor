@@ -1990,7 +1990,11 @@ static void chat(AppInferenceContext *context) {
             // perf/token packet sequence for later decode tokens.
             if (context->args->lastStageSampling && context->network != nullptr && batchSize == 1u) {
                 NnUint discardToken = 0u;
-                context->inference->tryReceiveLastStageSampledToken(discardToken, nullptr);
+                // Bounded drain (see RootLlmInference::tryReceiveLastStageSampledToken):
+                // the last stage may legitimately skip sending this packet
+                // (sampler unavailable / sample rejected), so a blocking read
+                // here would hang the prefill path forever.
+                context->inference->tryReceiveLastStageSampledToken(discardToken, nullptr, 1000);
             }
 
             i += batchSize;

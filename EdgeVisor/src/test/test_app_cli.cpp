@@ -361,6 +361,39 @@ int main() {
     assert(!resolvePpMigrationLayers(
         bypassNonAdjacent, &bypassPlan, &bypassRuntimePlan, bypassNonAdjacentLayers, &rangeReason));
     assert(rangeReason == "PP stages must be adjacent on the active chain");
+
+    // The static provision map still says that stage 2 initially owns
+    // [34,39), while PP1 has transferred [34,38) to stage 1.  Bypass must
+    // derive its required range from the current primary owner, then validate
+    // only that range against stage 3's immutable provision.
+    NnUnevenPartitionPlan runtimeBypassPlan{};
+    runtimeBypassPlan.nStages = 4u;
+    runtimeBypassPlan.stages = new NnStageConfig[4]{};
+    for (NnUint stageIndex = 0u; stageIndex < runtimeBypassPlan.nStages; ++stageIndex) {
+        NnStageConfig &stage = runtimeBypassPlan.stages[stageIndex];
+        stage.stageIndex = stageIndex;
+        stage.startLayer = (stageIndex == 0u) ? 0u : (stageIndex == 1u) ? 18u :
+            (stageIndex == 2u) ? 34u : 39u;
+        stage.endLayer = (stageIndex == 0u) ? 18u : (stageIndex == 1u) ? 34u :
+            (stageIndex == 2u) ? 39u : 40u;
+        stage.nLayers = stage.endLayer - stage.startLayer;
+        stage.rootNodeIndex = stageIndex;
+        stage.nNodes = 1u;
+        stage.nodeIndices = new NnUint[1]{stageIndex};
+    }
+    setenv("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", "4", 1);
+    const RuntimeStageLayerPlan staticProvision = buildRuntimeStageLayerPlan(&runtimeBypassPlan, 40u);
+    RuntimePrimaryOwnership runtimeOwnership;
+    assert(initializeRuntimePrimaryOwnership(&staticProvision, runtimeOwnership, &rangeReason));
+    assert(applyRuntimePrimaryOwnershipMove(
+        runtimeOwnership, 2u, 1u, std::vector<NnUint>{34u, 35u, 36u, 37u}, &rangeReason));
+    std::vector<NnUint> runtimeBypassLayers;
+    assert(resolveStageBypassRuntimeLayers(
+        runtimeOwnership, &staticProvision, 2u, 3u, runtimeBypassLayers, &rangeReason));
+    assert((runtimeBypassLayers == std::vector<NnUint>{38u}));
+    // NnStageConfig owns nodeIndices and releases it from its destructor.
+    delete[] runtimeBypassPlan.stages;
+    runtimeBypassPlan.stages = nullptr;
     delete[] bypassPlan.ppPrevStageIndex;
     bypassPlan.ppPrevStageIndex = nullptr;
     delete[] bypassPlan.ppNextStageIndex;

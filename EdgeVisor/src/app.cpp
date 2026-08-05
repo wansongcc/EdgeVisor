@@ -2303,6 +2303,105 @@ bool resolvePpMigrationLayers(
     return true;
 }
 
+bool initializeRuntimePrimaryOwnership(
+    const RuntimeStageLayerPlan *provisionMap,
+    RuntimePrimaryOwnership &ownership,
+    std::string *reason) {
+    ownership = {};
+    if (provisionMap == nullptr || provisionMap->nLayers == 0u || provisionMap->nStages == 0u) {
+        if (reason != nullptr) *reason = "missing runtime provision map";
+        return false;
+    }
+    ownership.nLayers = provisionMap->nLayers;
+    ownership.nStages = provisionMap->nStages;
+    ownership.ownerByLayer.assign(ownership.nLayers, (NnUint)-1);
+    for (NnUint layer = 0u; layer < ownership.nLayers; ++layer) {
+        NnUint owner = (NnUint)-1;
+        for (NnUint stage = 0u; stage < ownership.nStages; ++stage) {
+            if (provisionMap->getRole(stage, layer) != RUNTIME_LAYER_PRIMARY) continue;
+            if (owner != (NnUint)-1) {
+                if (reason != nullptr) *reason = "runtime provision has non-unique primary owner for layer " + std::to_string(layer);
+                ownership = {};
+                return false;
+            }
+            owner = stage;
+        }
+        if (owner == (NnUint)-1) {
+            if (reason != nullptr) *reason = "runtime provision has no primary owner for layer " + std::to_string(layer);
+            ownership = {};
+            return false;
+        }
+        ownership.ownerByLayer[layer] = owner;
+    }
+    if (reason != nullptr) reason->clear();
+    return true;
+}
+
+bool applyRuntimePrimaryOwnershipMove(
+    RuntimePrimaryOwnership &ownership,
+    NnUint fromStageIndex,
+    NnUint toStageIndex,
+    const std::vector<NnUint> &layers,
+    std::string *reason) {
+    if (ownership.nLayers == 0u || ownership.nStages == 0u ||
+            ownership.ownerByLayer.size() != ownership.nLayers ||
+            fromStageIndex >= ownership.nStages || toStageIndex >= ownership.nStages ||
+            fromStageIndex == toStageIndex || layers.empty()) {
+        if (reason != nullptr) *reason = "invalid runtime primary ownership move";
+        return false;
+    }
+    for (NnUint layer : layers) {
+        if (layer >= ownership.nLayers || ownership.ownerByLayer[layer] != fromStageIndex) {
+            if (reason != nullptr) *reason = "runtime primary owner mismatch for layer " + std::to_string(layer);
+            return false;
+        }
+    }
+    for (NnUint layer : layers) ownership.ownerByLayer[layer] = toStageIndex;
+    if (reason != nullptr) reason->clear();
+    return true;
+}
+
+bool resolveStageBypassRuntimeLayers(
+    const RuntimePrimaryOwnership &ownership,
+    const RuntimeStageLayerPlan *provisionMap,
+    NnUint ejectedStageIndex,
+    NnUint targetStageIndex,
+    std::vector<NnUint> &layers,
+    std::string *reason) {
+    layers.clear();
+    if (provisionMap == nullptr || ownership.nLayers == 0u ||
+            ownership.nLayers != provisionMap->nLayers || ownership.nStages != provisionMap->nStages ||
+            ownership.ownerByLayer.size() != ownership.nLayers ||
+            ejectedStageIndex >= ownership.nStages || targetStageIndex >= ownership.nStages ||
+            ejectedStageIndex == targetStageIndex) {
+        if (reason != nullptr) *reason = "invalid runtime primary ownership snapshot";
+        return false;
+    }
+    for (NnUint layer = 0u; layer < ownership.nLayers; ++layer) {
+        if (ownership.ownerByLayer[layer] == ejectedStageIndex) layers.push_back(layer);
+    }
+    if (layers.empty()) {
+        if (reason != nullptr) *reason = "ejected stage has no runtime primary layers";
+        return false;
+    }
+    for (size_t i = 1u; i < layers.size(); ++i) {
+        if (layers[i] != layers[i - 1u] + 1u) {
+            layers.clear();
+            if (reason != nullptr) *reason = "ejected runtime primary layers are non-contiguous";
+            return false;
+        }
+    }
+    for (NnUint layer : layers) {
+        if (provisionMap->getRole(targetStageIndex, layer) != RUNTIME_LAYER_REDUNDANT) {
+            layers.clear();
+            if (reason != nullptr) *reason = "target stage lacks redundant runtime layer " + std::to_string(layer);
+            return false;
+        }
+    }
+    if (reason != nullptr) reason->clear();
+    return true;
+}
+
 NnUint ppStartLayerSwitchFlag(
     const RuntimeStageLayerPlan *runtimePlan,
     NnUint fromStageIndex,
@@ -2323,34 +2422,6 @@ NnUint ppStartLayerSwitchFlag(
         return LLM_LAYER_SWITCH_RESTORE_PP_START;
     }
     return 0u;
-}
-
-static bool stageHasRedundantCoverageLocal(
-    const RuntimeStageLayerPlan *runtimePlan,
-    const NnStageConfig *ejectedStage,
-    const NnStageConfig *targetStage,
-    std::string *reason = nullptr) {
-    if (runtimePlan == nullptr || ejectedStage == nullptr || targetStage == nullptr) {
-        if (reason != nullptr) *reason = "missing runtime/stage plan";
-        return false;
-    }
-    if (runtimePlan->nStages <= targetStage->stageIndex || runtimePlan->nLayers == 0u) {
-        if (reason != nullptr) *reason = "runtime plan does not cover target stage";
-        return false;
-    }
-    for (NnUint layer = ejectedStage->startLayer; layer < ejectedStage->endLayer; ++layer) {
-        if (layer >= runtimePlan->nLayers) {
-            if (reason != nullptr) *reason = "ejected layer outside runtime plan";
-            return false;
-        }
-        if (runtimePlan->getRole(targetStage->stageIndex, layer) != RUNTIME_LAYER_REDUNDANT) {
-            if (reason != nullptr) {
-                *reason = "target stage lacks redundant layer " + std::to_string(layer);
-            }
-            return false;
-        }
-    }
-    return true;
 }
 
 static std::vector<NnUint> stageNodeListLocal(const NnStageConfig *stage) {
@@ -2478,6 +2549,11 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->network = network;
     this->plan = plan;
     this->runtimePlan = (net != nullptr) ? &net->runtimeStageLayerPlan : nullptr;
+    std::string runtimeOwnershipReason;
+    if (!initializeRuntimePrimaryOwnership(runtimePlan, runtimePrimaryOwnership, &runtimeOwnershipReason)) {
+        std::printf("⚠️  [runtime-primary-owner] initialization failed: %s\n", runtimeOwnershipReason.c_str());
+        std::fflush(stdout);
+    }
     this->logitsSegmentIndices = findLogitsSegmentIndices(&net->nodeConfigs[0]);
     this->profileEnabled = profileEnabled;
     this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
@@ -3703,6 +3779,15 @@ void RootLlmInference::recordPpMigrationApplied() {
     ppMigrationAppliedFromNodeIndex = migrationFromNodeIndex;
     ppMigrationAppliedToNodeIndex = nextStageRootNode;
     ppMigrationAppliedLayers = migrationLayers;
+    const NnStageConfig *fromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
+    const NnStageConfig *toStage = findStageForNodeLocal(plan, nextStageRootNode);
+    std::string ownershipReason;
+    if (fromStage == nullptr || toStage == nullptr || !applyRuntimePrimaryOwnershipMove(
+            runtimePrimaryOwnership, fromStage->stageIndex, toStage->stageIndex, migrationLayers, &ownershipReason)) {
+        std::printf("⚠️  [runtime-primary-owner] PP commit failed: %s\n",
+            ownershipReason.empty() ? "invalid PP route" : ownershipReason.c_str());
+        std::fflush(stdout);
+    }
 }
 
 void RootLlmInference::recordStageBypassApplied(
@@ -3782,6 +3867,17 @@ void RootLlmInference::consumeStageBypassAckFrame(NnUint socketIndex, const std:
 void RootLlmInference::tryVerifyStageBypassAcks() {
     if (stageBypassPendingGeneration == 0u || stageBypassExpectedAckNodes.empty()) return;
     for (NnUint node : stageBypassExpectedAckNodes) if (stageBypassAckCache.count(node) == 0u) return;
+    std::string ownershipReason;
+    if (!applyRuntimePrimaryOwnershipMove(
+            runtimePrimaryOwnership,
+            stageBypassAppliedEjectedStage,
+            stageBypassAppliedTargetStage,
+            stageBypassAppliedLayers,
+            &ownershipReason)) {
+        stageBypassFailureReason = ownershipReason.empty()
+            ? "runtime primary ownership commit failed" : ownershipReason;
+        return;
+    }
     stageBypassReceivedAckNodes = stageBypassExpectedAckNodes;
     stageBypassVerifiedGeneration = stageBypassPendingGeneration;
 }
@@ -4520,7 +4616,14 @@ void RootLlmInference::forward(bool collectProfile) {
                     prevStageIndex != (NnUint)-1 &&
                     nextStageIndex != (NnUint)-1 &&
                     (targetStageIndex == prevStageIndex || targetStageIndex == nextStageIndex);
-                const bool covered = stageHasRedundantCoverageLocal(runtimePlan, ejectedStage, targetStage, &rejectReason);
+                migrationLayers.clear();
+                const bool covered = resolveStageBypassRuntimeLayers(
+                    runtimePrimaryOwnership,
+                    runtimePlan,
+                    ejectedStageIndex,
+                    targetStageIndex,
+                    migrationLayers,
+                    &rejectReason);
                 if (!adjacentTarget) {
                     rejectReason = "target stage is not an active neighbor of ejected stage";
                 }
@@ -4536,10 +4639,6 @@ void RootLlmInference::forward(bool collectProfile) {
                     migrationFromNodeIndex = ejectedStage->rootNodeIndex;
                     nextStageRootNode = targetStage->rootNodeIndex;
                     kvAckSocketIndex = (network != nullptr) ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
-                    migrationLayers.clear();
-                    for (NnUint layer = ejectedStage->startLayer; layer < ejectedStage->endLayer; ++layer) {
-                        appendUniqueLayer(migrationLayers, layer);
-                    }
                     {
                         std::lock_guard<std::mutex> lk(kvTransferMutex);
                         pendingLayerSwitchLayers = migrationLayers;

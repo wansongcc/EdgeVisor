@@ -123,6 +123,34 @@ bool resolvePpMigrationLayers(
     const RuntimeStageLayerPlan *runtimePlan,
     std::vector<NnUint> &layers,
     std::string *reason = nullptr);
+
+// Mutable primary ownership is intentionally distinct from the immutable
+// runtime provision map.  PP moves change ownership only after their switch
+// succeeds; bypass admission uses that ownership but validates the target
+// against the provision map.
+struct RuntimePrimaryOwnership {
+    NnUint nLayers = 0u;
+    NnUint nStages = 0u;
+    std::vector<NnUint> ownerByLayer;
+};
+
+bool initializeRuntimePrimaryOwnership(
+    const RuntimeStageLayerPlan *provisionMap,
+    RuntimePrimaryOwnership &ownership,
+    std::string *reason = nullptr);
+bool applyRuntimePrimaryOwnershipMove(
+    RuntimePrimaryOwnership &ownership,
+    NnUint fromStageIndex,
+    NnUint toStageIndex,
+    const std::vector<NnUint> &layers,
+    std::string *reason = nullptr);
+bool resolveStageBypassRuntimeLayers(
+    const RuntimePrimaryOwnership &ownership,
+    const RuntimeStageLayerPlan *provisionMap,
+    NnUint ejectedStageIndex,
+    NnUint targetStageIndex,
+    std::vector<NnUint> &layers,
+    std::string *reason = nullptr);
 NnUint ppStartLayerSwitchFlag(
     const RuntimeStageLayerPlan *runtimePlan,
     NnUint fromStageIndex,
@@ -478,6 +506,7 @@ private:
     bool profileEnabled = false;
     const NnUnevenPartitionPlan* plan = nullptr;
     const RuntimeStageLayerPlan* runtimePlan = nullptr;
+    RuntimePrimaryOwnership runtimePrimaryOwnership;
     bool skipLogits_ = false;
     std::vector<NnUint> logitsSegmentIndices;
     mutable std::mutex lastPerfMutex;

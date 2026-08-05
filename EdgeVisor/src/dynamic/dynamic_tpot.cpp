@@ -117,6 +117,7 @@ struct ControllerRuntime {
     std::map<uint32_t, uint32_t> softCapacityByStage;
     std::map<uint32_t, double> riskPenaltyByStage;
     std::vector<tpot::StageSnapshot> committedPpLayout;
+    std::vector<tpot::StageSnapshot> authoritativePpLayout;
     bool hasCommittedPpLayout = false;
     unsigned long long lastObservedAppliedGeneration = 0ull;
     unsigned long long lastObservedStageBypassGeneration = 0ull;
@@ -579,7 +580,8 @@ static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) 
     if (!status.contains("stageBypass") || !status.at("stageBypass").is_object()) return false;
     const json &bypass = status.at("stageBypass");
     const unsigned long long generation = bypass.value("appliedGeneration", 0ull);
-    if (generation <= rt.lastObservedStageBypassGeneration || !rt.hasCommittedPpLayout) return false;
+    if (generation <= rt.lastObservedStageBypassGeneration || !rt.hasCommittedPpLayout ||
+            rt.authoritativePpLayout.empty()) return false;
     if (bypass.value("verifiedGeneration", 0ull) < generation) return false;
     // A root-side bypass may arrive while an earlier PP command is still in
     // flight. Retain this generation in status and commit it only after the
@@ -594,13 +596,14 @@ static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) 
         appliedLayers.push_back(bypass.at("appliedLayers").at(i).get<uint32_t>());
     }
     uint32_t targetOldLayers = 0u;
-    for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
-        if (rt.committedPpLayout[i].stageIndex == target) targetOldLayers = rt.committedPpLayout[i].nLayers;
+    for (size_t i = 0u; i < rt.authoritativePpLayout.size(); ++i) {
+        if (rt.authoritativePpLayout[i].stageIndex == target) targetOldLayers = rt.authoritativePpLayout[i].nLayers;
     }
-    std::vector<tpot::StageSnapshot> mergedLayout = rt.committedPpLayout;
     std::vector<uint32_t> mergedChain;
-    if (!tpot::commitStageBypassLayout(mergedLayout, ejected, target, appliedLayers, &mergedChain)) return false;
-    rt.committedPpLayout.swap(mergedLayout);
+    if (!tpot::rebaseStageBypassLayout(
+            rt.committedPpLayout, rt.authoritativePpLayout, ejected, target, appliedLayers, &mergedChain)) {
+        return false;
+    }
     for (size_t i = 0u; i < rt.committedPpLayout.size(); ++i) {
         if (rt.committedPpLayout[i].stageIndex == target) {
             tpot::rebasePpSoftCapacity(rt.committedPpLayout[i], targetOldLayers);
@@ -615,6 +618,7 @@ static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) 
     rt.softCapacityByStage.erase(ejected);
     rt.riskPenaltyByStage.erase(ejected);
     rt.activeStageChain.swap(mergedChain);
+    rt.authoritativePpLayout = rt.committedPpLayout;
     rt.ppLayoutGuard = tpot::PpLayoutGuard();
     rt.lastObservedStageBypassGeneration = generation;
     rt.topologyFenceGeneration = generation;
@@ -981,6 +985,7 @@ void DynamicTpotController::run() {
             std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status);
             if (!rt.hasCommittedPpLayout) {
                 rt.committedPpLayout = stages;
+                rt.authoritativePpLayout = stages;
                 rt.hasCommittedPpLayout = true;
                 for (size_t i = 0u; i < stages.size(); ++i) rt.activeStageChain.push_back(stages[i].stageIndex);
             }

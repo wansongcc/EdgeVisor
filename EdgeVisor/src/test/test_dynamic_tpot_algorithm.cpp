@@ -179,6 +179,45 @@ int main() {
     require(bypassLayout[2].startLayer == 8u && bypassLayout[2].endLayer == 16u && bypassLayout[2].nLayers == 8u,
         "bypass merge derives range and count from endpoints");
 
+    std::vector<tpot::StageSnapshot> authoritativeLayout;
+    authoritativeLayout.push_back(stage(0, 0, 0, 16, 5.0));
+    authoritativeLayout.push_back(stage(1, 1, 16, 11, 5.0));
+    authoritativeLayout.push_back(stage(2, 2, 27, 2, 5.0));
+    authoritativeLayout.push_back(stage(3, 3, 29, 11, 20.0));
+    std::vector<tpot::StageSnapshot> ppThenBypassLayout = authoritativeLayout;
+    tpot::Candidate pp1;
+    pp1.kind = tpot::CandidateKind::PP_MOVE;
+    pp1.valid = true;
+    pp1.fromStageIndex = 2u;
+    pp1.toStageIndex = 1u;
+    pp1.fromNodeIndex = 2u;
+    pp1.toNodeIndex = 1u;
+    pp1.layerIndex = 27u;
+    pp1.layerCount = 1u;
+    require(tpot::applyPpMove(ppThenBypassLayout, pp1),
+        "PP1 changes the controller's pre-bypass logical boundary");
+    require(ppThenBypassLayout[1].endLayer == 28u && ppThenBypassLayout[2].startLayer == 28u,
+        "PP1 leaves a stale boundary that bypass must not retain");
+    std::vector<uint32_t> rebasedBypassChain;
+    require(tpot::rebaseStageBypassLayout(
+                ppThenBypassLayout, authoritativeLayout, 2u, 3u,
+                std::vector<uint32_t>({27u, 28u}), &rebasedBypassChain),
+        "verified bypass rebases a prior PP layout to the root-authoritative generation");
+    require(rebasedBypassChain == std::vector<uint32_t>({0u, 1u, 3u}) &&
+            ppThenBypassLayout.size() == 3u && ppThenBypassLayout[1].endLayer == 27u &&
+            ppThenBypassLayout[2].startLayer == 29u,
+        "bypass discards PP1's stale boundary without exposing its owned range to PP2");
+    tpot::Candidate pp2 = pp1;
+    pp2.fromStageIndex = 3u;
+    pp2.toStageIndex = 1u;
+    pp2.fromNodeIndex = 3u;
+    pp2.toNodeIndex = 1u;
+    pp2.layerIndex = 29u;
+    require(tpot::applyPpMove(ppThenBypassLayout, pp2),
+        "PP2 commits after a verified bypass generation");
+    require(ppThenBypassLayout[1].endLayer == 28u && ppThenBypassLayout[2].startLayer == 30u,
+        "PP2 advances the rebased active-chain boundary");
+
     std::vector<tpot::StageSnapshot> rejectedBypassLayout;
     rejectedBypassLayout.push_back(stage(0, 0, 0, 4, 5.0));
     rejectedBypassLayout.push_back(stage(1, 1, 4, 4, 5.0));

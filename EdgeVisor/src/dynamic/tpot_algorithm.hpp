@@ -121,6 +121,13 @@ bool commitStageBypassLayout(
     uint32_t targetStageIndex,
     const std::vector<uint32_t> &appliedLayers,
     std::vector<uint32_t> *activeStageChain);
+bool rebaseStageBypassLayout(
+    std::vector<StageSnapshot> &committedStages,
+    const std::vector<StageSnapshot> &authoritativeStages,
+    uint32_t ejectedStageIndex,
+    uint32_t targetStageIndex,
+    const std::vector<uint32_t> &appliedLayers,
+    std::vector<uint32_t> *activeStageChain);
 void rebasePpSoftCapacity(StageSnapshot &stage, uint32_t previousLayerCount);
 void applyRollbackPenalty(StageSnapshot &target);
 const char *candidateKindName(CandidateKind kind);

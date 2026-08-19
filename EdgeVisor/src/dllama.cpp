@@ -21,6 +21,7 @@
 #include <fstream>
 #include <sstream>
 #include <chrono>
+#include <thread>
 #include <memory>
 #include <map>
 
@@ -1587,6 +1588,192 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     }
 }
 
+// E1 episode replay is deliberately a small, explicit runtime path rather
+// than an external loop of independent inference processes.  The controller
+// keeps the same KV state while it alternates model decoding with replayed
+// tool results, so the resulting token positions form one continuous
+// agentic-context episode.
+struct EpisodeRound {
+    unsigned int toolWaitMs = 0u;
+    unsigned int generationTokens = 0u;
+    std::string toolResult;
+};
+
+static unsigned long long episodeNowMs() {
+    return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static void appendEpisodeEvent(const char *eventType, unsigned int round, NnUint pos,
+                               unsigned int plannedMs, unsigned long long actualMs) {
+    const unsigned long long timestampMs = episodeNowMs();
+    std::printf("[episode-event] type=%s round=%u pos=%u ts_ms=%llu planned_ms=%u actual_ms=%llu\n",
+        eventType, round, (unsigned)pos, timestampMs, plannedMs, actualMs);
+    const char *path = std::getenv("DLLAMA_EPISODE_LOG");
+    if (path == nullptr || path[0] == '\0') return;
+    std::ofstream out(path, std::ios::app);
+    if (!out) return;
+    out << "{\"type\":\"" << eventType << "\",\"round\":" << round
+        << ",\"pos\":" << (unsigned)pos << ",\"ts_ms\":" << timestampMs
+        << ",\"planned_ms\":" << plannedMs << ",\"actual_ms\":" << actualMs << "}\n";
+}
+
+static bool parseEpisodeScript(const char *path, std::string &prompt, std::vector<EpisodeRound> &rounds) {
+    prompt.clear();
+    rounds.clear();
+    std::ifstream input(path);
+    if (!input) return false;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const std::string promptPrefix = "PROMPT\t";
+        const std::string roundPrefix = "ROUND\t";
+        if (line.rfind(promptPrefix, 0u) == 0u) {
+            if (!prompt.empty()) throw std::runtime_error("Episode script contains multiple PROMPT records");
+            prompt = line.substr(promptPrefix.size());
+            continue;
+        }
+        if (line.rfind(roundPrefix, 0u) != 0u) {
+            throw std::runtime_error("Episode script record must start with PROMPT or ROUND");
+        }
+        std::string payload = line.substr(roundPrefix.size());
+        const size_t firstTab = payload.find('\t');
+        const size_t secondTab = firstTab == std::string::npos ? std::string::npos : payload.find('\t', firstTab + 1u);
+        if (firstTab == std::string::npos || secondTab == std::string::npos) {
+            throw std::runtime_error("ROUND must be ROUND<TAB>tool_wait_ms<TAB>generation_tokens<TAB>tool_result");
+        }
+        EpisodeRound round;
+        try {
+            round.toolWaitMs = (unsigned int)std::stoul(payload.substr(0u, firstTab));
+            round.generationTokens = (unsigned int)std::stoul(payload.substr(firstTab + 1u, secondTab - firstTab - 1u));
+        } catch (...) {
+            throw std::runtime_error("Episode ROUND has invalid numeric fields");
+        }
+        round.toolResult = payload.substr(secondTab + 1u);
+        if (round.generationTokens == 0u || round.toolResult.empty()) {
+            throw std::runtime_error("Episode ROUND requires positive generation_tokens and non-empty tool_result");
+        }
+        rounds.push_back(std::move(round));
+    }
+    return !prompt.empty() && !rounds.empty();
+}
+
+static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int inputToken,
+                                   const char *phase, unsigned int round) {
+    if (pos >= context->header->seqLen) {
+        throw std::runtime_error("Episode reached model sequence length");
+    }
+    const auto wallStart = std::chrono::steady_clock::now();
+    context->inference->setBatchSize(1u);
+    context->inference->setPosition(pos);
+    context->inference->setToken(0u, inputToken);
+    context->inference->setSkipLogits(false);
+    context->inference->forward();
+    const std::vector<LlmPerfPacket> &perf = context->inference->getLastPerf();
+    NnUint remoteToken = 0u;
+    const bool haveRemoteToken = context->args->lastStageSampling && context->network != nullptr &&
+        context->inference->tryReceiveLastStageSampledToken(remoteToken, nullptr);
+    const int sampledToken = haveRemoteToken ? (int)remoteToken : context->sampler->sample(context->inference->logitsPipe);
+    const auto wallEnd = std::chrono::steady_clock::now();
+    const double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
+    std::printf("[episode-token] phase=%s round=%u pos=%u input=%d output=%d wall_ms=%.2f\n",
+        phase, round, (unsigned)pos, inputToken, sampledToken, wallMs);
+    if (dllamaTokenTimingPrintEnabled()) {
+        const std::string e2eLine = formatTokenE2eTimingLine((unsigned int)pos, sampledToken, wallMs);
+        std::printf("%s\n", e2eLine.c_str());
+        for (const LlmPerfPacket &packet : perf) {
+            DllamaTokenNodeTiming timing;
+            timing.nodeIndex = packet.nodeIndex;
+            timing.stageIndex = packet.stageIndex;
+            timing.hasStage = true;
+            timing.execUs = packet.execUs;
+            timing.syncUs = packet.syncUs;
+            timing.bubbleUs = packet.bubbleUs;
+            const std::string nodeLine = formatTokenNodeTimingLine((unsigned int)pos, timing);
+            std::printf("%s\n", nodeLine.c_str());
+        }
+    }
+    std::fflush(stdout);
+    return sampledToken;
+}
+
+static void episodePrefill(AppInferenceContext *context, const std::string &prompt, NnUint &pos, int &currentToken) {
+    TokenizerChatStops stops(context->tokenizer);
+    const std::string effectivePrompt = buildInferencePrompt(context, prompt.c_str(), &stops);
+    std::vector<int> tokens(effectivePrompt.size() + 3u);
+    int nTokens = 0;
+    context->tokenizer->encode(const_cast<char *>(effectivePrompt.c_str()), tokens.data(), &nTokens, true, true);
+    if (nTokens < 1) throw std::runtime_error("Episode PROMPT tokenized to zero tokens");
+    if ((NnUint)nTokens > context->header->seqLen) throw std::runtime_error("Episode PROMPT exceeds model sequence length");
+    pos = 0u;
+    while (pos + 1u < (NnUint)nTokens) {
+        const NnUint remaining = (NnUint)nTokens - 1u - pos;
+        const NnUint batchSize = std::min<NnUint>(remaining, std::max<NnUint>(1u, context->args->nBatches));
+        context->inference->setBatchSize(batchSize);
+        context->inference->setPosition(pos);
+        for (NnUint index = 0u; index < batchSize; ++index) context->inference->setToken(index, tokens[pos + index]);
+        context->inference->setSkipLogits(batchSize < remaining);
+        context->inference->forward();
+        pos += batchSize;
+    }
+    context->inference->setSkipLogits(false);
+    currentToken = tokens[(size_t)nTokens - 1u];
+    std::printf("[episode-event] type=prefill_complete round=0 pos=%u ts_ms=%llu planned_ms=0 actual_ms=0\n",
+        (unsigned)pos, episodeNowMs());
+}
+
+static void episodeAppendForcedText(AppInferenceContext *context, const std::string &text,
+                                    NnUint &pos, int &currentToken, unsigned int round) {
+    std::vector<int> tokens(text.size() + 3u);
+    int nTokens = 0;
+    context->tokenizer->encode(const_cast<char *>(text.c_str()), tokens.data(), &nTokens, false, false);
+    if (nTokens < 1) throw std::runtime_error("Episode tool result tokenized to zero tokens");
+    for (int index = 0; index < nTokens; ++index) {
+        (void)episodeForwardAndSample(context, pos, currentToken, "tool_replay", round);
+        currentToken = tokens[(size_t)index];
+        pos += 1u;
+    }
+}
+
+static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *scriptPath) {
+    std::string prompt;
+    std::vector<EpisodeRound> rounds;
+    if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
+        throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
+    }
+    if (rounds.size() != 5u) {
+        throw std::runtime_error("Formal E1 episode requires exactly five ROUND records");
+    }
+    NnUint pos = 0u;
+    int currentToken = 0;
+    episodePrefill(context, prompt, pos, currentToken);
+    for (size_t index = 0u; index < rounds.size(); ++index) {
+        const EpisodeRound &round = rounds[index];
+        const unsigned int roundNumber = (unsigned int)index + 1u;
+        appendEpisodeEvent("generation_start", roundNumber, pos, 0u, 0u);
+        for (unsigned int token = 0u; token < round.generationTokens; ++token) {
+            currentToken = episodeForwardAndSample(context, pos, currentToken, "generation", roundNumber);
+            pos += 1u;
+        }
+        appendEpisodeEvent("generation_end", roundNumber, pos, 0u, 0u);
+        appendEpisodeEvent("tool_wait_start", roundNumber, pos, round.toolWaitMs, 0u);
+        const auto waitStart = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(round.toolWaitMs));
+        const auto waitEnd = std::chrono::steady_clock::now();
+        const unsigned long long actualWaitMs = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(waitEnd - waitStart).count();
+        appendEpisodeEvent("tool_wait_end", roundNumber, pos, round.toolWaitMs, actualWaitMs);
+        const std::string framedToolResult = "\n<tool_result round=\"" + std::to_string(roundNumber) + "\">\n" +
+            round.toolResult + "\n</tool_result>\n";
+        episodeAppendForcedText(context, framedToolResult, pos, currentToken, roundNumber);
+        appendEpisodeEvent("tool_result_replayed", roundNumber, pos, 0u, 0u);
+    }
+    // Commit the final generated/tool token into the KV cache.  The sampled
+    // successor is intentionally ignored because the episode has ended.
+    (void)episodeForwardAndSample(context, pos, currentToken, "episode_finalize", 5u);
+    pos += 1u;
+    appendEpisodeEvent("episode_complete", 5u, pos, 0u, 0u);
+}
+
 static bool isInteractiveQuitLine(const std::string& s) {
     return s == ":q" || s == ":quit" || s == "q" || s == "quit" || s == "exit";
 }
@@ -1610,6 +1797,11 @@ static bool parseStepsCommand(const std::string& line, NnUint& outSteps) {
 }
 
 static void inference(AppInferenceContext *context) {
+    const char *episodeScript = std::getenv("DLLAMA_EPISODE_SCRIPT");
+    if (episodeScript != nullptr && episodeScript[0] != '\0') {
+        inferenceRunEpisodeScript(context, episodeScript);
+        return;
+    }
     if (!context->args->interactive) {
         inferenceRunOnce(context, context->args->prompt, context->args->steps);
         return;

@@ -174,6 +174,7 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_CONTROL_ONLY = 1u << 5,
     LLM_CTRL_HAS_BATCH_META = 1u << 6,
     LLM_CTRL_SKIP_LOGITS = 1u << 7, // non-final prefill chunk: skip end-segment logits compute+gather
+    LLM_CTRL_PRECOMMIT_PROBE = 1u << 8, // control-only liveness ACK before a PP binding hand-off
 };
 
 static constexpr NnUint LLM_BATCH_META_MAGIC = 0x4d54424du; // 'MBTM' little-endian
@@ -485,6 +486,10 @@ public:
         NnUint rangeStart = 0u,
         NnUint rangeLen = 0u);
     bool submitBoundaryKvTransfer(NnUint layerIndex, NnUint position, const std::vector<float> &kRow, const std::vector<float> &vRow);
+    // E5: a transport failure may arrive while state transfer is in flight.
+    // This only clears a migration that has not committed ownership; callers
+    // receive false if a committed migration would require a real rollback.
+    bool abortPendingPpMigrationForTransportFailure(const char *reason);
 private:
     void recordPpMigrationApplied();
     void recordStageBypassApplied(NnUint ejectedStage, NnUint targetStage, const std::vector<NnUint> &layers);
@@ -538,6 +543,10 @@ private:
     int migrationLayerCount = 1;
     bool ppMigrationEnabled = false;
     bool migrationBatchSubmitted = false;
+    // Set while a control-only layer-switch stream is being emitted.  A
+    // transport fault after this point may have reached only a subset of
+    // workers, so it is never reported as a completed rollback.
+    bool layerSwitchControlWriteStarted = false;
     bool migrationExportRequested = false;
     bool migrationLayerListPinnedByEnv = false;
     int boundaryLayerForMigration = -1;
@@ -588,6 +597,7 @@ private:
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     void resetPendingKvMigrationState(const char *reason);
+    bool verifyPendingLayerSwitchPrecommit();
     bool sendPendingLayerSwitchControlOnly();
     void maybeApplyShiftedPpStartForStageMove(
         const std::vector<NnUint> &switchLayers,

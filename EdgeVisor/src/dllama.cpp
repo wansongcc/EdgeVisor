@@ -1604,18 +1604,37 @@ static unsigned long long episodeNowMs() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+static const char *episodeEventLogPath() {
+    const char *path = std::getenv("DLLAMA_EPISODE_EVENT_LOG");
+    if (path != nullptr && path[0] != '\0') return path;
+    // Preserve older replay invocations that only provide DLLAMA_EPISODE_LOG.
+    return std::getenv("DLLAMA_EPISODE_LOG");
+}
+
 static void appendEpisodeEvent(const char *eventType, unsigned int round, NnUint pos,
                                unsigned int plannedMs, unsigned long long actualMs) {
     const unsigned long long timestampMs = episodeNowMs();
     std::printf("[episode-event] type=%s round=%u pos=%u ts_ms=%llu planned_ms=%u actual_ms=%llu\n",
         eventType, round, (unsigned)pos, timestampMs, plannedMs, actualMs);
-    const char *path = std::getenv("DLLAMA_EPISODE_LOG");
+    const char *path = episodeEventLogPath();
     if (path == nullptr || path[0] == '\0') return;
     std::ofstream out(path, std::ios::app);
     if (!out) return;
     out << "{\"type\":\"" << eventType << "\",\"round\":" << round
         << ",\"pos\":" << (unsigned)pos << ",\"ts_ms\":" << timestampMs
         << ",\"planned_ms\":" << plannedMs << ",\"actual_ms\":" << actualMs << "}\n";
+}
+
+static void appendEpisodeTokenCommit(const char *phase, unsigned int round, NnUint pos,
+                                     int inputToken, int outputToken) {
+    const char *path = episodeEventLogPath();
+    if (path == nullptr || path[0] == '\0') return;
+    std::ofstream out(path, std::ios::app);
+    if (!out) return;
+    out << "{\"type\":\"token_commit\",\"phase\":\"" << phase
+        << "\",\"round\":" << round << ",\"pos\":" << (unsigned)pos
+        << ",\"input\":" << inputToken << ",\"output\":" << outputToken
+        << ",\"ts_ms\":" << episodeNowMs() << "}\n";
 }
 
 static bool parseEpisodeScript(const char *path, std::string &prompt, std::vector<EpisodeRound> &rounds) {
@@ -1668,11 +1687,22 @@ static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int
     context->inference->setPosition(pos);
     context->inference->setToken(0u, inputToken);
     context->inference->setSkipLogits(false);
-    context->inference->forward();
-    const std::vector<LlmPerfPacket> &perf = context->inference->getLastPerf();
+    std::vector<LlmPerfPacket> perf;
     NnUint remoteToken = 0u;
-    const bool haveRemoteToken = context->args->lastStageSampling && context->network != nullptr &&
-        context->inference->tryReceiveLastStageSampledToken(remoteToken, nullptr);
+    bool haveRemoteToken = false;
+    try {
+        context->inference->forward();
+        perf = context->inference->getLastPerf();
+        haveRemoteToken = context->args->lastStageSampling && context->network != nullptr &&
+            context->inference->tryReceiveLastStageSampledToken(remoteToken, nullptr);
+    } catch (const NnTransferSocketException &e) {
+        appendEpisodeEvent("transport_abort", round, pos, 0u, 0u);
+        const bool rollbackComplete = context->inference->abortPendingPpMigrationForTransportFailure(e.what());
+        std::printf("🧯 [e5-frontier] phase=%s round=%u pos=%u rollback_complete=%s\n",
+            phase, round, (unsigned)pos, rollbackComplete ? "1" : "0");
+        std::fflush(stdout);
+        throw;
+    }
     const int sampledToken = haveRemoteToken ? (int)remoteToken : context->sampler->sample(context->inference->logitsPipe);
     const auto wallEnd = std::chrono::steady_clock::now();
     const double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
@@ -1694,6 +1724,7 @@ static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int
         }
     }
     std::fflush(stdout);
+    appendEpisodeTokenCommit(phase, round, pos, inputToken, sampledToken);
     return sampledToken;
 }
 

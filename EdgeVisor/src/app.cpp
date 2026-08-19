@@ -20,6 +20,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <fstream>
 #include <thread>
 #include <chrono>
 #include <cerrno>
@@ -65,6 +66,34 @@ static bool envFlagEnabledDefault(const char *name, bool fallback) {
         return false;
     }
     return true;
+}
+
+// E5 test-only phase marker.  It is a no-op unless DLLAMA_E5_PHASE_LOG is
+// configured; the optional hold lets an external fault injector land inside
+// a named protocol phase instead of racing an arbitrary token.
+static void e5PhaseHook(const char *phase, NnUint pos, NnUint fromNode,
+                        NnUint toNode, NnUint layer) {
+    const char *path = std::getenv("DLLAMA_E5_PHASE_LOG");
+    if (path == nullptr || path[0] == '\0') return;
+    const unsigned long long nowMs = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::printf("🧪 [e5-phase] phase=%s pos=%u from=%u to=%u layer=%u ts_ms=%llu\n",
+        phase, (unsigned)pos, (unsigned)fromNode, (unsigned)toNode, (unsigned)layer, nowMs);
+    std::fflush(stdout);
+    std::ofstream out(path, std::ios::app);
+    if (out) {
+        out << "{\"phase\":\"" << phase << "\",\"pos\":" << (unsigned)pos
+            << ",\"from_node\":" << (unsigned)fromNode << ",\"to_node\":" << (unsigned)toNode
+            << ",\"layer\":" << (unsigned)layer << ",\"ts_ms\":" << nowMs << "}\n";
+        out.flush();
+    }
+    const char *holdText = std::getenv("DLLAMA_E5_PHASE_HOLD_MS");
+    if (holdText == nullptr || holdText[0] == '\0') return;
+    char *end = nullptr;
+    const unsigned long holdMs = std::strtoul(holdText, &end, 10);
+    if (end != holdText && *end == '\0' && holdMs > 0ul) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+    }
 }
 
 static void setEnvIfUnsetOrEmpty(const char *name, const char *value) {
@@ -2922,6 +2951,71 @@ void RootLlmInference::resetPendingKvMigrationState(const char *reason) {
     }
 }
 
+bool RootLlmInference::abortPendingPpMigrationForTransportFailure(const char *reason) {
+    const NnUint triggerPos = asyncKvCollectPos >= 0 ? (NnUint)asyncKvCollectPos : 0xFFFFFFFFu;
+    const NnUint triggerLayer = asyncKvCollectLayer >= 0 ? (NnUint)asyncKvCollectLayer : 0xFFFFFFFFu;
+    bool hadPendingState = false;
+    {
+        std::lock_guard<std::mutex> lk(kvTransferMutex);
+        hadPendingState = !pendingKvTransfers.empty() || waitingKvAck || !pendingLayerSwitchLayers.empty() ||
+            asyncKvCollectPos >= 0;
+    }
+
+    bool ownerLedgerSane = runtimePrimaryOwnership.nLayers > 0u &&
+        runtimePrimaryOwnership.nStages > 0u &&
+        runtimePrimaryOwnership.ownerByLayer.size() == runtimePrimaryOwnership.nLayers;
+    if (ownerLedgerSane) {
+        for (NnUint owner : runtimePrimaryOwnership.ownerByLayer) {
+            if (owner >= runtimePrimaryOwnership.nStages) {
+                ownerLedgerSane = false;
+                break;
+            }
+        }
+    }
+
+    // A commit is recorded only after recovery and the ownership hand-off
+    // succeed.  This E5 abort routine is deliberately conservative: it never
+    // labels an already-committed hand-off as rolled back.
+    // A KV delivery ACK only proves that replica state arrived; it is not an
+    // ownership commit.  Treating it as one made an Install-phase transport
+    // failure appear irrecoverable even when no binding packet had been sent.
+    const bool commitAlreadyApplied = migrationBatchSubmitted;
+    const bool switchWriteStarted = layerSwitchControlWriteStarted;
+    resetPendingKvMigrationState(reason);
+    asyncKvCollectPos = -1;
+    asyncKvCollectLayer = -1;
+    migrationExportRequested = false;
+    if (!commitAlreadyApplied) migrationBatchSubmitted = false;
+
+    const bool abortComplete = hadPendingState && !commitAlreadyApplied && !switchWriteStarted && ownerLedgerSane;
+    EdgeVisorAblationEvent ev;
+    ev.eventId = "pp_migration_transport_abort";
+    ev.triggerPos = triggerPos;
+    ev.triggerLayer = triggerLayer;
+    const NnStageConfig *fromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
+    ev.affectedStage = fromStage != nullptr ? fromStage->stageIndex : 0xFFFFFFFFu;
+    ev.fromNode = migrationFromNodeIndex;
+    ev.toNode = nextStageRootNode;
+    ev.selectedPolicy = "transport_abort_pending_only";
+    ev.logicalGroup = "pp_stage_boundary";
+    ev.physicalDeviceGroup = "pp_route";
+    ev.bindingUpdateCount = 0u;
+    ev.applySuccess = abortComplete;
+    ev.fallbackReason = std::string("transport_abort;") +
+        (reason != nullptr ? reason : "unknown") +
+        ";pending=" + (hadPendingState ? "1" : "0") +
+        ";commit=" + (commitAlreadyApplied ? "1" : "0") +
+        ";switch_write_started=" + (switchWriteStarted ? "1" : "0") +
+        ";owner_ledger_sane=" + (ownerLedgerSane ? "1" : "0");
+    edgevisorAblationLogEvent(ev);
+    std::printf("🧯 [e5-abort] pending=%s commit=%s switch_write_started=%s owner_ledger_sane=%s rollback_complete=%s reason=%s\n",
+        hadPendingState ? "1" : "0", commitAlreadyApplied ? "1" : "0", switchWriteStarted ? "1" : "0",
+        ownerLedgerSane ? "1" : "0", abortComplete ? "1" : "0",
+        reason != nullptr ? reason : "unknown");
+    std::fflush(stdout);
+    return abortComplete;
+}
+
 static bool isLikelyPerfPacketPrefix(
     NnUint position,
     NnUint batchSize,
@@ -3669,10 +3763,27 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
     return true;
 }
 
+bool RootLlmInference::verifyPendingLayerSwitchPrecommit() {
+    if (network == nullptr) return false;
+    LlmControlPacket probe = controlPacket;
+    probe.flags = LLM_CTRL_CONTROL_ONLY | LLM_CTRL_PRECOMMIT_PROBE;
+    probe.batchSize = 1u;
+    probe.planCmdSeq = 0u;
+    logRootControlSend(probe);
+    network->writeAll(&probe, sizeof(probe));
+    for (NnUint socket = 0u; socket < network->nSockets; ++socket) {
+        network->readAckWithTimeout(socket, 1000ul);
+    }
+    std::printf("🧯 [e5-precommit] workers_acknowledged=%u status=ok\n", (unsigned)network->nSockets);
+    std::fflush(stdout);
+    return true;
+}
+
 bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     if (network == nullptr) return false;
     std::vector<NnUint> switchLayers;
     bool stageBypass = false;
+    bool rootLocalBindingChanged = false;
     NnUint bypassEjectedStage = 0xFFFFFFFFu;
     NnUint bypassTargetStage = 0xFFFFFFFFu;
     NnUint bypassGeneration = 0u;
@@ -3691,6 +3802,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
             const NnUint selfNodeIndex = 0u;
             const bool selfIsSource = areNodesInSameStageLocal(plan, selfNodeIndex, migrationFromNodeIndex);
             const bool selfIsTarget = areNodesInSameStageLocal(plan, selfNodeIndex, nextStageRootNode);
+            rootLocalBindingChanged = selfIsSource || selfIsTarget;
             for (NnUint layer : switchLayers) {
                 if (selfIsSource) {
                     executor->setPrimaryLayerEnabled(layer, false);
@@ -3725,6 +3837,11 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     out.batchSize = 1u;
     out.planCmdSeq = 0u;
     logRootControlSend(out);
+    // The control header and batch declaration do not change a worker's
+    // active layer binding.  A root-local binding may already have changed
+    // above when the root itself participates in the move; otherwise retain
+    // the pre-commit state until the first actual switch packet is written.
+    layerSwitchControlWriteStarted = rootLocalBindingChanged;
     network->writeAll(&out, sizeof(LlmControlPacket));
 
     LlmLayerSwitchBatchHeader sbh{};
@@ -3760,7 +3877,12 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
         switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
         stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
         network->writeAll(&switchPkt, sizeof(switchPkt));
+        // A failed send did not complete a layer-binding packet at the local
+        // socket boundary.  Keep the hand-off abortable in that case; after a
+        // successful packet the state is conservatively treated as committed.
+        layerSwitchControlWriteStarted = true;
     }
+    layerSwitchControlWriteStarted = false;
     if (stageBypass) {
         NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
         pendingBypassPreviousStage = getPpPrevStageIndex(plan, bypassEjectedStage);
@@ -4893,11 +5015,18 @@ void RootLlmInference::forward(bool collectProfile) {
                 NnUint exported = 0u;
                 NnUint queued = 0u;
                 uint64_t sourceBytes = 0u;
+                e5PhaseHook("freeze_quiesce", endPos, migrationFromNodeIndex, nextStageRootNode,
+                    migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
                 const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
                 auto t1 = std::chrono::steady_clock::now();
                 uint64_t targetBytes = 0u;
                 const bool transferred = collected && flushPendingKvTransfersControlOnly(&targetBytes);
-                const bool switched = transferred && sendPendingLayerSwitchControlOnly();
+                if (transferred) {
+                    e5PhaseHook("install", endPos, migrationFromNodeIndex, nextStageRootNode,
+                        migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
+                }
+                const bool precommitReady = transferred && verifyPendingLayerSwitchPrecommit();
+                const bool switched = precommitReady && sendPendingLayerSwitchControlOnly();
                 auto t2 = std::chrono::steady_clock::now();
                 statePrepareMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 recoverMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -4931,11 +5060,18 @@ void RootLlmInference::forward(bool collectProfile) {
             NnUint exported = 0u;
             NnUint queued = 0u;
             uint64_t sourceBytes = 0u;
+            e5PhaseHook("freeze_quiesce", endPos, migrationFromNodeIndex, nextStageRootNode,
+                migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
             const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
             auto t1 = std::chrono::steady_clock::now();
             uint64_t targetBytes = 0u;
             const bool transferred = collected && flushPendingKvTransfersControlOnly(&targetBytes);
-            const bool switched = transferred && sendPendingLayerSwitchControlOnly();
+            if (transferred) {
+                e5PhaseHook("install", endPos, migrationFromNodeIndex, nextStageRootNode,
+                    migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
+            }
+            const bool precommitReady = transferred && verifyPendingLayerSwitchPrecommit();
+            const bool switched = precommitReady && sendPendingLayerSwitchControlOnly();
             auto t2 = std::chrono::steady_clock::now();
             statePrepareMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
             recoverMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -5199,6 +5335,10 @@ bool WorkerLlmInference::tryReadControlPacket() {
                 (unsigned)req.layerCount);
             std::fflush(stdout);
         }
+    }
+
+    if ((controlPacket.flags & LLM_CTRL_PRECOMMIT_PROBE) != 0u) {
+        network->writeAck(ROOT_SOCKET_INDEX);
     }
 
     printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);

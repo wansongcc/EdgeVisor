@@ -5,9 +5,12 @@
 #include "json.hpp"
 #include "plan-command.hpp"
 
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -469,6 +472,114 @@ static void logRejectedJitPlan(
     edgevisorAblationLogEvent(ev);
 }
 
+// E6 decision gate.  The controller receives *online* estimates from the
+// planner rather than a pre-labelled answer: predicted benefit (ms),
+// enactment cost (ms), and the probability that enough useful work remains.
+// "enabled" is deliberately conservative: it only switches when the
+// probability-weighted benefit clears the full enactment cost plus an optional
+// safety margin.  "greedy" and "static" are the always-switch and
+// never-switch controls, respectively.  This makes the ablation modes affect
+// the command that reaches the runtime, instead of merely changing telemetry.
+struct JitGateDecision {
+    bool accept = false;
+    double predictedBenefitMs = 0.0;
+    double predictedCostMs = 0.0;
+    double survivalProbability = 0.0;
+    double safetyMarginMs = 0.0;
+    std::string reason;
+};
+
+static std::string formatJitDecisionReason(
+    const char *prefix,
+    double benefitMs,
+    double costMs,
+    double survivalProbability,
+    double marginMs) {
+    char buf[256];
+    std::snprintf(
+        buf,
+        sizeof(buf),
+        "%s benefit_ms=%.3f cost_ms=%.3f survive_p=%.4f margin_ms=%.3f expected_net_ms=%.3f",
+        prefix,
+        benefitMs,
+        costMs,
+        survivalProbability,
+        marginMs,
+        benefitMs * survivalProbability - costMs);
+    return std::string(buf);
+}
+
+static JitGateDecision evaluateJitGate(const json &jcmd) {
+    const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
+    JitGateDecision decision;
+
+    if (cfg.jitMode == JitMode::STATIC) {
+        decision.reason = "jit_static_never_switch";
+        return decision;
+    }
+    if (cfg.jitMode == JitMode::GREEDY) {
+        decision.accept = true;
+        decision.reason = "jit_greedy_always_switch";
+        return decision;
+    }
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    decision.predictedBenefitMs = parseDouble(jcmd, "predictedBenefitMs", nan);
+    decision.predictedCostMs = parseDouble(jcmd, "predictedCostMs", nan);
+    decision.survivalProbability = parseDouble(jcmd, "survivalProbability", nan);
+    decision.safetyMarginMs = parseDouble(jcmd, "safetyMarginMs", 0.0);
+    const bool valid =
+        std::isfinite(decision.predictedBenefitMs) && decision.predictedBenefitMs >= 0.0 &&
+        std::isfinite(decision.predictedCostMs) && decision.predictedCostMs >= 0.0 &&
+        std::isfinite(decision.survivalProbability) && decision.survivalProbability >= 0.0 &&
+        decision.survivalProbability <= 1.0 &&
+        std::isfinite(decision.safetyMarginMs) && decision.safetyMarginMs >= 0.0;
+    if (!valid) {
+        decision.reason = "jit_missing_or_invalid_online_estimates";
+        return decision;
+    }
+
+    // The oracle is intentionally experiment-only: it receives the measured
+    // post-hoc net value from the replay/audit harness.  The production
+    // (enabled) path can never use this field.
+    if (cfg.jitMode == JitMode::ORACLE) {
+        const double oracleNetMs = parseDouble(jcmd, "oracleNetBenefitMs", nan);
+        if (!std::isfinite(oracleNetMs)) {
+            decision.reason = "jit_oracle_missing_posthoc_net_benefit";
+            return decision;
+        }
+        decision.accept = oracleNetMs > 0.0;
+        decision.reason = decision.accept ? "jit_oracle_positive_posthoc_net_benefit" : "jit_oracle_nonpositive_posthoc_net_benefit";
+        return decision;
+    }
+
+    const double expectedNetMs = decision.predictedBenefitMs * decision.survivalProbability - decision.predictedCostMs;
+    decision.accept = expectedNetMs > decision.safetyMarginMs;
+    decision.reason = formatJitDecisionReason(
+        decision.accept ? "jit_conservative_accept" : "jit_conservative_reject",
+        decision.predictedBenefitMs,
+        decision.predictedCostMs,
+        decision.survivalProbability,
+        decision.safetyMarginMs);
+    return decision;
+}
+
+static void logJitGateDecision(
+    const PlanCommand &cmd,
+    const json &jcmd,
+    const JitGateDecision &decision,
+    uint64_t bindingCount,
+    double decisionMs) {
+    EdgeVisorAblationEvent ev;
+    populateAblationPlanEvent(ev, cmd, jcmd, "jit_decision", bindingCount);
+    ev.tDecisionMs = decisionMs;
+    ev.applySuccess = decision.accept;
+    ev.rejectedMoves = decision.accept ? 0u : bindingCount;
+    ev.fallbackCount = decision.accept ? 0u : 1u;
+    ev.fallbackReason = decision.reason;
+    edgevisorAblationLogEvent(ev);
+}
+
 std::unique_ptr<PlanUdsController> PlanUdsController::start(const std::string &socketPath, RootLlmInference *inference) {
 #ifdef _WIN32
     (void)socketPath;
@@ -664,6 +775,21 @@ void PlanUdsController::run() {
                     continue;
                 }
 
+                const uint64_t bindingCount =
+                    (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u;
+                const auto jitDecisionStart = std::chrono::steady_clock::now();
+                const JitGateDecision jitDecision = evaluateJitGate(jcmd);
+                const double jitDecisionMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - jitDecisionStart).count();
+                logJitGateDecision(cmd, jcmd, jitDecision, bindingCount, jitDecisionMs);
+                if (!jitDecision.accept) {
+                    resp = json{{"ok", false}, {"rejected", true}, {"reason", jitDecision.reason},
+                                {"jitMode", toString(cfg.jitMode)}, {"cmd", cmdToJson(cmd)}};
+                    writeLine(cfd, resp.dump());
+                    ::close(cfd);
+                    continue;
+                }
+
                 const uint64_t cacheSeq = planCommandCache().store(cmd);
                 EdgeVisorAblationEvent ev;
                 populateAblationPlanEvent(
@@ -671,7 +797,7 @@ void PlanUdsController::run() {
                     cmd,
                     jcmd,
                     "plan_command_emit",
-                    (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u);
+                    bindingCount);
                 edgevisorAblationLogEvent(ev);
                 resp = json{{"ok", true}, {"cacheSeq", cacheSeq}, {"cmd", cmdToJson(cmd)}};
             } else if (op == "set_pp_migration") {
@@ -684,6 +810,19 @@ void PlanUdsController::run() {
                 if (cfg.disablePipelineBalancer) {
                     logRejectedJitPlan(cmd, jcmd, "pipeline_balancer_disabled", 1u);
                     resp = json{{"ok", false}, {"rejected", true}, {"reason", "pipeline_balancer_disabled"}, {"cmd", cmdToJson(cmd)}, {"ppMigration", true}};
+                    writeLine(cfd, resp.dump());
+                    ::close(cfd);
+                    continue;
+                }
+
+                const auto jitDecisionStart = std::chrono::steady_clock::now();
+                const JitGateDecision jitDecision = evaluateJitGate(jcmd);
+                const double jitDecisionMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - jitDecisionStart).count();
+                logJitGateDecision(cmd, jcmd, jitDecision, 1u, jitDecisionMs);
+                if (!jitDecision.accept) {
+                    resp = json{{"ok", false}, {"rejected", true}, {"reason", jitDecision.reason},
+                                {"jitMode", toString(cfg.jitMode)}, {"cmd", cmdToJson(cmd)}, {"ppMigration", true}};
                     writeLine(cfd, resp.dump());
                     ::close(cfd);
                     continue;

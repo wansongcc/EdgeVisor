@@ -596,6 +596,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.kvRedundancyStr = nullptr;
     args.enablePlanBarrier = false;
     args.enableStageFullWeights = false;
+    args.enableStageFullWeightsExplicit = false;
     args.enableKvRedundancyDuringMigration = true;
     args.allowNoShadowHeadMigration = false;
     args.enableKvAggregate = false;
@@ -713,6 +714,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
         if (std::strcmp(name, "--enable-stage-full-weights") == 0) {
             // Support both: "--enable-stage-full-weights" and "--enable-stage-full-weights 1|0".
+            args.enableStageFullWeightsExplicit = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 args.enableStageFullWeights = std::atoi(argv[i + 1]) != 0;
                 i += 2;
@@ -1114,9 +1116,13 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         std::printf("⚠️  [pp-migrate] --enable-pp-migration requires KV aggregate; auto enabling --enable-kv-aggregate\n");
         std::fflush(stdout);
     }
-    if (args.enablePpMigration && !args.enableStageFullWeights) {
+    if (args.enablePpMigration && !args.enableStageFullWeights && !args.enableStageFullWeightsExplicit) {
         args.enableStageFullWeights = true;
         std::printf("⚠️  [pp-migrate] --enable-pp-migration requires stage full weights; auto enabling --enable-stage-full-weights\n");
+        std::fflush(stdout);
+    } else if (args.enablePpMigration && !args.enableStageFullWeights) {
+        std::printf("ℹ️  [pp-migrate] using explicitly bounded resident weights; "
+                    "migration coverage is limited to --runtime-redundant-boundary-layers\n");
         std::fflush(stdout);
     }
     if (args.ioProfileLogPath != nullptr && args.ioProfileLogPath[0] != '\0') {

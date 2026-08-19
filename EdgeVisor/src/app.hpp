@@ -73,6 +73,7 @@ public:
     char *kvRedundancyStr; // KV redundancy per node, format: "2" (all) or "2,3,2,3" (per-node)
     bool enablePlanBarrier; // Enable plan barrier for online migration
     bool enableStageFullWeights; // Enable stage full residency (full weights and buffers)
+    bool enableStageFullWeightsExplicit; // Preserve an explicit bounded-residency opt-out
     bool enableKvRedundancyDuringMigration; // Keep KV redundancy enabled during online migration
     bool allowNoShadowHeadMigration; // Allow head migration when runtime will recover KV state
     bool enableKvAggregate; // Build KV aggregate pipes (KC/VC)

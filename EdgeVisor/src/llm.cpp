@@ -1,4 +1,5 @@
 #include "nn/nn-core.hpp"
+#include <random>
 #include "nn/nn-config-builder.hpp"
 #include "nn/nn-cpu.hpp"
 #include "nn/nn-network-local.hpp"
@@ -2342,6 +2343,22 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
 
     const int boundarySpan = std::max(0, parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", 1));
 
+    // P1 admission-policy ablation. DLLAMA_COVERAGE_POLICY selects how the
+    // redundant (shadow) coverage budget is spent across PP-stage boundaries:
+    //   edgevisor    - boundary-proximal BOTH sides, depth=span per boundary
+    //                  (default; marginal-utility order, cost-normalized)
+    //   eager        - BOTH sides, max pool depth (budget-blind; the static
+    //                  memory gate is the only limiter)
+    //   random       - seeded random subset of the candidate pool, total
+    //                  count = 2*span per boundary
+    //   cost_only    - receiving-side only, depth=2*span (the same memory
+    //                  budget buys double depth when placement is cost-aware)
+    //   benefit_only - receiving-side only, depth=span (top-benefit side)
+    const char *policyStr = std::getenv("DLLAMA_COVERAGE_POLICY");
+    const std::string coveragePolicy = (policyStr != nullptr && policyStr[0] != '\0') ? std::string(policyStr) : std::string("edgevisor");
+    const unsigned coverageSeed = (unsigned)parseEnvInt("DLLAMA_COVERAGE_SEED", 42);
+    const NnUint poolDepth = 4u;
+
     // Primary ownership from stage ranges.
     for (NnUint s = 0; s < plan->nStages; ++s) {
         const NnStageConfig &st = plan->stages[s];
@@ -2354,30 +2371,62 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
 
     if (boundarySpan == 0) return out;
 
-    // Redundant ownership near PP stage boundaries:
-    // - Right stage keeps left-boundary layers as redundant.
-    // - Left stage keeps right-boundary layers as redundant.
+    struct BoundaryCandidate {
+        NnUint stage;
+        NnUint layer;
+        int side;      // +1 receiving(right) stage keeps its left-boundary layer
+        int distance;  // distance from the boundary (0 = adjacent)
+    };
+    std::vector<BoundaryCandidate> pool;
+    size_t boundaryCount = 0u;
     for (NnUint s = 0; s + 1u < plan->nStages; ++s) {
         const NnStageConfig &left = plan->stages[s];
         const NnStageConfig &right = plan->stages[s + 1u];
-
         const NnUint rightStart = std::min(right.startLayer, nLayers);
         const NnUint leftEnd = std::min(left.endLayer, nLayers);
-
-        for (int k = 0; k < boundarySpan; ++k) {
-            if ((NnUint)k < rightStart) {
-                const NnUint layer = rightStart - (NnUint)k - 1u;
-                if (out.getRole(right.stageIndex, layer) == RUNTIME_LAYER_DISABLED) {
-                    out.setRole(right.stageIndex, layer, RUNTIME_LAYER_REDUNDANT);
-                }
+        ++boundaryCount;
+        for (NnUint k = 0u; k < poolDepth; ++k) {
+            if (k < rightStart) {
+                pool.push_back(BoundaryCandidate{right.stageIndex, rightStart - k - 1u, +1, (int)k});
             }
-            if (leftEnd + (NnUint)k < nLayers) {
-                const NnUint layer = leftEnd + (NnUint)k;
-                if (out.getRole(left.stageIndex, layer) == RUNTIME_LAYER_DISABLED) {
-                    out.setRole(left.stageIndex, layer, RUNTIME_LAYER_REDUNDANT);
-                }
+            if (leftEnd + k < nLayers) {
+                pool.push_back(BoundaryCandidate{left.stageIndex, leftEnd + k, -1, (int)k});
             }
         }
+    }
+
+    auto admit = [&](NnUint stage, NnUint layer) {
+        if (out.getRole(stage, layer) == RUNTIME_LAYER_DISABLED) {
+            out.setRole(stage, layer, RUNTIME_LAYER_REDUNDANT);
+        }
+    };
+
+    if (coveragePolicy == "eager") {
+        for (const BoundaryCandidate &c : pool) admit(c.stage, c.layer);
+    } else if (coveragePolicy == "random") {
+        std::vector<BoundaryCandidate> shuffled(pool);
+        std::mt19937 rng(coverageSeed);
+        std::shuffle(shuffled.begin(), shuffled.end(), rng);
+        const size_t take = std::min<size_t>(shuffled.size(), (size_t)2u * (size_t)boundarySpan * boundaryCount);
+        for (size_t i = 0; i < take; ++i) admit(shuffled[i].stage, shuffled[i].layer);
+    } else if (coveragePolicy == "cost_only") {
+        for (const BoundaryCandidate &c : pool) {
+            if (c.side == +1 && (NnUint)c.distance < (NnUint)2u * (NnUint)boundarySpan) admit(c.stage, c.layer);
+        }
+    } else if (coveragePolicy == "benefit_only") {
+        for (const BoundaryCandidate &c : pool) {
+            if (c.side == +1 && (NnUint)c.distance < (NnUint)boundarySpan) admit(c.stage, c.layer);
+        }
+    } else {
+        // edgevisor (default): boundary-proximal both sides, depth = span.
+        for (const BoundaryCandidate &c : pool) {
+            if ((NnUint)c.distance < (NnUint)boundarySpan) admit(c.stage, c.layer);
+        }
+    }
+
+    if (policyStr != nullptr) {
+        printf("[coverage-policy] policy=%s span=%u pool=%zu seed=%u\n",
+            coveragePolicy.c_str(), (unsigned)boundarySpan, pool.size(), coverageSeed);
     }
 
     return out;

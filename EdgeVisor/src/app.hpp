@@ -175,6 +175,7 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_HAS_BATCH_META = 1u << 6,
     LLM_CTRL_SKIP_LOGITS = 1u << 7, // non-final prefill chunk: skip end-segment logits compute+gather
     LLM_CTRL_PRECOMMIT_PROBE = 1u << 8, // control-only liveness ACK before a PP binding hand-off
+    LLM_CTRL_TOOL_WINDOW_SHADOW = 1u << 9, // execute actual redundant ShadowKV work during a control-only tool window
 };
 
 static constexpr NnUint LLM_BATCH_META_MAGIC = 0x4d54424du; // 'MBTM' little-endian
@@ -368,6 +369,10 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_HAS_KV_REDUNDANCY = 1u << 7,
     LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV = 1u << 8,
     LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC = 1u << 9,
+    // Enable bubble ShadowKV after normal forward passes.  When clear, the
+    // redundant graph is still materialized but work is reserved for explicit
+    // control-only tool windows.
+    LLM_BOOTSTRAP_BUBBLE_SHADOW_KV_DURING_FORWARD = 1u << 12,
     LLM_BOOTSTRAP_LAST_STAGE_SAMPLING = 1u << 10,
     LLM_BOOTSTRAP_HAS_IO_PROFILE_LOG = 1u << 11,
 };
@@ -528,6 +533,13 @@ private:
     std::mutex kvTransferMutex;
     std::vector<PendingKvTransferItem> pendingKvTransfers;
     bool waitingKvAck = false;
+    // P2 BackgroundPreCopy baseline state (DLLAMA_BACKGROUND_PRECOPY=1):
+    // the candidate migration layers' KV is copied to the destination in the
+    // background during idle windows; the trigger only transfers the delta.
+    bool bgPrecopyEnabled = false;
+    NnUint bgCopiedPos = 0u;
+    unsigned long long bgPrecopyBytesTotal = 0u;
+    unsigned long long bgPrecopyPasses = 0u;
     NnUint waitingKvAckExpectedCount = 0u;
     std::vector<NnUint> waitingKvAckLayers;
     NnUint waitingKvAckReceivedCount = 0u;
@@ -593,7 +605,7 @@ private:
     uint64_t lastMigrationStateTransferBytes = 0u;
     uint64_t lastMigrationExportedRows = 0u;
     bool batchMetadataDirty = false;
-    bool collectSourceStageKvTransfers(NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
+    bool collectSourceStageKvTransfers(NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes, NnUint startPos = 0u);
     bool collectHeadKvTransfers(const PlanCommand &cmd, NnUint endPos, NnUint *exportedRows, NnUint *queuedRows, uint64_t *sourceTransferBytes);
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     void resetPendingKvMigrationState(const char *reason);
@@ -629,6 +641,9 @@ public:
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     void forward(bool collectProfile = true);
+    // Returns elapsed microseconds; zero means the operation was not run.
+    unsigned long long runToolWindowShadow();
+    unsigned long long runBackgroundPreCopy(NnUint endPos);
     void collectDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out);
     LlmPerfPacket makeRootPerfPacket() const;
     void finish();

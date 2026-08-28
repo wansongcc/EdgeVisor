@@ -96,6 +96,16 @@ static void e5PhaseHook(const char *phase, NnUint pos, NnUint fromNode,
     }
 }
 
+static void e5MaybeFailMigrationPhaseOnce(const char *envName, const char *phase) {
+    if (!envFlagEnabledDefault(envName, false)) return;
+    static std::set<std::string> injected;
+    if (!injected.insert(envName).second) return;
+    std::printf("🧪 [e5-fault] phase=%s action=fail_once migration_only=1\n", phase);
+    std::fflush(stdout);
+    throw NnTransferSocketException(ECANCELED,
+        std::string("E5 injected migration-only ") + phase + " failure");
+}
+
 static void setEnvIfUnsetOrEmpty(const char *name, const char *value) {
     const char *current = std::getenv(name);
     if (current == nullptr || current[0] == '\0') {
@@ -228,6 +238,10 @@ static bool bubbleShadowKvEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV", false);
 }
 
+static bool bubbleShadowKvDuringForwardEnabled() {
+    return bubbleShadowKvEnabled() && envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD", true);
+}
+
 static bool bubbleShadowKvAsyncEnabled() {
     return bubbleShadowKvEnabled() && envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", true);
 }
@@ -256,10 +270,10 @@ static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name
     return (NnUint)-1;
 }
 
-static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
+static NnBubbleShadowStats runBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize, bool forceSynchronous) {
     NnBubbleShadowStats stats{};
     if (!bubbleShadowKvEnabled() || executor == nullptr) return stats;
-    const bool asyncMode = executor->isBubbleShadowAsyncModeEnabled();
+    const bool asyncMode = !forceSynchronous && executor->isBubbleShadowAsyncModeEnabled();
     stats = asyncMode ? executor->getLastBubbleShadowStats() : executor->runBubbleShadowRedundant(0u);
     if (bubbleShadowKvLogEnabled()) {
         std::printf(
@@ -283,6 +297,18 @@ static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const ch
         std::fflush(stdout);
     }
     return stats;
+}
+
+static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
+    if (!bubbleShadowKvDuringForwardEnabled()) return {};
+    return runBubbleShadowKv(executor, who, nodeIndex, position, batchSize, false);
+}
+
+static NnBubbleShadowStats runToolWindowBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
+    // Tool-window work is deliberately synchronous: it must be completed and
+    // profiled before the root releases the tool result.  Its elapsed time is
+    // charged against that round's fixed tool-wait budget in dllama.cpp.
+    return runBubbleShadowKv(executor, who, nodeIndex, position, batchSize, true);
 }
 
 static bool parseEnvInt(const char *name, int &out) {
@@ -443,6 +469,9 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.samplerSeed = args->seed;
     if (p.bubbleShadowKvEnabled != 0u) {
         p.flags |= LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV;
+        if (bubbleShadowKvDuringForwardEnabled()) {
+            p.flags |= LLM_BOOTSTRAP_BUBBLE_SHADOW_KV_DURING_FORWARD;
+        }
         if (!bubbleShadowKvAsyncEnabled()) {
             p.flags |= LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC;
         }
@@ -2668,6 +2697,11 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     }
     std::sort(migrationLayers.begin(), migrationLayers.end());
 
+    {
+        const char *bgEnv = std::getenv("DLLAMA_BACKGROUND_PRECOPY");
+        bgPrecopyEnabled = (bgEnv != nullptr && bgEnv[0] == '1');
+    }
+
     if (!migrationLayers.empty() && this->ppMigrationEnabled) {
         std::ostringstream oss;
         for (size_t i = 0; i < migrationLayers.size(); ++i) {
@@ -3080,7 +3114,8 @@ bool RootLlmInference::collectSourceStageKvTransfers(
     NnUint endPos,
     NnUint *exportedRows,
     NnUint *queuedRows,
-    uint64_t *sourceTransferBytes) {
+    uint64_t *sourceTransferBytes,
+    NnUint startPos) {
     if (exportedRows != nullptr) *exportedRows = 0u;
     if (queuedRows != nullptr) *queuedRows = 0u;
     if (sourceTransferBytes != nullptr) *sourceTransferBytes = 0u;
@@ -3170,7 +3205,7 @@ bool RootLlmInference::collectSourceStageKvTransfers(
 
     if (stageContainsNodeLocal(sourceStage, 0u) && executor != nullptr) {
         for (NnUint layer : migrationLayers) {
-            for (NnUint pos = 0u; pos <= endPos; ++pos) {
+            for (NnUint pos = startPos; pos <= endPos; ++pos) {
                 std::vector<float> kRow;
                 std::vector<float> vRow;
                 if (executor->exportLayerKvRow(layer, pos, kvDim, kRow, vRow)) {
@@ -3765,6 +3800,11 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
 
 bool RootLlmInference::verifyPendingLayerSwitchPrecommit() {
     if (network == nullptr) return false;
+    // E5 test-only fault: fail after candidate KV installation but before any
+    // binding write.  Unlike dropping the shared data-plane link, this
+    // isolates the migration channel and leaves the old active pipeline
+    // healthy, which is the precondition for rollback continuation.
+    e5MaybeFailMigrationPhaseOnce("DLLAMA_E5_FAIL_PRECOMMIT_ONCE", "precommit");
     LlmControlPacket probe = controlPacket;
     probe.flags = LLM_CTRL_CONTROL_ONLY | LLM_CTRL_PRECOMMIT_PROBE;
     probe.batchSize = 1u;
@@ -3948,8 +3988,12 @@ void RootLlmInference::beginStageBypassAckVerification(
     stageBypassExpectedAckNodes.push_back(pendingBypassPreviousNode);
     const NnStageConfig *ejected = findStageByIndexLocal(plan, ejectedStage);
     if (ejected == nullptr) { stageBypassFailureReason = "missing ejected bypass stage"; return; }
-    stageBypassExpectedAckNodes.push_back(ejected->rootNodeIndex);
-    stageBypassExpectedAckNodes.push_back(target->rootNodeIndex);
+    if (std::find(stageBypassExpectedAckNodes.begin(), stageBypassExpectedAckNodes.end(), ejected->rootNodeIndex) == stageBypassExpectedAckNodes.end()) {
+        stageBypassExpectedAckNodes.push_back(ejected->rootNodeIndex);
+    }
+    if (std::find(stageBypassExpectedAckNodes.begin(), stageBypassExpectedAckNodes.end(), target->rootNodeIndex) == stageBypassExpectedAckNodes.end()) {
+        stageBypassExpectedAckNodes.push_back(target->rootNodeIndex);
+    }
     stageBypassReceivedAckNodes.clear();
     stageBypassAckCache.clear();
 }
@@ -3971,10 +4015,13 @@ void RootLlmInference::consumeStageBypassAckFrame(NnUint socketIndex, const std:
     const NnStageConfig *ejected = findStageByIndexLocal(plan, stageBypassAppliedEjectedStage);
     const NnStageConfig *target = findStageByIndexLocal(plan, stageBypassAppliedTargetStage);
     if (ejected == nullptr || target == nullptr) { stageBypassFailureReason = "missing bypass ACK stage"; return; }
-    const NnUint expectedRole = ack.fromNodeIndex == pendingBypassPreviousNode ? LLM_STAGE_BYPASS_ACK_NEXT_REROUTED :
-        (ack.fromNodeIndex == ejected->rootNodeIndex ? (LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED) : LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE);
-    const NnUint expectedStage = ack.fromNodeIndex == pendingBypassPreviousNode ? pendingBypassPreviousStage :
-        (ack.fromNodeIndex == ejected->rootNodeIndex ? stageBypassAppliedEjectedStage : stageBypassAppliedTargetStage);
+    // The target may also be the ejected stage's previous active stage. One
+    // physical worker then fulfils both roles and emits the stronger target
+    // ownership ACK; do not require a second, impossible ACK from that node.
+    const NnUint expectedRole = ack.fromNodeIndex == target->rootNodeIndex ? LLM_STAGE_BYPASS_ACK_TARGET_OWNS_RANGE :
+        (ack.fromNodeIndex == ejected->rootNodeIndex ? (LLM_STAGE_BYPASS_ACK_EJECTED_EXITED | LLM_STAGE_BYPASS_ACK_PP_SYNC_DISABLED) : LLM_STAGE_BYPASS_ACK_NEXT_REROUTED);
+    const NnUint expectedStage = ack.fromNodeIndex == target->rootNodeIndex ? stageBypassAppliedTargetStage :
+        (ack.fromNodeIndex == ejected->rootNodeIndex ? stageBypassAppliedEjectedStage : pendingBypassPreviousStage);
     if (ack.stageIndex != expectedStage || ack.roleFlags != expectedRole ||
             (ack.fromNodeIndex == target->rootNodeIndex &&
              (ack.startLayer != stageBypassAppliedLayers.front() || ack.endLayer != stageBypassAppliedLayers.back() + 1u ||
@@ -4008,6 +4055,17 @@ void RootLlmInference::tryVerifyStageBypassAcks() {
     }
     stageBypassReceivedAckNodes = stageBypassExpectedAckNodes;
     stageBypassVerifiedGeneration = stageBypassPendingGeneration;
+    const NnStageConfig *ejected = findStageByIndexLocal(plan, stageBypassAppliedEjectedStage);
+    const bool membershipRemoved = ejected != nullptr && network != nullptr
+        ? network->deactivateNode(ejected->rootNodeIndex, 0u)
+        : false;
+    std::printf("🔁 [stage-bypass-ack] verified generation=%llu ejectedStage=%u targetStage=%u participants=%zu\n",
+        (unsigned long long)stageBypassVerifiedGeneration,
+        (unsigned)stageBypassAppliedEjectedStage,
+        (unsigned)stageBypassAppliedTargetStage,
+        stageBypassReceivedAckNodes.size());
+    std::printf("🔁 [stage-bypass-ack] membership_removed=%u\n", membershipRemoved ? 1u : 0u);
+    std::fflush(stdout);
 }
 
 void RootLlmInference::pollStageBypassAckFrames() {
@@ -4078,6 +4136,7 @@ void RootLlmInference::collectDeferredProfile(const LlmPerfPacket &rootPacket, s
     if (network != nullptr && network->nSockets > 0) {
         const NnUint nWorkers = network->nSockets;
         for (NnUint i = 0; i < nWorkers; ++i) {
+            if (!network->isSocketActive(i)) continue;
             pumpWorkerFrames(i);
             if (!workerProfileFrameCache[i].empty()) {
                 out.push_back(workerProfileFrameCache[i].front());
@@ -4133,6 +4192,60 @@ void RootLlmInference::collectProfilePackets() {
         const size_t maxHistory = 512u;
         while (perfHistory.size() > maxHistory) perfHistory.pop_front();
     }
+}
+
+unsigned long long RootLlmInference::runToolWindowShadow() {
+    if (network == nullptr || executor == nullptr || !profileEnabled) return 0u;
+    LlmControlPacket out = controlPacket;
+    out.flags = LLM_CTRL_CONTROL_ONLY | LLM_CTRL_PROFILE | LLM_CTRL_TOOL_WINDOW_SHADOW;
+    out.batchSize = 1u;
+    out.planCmdSeq = 0u;
+    const auto started = std::chrono::steady_clock::now();
+    lastBubbleShadowStats = runToolWindowBubbleShadowKv(executor, "tool-window-root", 0u, out.position, out.batchSize);
+    logRootControlSend(out);
+    network->writeAll(&out, sizeof(out));
+    collectProfilePackets();
+    const auto finished = std::chrono::steady_clock::now();
+    const auto elapsedUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(finished - started).count();
+    std::printf("🪟 [tool-window-shadow] pos=%u elapsed_us=%llu root_ops=%u root_us=%llu workers=%u\n",
+        (unsigned)out.position, elapsedUs, (unsigned)lastBubbleShadowStats.opStepsExecuted,
+        (unsigned long long)lastBubbleShadowStats.elapsedUs, (unsigned)network->nSockets);
+    std::fflush(stdout);
+    return elapsedUs;
+}
+
+// P2 BackgroundPreCopy baseline: copy the candidate migration layers' KV to
+// the destination in idle windows; the trigger later transfers only the
+// delta [bgCopiedPos+1, endPos]. Returns elapsed microseconds.
+unsigned long long RootLlmInference::runBackgroundPreCopy(NnUint endPos) {
+    if (!bgPrecopyEnabled) return 0u;
+    if (network == nullptr || executor == nullptr || header == nullptr) return 0u;
+    if (!ppMigrationEnabled || migrationLayers.empty()) return 0u;
+    if (waitingKvAck) return 0u;
+    if (endPos == 0u || bgCopiedPos >= endPos) return 0u;
+    const auto started = std::chrono::steady_clock::now();
+    NnUint exported = 0u;
+    NnUint queued = 0u;
+    uint64_t sourceBytes = 0u;
+    const NnUint startPos = (bgPrecopyPasses == 0u) ? 0u : bgCopiedPos + 1u;
+    const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes, startPos);
+    uint64_t targetBytes = 0u;
+    const bool flushed = collected && flushPendingKvTransfersControlOnly(&targetBytes);
+    const auto finished = std::chrono::steady_clock::now();
+    const auto elapsedUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(finished - started).count();
+    if (flushed) {
+        bgCopiedPos = endPos;
+        bgPrecopyBytesTotal += sourceBytes + targetBytes;
+        bgPrecopyPasses += 1u;
+        std::printf("\U0001F9E9 [bg-precopy] copied_to=%u exported=%u queued=%u bytes=%llu total_bytes=%llu passes=%llu elapsed_us=%llu\n",
+            (unsigned)endPos, (unsigned)exported, (unsigned)queued,
+            (unsigned long long)(sourceBytes + targetBytes),
+            (unsigned long long)bgPrecopyBytesTotal,
+            (unsigned long long)bgPrecopyPasses,
+            elapsedUs);
+        std::fflush(stdout);
+    }
+    return elapsedUs;
 }
 
 bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens) {
@@ -5017,6 +5130,7 @@ void RootLlmInference::forward(bool collectProfile) {
                 uint64_t sourceBytes = 0u;
                 e5PhaseHook("freeze_quiesce", endPos, migrationFromNodeIndex, nextStageRootNode,
                     migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
+                e5MaybeFailMigrationPhaseOnce("DLLAMA_E5_FAIL_FREEZE_ONCE", "freeze_quiesce");
                 const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
                 auto t1 = std::chrono::steady_clock::now();
                 uint64_t targetBytes = 0u;
@@ -5062,10 +5176,18 @@ void RootLlmInference::forward(bool collectProfile) {
             uint64_t sourceBytes = 0u;
             e5PhaseHook("freeze_quiesce", endPos, migrationFromNodeIndex, nextStageRootNode,
                 migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
-            const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
+            e5MaybeFailMigrationPhaseOnce("DLLAMA_E5_FAIL_FREEZE_ONCE", "freeze_quiesce");
+            const bool bgActive = (bgPrecopyEnabled && bgPrecopyPasses > 0u);
+            const NnUint deltaStart = bgActive ? (bgCopiedPos + 1u) : 0u;
+            const bool fullyCopied = bgActive && (bgCopiedPos >= endPos);
+            bool collected = true;
+            if (!fullyCopied) {
+                collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes, deltaStart);
+            }
             auto t1 = std::chrono::steady_clock::now();
             uint64_t targetBytes = 0u;
-            const bool transferred = collected && flushPendingKvTransfersControlOnly(&targetBytes);
+            const bool transferred = fullyCopied ? true : (collected && flushPendingKvTransfersControlOnly(&targetBytes));
+            const bool deltaOnly = bgActive;
             if (transferred) {
                 e5PhaseHook("install", endPos, migrationFromNodeIndex, nextStageRootNode,
                     migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
@@ -5079,7 +5201,15 @@ void RootLlmInference::forward(bool collectProfile) {
             lastMigrationStateTransferBytes = stateBytes;
             lastMigrationExportedRows = exported;
             applyOk = switched;
-            fallbackReason = "shadow_kv_disabled_real_transfer";
+            fallbackReason = deltaOnly ? "background_precopy_delta_transfer" : "shadow_kv_disabled_real_transfer";
+            if (deltaOnly) {
+                std::printf("\U0001F9E9 [bg-precopy] trigger delta posRange=[%u,%u] trigger_bytes=%llu bg_total_bytes=%llu bg_passes=%llu\n",
+                    (unsigned)deltaStart, (unsigned)endPos,
+                    (unsigned long long)stateBytes,
+                    (unsigned long long)bgPrecopyBytesTotal,
+                    (unsigned long long)bgPrecopyPasses);
+                std::fflush(stdout);
+            }
             migrationBatchSubmitted = applyOk;
             std::printf("🧩 [kv-migrate] real transfer prepared exported=%u queued=%u layers=%u posRange=[0,%u] sourceBytes=%llu targetBytes=%llu targetRoot=%u status=%s\n",
                 (unsigned)exported,
@@ -5759,6 +5889,10 @@ void runWorkerApp(AppCliArgs *args) {
         const bool bootLastStageSamplingEnabled = (boot.flags & LLM_BOOTSTRAP_LAST_STAGE_SAMPLING) != 0u;
         if (bootBubbleShadowKvEnabled) {
             setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
+            setenv(
+                "DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD",
+                (boot.flags & LLM_BOOTSTRAP_BUBBLE_SHADOW_KV_DURING_FORWARD) != 0u ? "1" : "0",
+                1);
             if ((boot.flags & LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC) != 0u) {
                 setenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", "0", 1);
             } else {
@@ -5766,6 +5900,7 @@ void runWorkerApp(AppCliArgs *args) {
             }
         } else {
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
+            unsetenv("DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD");
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
         }
         if (bootLastStageSamplingEnabled) {
@@ -6083,6 +6218,10 @@ void runWorkerApp(AppCliArgs *args) {
                 }
 
                 if ((inference.flags() & LLM_CTRL_CONTROL_ONLY) != 0u) {
+                    NnBubbleShadowStats toolWindowBubbleStats{};
+                    if ((inference.flags() & LLM_CTRL_TOOL_WINDOW_SHADOW) != 0u) {
+                        toolWindowBubbleStats = runToolWindowBubbleShadowKv(&executor, "tool-window-worker", nodeConfig.nodeIndex, inference.position(), inference.batchSize());
+                    }
                     inference.flushPendingKvAck();
                     if ((inference.flags() & LLM_CTRL_PROFILE) != 0u) {
                         LlmPerfPacket p{};
@@ -6092,6 +6231,12 @@ void runWorkerApp(AppCliArgs *args) {
                         p.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
                         p.execUs = 0u;
                         p.syncUs = 0u;
+                        p.bubbleUs = (NnUint)std::min<unsigned long long>(toolWindowBubbleStats.elapsedUs, (unsigned long long)UINT32_MAX);
+                        p.bubbleSegments = toolWindowBubbleStats.segmentsVisited;
+                        p.bubbleOps = toolWindowBubbleStats.opStepsExecuted;
+                        p.bubbleSkippedSyncs = toolWindowBubbleStats.skippedSyncSteps;
+                        p.bubbleDrainUs = toolWindowBubbleStats.drainUs;
+                        p.bubbleCompleted = toolWindowBubbleStats.completed;
                         fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                         writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                     }

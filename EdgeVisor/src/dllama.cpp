@@ -1677,6 +1677,14 @@ static bool parseEpisodeScript(const char *path, std::string &prompt, std::vecto
     return !prompt.empty() && !rounds.empty();
 }
 
+static bool episodeRollbackContinuationEnabled() {
+    const char *value = std::getenv("DLLAMA_E5_CONTINUE_AFTER_ROLLBACK");
+    if (value == nullptr) return false;
+    return std::strcmp(value, "1") == 0 ||
+        std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "TRUE") == 0;
+}
+
 static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int inputToken,
                                    const char *phase, unsigned int round) {
     if (pos >= context->header->seqLen) {
@@ -1690,20 +1698,35 @@ static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int
     std::vector<LlmPerfPacket> perf;
     NnUint remoteToken = 0u;
     bool haveRemoteToken = false;
-    try {
-        context->inference->forward();
-        perf = context->inference->getLastPerf();
-        haveRemoteToken = context->args->lastStageSampling && context->network != nullptr &&
-            context->inference->tryReceiveLastStageSampledToken(remoteToken, nullptr);
-    } catch (const NnTransferSocketException &e) {
-        appendEpisodeEvent("transport_abort", round, pos, 0u, 0u);
-        const bool rollbackComplete = context->inference->abortPendingPpMigrationForTransportFailure(e.what());
-        std::printf("🧯 [e5-frontier] phase=%s round=%u pos=%u rollback_complete=%s\n",
-            phase, round, (unsigned)pos, rollbackComplete ? "1" : "0");
-        std::fflush(stdout);
-        throw;
+    unsigned int rollbackRetries = 0u;
+    while (true) {
+        try {
+            context->inference->forward();
+            perf = context->inference->getLastPerf();
+            haveRemoteToken = context->args->lastStageSampling && context->network != nullptr &&
+                context->inference->tryReceiveLastStageSampledToken(remoteToken, nullptr);
+            break;
+        } catch (const NnTransferSocketException &e) {
+            appendEpisodeEvent("transport_abort", round, pos, 0u, 0u);
+            const bool rollbackComplete = context->inference->abortPendingPpMigrationForTransportFailure(e.what());
+            const bool retryOldEpoch = rollbackComplete && rollbackRetries == 0u &&
+                episodeRollbackContinuationEnabled();
+            std::printf("🧯 [e5-frontier] phase=%s round=%u pos=%u rollback_complete=%s continuation=%s retry=%u\n",
+                phase, round, (unsigned)pos, rollbackComplete ? "1" : "0",
+                retryOldEpoch ? "old_epoch" : "stop", rollbackRetries);
+            std::fflush(stdout);
+            if (!retryOldEpoch) throw;
+            appendEpisodeEvent("rollback_continue", round, pos, 0u, 0u);
+            rollbackRetries += 1u;
+            // No ownership packet was written, so every worker still has the
+            // old active mapping. Re-running the same (token, position) pair
+            // overwrites the uncommitted KV slot and preserves the frontier.
+        }
     }
     const int sampledToken = haveRemoteToken ? (int)remoteToken : context->sampler->sample(context->inference->logitsPipe);
+    if (!haveRemoteToken && context->inference->logitsPipe != nullptr) {
+        debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, phase, pos, 0u);
+    }
     const auto wallEnd = std::chrono::steady_clock::now();
     const double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
     std::printf("[episode-token] phase=%s round=%u pos=%u input=%d output=%d wall_ms=%.2f\n",
@@ -1789,7 +1812,22 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
         appendEpisodeEvent("generation_end", roundNumber, pos, 0u, 0u);
         appendEpisodeEvent("tool_wait_start", roundNumber, pos, round.toolWaitMs, 0u);
         const auto waitStart = std::chrono::steady_clock::now();
-        std::this_thread::sleep_for(std::chrono::milliseconds(round.toolWaitMs));
+        unsigned long long toolShadowUs = 0u;
+        if (std::getenv("DLLAMA_TOOL_WINDOW_SHADOW") != nullptr) {
+            toolShadowUs = context->inference->runToolWindowShadow();
+            appendEpisodeEvent("tool_shadow_run", roundNumber, pos, 0u, toolShadowUs);
+        }
+        if (std::getenv("DLLAMA_BACKGROUND_PRECOPY") != nullptr) {
+            const unsigned long long bgUs = context->inference->runBackgroundPreCopy(pos);
+            if (bgUs > 0u) {
+                appendEpisodeEvent("bg_precopy_run", roundNumber, pos, 0u, bgUs);
+            }
+        }
+        const auto afterShadow = std::chrono::steady_clock::now();
+        const unsigned long long elapsedBeforeSleepMs = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(afterShadow - waitStart).count();
+        if (elapsedBeforeSleepMs < round.toolWaitMs) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(round.toolWaitMs - elapsedBeforeSleepMs));
+        }
         const auto waitEnd = std::chrono::steady_clock::now();
         const unsigned long long actualWaitMs = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(waitEnd - waitStart).count();
         appendEpisodeEvent("tool_wait_end", roundNumber, pos, round.toolWaitMs, actualWaitMs);
@@ -1803,6 +1841,472 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
     (void)episodeForwardAndSample(context, pos, currentToken, "episode_finalize", 5u);
     pos += 1u;
     appendEpisodeEvent("episode_complete", 5u, pos, 0u, 0u);
+}
+
+// E3 multi-session episode replay.  N independent agentic episodes share the
+// same deployed model, one KV slot per session (slotId == session index).
+// Every forward stays batch=1 exactly like the validated single-session path;
+// sessions interleave round-robin, so a session's tool wait is naturally
+// filled by other sessions' decode work.  This is the shared-model
+// multi-session experiment requested for E3; no worker-side changes are
+// required beyond sizing the KV cache with --max-active-seqs.
+
+static void appendMsEvent(const char *eventType, unsigned int session, unsigned int round,
+                          NnUint pos, unsigned int plannedMs, unsigned long long actualMs) {
+    const unsigned long long timestampMs = episodeNowMs();
+    std::printf("[episode-event] type=%s session=%u round=%u pos=%u ts_ms=%llu planned_ms=%u actual_ms=%llu\n",
+        eventType, session, round, (unsigned)pos, timestampMs, plannedMs, actualMs);
+    const char *path = episodeEventLogPath();
+    if (path == nullptr || path[0] == '\0') return;
+    std::ofstream out(path, std::ios::app);
+    if (!out) return;
+    out << "{\"type\":\"" << eventType << "\",\"session\":" << session
+        << ",\"round\":" << round << ",\"pos\":" << (unsigned)pos
+        << ",\"ts_ms\":" << timestampMs
+        << ",\"planned_ms\":" << plannedMs << ",\"actual_ms\":" << actualMs << "}\n";
+}
+
+static void appendMsTokenCommit(const char *phase, unsigned int session, unsigned int round,
+                                NnUint pos, int inputToken, int outputToken) {
+    const char *path = episodeEventLogPath();
+    if (path == nullptr || path[0] == '\0') return;
+    std::ofstream out(path, std::ios::app);
+    if (!out) return;
+    out << "{\"type\":\"token_commit\",\"phase\":\"" << phase
+        << "\",\"session\":" << session << ",\"round\":" << round
+        << ",\"pos\":" << (unsigned)pos << ",\"input\":" << inputToken
+        << ",\"output\":" << outputToken << ",\"ts_ms\":" << episodeNowMs() << "}\n";
+}
+
+static int msForwardAndSample(AppInferenceContext *context, unsigned int session, NnUint slotId,
+                              NnUint pos, int inputToken, const char *phase, unsigned int round) {
+    if (pos >= context->header->seqLen) {
+        throw std::runtime_error("Multi-session episode reached model sequence length");
+    }
+    const auto wallStart = std::chrono::steady_clock::now();
+    context->inference->setBatchSize(1u);
+    context->inference->setBatchItem(0u, (NnUint)inputToken, pos, slotId);
+    context->inference->setSkipLogits(false);
+    NnUint remoteToken = 0u;
+    bool haveRemoteToken = false;
+    try {
+        context->inference->forward();
+        haveRemoteToken = context->args->lastStageSampling && context->network != nullptr &&
+            context->inference->tryReceiveLastStageSampledToken(remoteToken, nullptr);
+    } catch (const NnTransferSocketException &e) {
+        appendMsEvent("transport_abort", session, round, pos, 0u, 0u);
+        const bool rollbackComplete = context->inference->abortPendingPpMigrationForTransportFailure(e.what());
+        std::printf("🧯 [e5-frontier] session=%u phase=%s round=%u pos=%u rollback_complete=%s\n",
+            session, phase, round, (unsigned)pos, rollbackComplete ? "1" : "0");
+        std::fflush(stdout);
+        throw;
+    }
+    const int sampledToken = haveRemoteToken ? (int)remoteToken : context->sampler->sample(context->inference->logitsPipe);
+    const auto wallEnd = std::chrono::steady_clock::now();
+    const double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
+    std::printf("[episode-token] session=%u phase=%s round=%u pos=%u input=%d output=%d wall_ms=%.2f\n",
+        session, phase, round, (unsigned)pos, inputToken, sampledToken, wallMs);
+    std::fflush(stdout);
+    appendMsTokenCommit(phase, session, round, pos, inputToken, sampledToken);
+    return sampledToken;
+}
+
+typedef enum {
+    MS_GENERATION = 0,
+    MS_TOOL_WAIT = 1,
+    MS_TOOL_REPLAY = 2,
+    MS_FINALIZE = 3,
+    MS_DONE = 4
+} MsPhase;
+
+struct MsSessionState {
+    unsigned int session = 0u;
+    NnUint slotId = 0u;
+    NnUint pos = 0u;
+    int currentToken = 0;
+    size_t roundIndex = 0u;
+    MsPhase phase = MS_GENERATION;
+    unsigned int genRemaining = 0u;
+    std::vector<int> replayTokens;
+    size_t replayIndex = 0u;
+    unsigned long long waitStartMs = 0u;
+    unsigned long long waitDeadlineMs = 0u;
+    unsigned int waitPlannedMs = 0u;
+    unsigned long long episodeStartMs = 0u;
+    unsigned long long episodeEndMs = 0u;
+    unsigned long long generatedTokens = 0u;
+    int batchedSampledToken = 0;
+};
+
+static const char *msPhaseName(MsPhase phase) {
+    switch (phase) {
+    case MS_GENERATION: return "generation";
+    case MS_TOOL_WAIT: return "tool_wait";
+    case MS_TOOL_REPLAY: return "tool_replay";
+    case MS_FINALIZE: return "episode_finalize";
+    default: return "done";
+    }
+}
+
+// P0 batched decode: one forward covers k runnable sessions (k >= 1), each
+// item carrying its own KV slot (SLT pipe), position (POS pipe) and token.
+// Per-item greedy sampling reads the [batch][vocab] logits pipe row i.
+// Enabled only when DLLAMA_MS_DECODE_BATCH > 1; the default scheduler below
+// remains exactly the validated batch=1 path.
+static void msForwardBatchAndSample(AppInferenceContext *context,
+                                    std::vector<MsSessionState *> &states) {
+    const NnUint k = (NnUint)states.size();
+    const NnUint vocabSize = context->header->vocabSize;
+    const auto wallStart = std::chrono::steady_clock::now();
+    context->inference->setBatchSize(k);
+    for (NnUint i = 0u; i < k; ++i) {
+        MsSessionState &st = *states[i];
+        context->inference->setBatchItem(i, (NnUint)st.currentToken, st.pos, st.slotId);
+    }
+    context->inference->setSkipLogits(false);
+    try {
+        context->inference->forward();
+    } catch (const NnTransferSocketException &e) {
+        for (MsSessionState *sp : states) {
+            appendMsEvent("transport_abort", sp->session,
+                          sp->phase == MS_FINALIZE ? 5u : (unsigned int)sp->roundIndex + 1u,
+                          sp->pos, 0u, 0u);
+        }
+        const bool rollbackComplete = context->inference->abortPendingPpMigrationForTransportFailure(e.what());
+        std::printf("🧯 [e5-frontier] batched_sessions=%u batch_size=%u rollback_complete=%s\n",
+            (unsigned)states.size(), (unsigned)k, rollbackComplete ? "1" : "0");
+        std::fflush(stdout);
+        throw;
+    }
+    const auto wallEnd = std::chrono::steady_clock::now();
+    const double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
+    for (NnUint i = 0u; i < k; ++i) {
+        MsSessionState &st = *states[i];
+        float *itemLogits = context->inference->logitsPipe + (size_t)i * (size_t)vocabSize;
+        const int sampledToken = context->sampler->sample(itemLogits);
+        const unsigned int round = st.phase == MS_FINALIZE ? 5u : (unsigned int)st.roundIndex + 1u;
+        const char *phase = msPhaseName(st.phase);
+        std::printf("[episode-token] session=%u phase=%s round=%u pos=%u input=%d output=%d wall_ms=%.2f batch_size=%u batch_index=%u\n",
+            st.session, phase, round, (unsigned)st.pos, st.currentToken, sampledToken, wallMs,
+            (unsigned)k, (unsigned)i);
+        appendMsTokenCommit(phase, st.session, round, st.pos, st.currentToken, sampledToken);
+        st.batchedSampledToken = sampledToken;
+    }
+    std::fflush(stdout);
+}
+
+// Batched decode scheduler. Mirrors the round-robin scheduler state machine,
+// but gathers every runnable session (up to DLLAMA_MS_DECODE_BATCH) into one
+// forward. Tool-wait deadline handling and tool-window ShadowKV behaviour are
+// identical. Returns true when all sessions completed.
+static bool inferenceRunMultiSessionEpisodeBatched(AppInferenceContext *context,
+                                                   std::vector<MsSessionState> &sessions,
+                                                   const std::vector<EpisodeRound> &rounds,
+                                                   unsigned int sessionCount,
+                                                   unsigned int decodeBatchSize,
+                                                   bool toolWindowShadow) {
+    std::printf("[multi-session] batched_decode=1 decode_batch_size=%u\n", decodeBatchSize);
+    std::fflush(stdout);
+    size_t doneCount = 0u;
+    size_t cursor = 0u;
+    while (doneCount < sessionCount) {
+        const unsigned long long nowMs = episodeNowMs();
+        // TOOL_WAIT sessions never forward: once their wall-clock deadline has
+        // passed, transition them to MS_TOOL_REPLAY (tokenize the tool result)
+        // without any model forward, exactly like the batch=1 scheduler.
+        for (MsSessionState &state : sessions) {
+            if (state.phase == MS_TOOL_WAIT && nowMs >= state.waitDeadlineMs) {
+                const unsigned int roundNumber = (unsigned int)state.roundIndex + 1u;
+                const unsigned long long actualWaitMs = episodeNowMs() - state.waitStartMs;
+                appendMsEvent("tool_wait_end", state.session, roundNumber, state.pos, state.waitPlannedMs, actualWaitMs);
+                const EpisodeRound &round = rounds[state.roundIndex];
+                const std::string framed = "\n<tool_result round=\"" + std::to_string(roundNumber) + "\">\n" +
+                    round.toolResult + "\n</tool_result>\n";
+                state.replayTokens.resize(framed.size() + 3u);
+                int nTokens = 0;
+                context->tokenizer->encode(const_cast<char *>(framed.c_str()), state.replayTokens.data(), &nTokens, false, false);
+                if (nTokens < 1) throw std::runtime_error("Multi-session tool result tokenized to zero tokens");
+                state.replayTokens.resize((size_t)nTokens);
+                state.replayIndex = 0u;
+                state.phase = MS_TOOL_REPLAY;
+            }
+        }
+        std::vector<MsSessionState *> batch;
+        for (size_t offset = 0u; offset < sessionCount && batch.size() < decodeBatchSize; ++offset) {
+            MsSessionState &candidate = sessions[(cursor + offset) % sessionCount];
+            if (candidate.phase == MS_DONE) continue;
+            if (candidate.phase == MS_TOOL_WAIT) continue;  // handled above / still waiting
+            batch.push_back(&candidate);
+        }
+        if (batch.empty()) {
+            unsigned long long earliest = ~0ull;
+            for (MsSessionState &state : sessions) {
+                if (state.phase == MS_TOOL_WAIT && state.waitDeadlineMs < earliest) earliest = state.waitDeadlineMs;
+            }
+            if (earliest == ~0ull) return false;
+            if (toolWindowShadow) {
+                const unsigned long long shadowUs = context->inference->runToolWindowShadow();
+                appendMsEvent("tool_shadow_run", sessionCount, 0u, 0u, 0u, shadowUs);
+            }
+            const unsigned long long afterMs = episodeNowMs();
+            if (afterMs < earliest) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(earliest - afterMs));
+            }
+            continue;
+        }
+        cursor = (batch.back()->session + 1u) % sessionCount;
+        msForwardBatchAndSample(context, batch);
+        for (MsSessionState *sp : batch) {
+            MsSessionState &state = *sp;
+            const unsigned int roundNumber = (unsigned int)state.roundIndex + 1u;
+            const int sampledToken = state.batchedSampledToken;
+            switch (state.phase) {
+            case MS_GENERATION: {
+                state.currentToken = sampledToken;
+                state.pos += 1u;
+                state.generatedTokens += 1u;
+                state.genRemaining -= 1u;
+                if (state.genRemaining == 0u) {
+                    appendMsEvent("generation_end", state.session, roundNumber, state.pos, 0u, 0u);
+                    const EpisodeRound &round = rounds[state.roundIndex];
+                    state.waitPlannedMs = round.toolWaitMs;
+                    state.waitStartMs = episodeNowMs();
+                    state.waitDeadlineMs = state.waitStartMs + (unsigned long long)round.toolWaitMs;
+                    appendMsEvent("tool_wait_start", state.session, roundNumber, state.pos, round.toolWaitMs, 0u);
+                    state.phase = MS_TOOL_WAIT;
+                }
+                break;
+            }
+            case MS_TOOL_REPLAY: {
+                state.currentToken = state.replayTokens[state.replayIndex];
+                state.replayIndex += 1u;
+                state.pos += 1u;
+                if (state.replayIndex >= state.replayTokens.size()) {
+                    appendMsEvent("tool_result_replayed", state.session, roundNumber, state.pos, 0u, 0u);
+                    state.roundIndex += 1u;
+                    if (state.roundIndex < rounds.size()) {
+                        state.genRemaining = rounds[state.roundIndex].generationTokens;
+                        appendMsEvent("generation_start", state.session, state.roundIndex + 1u, state.pos, 0u, 0u);
+                        state.phase = MS_GENERATION;
+                    } else {
+                        state.phase = MS_FINALIZE;
+                    }
+                }
+                break;
+            }
+            case MS_FINALIZE: {
+                state.pos += 1u;
+                state.episodeEndMs = episodeNowMs();
+                state.phase = MS_DONE;
+                doneCount += 1u;
+                appendMsEvent("episode_complete", state.session, 5u, state.pos, 0u,
+                              state.episodeEndMs - state.episodeStartMs);
+                break;
+            }
+            case MS_TOOL_WAIT:
+            case MS_DONE:
+                break;
+            }
+        }
+    }
+    std::printf("[multi-session] complete sessions=%u\n", sessionCount);
+    for (const MsSessionState &state : sessions) {
+        std::printf("[multi-session] session=%u wall_ms=%llu generated=%llu final_pos=%u\n",
+            state.session, state.episodeEndMs - state.episodeStartMs,
+            state.generatedTokens, (unsigned)state.pos);
+    }
+    std::fflush(stdout);
+    return true;
+}
+
+static void inferenceRunMultiSessionEpisode(AppInferenceContext *context, const char *scriptPath,
+                                            unsigned int sessionCount) {
+    std::string prompt;
+    std::vector<EpisodeRound> rounds;
+    if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
+        throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
+    }
+    if (rounds.size() != 5u) {
+        throw std::runtime_error("Formal E3 episode requires exactly five ROUND records");
+    }
+    if (sessionCount < 1u || sessionCount > 64u) {
+        throw std::runtime_error("DLLAMA_MULTI_SESSION_COUNT must be within 1..64");
+    }
+    if (context->args->maxActiveSeqs < sessionCount) {
+        throw std::runtime_error("--max-active-seqs must be >= DLLAMA_MULTI_SESSION_COUNT on every node");
+    }
+    const bool toolWindowShadow = std::getenv("DLLAMA_TOOL_WINDOW_SHADOW") != nullptr;
+    const char *msBatchEnv = std::getenv("DLLAMA_MS_DECODE_BATCH");
+    unsigned int decodeBatchSize = 1u;
+    if (msBatchEnv != nullptr && msBatchEnv[0] != '\0') {
+        decodeBatchSize = (unsigned int)std::strtoul(msBatchEnv, nullptr, 10);
+        if (decodeBatchSize < 1u) decodeBatchSize = 1u;
+        if (decodeBatchSize > sessionCount) decodeBatchSize = sessionCount;
+    }
+    std::printf("[multi-session] sessions=%u maxActiveSeqs=%u tool_window_shadow=%d decode_batch=%u\n",
+        sessionCount, (unsigned)context->args->maxActiveSeqs, toolWindowShadow ? 1 : 0, decodeBatchSize);
+    std::fflush(stdout);
+
+    // Prefill every session sequentially into its own KV slot, mirroring the
+    // continuous-batching evaluation loop.
+    TokenizerChatStops stops(context->tokenizer);
+    const std::string effectivePrompt = buildInferencePrompt(context, prompt.c_str(), &stops);
+    std::vector<int> promptTokens(effectivePrompt.size() + 3u);
+    int nPromptTokens = 0;
+    context->tokenizer->encode(const_cast<char *>(effectivePrompt.c_str()), promptTokens.data(), &nPromptTokens, true, true);
+    if (nPromptTokens < 1) throw std::runtime_error("Multi-session PROMPT tokenized to zero tokens");
+    if ((NnUint)nPromptTokens >= context->header->seqLen) throw std::runtime_error("Multi-session PROMPT exceeds sequence length");
+    const NnUint prefillBatchLimit = std::max<NnUint>(1u, context->args->nBatches);
+
+    std::vector<MsSessionState> sessions(sessionCount);
+    for (unsigned int s = 0u; s < sessionCount; ++s) {
+        MsSessionState &state = sessions[s];
+        state.session = s;
+        state.slotId = (NnUint)s;
+        state.episodeStartMs = episodeNowMs();
+        NnUint pos = 0u;
+        while (pos + 1u < (NnUint)nPromptTokens) {
+            const NnUint remaining = (NnUint)nPromptTokens - 1u - pos;
+            const NnUint batchSize = std::min<NnUint>(remaining, prefillBatchLimit);
+            context->inference->setBatchSize(batchSize);
+            for (NnUint index = 0u; index < batchSize; ++index) {
+                context->inference->setBatchItem(index, (NnUint)promptTokens[pos + index], pos + index, state.slotId);
+            }
+            context->inference->setSkipLogits(batchSize < remaining);
+            context->inference->forward();
+            pos += batchSize;
+        }
+        context->inference->setSkipLogits(false);
+        state.pos = pos;
+        state.currentToken = promptTokens[(size_t)nPromptTokens - 1u];
+        state.genRemaining = rounds[0].generationTokens;
+        appendMsEvent("prefill_complete", s, 0u, state.pos, 0u, 0u);
+        appendMsEvent("generation_start", s, 1u, state.pos, 0u, 0u);
+    }
+
+    // P0 batched decode path (DLLAMA_MS_DECODE_BATCH > 1). Gathers runnable
+    // sessions into shared forwards; the default batch=1 scheduler below is
+    // untouched and remains the validated reference path.
+    if (decodeBatchSize > 1u) {
+        if (inferenceRunMultiSessionEpisodeBatched(context, sessions, rounds, sessionCount,
+                                                   decodeBatchSize, toolWindowShadow)) {
+            return;
+        }
+        std::printf("[multi-session] batched scheduler did not complete; falling back to batch=1 scheduler\n");
+        std::fflush(stdout);
+    }
+
+    // Round-robin decode scheduler.  A session in MS_TOOL_WAIT re-enters the
+    // schedule only after its wall-clock deadline; when every active session
+    // is waiting, the root optionally runs tool-window ShadowKV once and then
+    // sleeps until the earliest deadline.
+    size_t doneCount = 0u;
+    size_t cursor = 0u;
+    while (doneCount < sessionCount) {
+        MsSessionState *next = nullptr;
+        const unsigned long long nowMs = episodeNowMs();
+        for (size_t offset = 0u; offset < sessionCount; ++offset) {
+            MsSessionState &candidate = sessions[(cursor + offset) % sessionCount];
+            if (candidate.phase == MS_DONE) continue;
+            if (candidate.phase == MS_TOOL_WAIT && nowMs < candidate.waitDeadlineMs) continue;
+            next = &candidate;
+            cursor = (candidate.session + 1u) % sessionCount;
+            break;
+        }
+        if (next == nullptr) {
+            unsigned long long earliest = ~0ull;
+            for (MsSessionState &state : sessions) {
+                if (state.phase == MS_TOOL_WAIT && state.waitDeadlineMs < earliest) earliest = state.waitDeadlineMs;
+            }
+            if (earliest == ~0ull) break;  // defensive: no runnable and no waiting session
+            if (toolWindowShadow) {
+                const unsigned long long shadowUs = context->inference->runToolWindowShadow();
+                appendMsEvent("tool_shadow_run", sessionCount, 0u, 0u, 0u, shadowUs);
+            }
+            const unsigned long long afterMs = episodeNowMs();
+            if (afterMs < earliest) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(earliest - afterMs));
+            }
+            continue;
+        }
+
+        MsSessionState &state = *next;
+        const unsigned int roundNumber = (unsigned int)state.roundIndex + 1u;
+        switch (state.phase) {
+        case MS_GENERATION: {
+            state.currentToken = msForwardAndSample(context, state.session, state.slotId, state.pos,
+                                                    state.currentToken, "generation", roundNumber);
+            state.pos += 1u;
+            state.generatedTokens += 1u;
+            state.genRemaining -= 1u;
+            if (state.genRemaining == 0u) {
+                appendMsEvent("generation_end", state.session, roundNumber, state.pos, 0u, 0u);
+                const EpisodeRound &round = rounds[state.roundIndex];
+                state.waitPlannedMs = round.toolWaitMs;
+                state.waitStartMs = episodeNowMs();
+                state.waitDeadlineMs = state.waitStartMs + (unsigned long long)round.toolWaitMs;
+                appendMsEvent("tool_wait_start", state.session, roundNumber, state.pos, round.toolWaitMs, 0u);
+                state.phase = MS_TOOL_WAIT;
+            }
+            break;
+        }
+        case MS_TOOL_WAIT: {
+            const unsigned long long actualWaitMs = episodeNowMs() - state.waitStartMs;
+            appendMsEvent("tool_wait_end", state.session, roundNumber, state.pos, state.waitPlannedMs, actualWaitMs);
+            const EpisodeRound &round = rounds[state.roundIndex];
+            const std::string framed = "\n<tool_result round=\"" + std::to_string(roundNumber) + "\">\n" +
+                round.toolResult + "\n</tool_result>\n";
+            state.replayTokens.resize(framed.size() + 3u);
+            int nTokens = 0;
+            context->tokenizer->encode(const_cast<char *>(framed.c_str()), state.replayTokens.data(), &nTokens, false, false);
+            if (nTokens < 1) throw std::runtime_error("Multi-session tool result tokenized to zero tokens");
+            state.replayTokens.resize((size_t)nTokens);
+            state.replayIndex = 0u;
+            state.phase = MS_TOOL_REPLAY;
+            break;
+        }
+        case MS_TOOL_REPLAY: {
+            (void)msForwardAndSample(context, state.session, state.slotId, state.pos,
+                                     state.currentToken, "tool_replay", roundNumber);
+            state.currentToken = state.replayTokens[state.replayIndex];
+            state.replayIndex += 1u;
+            state.pos += 1u;
+            if (state.replayIndex >= state.replayTokens.size()) {
+                appendMsEvent("tool_result_replayed", state.session, roundNumber, state.pos, 0u, 0u);
+                state.roundIndex += 1u;
+                if (state.roundIndex < rounds.size()) {
+                    state.genRemaining = rounds[state.roundIndex].generationTokens;
+                    appendMsEvent("generation_start", state.session, state.roundIndex + 1u, state.pos, 0u, 0u);
+                    state.phase = MS_GENERATION;
+                } else {
+                    state.phase = MS_FINALIZE;
+                }
+            }
+            break;
+        }
+        case MS_FINALIZE: {
+            (void)msForwardAndSample(context, state.session, state.slotId, state.pos,
+                                     state.currentToken, "episode_finalize", 5u);
+            state.pos += 1u;
+            state.episodeEndMs = episodeNowMs();
+            state.phase = MS_DONE;
+            doneCount += 1u;
+            appendMsEvent("episode_complete", state.session, 5u, state.pos, 0u,
+                          state.episodeEndMs - state.episodeStartMs);
+            break;
+        }
+        case MS_DONE:
+            break;
+        }
+    }
+
+    std::printf("[multi-session] complete sessions=%u\n", sessionCount);
+    for (const MsSessionState &state : sessions) {
+        std::printf("[multi-session] session=%u wall_ms=%llu generated=%llu final_pos=%u\n",
+            state.session, state.episodeEndMs - state.episodeStartMs,
+            state.generatedTokens, (unsigned)state.pos);
+    }
+    std::fflush(stdout);
 }
 
 static bool isInteractiveQuitLine(const std::string& s) {
@@ -1829,6 +2333,13 @@ static bool parseStepsCommand(const std::string& line, NnUint& outSteps) {
 
 static void inference(AppInferenceContext *context) {
     const char *episodeScript = std::getenv("DLLAMA_EPISODE_SCRIPT");
+    const char *multiSessionCount = std::getenv("DLLAMA_MULTI_SESSION_COUNT");
+    if (episodeScript != nullptr && episodeScript[0] != '\0' &&
+        multiSessionCount != nullptr && multiSessionCount[0] != '\0') {
+        const unsigned int count = (unsigned int)std::strtoul(multiSessionCount, nullptr, 10);
+        inferenceRunMultiSessionEpisode(context, episodeScript, count);
+        return;
+    }
     if (episodeScript != nullptr && episodeScript[0] != '\0') {
         inferenceRunEpisodeScript(context, episodeScript);
         return;

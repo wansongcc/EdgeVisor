@@ -2408,8 +2408,10 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
             return poolDepth;                       // budget-blind maximal
         }
         if (coveragePolicy == "random") {
+            // depth in 1..poolDepth: every boundary keeps at least minimal
+            // coverage (zero-coverage boundaries break shadow pairing).
             std::mt19937 rng(coverageSeed + boundaryIndex * 7919u);
-            return (NnUint)(rng() % (poolDepth + 1u));  // random depth 0..4
+            return 1u + (NnUint)(rng() % poolDepth);
         }
         if (coveragePolicy == "cost_only") {
             // Cost-minimal: prepare ONLY the boundary the measured migration

@@ -70,6 +70,7 @@ class NnNetwork {
 private:
     int *sockets;
     NnUint *peerNodeBySocket;
+    bool *socketActive;
     NnSize *sentBytes;
     NnSize *recvBytes;
     bool commProfileEnabled = false;
@@ -128,6 +129,8 @@ public:
     void recordSyncStepComplete();
     void recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size);
     int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const;
+    bool isSocketActive(NnUint socketIndex) const;
+    bool deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex);
     void resetStats();
     
 };

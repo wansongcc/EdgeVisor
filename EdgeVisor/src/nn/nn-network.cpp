@@ -1204,10 +1204,12 @@ NnNetwork::NnNetwork(std::vector<NnSocket> *sockets, std::vector<NnUint> *peerNo
     for (NnUint i = 0; i < nSockets; i++)
         this->sockets[i] = sockets->at(i).release();
     this->peerNodeBySocket = new NnUint[nSockets];
+    this->socketActive = new bool[nSockets];
     for (NnUint i = 0; i < nSockets; i++) {
         this->peerNodeBySocket[i] = (peerNodeBySocket != nullptr && i < peerNodeBySocket->size())
             ? peerNodeBySocket->at(i)
             : 0u;
+        this->socketActive[i] = true;
     }
     this->sentBytes = new NnSize[nSockets];
     this->recvBytes = new NnSize[nSockets];
@@ -1219,6 +1221,7 @@ NnNetwork::~NnNetwork() {
         printCommProfile("total", getCommProfileStats(), false);
     }
     delete[] peerNodeBySocket;
+    delete[] socketActive;
     delete[] sentBytes;
     delete[] recvBytes;
     for (NnUint i = 0; i < nSockets; i++)
@@ -1229,6 +1232,7 @@ NnNetwork::~NnNetwork() {
 
 void NnNetwork::setTurbo(bool enabled) {
     for (NnUint i = 0; i < nSockets; i++) {
+        if (!socketActive[i]) continue;
         ::setNonBlocking(sockets[i], enabled);
     }
 }
@@ -1502,6 +1506,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     for (NnUint i = 0; i < n; i++) {
         NnSocketIo *io = &ios[i];
         assert(io->socketIndex < nSockets);
+        if (!socketActive[io->socketIndex]) { io->size = 0; continue; }
         sentBytes[io->socketIndex] += io->size;
     }
     do {
@@ -1556,14 +1561,17 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
 }
 
 void NnNetwork::writeAll(const void *data, NnSize size) {
-    std::vector<NnSocketIo> ios(nSockets);
+    std::vector<NnSocketIo> ios;
+    ios.reserve(nSockets);
     for (NnUint i = 0; i < nSockets; i++) {
-        NnSocketIo *io = &ios[i];
+        if (!socketActive[i]) continue;
+        ios.push_back(NnSocketIo{});
+        NnSocketIo *io = &ios.back();
         io->socketIndex = i;
         io->data = data;
         io->size = size;
     }
-    writeMany(nSockets, &ios[0]);
+    if (!ios.empty()) writeMany((NnUint)ios.size(), ios.data());
 }
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
@@ -1582,6 +1590,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     for (NnUint i = 0; i < n; i++) {
         NnSocketIo *io = &ios[i];
         assert(io->socketIndex < nSockets);
+        if (!socketActive[io->socketIndex]) { io->size = 0; continue; }
         recvBytes[io->socketIndex] += io->size;
     }
     do {
@@ -1659,11 +1668,28 @@ void NnNetwork::resetStats() {
 int NnNetwork::getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const {
     (void)myNodeIndex;
     for (NnUint i = 0; i < nSockets; ++i) {
-        if (peerNodeBySocket[i] == targetNodeIndex) {
+        if (socketActive[i] && peerNodeBySocket[i] == targetNodeIndex) {
             return (int)i;
         }
     }
     return -1;
+}
+
+bool NnNetwork::isSocketActive(NnUint socketIndex) const {
+    return socketIndex < nSockets && socketActive[socketIndex];
+}
+
+bool NnNetwork::deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex) {
+    (void)myNodeIndex;
+    for (NnUint i = 0; i < nSockets; ++i) {
+        if (peerNodeBySocket[i] != targetNodeIndex) continue;
+        socketActive[i] = false;
+        std::printf("🔌 [network-membership] deactivated node=%u socket=%u\n",
+            (unsigned)targetNodeIndex, (unsigned)i);
+        std::fflush(stdout);
+        return true;
+    }
+    return false;
 }
 
 void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size) {

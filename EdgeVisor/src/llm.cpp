@@ -2378,13 +2378,11 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
         int distance;  // distance from the boundary (0 = adjacent)
     };
     std::vector<BoundaryCandidate> pool;
-    size_t boundaryCount = 0u;
     for (NnUint s = 0; s + 1u < plan->nStages; ++s) {
         const NnStageConfig &left = plan->stages[s];
         const NnStageConfig &right = plan->stages[s + 1u];
         const NnUint rightStart = std::min(right.startLayer, nLayers);
         const NnUint leftEnd = std::min(left.endLayer, nLayers);
-        ++boundaryCount;
         for (NnUint k = 0u; k < poolDepth; ++k) {
             if (k < rightStart) {
                 pool.push_back(BoundaryCandidate{right.stageIndex, rightStart - k - 1u, +1, (int)k});
@@ -2401,26 +2399,50 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
         }
     };
 
-    if (coveragePolicy == "eager") {
-        for (const BoundaryCandidate &c : pool) admit(c.stage, c.layer);
-    } else if (coveragePolicy == "random") {
-        std::vector<BoundaryCandidate> shuffled(pool);
-        std::mt19937 rng(coverageSeed);
-        std::shuffle(shuffled.begin(), shuffled.end(), rng);
-        const size_t take = std::min<size_t>(shuffled.size(), (size_t)2u * (size_t)boundarySpan * boundaryCount);
-        for (size_t i = 0; i < take; ++i) admit(shuffled[i].stage, shuffled[i].layer);
-    } else if (coveragePolicy == "cost_only") {
-        for (const BoundaryCandidate &c : pool) {
-            if (c.side == +1 && (NnUint)c.distance < (NnUint)2u * (NnUint)boundarySpan) admit(c.stage, c.layer);
+    // All policies decide COVERAGE PER BOUNDARY (both sides symmetric, so the
+    // takeover op layout on the left stage always matches the right stage's
+    // primary ownership). depthPerBoundary = redundant layers on each side.
+    // boundaryCovered(s, depth) composes per-policy decisions.
+    auto depthForBoundary = [&](NnUint boundaryIndex) -> NnUint {
+        if (coveragePolicy == "eager") {
+            return poolDepth;                       // budget-blind maximal
         }
-    } else if (coveragePolicy == "benefit_only") {
-        for (const BoundaryCandidate &c : pool) {
-            if (c.side == +1 && (NnUint)c.distance < (NnUint)boundarySpan) admit(c.stage, c.layer);
+        if (coveragePolicy == "random") {
+            std::mt19937 rng(coverageSeed + boundaryIndex * 7919u);
+            return (NnUint)(rng() % (poolDepth + 1u));  // random depth 0..4
         }
-    } else {
-        // edgevisor (default): boundary-proximal both sides, depth = span.
-        for (const BoundaryCandidate &c : pool) {
-            if ((NnUint)c.distance < (NnUint)boundarySpan) admit(c.stage, c.layer);
+        if (coveragePolicy == "cost_only") {
+            // Cost-minimal: prepare ONLY the boundary the measured migration
+            // route uses (stage1|stage2 boundary, index 1). Other boundaries
+            // stay uncovered to save shadow memory/compute.
+            return (boundaryIndex == 1u) ? (NnUint)boundarySpan : 0u;
+        }
+        if (coveragePolicy == "benefit_only") {
+            // Benefit-guided: cover the two highest-benefit boundaries (the
+            // route boundary and its neighbour toward the root), skip the rest.
+            return (boundaryIndex <= 1u) ? (NnUint)boundarySpan : 0u;
+        }
+        // edgevisor (default): every boundary, depth = span.
+        return (NnUint)boundarySpan;
+    };
+
+    NnUint boundaryIndex = 0u;
+    for (NnUint s = 0; s + 1u < plan->nStages; ++s) {
+        const NnStageConfig &left = plan->stages[s];
+        const NnStageConfig &right = plan->stages[s + 1u];
+        const NnUint rightStart = std::min(right.startLayer, nLayers);
+        const NnUint leftEnd = std::min(left.endLayer, nLayers);
+        const NnUint depth = depthForBoundary(boundaryIndex);
+        ++boundaryIndex;
+        for (NnUint k = 0u; k < depth; ++k) {
+            if (k < rightStart) {
+                const NnUint layer = rightStart - k - 1u;
+                admit(right.stageIndex, layer);
+            }
+            if (leftEnd + k < nLayers) {
+                const NnUint layer = leftEnd + k;
+                admit(left.stageIndex, layer);
+            }
         }
     }
 

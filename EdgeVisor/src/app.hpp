@@ -537,6 +537,7 @@ private:
     // the candidate migration layers' KV is copied to the destination in the
     // background during idle windows; the trigger only transfers the delta.
     bool bgPrecopyEnabled = false;
+    NnUint bgPrecopyMaxPasses = 0u;   // 0 = unlimited (DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES)
     NnUint bgCopiedPos = 0u;
     unsigned long long bgPrecopyBytesTotal = 0u;
     unsigned long long bgPrecopyPasses = 0u;

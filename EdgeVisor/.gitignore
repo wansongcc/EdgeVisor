@@ -20,3 +20,9 @@ server
 *.spv
 .vscode/launch.json
 
+
+# Local experiment snapshots and pre-change binaries. Keep on disk.
+*.bak
+*.bak_*
+*.pre_*
+dllama.pre_*

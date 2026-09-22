@@ -13,6 +13,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <iostream>
 #include <deque>
@@ -31,6 +32,51 @@ static void appendMigrationTpotLog(const std::string &line) {
     std::ofstream f(path, std::ios::app);
     if (!f) return;
     f << line << "\n";
+}
+
+static bool microbatchTraceEnabled() {
+    const char *v = std::getenv("DLLAMA_MICROBATCH_TRACE");
+    if (v == nullptr || v[0] == '\0') return false;
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 && std::strcmp(v, "False") != 0;
+}
+
+static const char *microbatchTraceRunId() {
+    const char *v = std::getenv("EDGEVISOR_MICROBATCH_RUN_ID");
+    return (v != nullptr && v[0] != '\0') ? v : "unspecified";
+}
+
+static void emitPrefillMicrobatchTrace(
+    NnUint microbatchId,
+    NnUint tokenStart,
+    NnUint tokenEnd,
+    unsigned long long forwardWallUs,
+    const std::vector<LlmPerfPacket> &perf) {
+    if (!microbatchTraceEnabled()) return;
+    for (const LlmPerfPacket &p : perf) {
+        std::printf(
+            "[mb-trace] run_id=%s phase=prefill microbatch_id=%u token_start=%u token_end=%u "
+            "logical_position=%u batch_size=%u stage_id=%u node_id=%u forward_wall_us=%llu "
+            "exec_us=%u sync_us=%u wait_us=NA forward_count=1 token_count=%u "
+            "shadow_work_us=%u shadow_data_movement_us=0 plan_id=static-runtime-plan "
+            "required_frontier=%u completed_frontier=%u shadow_complete=%u\n",
+            microbatchTraceRunId(),
+            (unsigned)microbatchId,
+            (unsigned)tokenStart,
+            (unsigned)tokenEnd,
+            (unsigned)p.position,
+            (unsigned)p.batchSize,
+            (unsigned)p.stageIndex,
+            (unsigned)p.nodeIndex,
+            forwardWallUs,
+            (unsigned)p.execUs,
+            (unsigned)p.syncUs,
+            (unsigned)std::max<NnUint>(1u, p.batchSize),
+            (unsigned)p.bubbleUs,
+            (unsigned)tokenEnd,
+            (unsigned)(p.bubbleCompleted ? tokenEnd : tokenStart),
+            (unsigned)p.bubbleCompleted);
+    }
+    std::fflush(stdout);
 }
 
 
@@ -908,6 +954,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     int token = inputTokens[pos];
     printf("%s\n", effectivePrompt.c_str());
     const auto evalWallStart = std::chrono::steady_clock::now();
+    NnUint microbatchId = 0u;
     for (;;) {
         long remainingTokens = nInputTokens - 1 - (long)pos;
         if (remainingTokens <= 0)
@@ -926,7 +973,19 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         // via the control-packet flag).
         const bool isFinalChunk = (remainingTokens <= (long)batchSize);
         context->inference->setSkipLogits(!context->args->lastStageSampling && !isFinalChunk);
+        const auto microbatchWallStart = std::chrono::steady_clock::now();
         context->inference->forward();
+        const auto microbatchWallEnd = std::chrono::steady_clock::now();
+        const unsigned long long microbatchWallUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(microbatchWallEnd - microbatchWallStart).count();
+        if (context->args->benchmark && microbatchTraceEnabled()) {
+            emitPrefillMicrobatchTrace(
+                microbatchId,
+                pos,
+                pos + batchSize,
+                microbatchWallUs,
+                context->inference->getLastPerf());
+        }
+        microbatchId += 1u;
 
         NnUint evalBubbleTime = 0;
         if (context->args->benchmark) {

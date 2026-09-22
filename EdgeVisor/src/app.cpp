@@ -2700,6 +2700,8 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     {
         const char *bgEnv = std::getenv("DLLAMA_BACKGROUND_PRECOPY");
         bgPrecopyEnabled = (bgEnv != nullptr && bgEnv[0] == '1');
+        const char *bgMax = std::getenv("DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES");
+        if (bgMax != nullptr && bgMax[0] != '\0') bgPrecopyMaxPasses = (NnUint)std::strtoul(bgMax, nullptr, 10);
     }
 
     if (!migrationLayers.empty() && this->ppMigrationEnabled) {
@@ -4219,6 +4221,7 @@ unsigned long long RootLlmInference::runToolWindowShadow() {
 // delta [bgCopiedPos+1, endPos]. Returns elapsed microseconds.
 unsigned long long RootLlmInference::runBackgroundPreCopy(NnUint endPos) {
     if (!bgPrecopyEnabled) return 0u;
+    if (bgPrecopyMaxPasses != 0u && bgPrecopyPasses >= bgPrecopyMaxPasses) return 0u;
     if (network == nullptr || executor == nullptr || header == nullptr) return 0u;
     if (!ppMigrationEnabled || migrationLayers.empty()) return 0u;
     if (waitingKvAck) return 0u;

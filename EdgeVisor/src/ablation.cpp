@@ -1,5 +1,6 @@
 #include "ablation.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
@@ -255,6 +256,14 @@ bool edgevisorAblationLogEnabled() {
 }
 
 void edgevisorAblationLogEvent(const EdgeVisorAblationEvent &event) {
+    // --- S2 instrumentation: sample the clock where the event is logged ---
+    const auto s2MonoNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto s2Sys = std::chrono::system_clock::now().time_since_epoch();
+    const auto s2WallMs = std::chrono::duration_cast<std::chrono::milliseconds>(s2Sys).count();
+    // 与 token 流同域：episodeNowMs() 也用 system_clock（dllama.cpp:1661）
+    const auto s2WallNs = std::chrono::duration_cast<std::chrono::nanoseconds>(s2Sys).count();
+    // --- end S2 ---
     const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
     if (cfg.ablationLogPath.empty()) return;
 
@@ -286,6 +295,11 @@ void edgevisorAblationLogEvent(const EdgeVisorAblationEvent &event) {
     j["rejected_moves"] = event.rejectedMoves;
     j["fallback_count"] = event.fallbackCount;
     j["apply_success"] = event.applySuccess;
+    j["t_mono_ns"] = static_cast<uint64_t>(s2MonoNs);
+    j["ts_unix_ms"] = static_cast<uint64_t>(s2WallMs);
+    j["t_wall_ns"] = static_cast<uint64_t>(s2WallNs);
+    j["clock_domain"] = "steady_clock";
+    j["wall_clock_domain"] = "system_clock";
 
     std::lock_guard<std::mutex> lock(g_ablationLogMutex);
     std::ofstream out(cfg.ablationLogPath.c_str(), std::ios::app);

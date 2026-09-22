@@ -2324,6 +2324,19 @@ static NnNodeConfig buildLlmNodeInternal(
     return config;
 }
 
+
+static bool boundaryInList(const char *list, NnUint idx) {
+    // list format: "0,1" or "1,3" — comma-separated boundary indices
+    NnUint start = 0u;
+    for (const char *p = list;; ++p) {
+        if (*p == ',' || *p == '\0') {
+            if (start == idx) return true;
+            if (*p == '\0') return false;
+            start++;
+        }
+    }
+}
+
 RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *plan, NnUint nLayers) {
     RuntimeStageLayerPlan out;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages == 0u || nLayers == 0u) return out;
@@ -2342,6 +2355,16 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
     };
 
     const int boundarySpan = std::max(0, parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", 1));
+    // Probe hook: coverage (how many boundaries) and depth (how many layers per
+    // boundary) are separate. One uniform span cannot express "deep next to the
+    // degraded stage, shallow elsewhere", and on a five-stage chain raising it
+    // makes both Nanos carry two deep boundaries -- which does not fit their GPU
+    // memory. Both default to `boundarySpan`, so an unset environment is
+    // byte-identical to the published behaviour.
+    const int budget = std::max(0, parseEnvInt(
+        "DLLAMA_REDUNDANT_BOUNDARY_BUDGET", boundarySpan));
+    const int depth = std::max(0, parseEnvInt(
+        "DLLAMA_REDUNDANT_BOUNDARY_DEPTH", boundarySpan));
 
     // P1 admission-policy ablation. DLLAMA_COVERAGE_POLICY selects how the
     // redundant (shadow) coverage budget is spent across PP-stage boundaries:
@@ -2399,44 +2422,134 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
         }
     };
 
-    // All policies decide COVERAGE PER BOUNDARY (both sides symmetric, so the
-    // takeover op layout on the left stage always matches the right stage's
-    // primary ownership). depthPerBoundary = redundant layers on each side.
-    // boundaryCovered(s, depth) composes per-policy decisions.
-    auto depthForBoundary = [&](NnUint boundaryIndex) -> NnUint {
-        if (coveragePolicy == "eager") {
-            return poolDepth;                       // budget-blind maximal
-        }
-        if (coveragePolicy == "random") {
-            // depth in 1..poolDepth: every boundary keeps at least minimal
-            // coverage (zero-coverage boundaries break shadow pairing).
-            std::mt19937 rng(coverageSeed + boundaryIndex * 7919u);
-            return 1u + (NnUint)(rng() % poolDepth);
-        }
-        if (coveragePolicy == "cost_only") {
-            // Cost-minimal: prepare ONLY the boundary the measured migration
-            // route uses (stage1|stage2 boundary, index 1). Other boundaries
-            // stay uncovered to save shadow memory/compute.
-            return (boundaryIndex == 1u) ? (NnUint)boundarySpan : 0u;
-        }
-        if (coveragePolicy == "benefit_only") {
-            // Benefit-guided: cover the two highest-benefit boundaries (the
-            // route boundary and its neighbour toward the root), skip the rest.
-            return (boundaryIndex <= 1u) ? (NnUint)boundarySpan : 0u;
-        }
-        // edgevisor (default): every boundary, depth = span.
-        return (NnUint)boundarySpan;
-    };
+    // ================================================================
+    // M1 Admission: score-driven boundary selection → materialization
+    // ================================================================
+    // Each PP boundary maps to one degradation scenario. The admission
+    // policy selects which boundaries to cover given a fixed budget.
+    //
+    // Score(b) = p(b) × R(b) / C(b)
+    //   p(b)  = scenario probability
+    //   R(b)  = avoided reactive recovery cost (uniform ≈ 550 ms, from P2)
+    //   C(b)  = prep cost = span × layers/boundary (uniform)
+    // → Score(b) ∝ p(b) since R and C are uniform per boundary.
 
+    const char *scenProbStr = std::getenv("DLLAMA_SCENARIO_PROBABILITIES");
+    double probs[8] = {0.4, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0};
+    if (scenProbStr != nullptr && scenProbStr[0] != '\0') {
+        // parse comma-separated probabilities
+        double vals[8]; int cnt = 0;
+        const char *p = scenProbStr;
+        while (*p && cnt < 8) {
+            char *end; double v = strtod(p, &end);
+            if (end == p) break;
+            vals[cnt++] = v; p = end;
+            while (*p == ',' || *p == ' ') ++p;
+        }
+        for (int i = 0; i < cnt; ++i) probs[i] = vals[i];
+    }
+
+    // Count boundaries and build candidate info
+    struct CandidateBoundary {
+        NnUint index;
+        NnUint rightStage, leftStage;
+        NnUint rightStart, leftEnd;
+        double probability;
+        double benefit_ms;       // avoided reactive recovery
+        double prep_cost_layers; // span (uniform)
+        double score;
+    };
+    std::vector<CandidateBoundary> candidates;
+    for (NnUint s = 0; s + 1u < plan->nStages; ++s) {
+        CandidateBoundary cb;
+        cb.index = (NnUint)candidates.size();
+        cb.rightStage = s + 1u;
+        cb.leftStage = s;
+        cb.rightStart = std::min(plan->stages[s + 1u].startLayer, nLayers);
+        cb.leftEnd = std::min(plan->stages[s].endLayer, nLayers);
+        cb.probability = (cb.index < 8) ? probs[cb.index] : 0.0;
+        cb.benefit_ms = 550.0;  // measured reactive recovery stall (P2)
+        cb.prep_cost_layers = (double)boundarySpan;
+        cb.score = (cb.prep_cost_layers > 0)
+            ? (cb.probability * cb.benefit_ms / cb.prep_cost_layers) : 0.0;
+        candidates.push_back(cb);
+    }
+
+    // --- Admission decision ---
+    std::vector<bool> covered(candidates.size(), false);
+    if (coveragePolicy == "edgevisor") {
+        // Score-ordered selection: top-(budget) boundaries by score
+        std::vector<NnUint> order(candidates.size());
+        for (NnUint i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](NnUint a, NnUint b) {
+            return candidates[a].score > candidates[b].score;
+        });
+        for (NnUint i = 0; i < candidates.size() && i < (NnUint)budget; ++i)
+            covered[order[i]] = true;
+    } else if (coveragePolicy == "random") {
+        // Seeded random selection of boundarySpan boundaries
+        std::mt19937 rng(coverageSeed);
+        std::vector<NnUint> order(candidates.size());
+        for (NnUint i = 0; i < order.size(); ++i) order[i] = i;
+        std::shuffle(order.begin(), order.end(), rng);
+        for (NnUint i = 0; i < candidates.size() && i < (NnUint)budget; ++i)
+            covered[order[i]] = true;
+    } else if (coveragePolicy == "eager") {
+        // Budget-blind: cover ALL boundaries
+        for (NnUint i = 0; i < candidates.size(); ++i) covered[i] = true;
+    } else {
+        // edgevisor (default): all boundaries at depth = span
+        for (NnUint i = 0; i < candidates.size(); ++i) covered[i] = true;
+    }
+
+    // --- Admission log ---
+    if (policyStr != nullptr) {
+        printf("\n[Admission] policy=%s budget=%u boundaries=%zu total_scenarios=%zu\n",
+            coveragePolicy.c_str(), (unsigned)budget, candidates.size(), candidates.size());
+        double ev_edgevisor = 0.0, ev_random = 0.0;
+        std::vector<bool> random_covered(candidates.size(), false);
+        {
+            std::mt19937 rng(20260902u);
+            std::vector<NnUint> order(candidates.size());
+            for (NnUint i = 0; i < order.size(); ++i) order[i] = i;
+            std::shuffle(order.begin(), order.end(), rng);
+            for (NnUint i = 0; i < candidates.size() && i < (NnUint)budget; ++i)
+                random_covered[order[i]] = true;
+        }
+        for (NnUint i = 0; i < candidates.size(); ++i) {
+            const CandidateBoundary &cb = candidates[i];
+            printf("[Admission] Scenario S%u:\n", cb.index + 1u);
+            printf("  probability = %.2f\n", cb.probability);
+            printf("  recovery_benefit = %.0f ms\n", cb.benefit_ms);
+            printf("  prep_cost = %.0f layers\n", cb.prep_cost_layers);
+            printf("  score = %.2f\n", cb.score);
+            printf("  EdgeVisor_selected = %s\n", covered[i] ? "true" : "false");
+            printf("  Random_selected = %s\n", random_covered[i] ? "true" : "false");
+            ev_edgevisor += cb.probability * (covered[i] ? 0.1 : 550.0);
+            ev_random += cb.probability * (random_covered[i] ? 0.1 : 550.0);
+        }
+        printf("[Admission] EdgeVisor covered = {");
+        for (NnUint i = 0; i < candidates.size(); ++i) if (covered[i]) printf("S%u,", i + 1u);
+        printf("} p=%.2f\n", [&]{ double p = 0; for (NnUint i = 0; i < candidates.size(); ++i) if (covered[i]) p += candidates[i].probability; return p; }());
+        printf("[Admission] Random covered = {");
+        for (NnUint i = 0; i < candidates.size(); ++i) if (random_covered[i]) printf("S%u,", i + 1u);
+        printf("} p=%.2f\n", [&]{ double p = 0; for (NnUint i = 0; i < candidates.size(); ++i) if (random_covered[i]) p += candidates[i].probability; return p; }());
+        printf("[Admission] ExpectedInterruption EdgeVisor = %.1f ms, Random = %.1f ms\n", ev_edgevisor, ev_random);
+        printf("[Admission] Equal budget: both cover %u boundaries x span %u = %u redundant layers\n",
+            (unsigned)budget, (unsigned)depth, (unsigned)(budget * depth * 2));
+    }
+
+    // --- Materialization: cover ONLY the selected boundaries ---
     NnUint boundaryIndex = 0u;
     for (NnUint s = 0; s + 1u < plan->nStages; ++s) {
         const NnStageConfig &left = plan->stages[s];
         const NnStageConfig &right = plan->stages[s + 1u];
         const NnUint rightStart = std::min(right.startLayer, nLayers);
         const NnUint leftEnd = std::min(left.endLayer, nLayers);
-        const NnUint depth = depthForBoundary(boundaryIndex);
+        const bool isCovered = boundaryIndex < covered.size() && covered[boundaryIndex];
         ++boundaryIndex;
-        for (NnUint k = 0u; k < depth; ++k) {
+        if (!isCovered) continue;
+        for (NnUint k = 0u; k < (NnUint)depth; ++k) {
             if (k < rightStart) {
                 const NnUint layer = rightStart - k - 1u;
                 admit(right.stageIndex, layer);
@@ -2446,6 +2559,25 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
                 admit(left.stageIndex, layer);
             }
         }
+    }
+
+    // --- Materialization summary ---
+    if (policyStr != nullptr) {
+        NnUint totalRedundant = 0u;
+        for (NnUint s = 0; s < out.nStages; ++s)
+            for (NnUint l = 0u; l < out.nLayers; ++l)
+                if (out.getRole(s, l) == RUNTIME_LAYER_REDUNDANT) ++totalRedundant;
+        printf("[Materialization] total_redundant_layers=%u redundantMarks=%u\n",
+            totalRedundant, totalRedundant * 2u);
+        printf("[Materialization] layers=");
+        bool first = true;
+        for (NnUint s = 0; s < out.nStages; ++s)
+            for (NnUint l = 0u; l < out.nLayers; ++l)
+                if (out.getRole(s, l) == RUNTIME_LAYER_REDUNDANT) {
+                    printf("%s%u", first ? "" : ",", l);
+                    first = false;
+                }
+        printf("\n");
     }
 
     if (policyStr != nullptr) {

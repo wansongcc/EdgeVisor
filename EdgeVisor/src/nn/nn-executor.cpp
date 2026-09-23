@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstring>
+#include <exception>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -758,6 +759,8 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
     }
 }
 
+static std::exception_ptr g_executorError;
+
 static inline void *executorThreadHandler(void *arg) {
     NnExecutorThread *thread = (NnExecutorThread *)arg;
     NnExecutorContext *context = thread->context;
@@ -774,6 +777,7 @@ static inline void *executorThreadHandler(void *arg) {
             executeStep(step, nThreads, thread, context);
         } catch (const std::runtime_error &e) {
             context->isAlive.store(false);
+            if (thread->threadIndex == 0u) g_executorError = std::current_exception();
             printf("Execution error: %s\n", e.what());
             break;
         }
@@ -837,6 +841,7 @@ static inline void *executorThreadHandler(void *arg) {
 }
 
 void NnExecutor::forward() {
+    g_executorError = nullptr;
     assert(netExecution->batchSize > 0);
 
     NnUint nThreads = netExecution->nThreads;
@@ -872,6 +877,11 @@ void NnExecutor::forward() {
     drainBubbleShadowAsync();
     const bool completed = context.isAlive.load();
     context.isAlive.store(false);
+    if (g_executorError) {
+        std::exception_ptr error = g_executorError;
+        g_executorError = nullptr;
+        std::rethrow_exception(error);
+    }
     if (!completed)
         throw NnExecutorException("Execution failed in one of the threads");
 }
@@ -1258,6 +1268,31 @@ void NnExecutor::setRedundantLayerEnabled(NnUint layerIndex, bool enabled) {
         enabled ? 1u : 0u,
         (unsigned)matched);
     std::fflush(stdout);
+}
+
+void NnExecutor::spliceRedundantLayersIntoSend(NnUint beginLayer, NnUint endLayer) {
+    if (netExecution == nullptr || beginLayer >= endLayer) return;
+    const NnUint batchSize = netExecution->batchSize;
+    if (batchSize == 0u) return;
+    auto layerInRange = [&](NnUint segmentIndex) -> bool {
+        if (segmentIndex >= segmentLayerIndex.size()) return false;
+        const int layer = segmentLayerIndex[segmentIndex];
+        return layer >= 0 && (NnUint)layer >= beginLayer && (NnUint)layer < endLayer;
+    };
+    for (const NnExecutorStep &step : steps) {
+        if (step.type != STEP_EXECUTE_OP || step.segment == nullptr) continue;
+        if (step.segmentIndex >= segmentRuntimeRoles.size()) continue;
+        if (segmentRuntimeRoles[step.segmentIndex] != SEG_ROLE_REDUNDANT) continue;
+        if (!layerInRange(step.segmentIndex)) continue;
+        if (segmentEnabled != nullptr &&
+            segmentEnabled[step.segmentIndex].load(std::memory_order_relaxed) == 0u) continue;
+        step.segment->forward(step.arg0, 1u, 0u, batchSize);
+    }
+    for (const NnExecutorStep &step : steps) {
+        if (step.type != STEP_EXECUTE_OP || step.segment == nullptr || step.opConfig == nullptr) continue;
+        if (step.opConfig->name == nullptr || std::strcmp(step.opConfig->name, "pp_cast_out") != 0) continue;
+        step.segment->forward(step.arg0, 1u, 0u, batchSize);
+    }
 }
 
 void NnExecutor::setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled) {

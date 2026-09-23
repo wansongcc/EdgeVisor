@@ -26,6 +26,10 @@ typedef SSIZE_T ssize_t;
 #include <set>
 #include <chrono>
 #include <fcntl.h>
+#include <csignal>
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 #ifndef _WIN32
 #include <unistd.h>
 #include <sched.h>
@@ -350,6 +354,37 @@ static inline const char *unixSocketPath(const char *host) {
     return isUnixSocketAddress(host) ? host + 5 : host;
 }
 
+static int envIntOr(const char *name, int fallback) {
+    const char *p = std::getenv(name);
+    if (p == nullptr || p[0] == '\0') return fallback;
+    char *end = nullptr;
+    long v = std::strtol(p, &end, 10);
+    if (end == p) return fallback;
+    return (int)v;
+}
+
+static inline void setTcpKeepAlive(int socket) {
+#ifndef _WIN32
+    const int idle = envIntOr("DLLAMA_TCP_KEEPIDLE_S", 1);
+    if (idle <= 0) return;
+    const int intvl = std::max(1, envIntOr("DLLAMA_TCP_KEEPINTVL_S", 1));
+    const int cnt = std::max(1, envIntOr("DLLAMA_TCP_KEEPCNT", 3));
+    int userMs = envIntOr("DLLAMA_TCP_USER_TIMEOUT_MS", (idle + intvl * cnt) * 1000);
+    int on = 1;
+    if (setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0) return;
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#ifdef TCP_USER_TIMEOUT
+    if (userMs > 0) setsockopt(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, &userMs, sizeof(userMs));
+#else
+    (void)userMs;
+#endif
+#else
+    (void)socket;
+#endif
+}
+
 static inline void setTcpSocketOptionsIfSupported(int socket) {
 #ifndef _WIN32
     int domain = AF_UNSPEC;
@@ -360,6 +395,39 @@ static inline void setTcpSocketOptionsIfSupported(int socket) {
 #endif
     setNoDelay(socket);
     setQuickAck(socket);
+    setTcpKeepAlive(socket);
+}
+
+static int g_acceptTimeoutMs = -1;
+static NnPpFailoverFn g_ppFailover = nullptr;
+
+void nnSetAcceptTimeoutMs(int timeoutMs) {
+    g_acceptTimeoutMs = timeoutMs;
+}
+
+void setNnPpFailoverHook(NnPpFailoverFn fn) {
+    g_ppFailover = fn;
+}
+
+static bool isOfflineErrno(int err) {
+    switch (err) {
+    case ECONNRESET:
+    case EPIPE:
+    case ECONNABORTED:
+    case ENOTCONN:
+    case EHOSTUNREACH:
+    case ENETDOWN:
+    case ENETRESET:
+    case ECONNREFUSED:
+        return true;
+    case ETIMEDOUT:
+        // Our own poll deadline uses ETIMEDOUT with DLLAMA_IO_TIMEOUT_MS set.
+        // A keepalive / TCP_USER_TIMEOUT failure shows up here only while that
+        // inference deadline is disabled, which is the offline signal.
+        return getIoTimeoutMs() == 0ul;
+    default:
+        return false;
+    }
 }
 
 void setReuseAddr(int socket) {
@@ -664,7 +732,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
     unsigned int eagainSpins = 0u;
     while (size > 0) {
         const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
-        ssize_t s = send(socket, (const char*)data, size, 0);
+        ssize_t s = send(socket, (const char*)data, size, MSG_NOSIGNAL);
         if (s < 0) {
             if (isEagainError()) {
                 if (ioProfile) dllamaIoProbeRecordNetSendEagain();
@@ -672,9 +740,11 @@ void writeSocket(int socket, const void *data, NnSize size) {
                 backoffOnEagain(eagainSpins);
                 continue;
             }
+            if (isOfflineErrno(SOCKET_LAST_ERRCODE))
+                throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket offline");
             throw NnTransferSocketException(0, "Error writing to socket");
         } else if (s == 0) {
-            throw NnTransferSocketException(0, "Socket closed");
+            throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket closed");
         }
         if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
         eagainSpins = 0u;
@@ -708,9 +778,11 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
                 }
                 continue;
             }
+            if (isOfflineErrno(SOCKET_LAST_ERRCODE))
+                throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket offline");
             throw NnTransferSocketException(0, "Error reading from socket");
         } else if (r == 0) {
-            throw NnTransferSocketException(0, "Socket closed");
+            throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket closed");
         }
         if (ioProfile) dllamaIoProbeRecordNetRecvSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
         printBytes("DEBUG: readSocket", data, r);
@@ -741,9 +813,11 @@ static inline bool tryPeekSocket(int socket, void *data, NnSize size, unsigned l
                 }
                 continue;
             }
+            if (isOfflineErrno(SOCKET_LAST_ERRCODE))
+                throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket offline");
             throw NnTransferSocketException(0, "Error peeking from socket");
         } else if (r == 0) {
-            throw NnTransferSocketException(0, "Socket closed");
+            throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket closed");
         }
         if ((NnSize)r >= size) return true;
         if (maxAttempts > 0) {
@@ -794,6 +868,47 @@ static inline NnUint peerWorkerToSocketIndex(NnUint myWorkerIndex, NnUint peerWo
     //   peer < my  -> socket = peer + 1
     //   peer > my  -> socket = peer
     return (peerWorkerIndex < myWorkerIndex) ? (peerWorkerIndex + 1u) : peerWorkerIndex;
+}
+
+bool probeWorkerReachable(const char *host, int port, int timeoutMs) {
+    if (host == nullptr || host[0] == '\0') return false;
+    if (isUnixSocketAddress(host)) return true;
+    if (timeoutMs < 0) timeoutMs = 0;
+    int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) return false;
+#ifndef _WIN32
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        ::close(fd);
+        return false;
+    }
+    int rc = ::connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    bool ok = false;
+    if (rc == 0) {
+        ok = true;
+    } else if (errno == EINPROGRESS || errno == EALREADY) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int pr;
+        do {
+            pr = ::poll(&pfd, 1, timeoutMs);
+        } while (pr < 0 && errno == EINTR);
+        if (pr > 0) {
+            int soerr = 0;
+            socklen_t sl = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr == 0) ok = true;
+        }
+    }
+    ::close(fd);
+    return ok;
 }
 
 static inline int connectSocket(char *host, int port) {
@@ -970,6 +1085,20 @@ void destroySocket(int serverSocket) {
 }
 
 int acceptSocket(int serverSocket) {
+#ifndef _WIN32
+    if (g_acceptTimeoutMs >= 0) {
+        struct pollfd pfd;
+        pfd.fd = serverSocket;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int rc;
+        do {
+            rc = ::poll(&pfd, 1, g_acceptTimeoutMs);
+        } while (rc < 0 && errno == EINTR);
+        if (rc == 0) throw std::runtime_error("Accept timeout");
+        if (rc < 0) throw std::runtime_error("Error polling accept");
+    }
+#endif
     int clientSocket = ::accept(serverSocket, nullptr, nullptr);
     if (clientSocket < 0)
         throw std::runtime_error("Error accepting connection");
@@ -983,6 +1112,9 @@ void initSockets() {
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         throw std::runtime_error("WSAStartup failed: " + std::to_string(WSAGetLastError()));
     }
+#else
+    // A dead peer must surface as EPIPE, not kill the process.
+    std::signal(SIGPIPE, SIG_IGN);
 #endif
 }
 
@@ -998,6 +1130,10 @@ NnConnectionSocketException::NnConnectionSocketException(const std::string messa
 
 NnTransferSocketException::NnTransferSocketException(int code, const std::string message)
     : code(code), std::runtime_error(message)
+{}
+
+NnPeerOfflineException::NnPeerOfflineException(NnUint peerNodeIndex, const std::string message)
+    : NnTransferSocketException(NN_PEER_OFFLINE, message), peerNodeIndex(peerNodeIndex)
 {}
 
 NnSocket::NnSocket() {
@@ -1359,11 +1495,18 @@ void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize s
     const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
-    for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
-        NnSize chunkSize = chunk + MAX_CHUNK_SIZE < size ? MAX_CHUNK_SIZE : size - chunk;
-        writeSocket(s, current, chunkSize);
-        current += chunkSize;
-        recordCommSend(chunkSize);
+    try {
+        for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
+            NnSize chunkSize = chunk + MAX_CHUNK_SIZE < size ? MAX_CHUNK_SIZE : size - chunk;
+            writeSocket(s, current, chunkSize);
+            current += chunkSize;
+            recordCommSend(chunkSize);
+        }
+    } catch (const NnTransferSocketException &error) {
+        if (error.code != NN_PEER_OFFLINE) throw;
+        const NnUint peer = peerNodeBySocket[socketIndex];
+        deactivateNode(peer, 0u);
+        throw NnPeerOfflineException(peer, error.what());
     }
     sentBytes[socketIndex] += size;
     if (ioProfile) dllamaIoProbeRecordNetWriteWall(dllamaIoProbeNowUs() - wallStartUs);
@@ -1376,11 +1519,18 @@ void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
     const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
-    for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
-        NnSize chunkSize = chunk + MAX_CHUNK_SIZE < size ? MAX_CHUNK_SIZE : size - chunk;
-        readSocket(s, current, chunkSize);
-        current += chunkSize;
-        recordCommRecv(chunkSize);
+    try {
+        for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
+            NnSize chunkSize = chunk + MAX_CHUNK_SIZE < size ? MAX_CHUNK_SIZE : size - chunk;
+            readSocket(s, current, chunkSize);
+            current += chunkSize;
+            recordCommRecv(chunkSize);
+        }
+    } catch (const NnTransferSocketException &error) {
+        if (error.code != NN_PEER_OFFLINE) throw;
+        const NnUint peer = peerNodeBySocket[socketIndex];
+        deactivateNode(peer, 0u);
+        throw NnPeerOfflineException(peer, error.what());
     }
     recvBytes[socketIndex] += size;
     if (ioProfile) dllamaIoProbeRecordNetReadWall(dllamaIoProbeNowUs() - wallStartUs);
@@ -1477,10 +1627,17 @@ static NnByte classifySegmentKind(const NnSegmentConfig &seg) {
 
 bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts) {
     assert(socketIndex >= 0 && socketIndex < nSockets);
-    if (tryReadSocket(sockets[socketIndex], data, size, maxAttempts)) {
-        recvBytes[socketIndex] += size;
-        recordCommRecv(size);
-        return true;
+    try {
+        if (tryReadSocket(sockets[socketIndex], data, size, maxAttempts)) {
+            recvBytes[socketIndex] += size;
+            recordCommRecv(size);
+            return true;
+        }
+    } catch (const NnTransferSocketException &error) {
+        if (error.code != NN_PEER_OFFLINE) throw;
+        const NnUint peer = peerNodeBySocket[socketIndex];
+        deactivateNode(peer, 0u);
+        throw NnPeerOfflineException(peer, error.what());
     }
     return false;
 }
@@ -1536,7 +1693,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 int socket = sockets[io->socketIndex];
                 ssize_t chunkSize = io->size > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : io->size;
                 const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
-                ssize_t s = send(socket, (const char*)io->data, chunkSize, 0);
+                ssize_t s = send(socket, (const char*)io->data, chunkSize, MSG_NOSIGNAL);
                 if (s < 0) {
                     if (isEagainError()) {
                         recordCommSendEagain();
@@ -1545,9 +1702,16 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
+                    if (isOfflineErrno(SOCKET_LAST_ERRCODE)) {
+                        deactivateNode(peerNodeBySocket[io->socketIndex], 0u);
+                        io->size = 0;
+                        continue;
+                    }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
                 } else if (s == 0) {
-                    throw NnTransferSocketException(0, "Socket closed");
+                    deactivateNode(peerNodeBySocket[io->socketIndex], 0u);
+                    io->size = 0;
+                    continue;
                 }
                 if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
                 recordCommSend((NnSize)s);
@@ -1628,9 +1792,16 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
+                    if (isOfflineErrno(SOCKET_LAST_ERRCODE)) {
+                        const NnUint peer = peerNodeBySocket[io->socketIndex];
+                        deactivateNode(peer, 0u);
+                        throw NnPeerOfflineException(peer, "Socket offline");
+                    }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
                 } else if (r == 0) {
-                    throw NnTransferSocketException(0, "Socket closed");
+                    const NnUint peer = peerNodeBySocket[io->socketIndex];
+                    deactivateNode(peer, 0u);
+                    throw NnPeerOfflineException(peer, "Socket closed");
                 }
                 if (ioProfile) dllamaIoProbeRecordNetRecvSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
                 recordCommRecv((NnSize)r);
@@ -1700,6 +1871,32 @@ void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const voi
     // write 函数内部会查找 this->sockets[socketIndex]
     if (socketIndex >= 0) {
         write(socketIndex, data, size);
+        // send() can return success after the peer is already gone: the bytes sit in
+        // the kernel buffer and the reset shows up on the next call. PP has to know
+        // before this step finishes, or the downstream stage reads the next token.
+#ifndef _WIN32
+        const int fd = sockets[socketIndex];
+        int soerr = 0;
+        socklen_t soerrLen = sizeof(soerr);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen) == 0 && soerr != 0 && isOfflineErrno(soerr)) {
+            deactivateNode(targetNodeIndex, 0u);
+            throw NnPeerOfflineException(targetNodeIndex, "PP peer reset");
+        }
+        struct tcp_info info;
+        std::memset(&info, 0, sizeof(info));
+        socklen_t infoLen = sizeof(info);
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && info.tcpi_state != TCP_ESTABLISHED) {
+            deactivateNode(targetNodeIndex, 0u);
+            throw NnPeerOfflineException(targetNodeIndex, "PP peer not established");
+        }
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLRDHUP)) != 0) {
+            deactivateNode(targetNodeIndex, 0u);
+            throw NnPeerOfflineException(targetNodeIndex, "PP peer hung up");
+        }
+#endif
     } else {
         // Error or Self
         printf("❌ Error: sendToNode target=%u my=%u invalid socket index\n", targetNodeIndex, myNodeIndex);
@@ -2305,72 +2502,55 @@ static void syncNodeSlices(
     }
 }
 
+static const NnStageConfig *ppStageForNode(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint *stageSlot) {
+    if (plan == nullptr || plan->stages == nullptr) return nullptr;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
+            if (plan->stages[s].nodeIndices[i] != myNodeIndex) continue;
+            if (stageSlot != nullptr) *stageSlot = s;
+            return &plan->stages[s];
+        }
+    }
+    return nullptr;
+}
+
+static void sendPpToNext(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, const NnUnevenPartitionPlan *plan) {
+    NnUint slot = 0u;
+    const NnStageConfig *myStage = ppStageForNode(plan, myNodeIndex, &slot);
+    if (myStage == nullptr || myStage->rootNodeIndex != myNodeIndex) return;
+    const NnUint nextStageIndex = getPpNextStageIndex(plan, slot);
+    if (nextStageIndex == (NnUint)-1 || nextStageIndex >= plan->nStages) return;
+    network->sendToNode(plan->stages[nextStageIndex].rootNodeIndex, myNodeIndex, buffer, nBytes);
+}
+
+static void recvPpFromPrev(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, const NnUnevenPartitionPlan *plan) {
+    NnUint slot = 0u;
+    const NnStageConfig *myStage = ppStageForNode(plan, myNodeIndex, &slot);
+    if (myStage == nullptr || myStage->rootNodeIndex != myNodeIndex) return;
+    const NnUint prevStageIndex = getPpPrevStageIndex(plan, slot);
+    if (prevStageIndex == (NnUint)-1 || prevStageIndex >= plan->nStages) return;
+    network->recvFromNode(plan->stages[prevStageIndex].rootNodeIndex, myNodeIndex, buffer, nBytes);
+}
+
 static void syncPpSend(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, 
                        const NnUnevenPartitionPlan *plan) {
-    // 1. 找到我所在的 Stage
-    const NnStageConfig* myStage = nullptr;
-    const NnStageConfig* nextStage = nullptr;
-    
-    for (NnUint s = 0; s < plan->nStages; ++s) {
-        // 检查我是否是该 Stage 的成员
-        for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
-            if (plan->stages[s].nodeIndices[i] == myNodeIndex) {
-                myStage = &plan->stages[s];
-                const NnUint nextStageIndex = getPpNextStageIndex(plan, s);
-                if (nextStageIndex != (NnUint)-1 && nextStageIndex < plan->nStages) {
-                    nextStage = &plan->stages[nextStageIndex];
-                }
-                break;
-            }
-        }
-        if (myStage) break;
-    }
-
-    // 2. 只有当前 Stage 的 Root 负责发送
-    if (myStage && myStage->rootNodeIndex == myNodeIndex) {
-        if (nextStage) {
-            // 发送给下一阶段的 Root
-            // printf("🚀 [PP] Node %u sending %zu bytes to Node %u (Stage %u)\n", 
-            //        myNodeIndex, nBytes, nextStage->rootNodeIndex, nextStage->stageIndex);
-            
-            // 注意：这里需要 network 实现点对点 write
-            // 如果网络拓扑不支持直连，可能需要通过 Node 0 中转
-            network->sendToNode(nextStage->rootNodeIndex, myNodeIndex, buffer, nBytes);
-        }
+    try {
+        sendPpToNext(network, myNodeIndex, buffer, nBytes, plan);
+    } catch (const NnPeerOfflineException &offline) {
+        NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
+        if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex)) throw;
+        sendPpToNext(network, myNodeIndex, buffer, nBytes, plan);
     }
 }
 
 static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, 
                        const NnUnevenPartitionPlan *plan) {
-    const NnStageConfig* myStage = nullptr;
-    const NnStageConfig* prevStage = nullptr;
-
-    for (NnUint s = 0; s < plan->nStages; ++s) {
-        for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
-            if (plan->stages[s].nodeIndices[i] == myNodeIndex) {
-                myStage = &plan->stages[s];
-                const NnUint prevStageIndex = getPpPrevStageIndex(plan, s);
-                if (prevStageIndex != (NnUint)-1 && prevStageIndex < plan->nStages) {
-                    prevStage = &plan->stages[prevStageIndex];
-                }
-                break;
-            }
-        }
-        if (myStage) break;
-    }
-
-    // 只有当前 Stage 的 Root 负责接收
-    if (myStage && myStage->rootNodeIndex == myNodeIndex) {
-        if (prevStage) {
-            // 从上一阶段的 Root 接收
-            // printf("📥 [PP] Node %u receiving %zu bytes from Node %u (Stage %u)\n", 
-            //        myNodeIndex, nBytes, prevStage->rootNodeIndex, prevStage->stageIndex);
-                   
-            network->recvFromNode(prevStage->rootNodeIndex, myNodeIndex, buffer, nBytes);
-        } else {
-            // 如果是 Stage 0 的第一层，数据应该来自 Embedding/Input，理论上不走 PP_RECV
-            // 除非我们在架构设计上把 Embedding 视为 "Stage -1"
-        }
+    try {
+        recvPpFromPrev(network, myNodeIndex, buffer, nBytes, plan);
+    } catch (const NnPeerOfflineException &offline) {
+        NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
+        if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex)) throw;
+        recvPpFromPrev(network, myNodeIndex, buffer, nBytes, plan);
     }
 }
 

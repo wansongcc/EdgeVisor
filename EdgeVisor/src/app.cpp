@@ -5623,7 +5623,166 @@ void WorkerLlmInference::flushPendingKvAck() {
     pendingKvAcks.clear();
 }
 
-void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+static NnExecutor *g_failoverExecutor = nullptr;
+
+struct FailoverExecGuard {
+    NnExecutor *executor;
+    explicit FailoverExecGuard(NnExecutor *executor) : executor(executor) { g_failoverExecutor = executor; }
+    ~FailoverExecGuard() { if (g_failoverExecutor == executor) g_failoverExecutor = nullptr; }
+};
+
+static bool ppStageCoversLayers(const RuntimeStageLayerPlan &roles, NnUint stageIndex, NnUint begin, NnUint end) {
+    if (begin >= end) return false;
+    for (NnUint layer = begin; layer < end; ++layer) {
+        if (roles.getRole(stageIndex, layer) != RUNTIME_LAYER_REDUNDANT) return false;
+    }
+    return true;
+}
+
+static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex) {
+    if (plan == nullptr || plan->stages == nullptr) return false;
+    NnUint stageIndex = (NnUint)-1;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        if (plan->stages[s].rootNodeIndex == deadNodeIndex) {
+            stageIndex = s;
+            break;
+        }
+    }
+    if (stageIndex == (NnUint)-1) return false;
+    const NnUint prev = getPpPrevStageIndex(plan, stageIndex);
+    const NnUint next = getPpNextStageIndex(plan, stageIndex);
+    if (prev == (NnUint)-1 && next == (NnUint)-1) {
+        std::printf("⚡ [failover] fast-path already bypassed deadNode=%u stage=%u\n",
+            (unsigned)deadNodeIndex, (unsigned)stageIndex);
+        std::fflush(stdout);
+        return true;
+    }
+    if (prev == (NnUint)-1 || next == (NnUint)-1) {
+        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=edge-stage\n",
+            (unsigned)deadNodeIndex, (unsigned)stageIndex);
+        std::fflush(stdout);
+        return false;
+    }
+    NnUint nLayers = 0u;
+    for (NnUint s = 0; s < plan->nStages; ++s) nLayers = std::max(nLayers, plan->stages[s].endLayer);
+    const RuntimeStageLayerPlan roles = buildRuntimeStageLayerPlan(plan, nLayers);
+    const NnStageConfig &dead = plan->stages[stageIndex];
+    NnUint target = (NnUint)-1;
+    // The previous stage's shadow KV is computed from its own stage-output cache,
+    // which is the real input of the dead layers. The next stage only ever sees
+    // the dead stage's output, so its left-boundary KV cannot stand in.
+    if (ppStageCoversLayers(roles, prev, dead.startLayer, dead.endLayer)) target = prev;
+    else if (ppStageCoversLayers(roles, next, dead.startLayer, dead.endLayer)) target = next;
+    if (target == (NnUint)-1) {
+        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u layers=[%u,%u) reason=partial-cover\n",
+            (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)dead.startLayer, (unsigned)dead.endLayer);
+        std::fflush(stdout);
+        return false;
+    }
+    if (!applyPpStageBypass(plan, stageIndex, target)) {
+        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=bypass-rejected\n",
+            (unsigned)deadNodeIndex, (unsigned)stageIndex);
+        std::fflush(stdout);
+        return false;
+    }
+    if (g_failoverExecutor != nullptr && myNodeIndex == plan->stages[target].rootNodeIndex) {
+        for (NnUint layer = dead.startLayer; layer < dead.endLayer; ++layer) {
+            g_failoverExecutor->setRedundantLayerEnabled(layer, true);
+        }
+        if (target == prev) {
+            g_failoverExecutor->spliceRedundantLayersIntoSend(dead.startLayer, dead.endLayer);
+        }
+    }
+    std::printf("⚡ [failover] fast-path deadNode=%u ejectedStage=%u targetStage=%u layers=[%u,%u) myNode=%u\n",
+        (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)target,
+        (unsigned)dead.startLayer, (unsigned)dead.endLayer, (unsigned)myNodeIndex);
+    std::fflush(stdout);
+    return true;
+}
+
+struct FailoverRestartRequest {
+    bool armed = false;
+    std::string prompt;
+    NnUint steps = 0u;
+    NnUint nLayers = 0u;
+};
+
+static FailoverRestartRequest g_failoverRestart;
+static std::string g_failoverPromptStorage;
+static std::string g_failoverRatiosStorage;
+static std::vector<std::string> g_failoverHostStorage;
+static std::vector<char *> g_failoverHostPtrs;
+static std::vector<NnUint> g_failoverPorts;
+
+void failoverArmSessionRestart(const std::string &prompt, NnUint steps, NnUint nLayers) {
+    g_failoverRestart.armed = true;
+    g_failoverRestart.prompt = prompt;
+    g_failoverRestart.steps = steps;
+    g_failoverRestart.nLayers = nLayers;
+    std::printf("🔁 [failover] session-restart armed steps=%u layers=%u promptBytes=%zu\n",
+        (unsigned)steps, (unsigned)nLayers, prompt.size());
+    std::fflush(stdout);
+}
+
+static std::string evenPpRatios(NnUint nNodes, NnUint nLayers) {
+    std::ostringstream out;
+    const NnUint base = nNodes == 0u ? 0u : nLayers / nNodes;
+    NnUint rem = nNodes == 0u ? 0u : nLayers % nNodes;
+    NnUint cursor = 0u;
+    for (NnUint i = 0; i < nNodes; ++i) {
+        const NnUint count = base + (rem > 0u ? 1u : 0u);
+        if (rem > 0u) --rem;
+        if (i > 0u) out << '*';
+        out << "1@" << count;
+        cursor += count;
+    }
+    (void)cursor;
+    return out.str();
+}
+
+static void applyFailoverRestart(AppCliArgs *args) {
+    g_failoverPromptStorage = g_failoverRestart.prompt;
+    args->prompt = const_cast<char *>(g_failoverPromptStorage.c_str());
+    if (g_failoverRestart.steps > 0u) args->steps = g_failoverRestart.steps;
+    g_failoverHostStorage.clear();
+    g_failoverPorts.clear();
+    for (NnUint i = 0; i < args->nWorkers; ++i) {
+        const char *host = args->workerHosts[i];
+        const int port = (int)args->workerPorts[i];
+        bool reachable = false;
+        for (int attempt = 0; attempt < 5 && !reachable; ++attempt) {
+            reachable = probeWorkerReachable(host, port, 300);
+            if (!reachable) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        if (!reachable) {
+            std::printf("🔁 [failover] drop worker %s:%d\n", host, port);
+            continue;
+        }
+        std::printf("🔁 [failover] keep worker %s:%d\n", host, port);
+        g_failoverHostStorage.emplace_back(host);
+        g_failoverPorts.push_back(args->workerPorts[i]);
+    }
+    std::fflush(stdout);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    g_failoverHostPtrs.clear();
+    for (std::string &host : g_failoverHostStorage) g_failoverHostPtrs.push_back(const_cast<char *>(host.c_str()));
+    args->nWorkers = (NnUint)g_failoverHostPtrs.size();
+    args->workerHosts = g_failoverHostPtrs.empty() ? nullptr : g_failoverHostPtrs.data();
+    args->workerPorts = g_failoverPorts.empty() ? nullptr : g_failoverPorts.data();
+    if (args->nWorkers == 0u || g_failoverRestart.nLayers == 0u) {
+        args->ratiosStr = nullptr;
+    } else {
+        g_failoverRatiosStorage = evenPpRatios(args->nWorkers + 1u, g_failoverRestart.nLayers);
+        args->ratiosStr = const_cast<char *>(g_failoverRatiosStorage.c_str());
+    }
+    std::printf("🔁 [failover] session-restart workers=%u ratios=%s\n",
+        (unsigned)args->nWorkers, args->ratiosStr == nullptr ? "(single)" : args->ratiosStr);
+    std::fflush(stdout);
+    g_failoverRestart.armed = false;
+}
+
+static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    setNnPpFailoverHook(failoverBypassDeadNode);
     applyProcessMemoryLimit(args->memoryLimitBytes);
     if (args != nullptr && args->ioProfileLogPath != nullptr && args->ioProfileLogPath[0] != '\0') {
         dllamaIoProbeConfigure(args->ioProfileLogPath);
@@ -5778,6 +5937,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
     NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), profileEnabled);
+    FailoverExecGuard failoverExecGuard(&executor);
 
     // Load weights
     if (args->ratiosStr != nullptr) {
@@ -5848,12 +6008,65 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     dllamaIoProbeFlush("root-inference");
 }
 
+void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    // applyFailoverRestart points hosts/ports at session storage. The destructor
+    // still frees the arrays parse() allocated, so put those back first.
+    char **const savedHosts = args->workerHosts;
+    NnUint *const savedPorts = args->workerPorts;
+    const NnUint savedWorkers = args->nWorkers;
+    char *const savedPrompt = args->prompt;
+    char *const savedRatios = args->ratiosStr;
+    struct RestoreCliArgs {
+        AppCliArgs *args;
+        char **hosts;
+        NnUint *ports;
+        NnUint nWorkers;
+        char *prompt;
+        char *ratios;
+        ~RestoreCliArgs() {
+            args->workerHosts = hosts;
+            args->workerPorts = ports;
+            args->nWorkers = nWorkers;
+            args->prompt = prompt;
+            args->ratiosStr = ratios;
+        }
+    } restore{args, savedHosts, savedPorts, savedWorkers, savedPrompt, savedRatios};
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        try {
+            runInferenceAppBody(args, handler);
+            return;
+        } catch (const NnSessionRestartException &) {
+            if (attempt == 1 || !g_failoverRestart.armed) throw;
+            applyFailoverRestart(args);
+        }
+    }
+}
+
 void runWorkerApp(AppCliArgs *args) {
+    setNnPpFailoverHook(failoverBypassDeadNode);
     applyProcessMemoryLimit(args->memoryLimitBytes);
+    bool armAcceptTimeout = false;
     while (true) {
-        std::unique_ptr<NnNetwork> networkPtr = args->listenUnixPath != nullptr
-            ? NnNetwork::serveUnix(args->listenUnixPath)
-            : NnNetwork::serve(args->port);
+        nnSetAcceptTimeoutMs(armAcceptTimeout ? 15000 : -1);
+        std::unique_ptr<NnNetwork> networkPtr;
+        try {
+            networkPtr = args->listenUnixPath != nullptr
+                ? NnNetwork::serveUnix(args->listenUnixPath)
+                : NnNetwork::serve(args->port);
+        } catch (const std::runtime_error &e) {
+            if (std::strcmp(e.what(), "Accept timeout") == 0) {
+                std::printf("👋 [failover] worker exit: root did not reconnect\n");
+                std::fflush(stdout);
+                return;
+            }
+            // A liveness probe connects and closes before the handshake. Relisten.
+            std::printf("🚨 [failover] handshake ended: %s\n", e.what());
+            std::fflush(stdout);
+            continue;
+        }
+        armAcceptTimeout = false;
+        try {
         NnNetwork *network = networkPtr.get();
 
         // Read bootstrap settings from root.
@@ -5976,6 +6189,7 @@ void runWorkerApp(AppCliArgs *args) {
         // Worker CLI --benchmark is no longer required.
         const bool profileEnabled = bootBenchmarkEnabled;
         NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, profileEnabled);
+        FailoverExecGuard failoverExecGuard(&executor);
 
         if (useLocalLoading) {
             // [Local Loading Mode]
@@ -6289,14 +6503,25 @@ void runWorkerApp(AppCliArgs *args) {
                 }
                 inference.maybeSendLastStageSampledToken(planPtr.get());
                 isFirstAttempt = true;
+            } catch (const NnPeerOfflineException &e) {
+                printf("🚨 Peer offline: node=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
+                armAcceptTimeout = true;
+                break;
             } catch (const NnTransferSocketException &e) {
                 printf("🚨 Network error: %s\n", e.what());
+                armAcceptTimeout = true;
                 break;
             } catch (const NnExecutorException &e) {
                 printf("🚨 Inference error: %s\n", e.what());
+                armAcceptTimeout = true;
                 break;
             }
         }
         dllamaIoProbeFlush("worker-session");
+        } catch (const std::exception &e) {
+            std::printf("🚨 Worker session ended: %s\n", e.what());
+            std::fflush(stdout);
+            armAcceptTimeout = true;
+        }
     }
 }

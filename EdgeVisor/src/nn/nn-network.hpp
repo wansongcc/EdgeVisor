@@ -26,11 +26,31 @@ public:
     NnConnectionSocketException(const std::string message);
 };
 
+static constexpr int NN_PEER_OFFLINE = 20060;
+
 class NnTransferSocketException : public std::runtime_error {
 public:
     int code;
     NnTransferSocketException(int code, const std::string message);
 };
+
+class NnPeerOfflineException : public NnTransferSocketException {
+public:
+    NnUint peerNodeIndex;
+    NnPeerOfflineException(NnUint peerNodeIndex, const std::string message);
+};
+
+class NnSessionRestartException : public std::runtime_error {
+public:
+    NnSessionRestartException() : std::runtime_error("session restart") {}
+};
+
+// Returns true when the dead node's layers were already covered and the local
+// plan now skips that stage. The target node also enables those redundant layers.
+typedef bool (*NnPpFailoverFn)(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex);
+void setNnPpFailoverHook(NnPpFailoverFn fn);
+void nnSetAcceptTimeoutMs(int timeoutMs);
+bool probeWorkerReachable(const char *host, int port, int timeoutMs);
 
 class NnSocket {
 public:

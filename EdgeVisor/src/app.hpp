@@ -701,6 +701,7 @@ typedef struct {
 } AppInferenceContext;
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
+void failoverArmSessionRestart(const std::string &prompt, NnUint steps, NnUint nLayers);
 void runWorkerApp(AppCliArgs *args);
 
 #endif

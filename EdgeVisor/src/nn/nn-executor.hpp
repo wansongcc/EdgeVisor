@@ -236,6 +236,8 @@ public:
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
     void setRedundantLayerEnabled(NnUint layerIndex, bool enabled);
+    // Run enabled right-boundary layers, then copy the stage-output cache back to the PP send pipe.
+    void spliceRedundantLayersIntoSend(NnUint beginLayer, NnUint endLayer);
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     bool isSegmentEnabled(NnUint segmentIndex) const;
     void setPpSyncEnabled(bool enabled);

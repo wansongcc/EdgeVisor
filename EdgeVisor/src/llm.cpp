@@ -1481,7 +1481,7 @@ static NnNodeConfig buildLlmNodeInternal(
         addSegmentLogged(ppRecvSeg, "pp_recv", startLayer);
     }
 
-    auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromXPipe, bool writeBackToXPipe) {
+    auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromXPipe, bool writeBackToXPipe, bool readFromStageCache) {
         const NnUint redundantKBufferIndex = nodeBuilder.addBuffer(
             "red_k",
             fullAttBuffers ? size2D(F_32, h->seqLen * kvSlotCount, h->kvDim) : kvCacheSlice.keySize);
@@ -1496,7 +1496,15 @@ static NnNodeConfig buildLlmNodeInternal(
         }
 
         NnSegmentConfigBuilder redAtt;
-        if (readFromXPipe) {
+        if (readFromStageCache) {
+            // Right-boundary shadow runs after pp_prepare has stored this stage's
+            // output. That cache is the real input of the next layer; merging the
+            // leftover FFN delta again would double-count the residual.
+            redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_right", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(), NnCastOpCodeConfig{});
+        } else if (readFromXPipe) {
             redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_left", layerIndex,
                 pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, xBufferIndex),
@@ -1577,7 +1585,12 @@ static NnNodeConfig buildLlmNodeInternal(
         addSegmentLogged(redAtt, "shadow_kv", layerIndex);
 
         NnSegmentConfigBuilder takeoverAtt;
-        if (readFromXPipe) {
+        if (readFromStageCache) {
+            takeoverAtt.addOp(OP_CAST, "runtime_redundant_att_in_right", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(), NnCastOpCodeConfig{});
+        } else if (readFromXPipe) {
             takeoverAtt.addOp(OP_CAST, "runtime_redundant_att_in_left", layerIndex,
                 pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, xBufferIndex),
@@ -1831,16 +1844,24 @@ static NnNodeConfig buildLlmNodeInternal(
             size0(), NnCastOpCodeConfig{});
         takeoverFf.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
         addSegmentLogged(takeoverFf, "redundant_ff", layerIndex);
-        if (writeBackToXPipe) {
+        if (writeBackToXPipe || readFromStageCache) {
             NnSegmentConfigBuilder takeoverPost;
             takeoverPost.addOp(OP_MERGE_ADD, "runtime_redundant_ff_out_left_merge", layerIndex,
                 pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, xBufferIndex),
                 size0(), NnMergeAddOpCodeConfig{});
-            takeoverPost.addOp(OP_CAST, "runtime_redundant_ff_out_left_x", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-                pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
-                size0(), NnCastOpCodeConfig{});
+            if (readFromStageCache) {
+                takeoverPost.addOp(OP_CAST, "runtime_redundant_ff_out_cache", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
+                    size0(), NnCastOpCodeConfig{});
+            }
+            if (writeBackToXPipe) {
+                takeoverPost.addOp(OP_CAST, "runtime_redundant_ff_out_left_x", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                    pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
+                    size0(), NnCastOpCodeConfig{});
+            }
             addSegmentLogged(takeoverPost, "redundant_post", layerIndex);
         }
     };
@@ -1852,7 +1873,7 @@ static NnNodeConfig buildLlmNodeInternal(
             // Runtime migration may enable any suffix of the built redundant
             // boundary set. Keep each takeover layer self-contained through
             // X so both single-layer and consecutive-layer takeover work.
-            addRedundantWeightHolderForLayer(layerIndex, true, true);
+            addRedundantWeightHolderForLayer(layerIndex, true, true, false);
             printf("⚠️ [seg-build] Adding redundant weight holder for layer %u before startLayer %u\n", layerIndex, startLayer);
         }
     }
@@ -2236,40 +2257,41 @@ static NnNodeConfig buildLlmNodeInternal(
         }
     }
 
-    // Place right-boundary redundant layers after active range and before pp_send/end.
-    for (NnUint i = 0; i < redundantLayers.size(); ++i) {
-        const NnUint layerIndex = redundantLayers[i];
-        if (layerIndex >= endLayer) {
-            addRedundantWeightHolderForLayer(layerIndex, false, false);
-        }
-    }
-
     if (!isLastStage) {
-        NnSegmentConfigBuilder ppSendSeg;
+        NnSegmentConfigBuilder ppPrepareSeg;
 
         // 1. Apply the final FFN residual at the PP boundary. Normal intra-stage
         // layers merge FFN output at the next layer's attention entry; a stage
         // boundary has no next local layer, so do it before sending X onward.
-        ppSendSeg.addOp(OP_MERGE_ADD, "pp_stage_merge", endLayer-1,
+        ppPrepareSeg.addOp(OP_MERGE_ADD, "pp_stage_merge", endLayer-1,
             pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
             pointerBatchConfig(SRC_BUFFER, xBufferIndex),
             size0(), NnMergeAddOpCodeConfig{});
 
-        // 2. Snapshot: copy stage output to dedicated PP cache buffer.
-        ppSendSeg.addOp(OP_CAST, "pp_stage_cache", endLayer-1,
+        // 2. Snapshot: copy stage output to dedicated PP cache buffer. Right-boundary
+        // takeover reads this snapshot, so it stays valid after the merge.
+        ppPrepareSeg.addOp(OP_CAST, "pp_stage_cache", endLayer-1,
             pointerBatchConfig(SRC_BUFFER, xBufferIndex),
             pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
             size0(), NnCastOpCodeConfig{});
+        addSegmentLogged(ppPrepareSeg, "pp_prepare", (endLayer > 0u ? endLayer - 1u : 0u));
 
-        // 3. Cast: 固定从 PP stage cache buffer 读取后写入 X Pipe (复用通信管道)
+        // Right-boundary layers sit between the snapshot and the send. Disabled
+        // segments leave the cache untouched, so the bytes on the wire match a
+        // graph with no redundant layers.
+        for (NnUint i = 0; i < redundantLayers.size(); ++i) {
+            const NnUint layerIndex = redundantLayers[i];
+            if (layerIndex >= endLayer) {
+                addRedundantWeightHolderForLayer(layerIndex, false, false, true);
+            }
+        }
+
+        NnSegmentConfigBuilder ppSendSeg;
         ppSendSeg.addOp(OP_CAST, "pp_cast_out", endLayer-1,
             pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
             pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
             size0(), NnCastOpCodeConfig{});
-            
-        // 4. Send: 触发 PP 发送
         ppSendSeg.addSync(n->xPipeIndex, SYNC_PP_SEND);
-        
         addSegmentLogged(ppSendSeg, "pp_send", (endLayer > 0u ? endLayer - 1u : 0u));
     }
 
@@ -2380,7 +2402,7 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
     const char *policyStr = std::getenv("DLLAMA_COVERAGE_POLICY");
     const std::string coveragePolicy = (policyStr != nullptr && policyStr[0] != '\0') ? std::string(policyStr) : std::string("edgevisor");
     const unsigned coverageSeed = (unsigned)parseEnvInt("DLLAMA_COVERAGE_SEED", 42);
-    const NnUint poolDepth = 4u;
+    const NnUint poolDepth = (NnUint)std::max(4, depth);
 
     // Primary ownership from stage ranges.
     for (NnUint s = 0; s < plan->nStages; ++s) {

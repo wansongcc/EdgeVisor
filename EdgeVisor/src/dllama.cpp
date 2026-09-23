@@ -845,6 +845,20 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     TokenizerChatStops stops(context->tokenizer);
     EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
     std::string effectivePrompt = buildInferencePrompt(context, prompt, &stops);
+    std::string generatedText;
+    auto armSessionRestart = [&](NnUint peer) {
+        std::printf("🔁 [failover] session-restart peer=%u\n", (unsigned)peer);
+        std::fflush(stdout);
+        failoverArmSessionRestart(effectivePrompt + generatedText, steps, context->header->nLayers);
+        throw NnSessionRestartException();
+    };
+    auto forwardOrRestart = [&]() {
+        try {
+            context->inference->forward();
+        } catch (const NnPeerOfflineException &e) {
+            armSessionRestart(e.peerNodeIndex);
+        }
+    };
 
     std::vector<int> inputTokensVec(effectivePrompt.size() + 3);
     int *inputTokens = inputTokensVec.data();
@@ -974,7 +988,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         const bool isFinalChunk = (remainingTokens <= (long)batchSize);
         context->inference->setSkipLogits(!context->args->lastStageSampling && !isFinalChunk);
         const auto microbatchWallStart = std::chrono::steady_clock::now();
-        context->inference->forward();
+        forwardOrRestart();
         const auto microbatchWallEnd = std::chrono::steady_clock::now();
         const unsigned long long microbatchWallUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(microbatchWallEnd - microbatchWallStart).count();
         if (context->args->benchmark && microbatchTraceEnabled()) {
@@ -1112,14 +1126,19 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         const auto tokenWallStart = std::chrono::steady_clock::now();
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
-        context->inference->forward();
+        forwardOrRestart();
         const std::vector<LlmPerfPacket>& tokenPerf = context->inference->getLastPerf();
 
         NnUint lastStageToken = 0u;
-        const bool haveLastStageToken =
-            context->args->lastStageSampling &&
-            context->network != nullptr &&
-            context->inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr);
+        bool haveLastStageToken = false;
+        try {
+            haveLastStageToken =
+                context->args->lastStageSampling &&
+                context->network != nullptr &&
+                context->inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr);
+        } catch (const NnPeerOfflineException &e) {
+            armSessionRestart(e.peerNodeIndex);
+        }
 
         // In pred stage batchSize==1. Always compute logits stats for debugging.
         if (!haveLastStageToken) {
@@ -1468,6 +1487,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         char *delta = nullptr;
         if (eosType == NOT_EOS || eosType == EOS) {
             delta = eosDetector.getDelta();
+            if (delta != nullptr) generatedText.append(delta);
         }
 
         if (context->network != nullptr)

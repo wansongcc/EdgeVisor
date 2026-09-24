@@ -6262,6 +6262,7 @@ void runWorkerApp(AppCliArgs *args) {
         }
 
         const NnUint logitsPipeIndex = findPipeIndexByName(&netConfig, "LG");
+        const NnUint xPipeIndex = findPipeIndexByName(&netConfig, "X");
         std::unique_ptr<Sampler> lastStageSampler;
         if (bootLastStageSamplingEnabled && lastStageSamplingPlanSupported(planPtr.get())) {
             const NnStageConfig &last = planPtr->stages[planPtr->nStages - 1u];
@@ -6287,6 +6288,11 @@ void runWorkerApp(AppCliArgs *args) {
                     startTime = clock();
 
                 if (!inference.tryReadControlPacket()) {
+                    if (execution.batchSize > 0u && xPipeIndex < netConfig.nPipes && execution.pipes != nullptr) {
+                        const NnPipeConfig &xPipe = netConfig.pipes[xPipeIndex];
+                        const NnSize xBytes = getBytes(xPipe.size.floatType, xPipe.size.x) * (NnSize)execution.batchSize;
+                        network->recoverPpIfNextOffline(planPtr.get(), nodeConfig.nodeIndex, execution.pipes[xPipeIndex], xBytes);
+                    }
                     if (isTurboEnabled && !isFirstAttempt && clock() - startTime > CLOCKS_PER_SEC) {
                         network->setTurbo(false);
                         isTurboEnabled = false;

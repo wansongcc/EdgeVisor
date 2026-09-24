@@ -400,6 +400,8 @@ static inline void setTcpSocketOptionsIfSupported(int socket) {
 
 static int g_acceptTimeoutMs = -1;
 static NnPpFailoverFn g_ppFailover = nullptr;
+static const NnStageConfig *ppStageForNode(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint *stageSlot);
+static void sendPpToNext(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, const NnUnevenPartitionPlan *plan);
 
 void nnSetAcceptTimeoutMs(int timeoutMs) {
     g_acceptTimeoutMs = timeoutMs;
@@ -1901,6 +1903,49 @@ void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const voi
         // Error or Self
         printf("❌ Error: sendToNode target=%u my=%u invalid socket index\n", targetNodeIndex, myNodeIndex);
     }
+}
+
+bool NnNetwork::peerLooksOffline(NnUint targetNodeIndex) const {
+#ifndef _WIN32
+    const int socketIndex = getSocketIndexForNode(targetNodeIndex, 0u);
+    if (socketIndex < 0) return false;
+    const int fd = sockets[socketIndex];
+    int soerr = 0;
+    socklen_t soerrLen = sizeof(soerr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen) == 0 && soerr != 0 && isOfflineErrno(soerr))
+        return true;
+    struct tcp_info info;
+    std::memset(&info, 0, sizeof(info));
+    socklen_t infoLen = sizeof(info);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && info.tcpi_state != TCP_ESTABLISHED)
+        return true;
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLRDHUP)) != 0)
+        return true;
+#else
+    (void)targetNodeIndex;
+#endif
+    return false;
+}
+
+bool NnNetwork::recoverPpIfNextOffline(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnByte *pipe, NnSize nBytes) {
+    if (plan == nullptr || pipe == nullptr || nBytes == 0u || g_ppFailover == nullptr) return false;
+    NnUint slot = 0u;
+    const NnStageConfig *myStage = ppStageForNode(plan, myNodeIndex, &slot);
+    if (myStage == nullptr || myStage->rootNodeIndex != myNodeIndex) return false;
+    const NnUint nextStageIndex = getPpNextStageIndex(plan, slot);
+    if (nextStageIndex == (NnUint)-1 || nextStageIndex >= plan->nStages) return false;
+    const NnUint nextNode = plan->stages[nextStageIndex].rootNodeIndex;
+    if (!peerLooksOffline(nextNode)) return false;
+    NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
+    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode)) return false;
+    sendPpToNext(this, myNodeIndex, pipe, nBytes, plan);
+    std::printf("🔁 [failover] resent pp activation deadNext=%u bytes=%zu\n",
+        (unsigned)nextNode, (size_t)nBytes);
+    std::fflush(stdout);
+    return true;
 }
 
 void NnNetwork::recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size) {

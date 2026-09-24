@@ -26,6 +26,9 @@
 #include <cerrno>
 #if defined(__linux__)
 #include <sys/resource.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #endif
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
@@ -5794,6 +5797,93 @@ static std::string evenPpRatios(NnUint nNodes, NnUint nLayers) {
     return out.str();
 }
 
+struct SpeedDeviceProfile {
+    double msPerLayer;
+    NnUint cap;
+    const char *name;
+};
+
+static SpeedDeviceProfile speedProfileForAddress(const char *host) {
+    if (host != nullptr) {
+        if (std::strcmp(host, "192.168.137.13") == 0 || std::strcmp(host, "192.168.137.15") == 0)
+            return {5.8, 22u, "nx"};
+        if (std::strcmp(host, "192.168.137.16") == 0 || std::strcmp(host, "192.168.137.18") == 0)
+            return {7.4, 10u, "nano"};
+        if (std::strcmp(host, "192.168.137.31") == 0)
+            return {8.3, 11u, "laptop"};
+    }
+    return {7.4, 10u, "unknown"};
+}
+
+static SpeedDeviceProfile localSpeedProfile() {
+#if defined(__linux__)
+    struct ifaddrs *list = nullptr;
+    if (getifaddrs(&list) == 0) {
+        for (struct ifaddrs *ifa = list; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) continue;
+            char text[INET_ADDRSTRLEN];
+            const struct sockaddr_in *addr = (const struct sockaddr_in *)ifa->ifa_addr;
+            if (inet_ntop(AF_INET, &addr->sin_addr, text, sizeof(text)) == nullptr) continue;
+            const SpeedDeviceProfile profile = speedProfileForAddress(text);
+            if (std::strcmp(profile.name, "unknown") != 0) {
+                freeifaddrs(list);
+                return profile;
+            }
+        }
+        freeifaddrs(list);
+    }
+#endif
+    return speedProfileForAddress(nullptr);
+}
+
+// Cold start keeps the given pipeline order and assigns layers to faster
+// devices first. Memory caps stop a slow device from taking more than it
+// completed in the device tests. An explicit --ratios skips this.
+static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers) {
+    const NnUint nNodes = args->nWorkers + 1u;
+    std::vector<SpeedDeviceProfile> profiles(nNodes);
+    std::vector<NnUint> layers(nNodes, 0u);
+    profiles[0] = localSpeedProfile();
+    for (NnUint i = 0; i < args->nWorkers; ++i)
+        profiles[i + 1u] = speedProfileForAddress(args->workerHosts[i]);
+    std::ostringstream classes;
+    for (NnUint i = 0; i < nNodes; ++i) {
+        if (i > 0u) classes << ',';
+        classes << profiles[i].name;
+    }
+    if (nNodes == 0u || nLayers == 0u) return std::string();
+    const NnUint base = nLayers >= nNodes ? 1u : 0u;
+    NnUint left = nLayers;
+    for (NnUint i = 0; i < nNodes && left > 0u; ++i) {
+        const NnUint give = std::min<NnUint>(base, left);
+        layers[i] = give;
+        left -= give;
+    }
+    std::vector<NnUint> order(nNodes);
+    for (NnUint i = 0; i < nNodes; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](NnUint a, NnUint b) {
+        if (profiles[a].msPerLayer != profiles[b].msPerLayer)
+            return profiles[a].msPerLayer < profiles[b].msPerLayer;
+        return a < b;
+    });
+    for (NnUint index : order) {
+        if (left == 0u) break;
+        const NnUint room = profiles[index].cap > layers[index] ? profiles[index].cap - layers[index] : 0u;
+        const NnUint take = std::min<NnUint>(room, left);
+        layers[index] += take;
+        left -= take;
+    }
+    if (left > 0u && !order.empty()) layers[order[0]] += left;
+    std::ostringstream out;
+    for (NnUint i = 0; i < nNodes; ++i) {
+        if (i > 0u) out << '*';
+        out << "1@" << layers[i];
+    }
+    std::printf("⚖️  [auto-ratios] speed-pack classes=%s ratios=%s\n", classes.str().c_str(), out.str().c_str());
+    std::fflush(stdout);
+    return out.str();
+}
+
 static void applyFailoverRestart(AppCliArgs *args) {
     g_failoverPromptStorage = g_failoverRestart.prompt;
     args->prompt = const_cast<char *>(g_failoverPromptStorage.c_str());
@@ -5874,6 +5964,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     std::unique_ptr<NnUnevenPartitionPlan> planPtr;
     std::vector<float> ratios;
     std::string warmupSelectedRatios;
+    std::string autoRatiosStorage;
     NnUint warmupSelectedWorkers = args->nWorkers;
 
     // IMPORTANT: plan barrier affects graph construction (insertion of OP_PLAN_BARRIER/OP_PLAN_APPLY)
@@ -5913,6 +6004,15 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
             args->ratiosStr = warmupSelectedRatios.empty() ? nullptr : const_cast<char*>(warmupSelectedRatios.c_str());
             if (warmupSelectedWorkers > 0u) waitForWarmupWorkersToRelisten();
         }
+    }
+
+    if (args->ratiosStr == nullptr && args->nWorkers > 0u) {
+        autoRatiosStorage = speedPackRatios(args, header.nLayers);
+        if (!autoRatiosStorage.empty())
+            args->ratiosStr = const_cast<char *>(autoRatiosStorage.c_str());
+    } else if (args->ratiosStr != nullptr) {
+        std::printf("⚖️  [manual-ratios] ratios=%s\n", args->ratiosStr);
+        std::fflush(stdout);
     }
 
     if(args->ratiosStr != nullptr){

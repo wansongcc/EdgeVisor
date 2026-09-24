@@ -4080,7 +4080,7 @@ void RootLlmInference::pollStageBypassAckFrames() {
 }
 
 void RootLlmInference::pumpWorkerFrames(NnUint socketIndex) {
-    if (network == nullptr) return;
+    if (network == nullptr || !network->isSocketActive(socketIndex)) return;
     for (;;) {
         LlmWorkerFrameHeader peek{};
         if (!network->tryPeekWithMaxAttempts(socketIndex, &peek, sizeof(peek), 1ul)) return;
@@ -4139,6 +4139,7 @@ void RootLlmInference::collectDeferredProfile(const LlmPerfPacket &rootPacket, s
         const NnUint nWorkers = network->nSockets;
         for (NnUint i = 0; i < nWorkers; ++i) {
             if (!network->isSocketActive(i)) continue;
+            try {
             pumpWorkerFrames(i);
             if (!workerProfileFrameCache[i].empty()) {
                 out.push_back(workerProfileFrameCache[i].front());
@@ -4155,6 +4156,9 @@ void RootLlmInference::collectDeferredProfile(const LlmPerfPacket &rootPacket, s
             LlmPerfPacket packet{};
             std::memcpy(&packet, payload.data(), sizeof(packet));
             out.push_back(packet);
+            } catch (const NnPeerOfflineException &e) {
+                network->deactivateNode(e.peerNodeIndex, 0u);
+            }
         }
     }
 }
@@ -4739,7 +4743,12 @@ void RootLlmInference::forward(bool collectProfile) {
             if (socketIndex < 0) continue;
 
             LlmKvAckBatchHeader peek{};
-            if (!network->tryPeekWithMaxAttempts((NnUint)socketIndex, &peek, sizeof(peek), 1ul)) continue;
+            try {
+                if (!network->tryPeekWithMaxAttempts((NnUint)socketIndex, &peek, sizeof(peek), 1ul)) continue;
+            } catch (const NnPeerOfflineException &e) {
+                network->deactivateNode(e.peerNodeIndex, 0u);
+                continue;
+            }
             if (peek.magic != LLM_KV_ACK_BATCH_MAGIC && peek.magic != LLM_KV_ACK_MAGIC) {
                 // The same socket also carries profile packets. Do not consume
                 // non-ACK data here; collectProfilePackets() will read it later.

@@ -1646,7 +1646,14 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 
 bool NnNetwork::tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts) {
     assert(socketIndex >= 0 && socketIndex < nSockets);
-    return tryPeekSocket(sockets[socketIndex], data, size, maxAttempts);
+    try {
+        return tryPeekSocket(sockets[socketIndex], data, size, maxAttempts);
+    } catch (const NnTransferSocketException &error) {
+        if (error.code != NN_PEER_OFFLINE) throw;
+        const NnUint peer = peerNodeBySocket[socketIndex];
+        deactivateNode(peer, 0u);
+        throw NnPeerOfflineException(peer, error.what());
+    }
 }
 
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {

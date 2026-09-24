@@ -5639,6 +5639,22 @@ static bool ppStageCoversLayers(const RuntimeStageLayerPlan &roles, NnUint stage
     return true;
 }
 
+// A holds a non-empty prefix of the dead range and C holds the rest.
+// Overlap is allowed: the split is the first layer A does not cover, and C
+// must cover every layer from there to the end.
+static bool ppBilateralSplit(const RuntimeStageLayerPlan &roles, NnUint prev, NnUint next,
+                             NnUint begin, NnUint end, NnUint *splitOut) {
+    if (begin >= end || splitOut == nullptr) return false;
+    NnUint split = begin;
+    while (split < end && roles.getRole(prev, split) == RUNTIME_LAYER_REDUNDANT) ++split;
+    if (split == begin || split == end) return false;
+    for (NnUint layer = split; layer < end; ++layer) {
+        if (roles.getRole(next, layer) != RUNTIME_LAYER_REDUNDANT) return false;
+    }
+    *splitOut = split;
+    return true;
+}
+
 static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex) {
     if (plan == nullptr || plan->stages == nullptr) return false;
     NnUint stageIndex = (NnUint)-1;
@@ -5673,17 +5689,43 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     // the dead stage's output, so its left-boundary KV cannot stand in.
     if (ppStageCoversLayers(roles, prev, dead.startLayer, dead.endLayer)) target = prev;
     else if (ppStageCoversLayers(roles, next, dead.startLayer, dead.endLayer)) target = next;
-    if (target == (NnUint)-1) {
+    NnUint bilateralSplit = 0u;
+    const bool bilateral = target == (NnUint)-1 &&
+        ppBilateralSplit(roles, prev, next, dead.startLayer, dead.endLayer, &bilateralSplit);
+    if (target == (NnUint)-1 && !bilateral) {
         std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u layers=[%u,%u) reason=partial-cover\n",
             (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)dead.startLayer, (unsigned)dead.endLayer);
         std::fflush(stdout);
         return false;
     }
+    if (bilateral) target = prev;
     if (!applyPpStageBypass(plan, stageIndex, target)) {
         std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=bypass-rejected\n",
             (unsigned)deadNodeIndex, (unsigned)stageIndex);
         std::fflush(stdout);
         return false;
+    }
+    if (bilateral) {
+        const NnUint nextNode = plan->stages[next].rootNodeIndex;
+        if (g_failoverExecutor != nullptr && myNodeIndex == plan->stages[prev].rootNodeIndex) {
+            for (NnUint layer = dead.startLayer; layer < bilateralSplit; ++layer) {
+                g_failoverExecutor->setRedundantLayerEnabled(layer, true);
+            }
+            g_failoverExecutor->spliceRedundantLayersIntoSend(dead.startLayer, bilateralSplit);
+        }
+        if (g_failoverExecutor != nullptr && myNodeIndex == nextNode) {
+            // Suffix segments read the PP activation from X and write it back.
+            // Recv retries after this hook, then the rest of this forward runs them.
+            for (NnUint layer = bilateralSplit; layer < dead.endLayer; ++layer) {
+                g_failoverExecutor->setRedundantLayerEnabled(layer, true);
+            }
+        }
+        std::printf("⚡ [failover] fast-path bilateral deadNode=%u ejectedStage=%u split=%u prefix=[%u,%u) suffix=[%u,%u) myNode=%u\n",
+            (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)bilateralSplit,
+            (unsigned)dead.startLayer, (unsigned)bilateralSplit,
+            (unsigned)bilateralSplit, (unsigned)dead.endLayer, (unsigned)myNodeIndex);
+        std::fflush(stdout);
+        return true;
     }
     if (g_failoverExecutor != nullptr && myNodeIndex == plan->stages[target].rootNodeIndex) {
         for (NnUint layer = dead.startLayer; layer < dead.endLayer; ++layer) {

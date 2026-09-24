@@ -5683,8 +5683,11 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
         return true;
     }
     if (prev == (NnUint)-1 || next == (NnUint)-1) {
-        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=edge-stage\n",
-            (unsigned)deadNodeIndex, (unsigned)stageIndex);
+        // Last stage owns final_norm and the logits head. Do not splice a
+        // neighbor into that role; the root restarts the session instead.
+        const char *reason = (next == (NnUint)-1 && prev != (NnUint)-1) ? "last-stage" : "edge-stage";
+        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=%s\n",
+            (unsigned)deadNodeIndex, (unsigned)stageIndex, reason);
         std::fflush(stdout);
         return false;
     }

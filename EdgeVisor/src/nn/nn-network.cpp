@@ -432,6 +432,23 @@ static bool isOfflineErrno(int err) {
     }
 }
 
+#ifndef _WIN32
+static bool tcpStateIsDead(int state) {
+    switch (state) {
+    case TCP_CLOSE:
+    case TCP_CLOSE_WAIT:
+    case TCP_LAST_ACK:
+    case TCP_CLOSING:
+    case TCP_TIME_WAIT:
+    case TCP_FIN_WAIT1:
+    case TCP_FIN_WAIT2:
+        return true;
+    default:
+        return false;
+    }
+}
+#endif
+
 void setReuseAddr(int socket) {
     int opt = 1;
     #ifdef _WIN32
@@ -1894,14 +1911,14 @@ void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const voi
         struct tcp_info info;
         std::memset(&info, 0, sizeof(info));
         socklen_t infoLen = sizeof(info);
-        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && info.tcpi_state != TCP_ESTABLISHED) {
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && tcpStateIsDead(info.tcpi_state)) {
             deactivateNode(targetNodeIndex, 0u);
             throw NnPeerOfflineException(targetNodeIndex, "PP peer not established");
         }
         pollfd pfd{};
         pfd.fd = fd;
         pfd.events = POLLIN;
-        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLRDHUP)) != 0) {
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLERR) != 0) {
             deactivateNode(targetNodeIndex, 0u);
             throw NnPeerOfflineException(targetNodeIndex, "PP peer hung up");
         }
@@ -1924,12 +1941,12 @@ bool NnNetwork::peerLooksOffline(NnUint targetNodeIndex) const {
     struct tcp_info info;
     std::memset(&info, 0, sizeof(info));
     socklen_t infoLen = sizeof(info);
-    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && info.tcpi_state != TCP_ESTABLISHED)
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && tcpStateIsDead(info.tcpi_state))
         return true;
     pollfd pfd{};
     pfd.fd = fd;
     pfd.events = POLLIN;
-    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLRDHUP)) != 0)
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLERR) != 0)
         return true;
 #else
     (void)targetNodeIndex;

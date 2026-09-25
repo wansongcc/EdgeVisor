@@ -54,6 +54,7 @@ typedef struct {
 // [新增] 用于 createPartitionPlan 的输入参数，描述一个 Stage 的需求
 struct NnStageDef {
     NnUint nLayers;              // 该 Stage 负责多少层
+    bool layersExplicit = false; // true when "@N" was written, including "@0"
     std::vector<float> tpRatios; // 该 Stage 内部的 TP 比例 (例如 {1.0, 3.0})
     std::vector<NnUint> kvRedundancyPerNode; // 每个节点的 KV 冗余 head 数量
 };
@@ -792,6 +793,10 @@ NnUnevenPartitionPlan createPartitionPlan(
 NnUint getPpPrevStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex);
 NnUint getPpNextStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex);
 bool applyPpStageBypass(NnUnevenPartitionPlan *plan, NnUint ejectedStageIndex, NnUint targetStageIndex);
+// Drop a stage out of the pipeline. Neighbors link to each other.
+void unlinkPpStage(NnUnevenPartitionPlan *plan, NnUint stageIndex);
+// Place newStage immediately after afterStage. newStage may currently be unlinked.
+bool applyPpStageInsert(NnUnevenPartitionPlan *plan, NnUint newStageIndex, NnUint afterStageIndex);
 
 // 释放计划 (旧接口，如果使用栈上对象+析构函数可忽略，但保留以防遗留调用)
 void releasePartitionPlan(NnUnevenPartitionPlan* plan);

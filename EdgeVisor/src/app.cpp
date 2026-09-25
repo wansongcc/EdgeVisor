@@ -22,6 +22,7 @@
 #include <string>
 #include <fstream>
 #include <thread>
+#include <mutex>
 #include <chrono>
 #include <cerrno>
 #if defined(__linux__)
@@ -452,6 +453,23 @@ static void maybeSeedPlanCommandFromLegacyEnv() {
     planCommandCache().store(cmd);
 }
 
+struct ReservedDevice {
+    bool armed = false;
+    bool joined = false;
+    NnUint workerIndex = 0u;
+    NnUint stageIndex = 0u;
+    NnUint donorStage = 0u;
+    NnUint donorNode = 0u;
+    NnUint layerBegin = 0u;
+    NnUint layerEnd = 0u;
+};
+static ReservedDevice g_reserved;
+static std::vector<char> g_poolLive;
+static bool g_writeJoinFields = false;
+static LlmNet *g_joinNet = nullptr;
+static std::mutex g_workerJoinMu;
+static std::vector<LlmDeviceJoinPacket> g_workerJoinOps;
+
 static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const AppCliArgs *args) {
     LlmBootstrapPacket p{};
     p.magic = LLM_BOOTSTRAP_MAGIC;
@@ -470,6 +488,16 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.samplerTemperature = args->temperature;
     p.samplerTopP = args->topp;
     p.samplerSeed = args->seed;
+    p.joinAfterStage = 0xFFFFFFFFu;
+    p.joinLayerBegin = 0u;
+    p.joinLayerEnd = 0u;
+    p.joinStageIndex = 0xFFFFFFFFu;
+    if (g_writeJoinFields && g_reserved.armed) {
+        p.joinAfterStage = g_reserved.donorStage;
+        p.joinLayerBegin = g_reserved.layerBegin;
+        p.joinLayerEnd = g_reserved.layerEnd;
+        p.joinStageIndex = g_reserved.stageIndex;
+    }
     if (p.bubbleShadowKvEnabled != 0u) {
         p.flags |= LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV;
         if (bubbleShadowKvDuringForwardEnabled()) {
@@ -1414,7 +1442,7 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
         NnUint totalExplicitLayers = 0;
         std::vector<int> autoLayerIndices;
         for (size_t i = 0; i < stages.size(); ++i) {
-            if (stages[i].nLayers == 0) {
+            if (stages[i].nLayers == 0 && !stages[i].layersExplicit) {
                 autoLayerIndices.push_back((int)i);
             } else {
                 totalExplicitLayers += stages[i].nLayers;
@@ -1485,6 +1513,7 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
             auto parsed = parseRatiosAndMaybeLayers(seg);
             st.tpRatios = std::move(parsed.first);
             st.nLayers = parsed.second;
+            st.layersExplicit = seg.find('@') != std::string::npos;
             stages.push_back(std::move(st));
         }
 
@@ -1540,6 +1569,7 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
             auto parsed = parseRatiosAndMaybeLayers(seg);
             st.tpRatios = std::move(parsed.first);
             st.nLayers = parsed.second;
+            st.layersExplicit = seg.find('@') != std::string::npos;
             stages.push_back(std::move(st));
         }
 
@@ -5486,6 +5516,31 @@ bool WorkerLlmInference::tryReadControlPacket() {
         network->writeAck(ROOT_SOCKET_INDEX);
     }
 
+    if ((controlPacket.flags & LLM_CTRL_DEVICE_JOIN) != 0u) {
+        LlmDeviceJoinPacket pkt{};
+        network->read(ROOT_SOCKET_INDEX, &pkt, sizeof(pkt));
+        if (pkt.magic == LLM_DEVICE_JOIN_MAGIC && pkt.version == LLM_DEVICE_JOIN_VERSION) {
+            if (pkt.op == LLM_DEVICE_JOIN_ACCEPT && localNodeIndex > 0u) {
+                NnNetwork *net = network;
+                const NnUint me = localNodeIndex - 1u;
+                const NnUint peer = pkt.workerIndex;
+                const int peerPort = (int)pkt.peerPort;
+                if (me < peer) {
+                    std::thread([net, me, peer, peerPort]() {
+                        net->connectAndInstallPeer(me, peer, "127.0.0.1", peerPort);
+                    }).detach();
+                } else {
+                    std::thread([net, me, peer]() { net->acceptAndInstallPeer(me, peer); }).detach();
+                }
+                network->writeAck(ROOT_SOCKET_INDEX);
+            } else {
+                std::lock_guard<std::mutex> lk(g_workerJoinMu);
+                g_workerJoinOps.push_back(pkt);
+                network->writeAck(ROOT_SOCKET_INDEX);
+            }
+        }
+    }
+
     printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);
     bool gotBatchMeta = false;
     if ((controlPacket.flags & LLM_CTRL_HAS_BATCH_META) != 0u) {
@@ -5839,13 +5894,16 @@ static SpeedDeviceProfile localSpeedProfile() {
 // Cold start keeps the given pipeline order and assigns layers to faster
 // devices first. Memory caps stop a slow device from taking more than it
 // completed in the device tests. An explicit --ratios skips this.
-static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers) {
+static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers, const std::vector<char> *liveNodes) {
     const NnUint nNodes = args->nWorkers + 1u;
     std::vector<SpeedDeviceProfile> profiles(nNodes);
     std::vector<NnUint> layers(nNodes, 0u);
     profiles[0] = localSpeedProfile();
     for (NnUint i = 0; i < args->nWorkers; ++i)
         profiles[i + 1u] = speedProfileForAddress(args->workerHosts[i]);
+    auto isLive = [&](NnUint node) {
+        return liveNodes == nullptr || node >= liveNodes->size() || (*liveNodes)[node] != 0;
+    };
     std::ostringstream classes;
     for (NnUint i = 0; i < nNodes; ++i) {
         if (i > 0u) classes << ',';
@@ -5855,12 +5913,16 @@ static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers) {
     const NnUint base = nLayers >= nNodes ? 1u : 0u;
     NnUint left = nLayers;
     for (NnUint i = 0; i < nNodes && left > 0u; ++i) {
+        if (!isLive(i)) continue;
         const NnUint give = std::min<NnUint>(base, left);
         layers[i] = give;
         left -= give;
     }
-    std::vector<NnUint> order(nNodes);
-    for (NnUint i = 0; i < nNodes; ++i) order[i] = i;
+    std::vector<NnUint> order;
+    order.reserve(nNodes);
+    for (NnUint i = 0; i < nNodes; ++i) {
+        if (isLive(i)) order.push_back(i);
+    }
     std::stable_sort(order.begin(), order.end(), [&](NnUint a, NnUint b) {
         if (profiles[a].msPerLayer != profiles[b].msPerLayer)
             return profiles[a].msPerLayer < profiles[b].msPerLayer;
@@ -5882,6 +5944,69 @@ static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers) {
     std::printf("⚖️  [auto-ratios] speed-pack classes=%s ratios=%s\n", classes.str().c_str(), out.str().c_str());
     std::fflush(stdout);
     return out.str();
+}
+
+static void probeDevicePool(const AppCliArgs *args) {
+    const NnUint nNodes = args->nWorkers + 1u;
+    g_poolLive.assign(nNodes, 1);
+    g_reserved = ReservedDevice();
+    for (NnUint i = 0; i < args->nWorkers; ++i) {
+        const bool up = probeWorkerReachable(args->workerHosts[i], (int)args->workerPorts[i], 300);
+        if (up) {
+            std::printf("🟢 [pool] worker %s:%u is up\n", args->workerHosts[i], (unsigned)args->workerPorts[i]);
+        } else {
+            g_poolLive[i + 1u] = 0;
+            std::printf("⚪ [pool] worker %s:%u is offline; slot reserved\n", args->workerHosts[i], (unsigned)args->workerPorts[i]);
+        }
+    }
+    NnUint mask = 0u;
+    for (NnUint i = 0; i < args->nWorkers && i < 32u; ++i) {
+        if (g_poolLive[i + 1u] != 0) mask |= (1u << i);
+    }
+    setReservedWorkerMask(mask);
+    std::fflush(stdout);
+}
+
+static void reserveOfflineSlice(NnUnevenPartitionPlan *plan) {
+    if (plan == nullptr || plan->stages == nullptr) return;
+    NnUint offline = 0xFFFFFFFFu;
+    for (NnUint node = 1u; node < g_poolLive.size() && node < plan->nStages; ++node) {
+        if (g_poolLive[node] == 0) { offline = node; break; }
+    }
+    if (offline == 0xFFFFFFFFu) return;
+    NnUint donor = 0xFFFFFFFFu;
+    NnUint best = 1u;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        if (s == offline) continue;
+        if (s < g_poolLive.size() && g_poolLive[s] == 0) continue;
+        if (getPpNextStageIndex(plan, s) == 0xFFFFFFFFu) continue;
+        if (plan->stages[s].nLayers < 2u) continue;
+        if (plan->stages[s].nLayers < best) continue;
+        best = plan->stages[s].nLayers;
+        donor = s;
+    }
+    if (donor == 0xFFFFFFFFu) return;
+    const NnStageConfig &src = plan->stages[donor];
+    const NnUint room = src.nLayers;
+    NnUint take = room / 2u;
+    if (take < 1u) take = 1u;
+    if (take >= room) take = room - 1u;
+    const NnUint begin = src.endLayer - take;
+    const NnUint end = src.endLayer;
+    NnStageConfig &dst = plan->stages[offline];
+    dst.startLayer = begin;
+    dst.endLayer = end;
+    dst.nLayers = end - begin;
+    g_reserved.armed = true;
+    g_reserved.workerIndex = offline - 1u;
+    g_reserved.stageIndex = offline;
+    g_reserved.donorStage = donor;
+    g_reserved.donorNode = plan->stages[donor].rootNodeIndex;
+    g_reserved.layerBegin = begin;
+    g_reserved.layerEnd = end;
+    std::printf("🧩 [pool] reserve node=%u layers=[%u,%u) from donor stage=%u node=%u\n",
+        (unsigned)offline, (unsigned)begin, (unsigned)end, (unsigned)donor, (unsigned)g_reserved.donorNode);
+    std::fflush(stdout);
 }
 
 static void applyFailoverRestart(AppCliArgs *args) {
@@ -6007,7 +6132,8 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     }
 
     if (args->ratiosStr == nullptr && args->nWorkers > 0u) {
-        autoRatiosStorage = speedPackRatios(args, header.nLayers);
+        probeDevicePool(args);
+        autoRatiosStorage = speedPackRatios(args, header.nLayers, &g_poolLive);
         if (!autoRatiosStorage.empty())
             args->ratiosStr = const_cast<char *>(autoRatiosStorage.c_str());
     } else if (args->ratiosStr != nullptr) {
@@ -6034,6 +6160,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
         planPtr.reset(new NnUnevenPartitionPlan(
             createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, kvRedundancyPerNode)
         ));
+        reserveOfflineSlice(planPtr.get());
         
         // 使用 Uneven Builder (传入 planPtr)
         net = buildLlmNetUneven(&header, nNodes, args->nBatches, planPtr.get(), args->maxActiveSeqs);
@@ -6079,6 +6206,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
         // Bootstrap: send modelPath/ratios/maxSeqLen/syncType to workers so they don't need CLI args.
         for (NnUint nodeIndex = 1; nodeIndex < nNodes; ++nodeIndex) {
             const NnUint socketIndex = nodeIndex - 1;
+            if (!network->isSocketActive(socketIndex)) continue;
             writeBootstrapPacket(network, socketIndex, args);
         }
 
@@ -6155,11 +6283,188 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     context.network = network;
     context.executor = &executor;
     context.nodeConfig = rootNodeConfig;
+    g_joinNet = &net;
 
     handler(&context);
+    g_joinNet = nullptr;
 
     inference.finish();
     dllamaIoProbeFlush("root-inference");
+}
+
+static void sendJoinPacket(NnNetwork *network, NnUint socketIndex, const LlmDeviceJoinPacket &pkt) {
+    LlmControlPacket ctrl{};
+    ctrl.position = 0u;
+    ctrl.batchSize = 1u;
+    ctrl.flags = LLM_CTRL_DEVICE_JOIN | LLM_CTRL_CONTROL_ONLY;
+    network->write(socketIndex, &ctrl, sizeof(ctrl));
+    network->write(socketIndex, &pkt, sizeof(pkt));
+    network->readAck(socketIndex);
+}
+
+void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
+    if (!g_reserved.armed || g_reserved.joined || context == nullptr || context->network == nullptr) return;
+    if (context->args == nullptr || g_joinNet == nullptr || position == 0u) return;
+    const NnUint workerIndex = g_reserved.workerIndex;
+    if (workerIndex >= context->args->nWorkers) return;
+    const char *host = context->args->workerHosts[workerIndex];
+    const int port = (int)context->args->workerPorts[workerIndex];
+    if (!probeWorkerReachable(host, port, 200)) return;
+    // The probe is a real TCP accept. Give the worker time to listen again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    NnNetwork *network = context->network;
+    const NnUint nWorkers = context->args->nWorkers;
+    NnUint onlineMask = 1u << workerIndex;
+    for (NnUint i = 0; i < nWorkers; ++i) {
+        if (i < g_poolLive.size() - 1u && g_poolLive[i + 1u] != 0) onlineMask |= (1u << i);
+    }
+    std::printf("🧩 [pool] joining %s:%d at pos=%u layers=[%u,%u)\n",
+        host, port, (unsigned)position, (unsigned)g_reserved.layerBegin, (unsigned)g_reserved.layerEnd);
+    std::fflush(stdout);
+
+    bool connected = false;
+    for (int attempt = 0; attempt < 8 && !connected; ++attempt) {
+        try {
+            connected = network->connectReservedWorker(workerIndex, host, port, nWorkers, context->args->workerHosts, context->args->workerPorts, onlineMask);
+        } catch (const std::runtime_error &err) {
+            std::printf("⚠️  [pool] connect attempt %d: %s\n", attempt + 1, err.what());
+            std::fflush(stdout);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+    if (!connected) {
+        std::printf("⚠️  [pool] connect failed for worker %u\n", (unsigned)workerIndex);
+        std::fflush(stdout);
+        g_reserved.joined = true;
+        return;
+    }
+
+    LlmDeviceJoinPacket accept{};
+    accept.magic = LLM_DEVICE_JOIN_MAGIC;
+    accept.version = LLM_DEVICE_JOIN_VERSION;
+    accept.op = LLM_DEVICE_JOIN_ACCEPT;
+    accept.workerIndex = workerIndex;
+    accept.peerPort = (NnUint)port;
+    for (NnUint i = 0; i < nWorkers; ++i) {
+        if ((onlineMask & (1u << i)) == 0u || i == workerIndex) continue;
+        if (!network->isSocketActive(i)) continue;
+        sendJoinPacket(network, i, accept);
+    }
+
+    g_writeJoinFields = true;
+    writeBootstrapPacket(network, workerIndex, context->args);
+    g_writeJoinFields = false;
+    NnRootConfigWriter configWriter(network);
+    configWriter.writeNet(workerIndex, &g_joinNet->netConfig);
+    configWriter.writeNode(workerIndex, &g_joinNet->nodeConfigs[g_reserved.stageIndex]);
+
+    const NnUint kvDim = context->header->kvDim;
+    const NnUint endPos = position - 1u;
+    const NnUint targetNode = g_reserved.stageIndex;
+    std::vector<LlmKvTransferHeader> headers;
+    std::vector<std::vector<float>> ks;
+    std::vector<std::vector<float>> vs;
+    if (g_reserved.donorNode == 0u && context->executor != nullptr) {
+        for (NnUint layer = g_reserved.layerBegin; layer < g_reserved.layerEnd; ++layer) {
+            for (NnUint pos = 0u; pos <= endPos; ++pos) {
+                std::vector<float> kRow;
+                std::vector<float> vRow;
+                if (!context->executor->exportLayerKvRow(layer, pos, kvDim, kRow, vRow)) continue;
+                LlmKvTransferHeader hdr{};
+                hdr.magic = LLM_KV_TRANSFER_MAGIC;
+                hdr.version = LLM_KV_TRANSFER_VERSION;
+                hdr.layerIndex = layer;
+                hdr.position = pos;
+                hdr.kvDim = kvDim;
+                hdr.fromNodeIndex = 0u;
+                hdr.targetNodeIndex = targetNode;
+                headers.push_back(hdr);
+                ks.push_back(std::move(kRow));
+                vs.push_back(std::move(vRow));
+            }
+        }
+    } else if (network->isSocketActive(g_reserved.donorNode - 1u)) {
+        LlmControlPacket ctrl{};
+        ctrl.batchSize = 1u;
+        ctrl.flags = LLM_CTRL_HAS_KV_EXPORT_REQUEST | LLM_CTRL_CONTROL_ONLY;
+        LlmKvExportRequestHeader req{};
+        req.magic = LLM_KV_EXPORT_REQUEST_MAGIC;
+        req.version = LLM_KV_EXPORT_REQUEST_VERSION;
+        req.requestId = 1u;
+        req.fromNodeIndex = 0xFFFFFFFFu;
+        req.targetStageRootNodeIndex = targetNode;
+        req.endPosition = endPos;
+        req.layerCount = g_reserved.layerEnd - g_reserved.layerBegin;
+        req.kvDim = kvDim;
+        const NnUint donorSocket = g_reserved.donorNode - 1u;
+        network->write(donorSocket, &ctrl, sizeof(ctrl));
+        network->write(donorSocket, &req, sizeof(req));
+        for (NnUint layer = g_reserved.layerBegin; layer < g_reserved.layerEnd; ++layer) {
+            network->write(donorSocket, &layer, sizeof(layer));
+        }
+        LlmKvExportResponseHeader resp{};
+        network->read(donorSocket, &resp, sizeof(resp));
+        if (resp.magic == LLM_KV_EXPORT_RESPONSE_MAGIC) {
+            for (NnUint i = 0u; i < resp.rowCount; ++i) {
+                LlmKvTransferHeader hdr{};
+                network->read(donorSocket, &hdr, sizeof(hdr));
+                std::vector<float> kRow(hdr.kvDim);
+                std::vector<float> vRow(hdr.kvDim);
+                network->read(donorSocket, kRow.data(), kRow.size() * sizeof(float));
+                network->read(donorSocket, vRow.data(), vRow.size() * sizeof(float));
+                hdr.targetNodeIndex = targetNode;
+                headers.push_back(hdr);
+                ks.push_back(std::move(kRow));
+                vs.push_back(std::move(vRow));
+            }
+        }
+    }
+
+    if (!headers.empty()) {
+        LlmControlPacket ctrl{};
+        ctrl.batchSize = 1u;
+        ctrl.flags = LLM_CTRL_HAS_KV_TRANSFER | LLM_CTRL_CONTROL_ONLY;
+        LlmKvTransferBatchHeader bh{};
+        bh.magic = LLM_KV_TRANSFER_BATCH_MAGIC;
+        bh.version = LLM_KV_TRANSFER_BATCH_VERSION;
+        bh.count = (NnUint)headers.size();
+        network->write(workerIndex, &ctrl, sizeof(ctrl));
+        network->write(workerIndex, &bh, sizeof(bh));
+        for (size_t i = 0u; i < headers.size(); ++i) {
+            network->write(workerIndex, &headers[i], sizeof(headers[i]));
+            network->write(workerIndex, ks[i].data(), ks[i].size() * sizeof(float));
+            network->write(workerIndex, vs[i].data(), vs[i].size() * sizeof(float));
+        }
+    }
+
+    LlmDeviceJoinPacket insert{};
+    insert.magic = LLM_DEVICE_JOIN_MAGIC;
+    insert.version = LLM_DEVICE_JOIN_VERSION;
+    insert.op = LLM_DEVICE_JOIN_INSERT;
+    insert.stageIndex = g_reserved.stageIndex;
+    insert.donorStage = g_reserved.donorStage;
+    LlmDeviceJoinPacket disable = insert;
+    disable.op = LLM_DEVICE_JOIN_DISABLE;
+    disable.workerIndex = g_reserved.donorNode;
+    disable.layerBegin = g_reserved.layerBegin;
+    disable.layerEnd = g_reserved.layerEnd;
+    for (NnUint i = 0; i < nWorkers; ++i) {
+        if (i == workerIndex || !network->isSocketActive(i)) continue;
+        sendJoinPacket(network, i, insert);
+        if (g_reserved.donorNode != 0u && i + 1u == g_reserved.donorNode) sendJoinPacket(network, i, disable);
+    }
+    const NnUnevenPartitionPlan *plan = context->inference->getPartitionPlan();
+    applyPpStageInsert(const_cast<NnUnevenPartitionPlan *>(plan), g_reserved.stageIndex, g_reserved.donorStage);
+    if (g_reserved.donorNode == 0u && context->executor != nullptr) {
+        for (NnUint layer = g_reserved.layerBegin; layer < g_reserved.layerEnd; ++layer) {
+            context->executor->setPrimaryLayerEnabled(layer, false);
+        }
+    }
+    g_poolLive[g_reserved.stageIndex] = 1;
+    g_reserved.joined = true;
+    std::printf("✅ [pool] node=%u joined with %u kv rows\n", (unsigned)targetNode, (unsigned)headers.size());
+    std::fflush(stdout);
 }
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
@@ -6327,6 +6632,17 @@ void runWorkerApp(AppCliArgs *args) {
              planPtr.reset(new NnUnevenPartitionPlan(
                  createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, kvRedundancyPerNode)
              ));
+             if (boot.joinStageIndex != 0xFFFFFFFFu && boot.joinStageIndex < planPtr->nStages &&
+                 boot.joinLayerEnd > boot.joinLayerBegin) {
+                 NnStageConfig &slot = planPtr->stages[boot.joinStageIndex];
+                 slot.startLayer = boot.joinLayerBegin;
+                 slot.endLayer = boot.joinLayerEnd;
+                 slot.nLayers = boot.joinLayerEnd - boot.joinLayerBegin;
+                 applyPpStageInsert(planPtr.get(), boot.joinStageIndex, boot.joinAfterStage);
+                 std::printf("🧩 [pool] worker owns reserved layers=[%u,%u) after stage=%u\n",
+                     (unsigned)boot.joinLayerBegin, (unsigned)boot.joinLayerEnd, (unsigned)boot.joinAfterStage);
+                 std::fflush(stdout);
+             }
         }
 
         dllamaIoProbeSetNode(nodeConfig.nodeIndex, getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex));
@@ -6425,6 +6741,28 @@ void runWorkerApp(AppCliArgs *args) {
                 LlmKvTransferHeader kvHdr{};
                 std::vector<float> kvK;
                 std::vector<float> kvV;
+                {
+                    std::vector<LlmDeviceJoinPacket> joinOps;
+                    {
+                        std::lock_guard<std::mutex> lk(g_workerJoinMu);
+                        joinOps.swap(g_workerJoinOps);
+                    }
+                    for (const LlmDeviceJoinPacket &pkt : joinOps) {
+                        if (pkt.op == LLM_DEVICE_JOIN_INSERT && planPtr != nullptr) {
+                            applyPpStageInsert(planPtr.get(), pkt.stageIndex, pkt.donorStage);
+                            std::printf("🧩 [pool] node=%u inserted stage=%u after=%u\n",
+                                (unsigned)nodeConfig.nodeIndex, (unsigned)pkt.stageIndex, (unsigned)pkt.donorStage);
+                        } else if (pkt.op == LLM_DEVICE_JOIN_DISABLE && pkt.workerIndex == nodeConfig.nodeIndex) {
+                            for (NnUint layer = pkt.layerBegin; layer < pkt.layerEnd; ++layer) {
+                                executor.setPrimaryLayerEnabled(layer, false);
+                            }
+                            std::printf("🧩 [pool] node=%u dropped layers=[%u,%u)\n",
+                                (unsigned)nodeConfig.nodeIndex, (unsigned)pkt.layerBegin, (unsigned)pkt.layerEnd);
+                        }
+                        std::fflush(stdout);
+                    }
+                }
+
                 while (inference.consumePendingKvTransfer(kvHdr, kvK, kvV)) {
                     const bool wOk = executor.applyTransferredKvRow(
                         kvHdr.layerIndex,

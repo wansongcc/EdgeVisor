@@ -51,6 +51,8 @@ typedef bool (*NnPpFailoverFn)(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, 
 void setNnPpFailoverHook(NnPpFailoverFn fn);
 void nnSetAcceptTimeoutMs(int timeoutMs);
 bool probeWorkerReachable(const char *host, int port, int timeoutMs);
+// Bit i set means worker i is online. Default is every worker.
+void setReservedWorkerMask(NnUint onlineMask);
 
 class NnSocket {
 public:
@@ -60,6 +62,7 @@ public:
     ~NnSocket();
     void assign(int fd);
     int release();
+    int detach();
 };
 
 struct NnSocketIo {
@@ -159,7 +162,11 @@ public:
     bool isSocketActive(NnUint socketIndex) const;
     bool deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex);
     void resetStats();
-    
+    // Listen socket kept open so a reserved pool member can connect later.
+    int listenFd = -1;
+    bool acceptAndInstallPeer(NnUint myWorkerIndex, NnUint expectedPeerWorkerIndex);
+    bool connectAndInstallPeer(NnUint myWorkerIndex, NnUint peerWorkerIndex, const char *host, int port);
+    bool connectReservedWorker(NnUint workerIndex, const char *host, int port, NnUint nPoolWorkers, char **hosts, NnUint *ports, NnUint onlineMask);
 };
 
 // Fixed-size per-layer compute timing message sent from node -> stage root.

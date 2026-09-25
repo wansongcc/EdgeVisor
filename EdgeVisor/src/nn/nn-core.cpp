@@ -877,6 +877,9 @@ NnUnevenPartitionPlan createPartitionPlan(
             currentNodeOffset += config.nNodes;
             currentLayerOffset += config.nLayers;
         }
+        for (NnUint s = 0; s < plan.nStages; ++s) {
+            if (plan.stages[s].nLayers == 0u) unlinkPpStage(&plan, s);
+        }
 
     } catch (...) {
         // NnUnevenPartitionPlan 析构函数会处理内存释放
@@ -1332,6 +1335,29 @@ bool applyPpStageBypass(NnUnevenPartitionPlan *plan, NnUint ejectedStageIndex, N
     plan->ppPrevStageIndex[next] = prev;
     plan->ppPrevStageIndex[ejectedStageIndex] = (NnUint)-1;
     plan->ppNextStageIndex[ejectedStageIndex] = (NnUint)-1;
+    return true;
+}
+
+void unlinkPpStage(NnUnevenPartitionPlan *plan, NnUint stageIndex) {
+    if (plan == nullptr || plan->ppPrevStageIndex == nullptr || plan->ppNextStageIndex == nullptr) return;
+    if (stageIndex >= plan->nStages) return;
+    const NnUint prev = plan->ppPrevStageIndex[stageIndex];
+    const NnUint next = plan->ppNextStageIndex[stageIndex];
+    if (prev != (NnUint)-1 && prev < plan->nStages) plan->ppNextStageIndex[prev] = next;
+    if (next != (NnUint)-1 && next < plan->nStages) plan->ppPrevStageIndex[next] = prev;
+    plan->ppPrevStageIndex[stageIndex] = (NnUint)-1;
+    plan->ppNextStageIndex[stageIndex] = (NnUint)-1;
+}
+
+bool applyPpStageInsert(NnUnevenPartitionPlan *plan, NnUint newStageIndex, NnUint afterStageIndex) {
+    if (plan == nullptr || plan->ppPrevStageIndex == nullptr || plan->ppNextStageIndex == nullptr) return false;
+    if (newStageIndex >= plan->nStages || afterStageIndex >= plan->nStages) return false;
+    if (newStageIndex == afterStageIndex) return false;
+    const NnUint oldNext = plan->ppNextStageIndex[afterStageIndex];
+    plan->ppNextStageIndex[afterStageIndex] = newStageIndex;
+    plan->ppPrevStageIndex[newStageIndex] = afterStageIndex;
+    plan->ppNextStageIndex[newStageIndex] = oldNext;
+    if (oldNext != (NnUint)-1 && oldNext < plan->nStages) plan->ppPrevStageIndex[oldNext] = newStageIndex;
     return true;
 }
 

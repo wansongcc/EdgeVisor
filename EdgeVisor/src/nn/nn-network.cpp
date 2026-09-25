@@ -304,10 +304,21 @@ static bool isNodeInStage(const NnStageConfig *stage, NnUint nodeIndex) {
     return false;
 }
 
+static const NnStageConfig *pipelineLastStage(const NnUnevenPartitionPlan *plan) {
+    if (plan == nullptr || plan->stages == nullptr || plan->nStages == 0u) return nullptr;
+    const NnStageConfig *fallback = &plan->stages[plan->nStages - 1u];
+    if (plan->ppNextStageIndex == nullptr || plan->ppPrevStageIndex == nullptr) return fallback;
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        if (plan->ppNextStageIndex[s] == (NnUint)-1 && plan->ppPrevStageIndex[s] != (NnUint)-1)
+            return &plan->stages[s];
+    }
+    return fallback;
+}
+
 static bool isLogitsGatherWorkerActive(const NnUnevenPartitionPlan *plan, NnUint nodeIndex) {
     if (plan == nullptr || plan->nStages == 0 || plan->stages == nullptr) return false;
-    const NnStageConfig *lastStage = &plan->stages[plan->nStages - 1u];
-    if (!isNodeInStage(lastStage, nodeIndex)) return false;
+    const NnStageConfig *lastStage = pipelineLastStage(plan);
+    if (lastStage == nullptr || !isNodeInStage(lastStage, nodeIndex)) return false;
     if (plan->vocabSplit.lengths == nullptr) return true;
     return plan->vocabSplit.lengths[nodeIndex] > 0u;
 }
@@ -889,6 +900,12 @@ static inline NnUint peerWorkerToSocketIndex(NnUint myWorkerIndex, NnUint peerWo
     return (peerWorkerIndex < myWorkerIndex) ? (peerWorkerIndex + 1u) : peerWorkerIndex;
 }
 
+static NnUint g_reservedOnlineMask = 0xFFFFFFFFu;
+
+void setReservedWorkerMask(NnUint onlineMask) {
+    g_reservedOnlineMask = onlineMask;
+}
+
 bool probeWorkerReachable(const char *host, int port, int timeoutMs) {
     if (host == nullptr || host[0] == '\0') return false;
     if (isUnixSocketAddress(host)) return true;
@@ -1181,6 +1198,12 @@ int NnSocket::release() {
     return fd;
 }
 
+int NnSocket::detach() {
+    int fd = this->fd;
+    this->fd = -1;
+    return fd;
+}
+
 static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
 
     NnUint nSockets;
@@ -1217,6 +1240,9 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
         readSocket(rootSocketFd, &ports[i], sizeof(ports[i]));
     }
 
+    NnUint onlineMask = 0xFFFFFFFFu;
+    readSocket(rootSocketFd, &onlineMask, sizeof(onlineMask));
+
     writeAckPacket(rootSocketFd);
 
     // We need to wait here until the root node will send a "root is ready" packet
@@ -1226,6 +1252,10 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
         char *host = hosts[i].get();
         int port = ports[i];
         const NnUint peerWorkerIndex = (i < nodeIndex) ? i : (i + 1u);
+        if (peerWorkerIndex < 32u && (onlineMask & (1u << peerWorkerIndex)) == 0u) {
+            printf("⭕ Reserved worker %u is offline; leaving its socket inactive\n", peerWorkerIndex);
+            continue;
+        }
 
         if (i >= nodeIndex) {
             if (isUnixSocketAddress(host)) {
@@ -1299,6 +1329,7 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
 
     for (NnUint workerIndex = 0; workerIndex < nNodes; ++workerIndex) {
         if (workerIndex == nodeIndex) continue;
+        if (workerIndex < 32u && (onlineMask & (1u << workerIndex)) == 0u) continue;
         const NnUint socketIndex = peerWorkerToSocketIndex(nodeIndex, workerIndex);
         if (socketIndex >= nSockets || !slotAssigned[socketIndex]) {
             throw std::runtime_error("Missing worker-peer socket at startup");
@@ -1311,7 +1342,9 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
 
 std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
     NnSocket socketSocket(createServerSocket(port));
-    return serveFromSocket(&socketSocket);
+    std::unique_ptr<NnNetwork> net = serveFromSocket(&socketSocket);
+    net->listenFd = socketSocket.detach();
+    return net;
 }
 
 std::unique_ptr<NnNetwork> NnNetwork::serveUnix(const char *path) {
@@ -1324,7 +1357,18 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
 
     std::vector<NnSocket> sockets(nSockets);
     std::vector<NnUint> peerNodeBySocket(nSockets, 0u);
+    NnUint onlineMask = 0u;
     for (NnUint i = 0; i < nSockets; i++) {
+        peerNodeBySocket[i] = i + 1u;
+        const bool reservedOff = i < 32u && (g_reservedOnlineMask & (1u << i)) == 0u;
+        if (reservedOff && !isUnixSocketAddress(hosts[i])) {
+            printf("⭕ Socket[%d]: %s:%d is offline; reserving its slot\n", i, hosts[i], ports[i]);
+            continue;
+        }
+        onlineMask |= (i < 32u) ? (1u << i) : 0u;
+    }
+    for (NnUint i = 0; i < nSockets; i++) {
+        if ((onlineMask & (1u << i)) == 0u) continue;
         if (isUnixSocketAddress(hosts[i])) {
             printf("⭕ Socket[%d]: connecting to %s worker\n", i, hosts[i]);
         } else {
@@ -1342,11 +1386,12 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
             writeSocket(fd, hosts[j], hostLen);
             writeSocket(fd, &ports[j], sizeof(ports[j]));
         }
+        writeSocket(fd, &onlineMask, sizeof(onlineMask));
         readAckPacket(fd);
         printf("⭕ Socket[%d]: connected\n", i);
-        peerNodeBySocket[i] = i + 1u;
     }
     for (NnUint i = 0; i < nSockets; i++) {
+        if (sockets[i].fd < 0) continue;
         writeAckPacket(sockets[i].fd);
     }
     printf("⭕ Network is initialized\n");
@@ -1357,14 +1402,14 @@ NnNetwork::NnNetwork(std::vector<NnSocket> *sockets, std::vector<NnUint> *peerNo
     this->nSockets = sockets->size();
     this->sockets = new int[nSockets];
     for (NnUint i = 0; i < nSockets; i++)
-        this->sockets[i] = sockets->at(i).release();
+        this->sockets[i] = sockets->at(i).detach();
     this->peerNodeBySocket = new NnUint[nSockets];
     this->socketActive = new bool[nSockets];
     for (NnUint i = 0; i < nSockets; i++) {
         this->peerNodeBySocket[i] = (peerNodeBySocket != nullptr && i < peerNodeBySocket->size())
             ? peerNodeBySocket->at(i)
             : 0u;
-        this->socketActive[i] = true;
+        this->socketActive[i] = this->sockets[i] >= 0;
     }
     this->sentBytes = new NnSize[nSockets];
     this->recvBytes = new NnSize[nSockets];
@@ -1379,8 +1424,10 @@ NnNetwork::~NnNetwork() {
     delete[] socketActive;
     delete[] sentBytes;
     delete[] recvBytes;
-    for (NnUint i = 0; i < nSockets; i++)
-        destroySocket(sockets[i]);
+    for (NnUint i = 0; i < nSockets; i++) {
+        if (sockets[i] >= 0) destroySocket(sockets[i]);
+    }
+    if (listenFd >= 0) destroySocket(listenFd);
     delete[] sockets;
     printf("⭕ Network is closed\n");
 }
@@ -1876,6 +1923,77 @@ bool NnNetwork::isSocketActive(NnUint socketIndex) const {
     return socketIndex < nSockets && socketActive[socketIndex];
 }
 
+bool NnNetwork::acceptAndInstallPeer(NnUint myWorkerIndex, NnUint expectedPeerWorkerIndex) {
+    if (listenFd < 0) return false;
+    const int fd = acceptSocket(listenFd);
+    NnUint actualPeer = 0u;
+    exchangeWorkerPeerIndex(fd, myWorkerIndex, &actualPeer);
+    if (actualPeer != expectedPeerWorkerIndex) {
+        destroySocket(fd);
+        return false;
+    }
+    const NnUint socketIndex = peerWorkerToSocketIndex(myWorkerIndex, actualPeer);
+    if (socketIndex >= nSockets) {
+        destroySocket(fd);
+        return false;
+    }
+    if (sockets[socketIndex] >= 0) destroySocket(sockets[socketIndex]);
+    sockets[socketIndex] = fd;
+    peerNodeBySocket[socketIndex] = actualPeer + 1u;
+    socketActive[socketIndex] = true;
+    printf("⭕ Socket[%u]: late peer worker %u joined\n", socketIndex, actualPeer);
+    fflush(stdout);
+    return true;
+}
+
+bool NnNetwork::connectAndInstallPeer(NnUint myWorkerIndex, NnUint peerWorkerIndex, const char *host, int port) {
+    if (host == nullptr) return false;
+    const int fd = connectSocket(const_cast<char *>(host), port);
+    NnUint actualPeer = 0u;
+    exchangeWorkerPeerIndex(fd, myWorkerIndex, &actualPeer);
+    if (actualPeer != peerWorkerIndex) {
+        destroySocket(fd);
+        return false;
+    }
+    const NnUint socketIndex = peerWorkerToSocketIndex(myWorkerIndex, actualPeer);
+    if (socketIndex >= nSockets) {
+        destroySocket(fd);
+        return false;
+    }
+    if (sockets[socketIndex] >= 0) destroySocket(sockets[socketIndex]);
+    sockets[socketIndex] = fd;
+    peerNodeBySocket[socketIndex] = actualPeer + 1u;
+    socketActive[socketIndex] = true;
+    printf("⭕ Socket[%u]: connected late to worker %u\n", socketIndex, actualPeer);
+    fflush(stdout);
+    return true;
+}
+
+bool NnNetwork::connectReservedWorker(NnUint workerIndex, const char *host, int port, NnUint nPoolWorkers, char **hosts, NnUint *ports, NnUint onlineMask) {
+    if (workerIndex >= nSockets || host == nullptr) return false;
+    const int fd = connectSocket(const_cast<char *>(host), port);
+    writeSocket(fd, &nPoolWorkers, sizeof(nPoolWorkers));
+    writeSocket(fd, &workerIndex, sizeof(workerIndex));
+    for (NnUint j = 0; j < nPoolWorkers; j++) {
+        if (j == workerIndex) continue;
+        NnUint hostLen = (NnUint)std::strlen(hosts[j]) + 1u;
+        writeSocket(fd, &hostLen, sizeof(hostLen));
+        writeSocket(fd, hosts[j], hostLen);
+        int peerPort = (int)ports[j];
+        writeSocket(fd, &peerPort, sizeof(peerPort));
+    }
+    writeSocket(fd, &onlineMask, sizeof(onlineMask));
+    readAckPacket(fd);
+    writeAckPacket(fd);
+    if (sockets[workerIndex] >= 0) destroySocket(sockets[workerIndex]);
+    sockets[workerIndex] = fd;
+    peerNodeBySocket[workerIndex] = workerIndex + 1u;
+    socketActive[workerIndex] = true;
+    printf("⭕ Socket[%u]: reserved worker is online\n", workerIndex);
+    fflush(stdout);
+    return true;
+}
+
 bool NnNetwork::deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex) {
     (void)myNodeIndex;
     for (NnUint i = 0; i < nSockets; ++i) {
@@ -2166,7 +2284,9 @@ static void syncNodeSlices(
                 if (targetNode != groupRootIndex) continue; 
 
                 if (logitsGather) {
-                    const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
+                    const NnStageConfig *lastStagePtr = pipelineLastStage(plan);
+                    if (lastStagePtr == nullptr) continue;
+                    const NnStageConfig& lastStage = *lastStagePtr;
                     bool amInLastStage = false;
                     for(unsigned k=0; k<lastStage.nNodes; ++k) {
                         if (lastStage.nodeIndices[k] == myNodeIndex) {
@@ -2183,7 +2303,9 @@ static void syncNodeSlices(
                 // Root 理会所有人 (接收)
                 // 但如果是 Logits 收集，Root 只接收 Last Stage 的数据
                 if (logitsGather) {
-                    const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
+                    const NnStageConfig *lastStagePtr = pipelineLastStage(plan);
+                    if (lastStagePtr == nullptr) continue;
+                    const NnStageConfig& lastStage = *lastStagePtr;
                     bool targetInLastStage = false;
                     for(unsigned k=0; k<lastStage.nNodes; ++k) {
                         if (lastStage.nodeIndices[k] == targetNode) {
@@ -2221,7 +2343,7 @@ static void syncNodeSlices(
     // For PP, split tables are stage-local. For logits gather, slices come from the LAST stage.
     const NnStageConfig* stageForSplit = stage;
     if (isLogitsGather) {
-        stageForSplit = &plan->stages[plan->nStages - 1];
+        stageForSplit = pipelineLastStage(plan);
     }
 
     // [Fix] Pass floatType + total elements for accurate matching (incl. Q80)
@@ -2232,7 +2354,9 @@ static void syncNodeSlices(
     // --- logits gather (LastStage -> Root) 调试：打印 Root 端的目标节点与切片信息 ---
 #if NN_NETWORK_COMM_DATA_LOG
     if (onlyFromWorkerToRoot && amIRoot && plan != nullptr && plan->nStages > 0 && stage == nullptr && threadIndex == 0) {
-        const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
+        const NnStageConfig *lastStagePtr = pipelineLastStage(plan);
+        if (lastStagePtr == nullptr) return;
+        const NnStageConfig& lastStage = *lastStagePtr;
         printf("LOGITS GATHER root=%u lastStageNodes=", myNodeIndex);
         for (unsigned k = 0; k < lastStage.nNodes; ++k) {
             printf("%u%s", lastStage.nodeIndices[k], (k + 1 < lastStage.nNodes) ? "," : "");
@@ -3354,6 +3478,7 @@ void NnRootConfigWriter::writeNode(NnUint socketIndex, NnNodeConfig *config) {
 void NnRootConfigWriter::writeToWorkers(NnNetConfig *netConfig, NnNodeConfig *nodeConfigs) {
     for (NnUint nodeIndex = 1; nodeIndex < netConfig->nNodes; nodeIndex++) {
         NnUint socketIndex = nodeIndex - 1;
+        if (!network->isSocketActive(socketIndex)) continue;
         writeNet(socketIndex, netConfig);
         writeNode(socketIndex, &nodeConfigs[nodeIndex]);
     }

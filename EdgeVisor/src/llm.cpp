@@ -2664,8 +2664,11 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
         if (myStage) {
             startLayer = myStage->startLayer;
             endLayer = myStage->endLayer;
-            isFirstStage = (myStage->stageIndex == 0);
-            isLastStage = (myStage->stageIndex == plan->nStages - 1);
+            const NnUint prev = getPpPrevStageIndex(plan, myStage->stageIndex);
+            const NnUint next = getPpNextStageIndex(plan, myStage->stageIndex);
+            const bool unlinked = prev == (NnUint)-1 && next == (NnUint)-1 && plan->nStages > 1u;
+            isFirstStage = !unlinked && prev == (NnUint)-1;
+            isLastStage = !unlinked && next == (NnUint)-1;
         }
         n.nodeConfigs[nodeIndex] = buildLlmNodeInternal(
             nodeIndex, h, &n, plan, &n.runtimeStageLayerPlan,
@@ -2790,8 +2793,11 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     if (myStage) {
         startLayer = myStage->startLayer;
         endLayer = myStage->endLayer;
-        isFirstStage = (myStage->stageIndex == 0);
-        isLastStage = (myStage->stageIndex == plan->nStages - 1);
+        const NnUint prev = getPpPrevStageIndex(plan, myStage->stageIndex);
+        const NnUint next = getPpNextStageIndex(plan, myStage->stageIndex);
+        const bool unlinked = prev == (NnUint)-1 && next == (NnUint)-1 && plan->nStages > 1u;
+        isFirstStage = !unlinked && prev == (NnUint)-1;
+        isLastStage = !unlinked && next == (NnUint)-1;
         printf("   [PP] Node %u: Responsible for Layers %u-%u %s%s\n", 
             nodeIndex, startLayer, endLayer, 
             isFirstStage ? "[First]" : "", isLastStage ? "[Last]" : "");

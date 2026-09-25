@@ -176,7 +176,26 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_SKIP_LOGITS = 1u << 7, // non-final prefill chunk: skip end-segment logits compute+gather
     LLM_CTRL_PRECOMMIT_PROBE = 1u << 8, // control-only liveness ACK before a PP binding hand-off
     LLM_CTRL_TOOL_WINDOW_SHADOW = 1u << 9, // execute actual redundant ShadowKV work during a control-only tool window
+    LLM_CTRL_DEVICE_JOIN = 1u << 10,
 };
+
+static constexpr NnUint LLM_DEVICE_JOIN_MAGIC = 0x4e4f4a44u; // 'DJON'
+static constexpr NnUint LLM_DEVICE_JOIN_VERSION = 1u;
+static constexpr NnUint LLM_DEVICE_JOIN_ACCEPT = 1u;
+static constexpr NnUint LLM_DEVICE_JOIN_INSERT = 2u;
+static constexpr NnUint LLM_DEVICE_JOIN_DISABLE = 3u;
+
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint op;
+    NnUint workerIndex;
+    NnUint stageIndex;
+    NnUint donorStage;
+    NnUint layerBegin;
+    NnUint layerEnd;
+    NnUint peerPort;
+} LlmDeviceJoinPacket;
 
 static constexpr NnUint LLM_BATCH_META_MAGIC = 0x4d54424du; // 'MBTM' little-endian
 static constexpr NnUint LLM_BATCH_META_VERSION = 1u;
@@ -401,10 +420,15 @@ typedef struct {
     float samplerTemperature;
     float samplerTopP;
     unsigned long long samplerSeed;
+    // UINT32_MAX means this worker is not a late pool member.
+    NnUint joinAfterStage;
+    NnUint joinLayerBegin;
+    NnUint joinLayerEnd;
+    NnUint joinStageIndex;
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 13u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 14u;
 
 static constexpr NnUint LLM_SAMPLED_TOKEN_MAGIC = 0x4b545344u; // 'DSTK' little-endian
 static constexpr NnUint LLM_SAMPLED_TOKEN_VERSION = 1u;
@@ -701,6 +725,8 @@ typedef struct {
 } AppInferenceContext;
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
+// Between tokens, connect a reserved pool member and move a slice of the slowest donor onto it.
+void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position);
 void failoverArmSessionRestart(const std::string &prompt, NnUint steps, NnUint nLayers);
 void runWorkerApp(AppCliArgs *args);
 

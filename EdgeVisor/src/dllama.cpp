@@ -1124,6 +1124,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     const auto predWallStart = std::chrono::steady_clock::now();
     for (; pos < maxPos; pos++) {
         const auto tokenWallStart = std::chrono::steady_clock::now();
+        maybeJoinReservedDevice(context, pos);
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
         forwardOrRestart();

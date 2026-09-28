@@ -14,9 +14,13 @@ typedef SSIZE_T ssize_t;
 #endif
 #include "nn-network.hpp"
 #include "failover_gate.hpp"
+#include "device_profile.hpp"
+#include "product_log.hpp"
 #include "nn/io-profile.hpp"
 #include "nn-core.hpp"
 #include <cassert>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <cmath>
@@ -1212,19 +1216,121 @@ int NnSocket::detach() {
     return fd;
 }
 
+#define NET_VLOG(...) do { if (productLogLevel() >= 1) std::printf(__VA_ARGS__); } while (0)
+
+static int connectSocketWithin(const char *host, int port, int timeoutMs);
+
+static const NnUint kProfileProbeMagic = 0x50524F46u;
+
+struct ProfileWireRequest {
+    uint32_t dim;
+    uint32_t hiddenDim;
+    uint32_t nHeads;
+    uint32_t nKvHeads;
+    uint32_t maxSeqLen;
+    uint32_t nLayers;
+    int32_t weightType;
+};
+
+struct ProfileWireResponse {
+    double msPerLayer;
+    uint32_t cap;
+    char name[16];
+};
+
+static void serveProfileProbe(int fd) {
+    ProfileWireRequest request;
+    std::memset(&request, 0, sizeof(request));
+    readSocket(fd, &request, sizeof(request));
+    ModelShape shape;
+    shape.dim = request.dim;
+    shape.hiddenDim = request.hiddenDim;
+    shape.nHeads = request.nHeads;
+    shape.nKvHeads = request.nKvHeads;
+    shape.maxSeqLen = request.maxSeqLen;
+    shape.nLayers = request.nLayers;
+    shape.weightType = request.weightType;
+    SpeedDeviceProfile profile = unknownSpeedProfile();
+    try {
+        profile = measureLocalProfile(shape);
+    } catch (...) {
+        profile = unknownSpeedProfile();
+    }
+    ProfileWireResponse response;
+    std::memset(&response, 0, sizeof(response));
+    response.msPerLayer = profile.msPerLayer;
+    response.cap = profile.cap;
+    std::memcpy(response.name, profile.name, sizeof(response.name));
+    writeSocket(fd, &response, sizeof(response));
+}
+
+bool queryWorkerSpeedProfile(
+    const char *host,
+    int port,
+    unsigned dim,
+    unsigned hiddenDim,
+    unsigned nHeads,
+    unsigned nKvHeads,
+    unsigned maxSeqLen,
+    unsigned nLayers,
+    int weightType,
+    double *msPerLayer,
+    unsigned *cap,
+    char *name,
+    unsigned nameBytes) {
+    if (host == nullptr || msPerLayer == nullptr || cap == nullptr || name == nullptr || nameBytes == 0u)
+        return false;
+    char hostCopy[256];
+    std::snprintf(hostCopy, sizeof(hostCopy), "%s", host);
+    const int fd = connectSocketWithin(hostCopy, port, 3000);
+    if (fd < 0) return false;
+    bool ok = false;
+    try {
+        const NnUint magic = kProfileProbeMagic;
+        writeSocket(fd, &magic, sizeof(magic));
+        ProfileWireRequest request;
+        std::memset(&request, 0, sizeof(request));
+        request.dim = dim;
+        request.hiddenDim = hiddenDim;
+        request.nHeads = nHeads;
+        request.nKvHeads = nKvHeads;
+        request.maxSeqLen = maxSeqLen;
+        request.nLayers = nLayers;
+        request.weightType = weightType;
+        writeSocket(fd, &request, sizeof(request));
+        ProfileWireResponse response;
+        std::memset(&response, 0, sizeof(response));
+        readSocket(fd, &response, sizeof(response));
+        if (response.msPerLayer > 0.0 && response.cap > 0u) {
+            *msPerLayer = response.msPerLayer;
+            *cap = response.cap;
+            std::snprintf(name, nameBytes, "%s", response.name);
+            ok = true;
+        }
+    } catch (...) {
+        ok = false;
+    }
+    destroySocket(fd);
+    return ok;
+}
+
 static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
 
     NnUint nSockets;
     NnUint nodeIndex;
     int rootSocketFd = acceptSocket(socketSocket->fd);
     NnSocket rootSocket(rootSocketFd);
-    printf("⭕ The root node has connected\n");
+    NET_VLOG("⭕ The root node has connected\n");
 
     readSocket(rootSocketFd, &nSockets, sizeof(nSockets));
+    if (nSockets == kProfileProbeMagic) {
+        serveProfileProbe(rootSocketFd);
+        throw NnProfileProbeException();
+    }
     NnUint nNodes = nSockets - 1; // nSockets - 1 root node
-    printf("⭕ peerWorkers: %d\n", nNodes);
+    NET_VLOG("⭕ peerWorkers: %d\n", nNodes);
     readSocket(rootSocketFd, &nodeIndex, sizeof(nodeIndex));
-    printf("⭕ NodeIndex: %d\n", nodeIndex);
+    NET_VLOG("⭕ NodeIndex: %d\n", nodeIndex);
 
     std::vector<NnSocket> sockets(nSockets);
     std::vector<NnUint> peerNodeBySocket(nSockets, 0u);
@@ -1233,7 +1339,7 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
     peerNodeBySocket[0] = 0u;
     slotAssigned[0] = true;
 
-    printf("⭕ Socket[0]: accepted root node\n");
+    NET_VLOG("⭕ Socket[0]: accepted root node\n");
     std::vector<std::unique_ptr<char[]>> hosts(nNodes);
     std::vector<int> ports(nNodes);
 
@@ -1261,18 +1367,18 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
         int port = ports[i];
         const NnUint peerWorkerIndex = (i < nodeIndex) ? i : (i + 1u);
         if (peerWorkerIndex < 32u && (onlineMask & (1u << peerWorkerIndex)) == 0u) {
-            printf("⭕ Reserved worker %u is offline; leaving its socket inactive\n", peerWorkerIndex);
+            NET_VLOG("⭕ Reserved worker %u is offline; leaving its socket inactive\n", peerWorkerIndex);
             continue;
         }
 
         if (i >= nodeIndex) {
             if (isUnixSocketAddress(host)) {
-                printf("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s)\n",
+                NET_VLOG("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s)\n",
                        nodeIndex,
                        peerWorkerIndex,
                        host);
             } else {
-                printf("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s:%d)\n",
+                NET_VLOG("⭕ Connect worker-pair: localWorker=%u -> expectedPeerWorker=%u (%s:%d)\n",
                        nodeIndex,
                        peerWorkerIndex,
                        host,
@@ -1299,12 +1405,12 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
             peerNodeBySocket[socketIndex] = actualPeerWorkerIndex + 1u;
             slotAssigned[socketIndex] = true;
 
-            printf("⭕ Socket[%u]: connected to worker(globalNode=%u, workerIndex=%u)\n",
+            NET_VLOG("⭕ Socket[%u]: connected to worker(globalNode=%u, workerIndex=%u)\n",
                    socketIndex,
                    actualPeerWorkerIndex + 1u,
                    actualPeerWorkerIndex);
         } else {
-            printf("⭕ Waiting worker-pair accept: localWorker=%u expecting one of [0..%u]\n",
+            NET_VLOG("⭕ Waiting worker-pair accept: localWorker=%u expecting one of [0..%u]\n",
                    nodeIndex,
                    nodeIndex == 0 ? 0 : (nodeIndex - 1u));
 
@@ -1328,7 +1434,7 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
             peerNodeBySocket[socketIndex] = actualPeerWorkerIndex + 1u;
             slotAssigned[socketIndex] = true;
 
-            printf("⭕ Socket[%u]: accepted worker(globalNode=%u, workerIndex=%u)\n",
+            NET_VLOG("⭕ Socket[%u]: accepted worker(globalNode=%u, workerIndex=%u)\n",
                    socketIndex,
                    actualPeerWorkerIndex + 1u,
                    actualPeerWorkerIndex);
@@ -1344,7 +1450,7 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
         }
     }
 
-    printf("⭕ Network is initialized\n");
+    NET_VLOG("⭕ Network is initialized\n");
     return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets, &peerNodeBySocket));
 }
 
@@ -1370,7 +1476,7 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
         peerNodeBySocket[i] = i + 1u;
         const bool reservedOff = i < 32u && (g_reservedOnlineMask & (1u << i)) == 0u;
         if (reservedOff && !isUnixSocketAddress(hosts[i])) {
-            printf("⭕ Socket[%d]: %s:%d is offline; reserving its slot\n", i, hosts[i], ports[i]);
+            NET_VLOG("⭕ Socket[%d]: %s:%d is offline; reserving its slot\n", i, hosts[i], ports[i]);
             continue;
         }
         onlineMask |= (i < 32u) ? (1u << i) : 0u;
@@ -1378,9 +1484,9 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
     for (NnUint i = 0; i < nSockets; i++) {
         if ((onlineMask & (1u << i)) == 0u) continue;
         if (isUnixSocketAddress(hosts[i])) {
-            printf("⭕ Socket[%d]: connecting to %s worker\n", i, hosts[i]);
+            NET_VLOG("⭕ Socket[%d]: connecting to %s worker\n", i, hosts[i]);
         } else {
-            printf("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
+            NET_VLOG("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
         }
         int fd = connectSocket(hosts[i], ports[i]);
         sockets[i].assign(fd);
@@ -1396,13 +1502,13 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
         }
         writeSocket(fd, &onlineMask, sizeof(onlineMask));
         readAckPacket(fd);
-        printf("⭕ Socket[%d]: connected\n", i);
+        NET_VLOG("⭕ Socket[%d]: connected\n", i);
     }
     for (NnUint i = 0; i < nSockets; i++) {
         if (sockets[i].fd < 0) continue;
         writeAckPacket(sockets[i].fd);
     }
-    printf("⭕ Network is initialized\n");
+    NET_VLOG("⭕ Network is initialized\n");
     return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets, &peerNodeBySocket));
 }
 
@@ -1437,7 +1543,7 @@ NnNetwork::~NnNetwork() {
     }
     if (listenFd >= 0) destroySocket(listenFd);
     delete[] sockets;
-    printf("⭕ Network is closed\n");
+    NET_VLOG("⭕ Network is closed\n");
 }
 
 void NnNetwork::setTurbo(bool enabled) {
@@ -2034,7 +2140,7 @@ bool NnNetwork::acceptAndInstallPeer(NnUint myWorkerIndex, NnUint expectedPeerWo
     sockets[socketIndex] = fd;
     peerNodeBySocket[socketIndex] = actualPeer + 1u;
     socketActive[socketIndex] = true;
-    printf("⭕ Socket[%u]: late peer worker %u joined\n", socketIndex, actualPeer);
+    NET_VLOG("⭕ Socket[%u]: late peer worker %u joined\n", socketIndex, actualPeer);
     fflush(stdout);
     return true;
 }
@@ -2058,7 +2164,7 @@ bool NnNetwork::connectAndInstallPeer(NnUint myWorkerIndex, NnUint peerWorkerInd
     sockets[socketIndex] = fd;
     peerNodeBySocket[socketIndex] = actualPeer + 1u;
     socketActive[socketIndex] = true;
-    printf("⭕ Socket[%u]: connected late to worker %u\n", socketIndex, actualPeer);
+    NET_VLOG("⭕ Socket[%u]: connected late to worker %u\n", socketIndex, actualPeer);
     fflush(stdout);
     return true;
 }
@@ -2084,7 +2190,7 @@ bool NnNetwork::connectReservedWorker(NnUint workerIndex, const char *host, int 
     sockets[workerIndex] = fd;
     peerNodeBySocket[workerIndex] = workerIndex + 1u;
     socketActive[workerIndex] = true;
-    printf("⭕ Socket[%u]: reserved worker is online\n", workerIndex);
+    NET_VLOG("⭕ Socket[%u]: reserved worker is online\n", workerIndex);
     fflush(stdout);
     return true;
 }

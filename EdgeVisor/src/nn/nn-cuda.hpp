@@ -10,6 +10,8 @@
 int nnCudaDeviceCount();
 std::string nnCudaDeviceInfo(NnUint gpuIndex);
 void nnCudaPrintDeviceInfo(NnUint gpuIndex);
+double nnCudaProfileGemmMs(NnUint gpuIndex, int n);
+unsigned long long nnCudaFreeBytes(NnUint gpuIndex);
 
 struct NnCudaLaunchConfig {
     int computeCapabilityMajor;

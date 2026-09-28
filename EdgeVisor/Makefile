@@ -25,6 +25,26 @@ ifndef TERMUX_VERSION
 	CXXFLAGS += -march=native -mtune=native
 endif
 
+# Bare `make` builds the binary. `make clean` still cleans.
+.DEFAULT_GOAL := dllama
+
+# 0 or 1 from the command line or environment wins. Otherwise detect.
+ifeq ($(strip $(DLLAMA_CUDA)),)
+  ifneq ($(shell if [ -x "$(NVCC)" ] || command -v "$(NVCC)" >/dev/null 2>&1; then echo yes; fi),)
+    DLLAMA_CUDA := 1
+  else
+    DLLAMA_CUDA := 0
+  endif
+endif
+ifeq ($(strip $(DLLAMA_VULKAN)),)
+  ifneq ($(shell command -v glslc >/dev/null 2>&1 && echo yes || command -v glslangValidator >/dev/null 2>&1 && echo yes),)
+    DLLAMA_VULKAN := 1
+  else
+    DLLAMA_VULKAN := 0
+  endif
+endif
+$(info dllama backends: cuda=$(DLLAMA_CUDA) vulkan=$(DLLAMA_VULKAN))
+
 ifdef DEBUG
 	CXXFLAGS += -g -fsanitize=address
 else
@@ -35,7 +55,7 @@ ifdef WVLA
 	CXXFLAGS += -Wvla-extension
 endif
 
-ifdef DLLAMA_VULKAN
+ifeq ($(DLLAMA_VULKAN),1)
 ifeq ($(OS),Windows_NT)
 	CGLSLC ?= glslc
 else
@@ -61,7 +81,7 @@ endif
 	DEPS += nn-vulkan.o
 endif
 
-ifdef DLLAMA_CUDA
+ifeq ($(DLLAMA_CUDA),1)
 CUDA_ARCHS_DETECTED := $(shell \
 	detected="`nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/[^0-9.]//g; s/\.//g' | awk 'NF' | sort -u | tr '\n' ' '`"; \
 	if [ -z "$$detected" ] && [ -r /proc/device-tree/compatible ]; then \
@@ -106,7 +126,7 @@ else
     DELETE_CMD = rm -fv
 endif
 
-DEPS += io-profile.o
+DEPS += io-profile.o product-log.o device-profile.o
 
 .PHONY: clean dllama
 
@@ -123,6 +143,10 @@ nn-executor.o: src/nn/nn-executor.cpp
 nn-network.o: src/nn/nn-network.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 io-profile.o: src/nn/io-profile.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+product-log.o: src/product_log.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+device-profile.o: src/device_profile.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-network-local.o: src/nn/nn-network-local.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -145,7 +169,7 @@ nn-vulkan.o: src/nn/nn-vulkan.cpp
 nn-cuda.o: src/nn/nn-cuda.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-ifdef DLLAMA_VULKAN
+ifeq ($(DLLAMA_VULKAN),1)
 VULKAN_SHADER_SRCS := $(wildcard src/nn/vulkan/*.comp)
 VULKAN_SHADER_BINS := $(VULKAN_SHADER_SRCS:.comp=.spv)
 DEPS += $(VULKAN_SHADER_BINS)
@@ -163,7 +187,7 @@ nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o ll
 	$(CXX) $(CXXFLAGS) src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
 endif
 
-ifdef DLLAMA_CUDA
+ifeq ($(DLLAMA_CUDA),1)
 nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o
 	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o -o $@ $(LIBS)
 endif
@@ -199,6 +223,9 @@ dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o
 
 failover-gate-test: src/test/test_failover_gate.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
+device-profile-test: src/test/test_device_profile.cpp
+	$(CXX) $(CXXFLAGS) src/test/test_device_profile.cpp -o $@ $(LIBS)
 
 token-timing-test: src/test/test_token_timing.cpp token-timing.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)

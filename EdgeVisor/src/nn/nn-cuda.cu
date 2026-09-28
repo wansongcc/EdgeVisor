@@ -1,4 +1,5 @@
 #include "nn-cuda.hpp"
+#include "product_log.hpp"
 #include "nn/io-profile.hpp"
 #include "llm.hpp"
 #include "plan-command.hpp"
@@ -7,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cmath>
 #include <cstdio>
@@ -1245,6 +1247,54 @@ void nnCudaPrintDeviceInfo(NnUint gpuIndex) {
     std::fflush(stdout);
 }
 
+double nnCudaProfileGemmMs(NnUint gpuIndex, int n) {
+    if (n < 16) n = 16;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    const size_t bytes = (size_t)n * (size_t)n * sizeof(float);
+    float *a = nullptr;
+    float *b = nullptr;
+    float *c = nullptr;
+    cublasHandle_t handle = nullptr;
+    try {
+        NN_CUDA_CHECK(cudaMalloc(&a, bytes));
+        NN_CUDA_CHECK(cudaMalloc(&b, bytes));
+        NN_CUDA_CHECK(cudaMalloc(&c, bytes));
+        NN_CUDA_CHECK(cudaMemset(a, 0, bytes));
+        NN_CUDA_CHECK(cudaMemset(b, 0, bytes));
+        NN_CUBLAS_CHECK(cublasCreate(&handle));
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        NN_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, b, n, a, n, &beta, c, n));
+        NN_CUDA_CHECK(cudaDeviceSynchronize());
+        const auto start = std::chrono::steady_clock::now();
+        const int iters = 3;
+        for (int i = 0; i < iters; ++i) {
+            NN_CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, b, n, a, n, &beta, c, n));
+        }
+        NN_CUDA_CHECK(cudaDeviceSynchronize());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        cublasDestroy(handle);
+        cudaFree(a);
+        cudaFree(b);
+        cudaFree(c);
+        return ms / (double)iters;
+    } catch (...) {
+        if (handle != nullptr) cublasDestroy(handle);
+        if (a != nullptr) cudaFree(a);
+        if (b != nullptr) cudaFree(b);
+        if (c != nullptr) cudaFree(c);
+        throw;
+    }
+}
+
+unsigned long long nnCudaFreeBytes(NnUint gpuIndex) {
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    size_t freeBytes = 0;
+    size_t totalBytes = 0;
+    NN_CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+    return (unsigned long long)freeBytes;
+}
+
 NnCudaPinnedStaging::NnCudaPinnedStaging()
     : hostPointer(nullptr), allocatedSize(0u) {}
 
@@ -1411,9 +1461,11 @@ NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig
     cudaDeviceProp prop{};
     NN_CUDA_CHECK(cudaGetDeviceProperties(&prop, (int)gpuIndex));
     launchConfig = buildCudaLaunchConfig(prop);
-    nnCudaPrintDeviceInfo(gpuIndex);
-    std::printf("🔷 %s\n", launchConfigInfo().c_str());
-    std::fflush(stdout);
+    if (productLogLevel() >= 1) {
+        nnCudaPrintDeviceInfo(gpuIndex);
+        std::printf("🔷 %s\n", launchConfigInfo().c_str());
+        std::fflush(stdout);
+    }
     cudaStream_t s = nullptr;
     NN_CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     stream = (void *)s;

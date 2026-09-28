@@ -1,5 +1,7 @@
 #include "app.hpp"
+#include "device_profile.hpp"
 #include "failover_gate.hpp"
+#include "product_log.hpp"
 #include "nn/io-profile.hpp"
 #include "plan-controller.hpp"
 #include "dynamic/dynamic_layer.hpp"
@@ -28,9 +30,6 @@
 #include <cerrno>
 #if defined(__linux__)
 #include <sys/resource.h>
-#include <ifaddrs.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #endif
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
@@ -615,10 +614,11 @@ static ChatTemplateType parseChatTemplateType(char *val) {
 }
 
 static AppCliArgs::Backend parseBackendType(char *val) {
+    if (std::strcmp(val, "auto") == 0) return AppCliArgs::BACKEND_AUTO;
     if (std::strcmp(val, "cpu") == 0) return AppCliArgs::BACKEND_CPU;
     if (std::strcmp(val, "vulkan") == 0) return AppCliArgs::BACKEND_VULKAN;
     if (std::strcmp(val, "cuda") == 0) return AppCliArgs::BACKEND_CUDA;
-    throw std::runtime_error("Invalid backend: " + std::string(val) + " (expected cpu, vulkan, or cuda)");
+    throw std::runtime_error("Invalid backend: " + std::string(val) + " (expected auto, cpu, vulkan, or cuda)");
 }
 
 const char *AppCliArgs::backendToString(AppCliArgs::Backend backend) {
@@ -633,8 +633,11 @@ const char *AppCliArgs::backendToString(AppCliArgs::Backend backend) {
 
 AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     AppCliArgs args;
-    args.info = true;
+    args.info = false;
     args.help = false;
+    args.listDevices = false;
+    args.syncTypeExplicit = false;
+    args.logLevel = 0;
     args.backend = BACKEND_AUTO;
     args.backendStr = nullptr;
     args.memoryLimitBytes = 0;
@@ -649,7 +652,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             if (v > 0) args.nBatches = v;
         } catch (...) {}
     }
-    args.nThreads = 1;
+    const unsigned hwThreads = std::thread::hardware_concurrency();
+    args.nThreads = hwThreads == 0u ? 1u : (NnUint)hwThreads;
     args.modelPath = nullptr;
     args.tokenizerPath = nullptr;
     args.prompt = nullptr;
@@ -737,7 +741,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     }
 
     int i = 1;
-    if (requireMode && argc > 1) {
+    if (requireMode && argc > 1 && argv[1][0] != '-') {
         args.mode = argv[1];
         i++;
     }
@@ -764,6 +768,24 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 args.continuousBatching = true;
                 i += 1;
             }
+            continue;
+        }
+
+        if (std::strcmp(name, "--list-devices") == 0) {
+            args.listDevices = true;
+            i += 1;
+            continue;
+        }
+        if (std::strcmp(name, "--verbose") == 0) {
+            args.logLevel = std::max(args.logLevel, 1);
+            args.info = true;
+            i += 1;
+            continue;
+        }
+        if (std::strcmp(name, "--debug") == 0) {
+            args.logLevel = 2;
+            args.info = true;
+            i += 1;
             continue;
         }
 
@@ -990,6 +1012,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.prompt = value;
         } else if (std::strcmp(name, "--buffer-float-type") == 0) {
             args.syncType = parseFloatType(value);
+            args.syncTypeExplicit = true;
         } else if (std::strcmp(name, "--backend") == 0) {
             args.backend = parseBackendType(value);
             args.backendStr = value;
@@ -1122,11 +1145,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     if (args.backend == BACKEND_CPU && (args.gpuSegmentFrom >= 0 || args.gpuSegmentTo >= 0)) {
         throw std::runtime_error("--backend cpu conflicts with --gpu-segments; CPU mode cannot own GPU segments");
     }
-    if (args.backend == BACKEND_AUTO) {
-        args.backend = (args.gpuIndex >= 0) ? BACKEND_VULKAN : BACKEND_CPU;
-    } else if ((args.backend == BACKEND_VULKAN || args.backend == BACKEND_CUDA) && args.gpuIndex < 0) {
+    if (args.backend != BACKEND_AUTO &&
+            (args.backend == BACKEND_VULKAN || args.backend == BACKEND_CUDA) &&
+            args.gpuIndex < 0) {
         args.gpuIndex = 0;
     }
+    productSetLogLevel(args.logLevel);
 #if !defined(DLLAMA_VULKAN)
     if (args.backend == BACKEND_VULKAN) {
         throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
@@ -5860,99 +5884,74 @@ void failoverArmSessionRestart(const std::string &prompt, NnUint steps, NnUint n
     std::fflush(stdout);
 }
 
-struct SpeedDeviceProfile {
-    double msPerLayer;
-    NnUint cap;
-    const char *name;
-};
-
-static SpeedDeviceProfile speedProfileForAddress(const char *host) {
-    if (host != nullptr) {
-        if (std::strcmp(host, "192.168.137.13") == 0 || std::strcmp(host, "192.168.137.15") == 0)
-            return {5.8, 22u, "nx"};
-        if (std::strcmp(host, "192.168.137.16") == 0 || std::strcmp(host, "192.168.137.18") == 0)
-            return {7.4, 8u, "nano"};
-        if (std::strcmp(host, "192.168.137.31") == 0)
-            return {8.3, 11u, "laptop"};
-    }
-    // 10 primary layers plus the redundant boundary graph did not fit a Nano.
-    return {7.4, 8u, "unknown"};
+static ModelShape modelShapeFromHeader(const LlmHeader &header) {
+    ModelShape shape;
+    shape.dim = header.dim;
+    shape.hiddenDim = header.hiddenDim;
+    shape.nHeads = header.nHeads;
+    shape.nKvHeads = header.nKvHeads;
+    shape.maxSeqLen = header.seqLen;
+    shape.nLayers = header.nLayers;
+    shape.weightType = (int)header.weightType;
+    return shape;
 }
 
-static SpeedDeviceProfile localSpeedProfile() {
-#if defined(__linux__)
-    struct ifaddrs *list = nullptr;
-    if (getifaddrs(&list) == 0) {
-        for (struct ifaddrs *ifa = list; ifa != nullptr; ifa = ifa->ifa_next) {
-            if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) continue;
-            char text[INET_ADDRSTRLEN];
-            const struct sockaddr_in *addr = (const struct sockaddr_in *)ifa->ifa_addr;
-            if (inet_ntop(AF_INET, &addr->sin_addr, text, sizeof(text)) == nullptr) continue;
-            const SpeedDeviceProfile profile = speedProfileForAddress(text);
-            if (std::strcmp(profile.name, "unknown") != 0) {
-                freeifaddrs(list);
-                return profile;
-            }
-        }
-        freeifaddrs(list);
+static SpeedDeviceProfile profileForHost(const char *host, int port, bool live, const ModelShape *shape) {
+    SpeedDeviceProfile profile = unknownSpeedProfile();
+    if (host != nullptr && knownSpeedProfile(host, &profile)) return profile;
+    const std::string key = host == nullptr ? std::string("local") : std::string(host);
+    if (cachedSpeedProfile(key, &profile)) return profile;
+    if (!live || shape == nullptr || host == nullptr) return unknownSpeedProfile();
+    double ms = 0.0;
+    unsigned cap = 0;
+    char name[16];
+    std::memset(name, 0, sizeof(name));
+    if (!queryWorkerSpeedProfile(host, port, shape->dim, shape->hiddenDim, shape->nHeads, shape->nKvHeads,
+            shape->maxSeqLen, shape->nLayers, shape->weightType, &ms, &cap, name, sizeof(name))) {
+        profile = unknownSpeedProfile();
+    } else {
+        profile = makeSpeedProfile(ms, cap, name[0] == '\0' ? "measured" : name);
     }
-#endif
-    return speedProfileForAddress(nullptr);
+    cacheSpeedProfile(key, profile);
+    std::printf("profile: %s %s %.2f ms/layer cap=%u\n", host, profile.name, profile.msPerLayer, profile.cap);
+    std::fflush(stdout);
+    return profile;
+}
+
+static SpeedDeviceProfile profileForLocal(const ModelShape *shape) {
+    SpeedDeviceProfile profile = unknownSpeedProfile();
+    if (localKnownSpeedProfile(&profile)) return profile;
+    if (cachedSpeedProfile("local", &profile)) return profile;
+    if (shape == nullptr) return unknownSpeedProfile();
+    profile = measureLocalProfile(*shape);
+    cacheSpeedProfile("local", profile);
+    std::printf("profile: local %s %.2f ms/layer cap=%u\n", profile.name, profile.msPerLayer, profile.cap);
+    std::fflush(stdout);
+    return profile;
 }
 
 // Cold start keeps the given pipeline order and assigns layers to faster
-// devices first. Memory caps stop a slow device from taking more than it
-// completed in the device tests. An explicit --ratios skips this.
-static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers, const std::vector<char> *liveNodes) {
+// devices first. Lab addresses use the measured table. Any other address
+// is profiled once, then packed with the same formula.
+static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers, const std::vector<char> *liveNodes, const ModelShape *shape) {
     const NnUint nNodes = args->nWorkers + 1u;
     std::vector<SpeedDeviceProfile> profiles(nNodes);
-    std::vector<NnUint> layers(nNodes, 0u);
-    profiles[0] = localSpeedProfile();
-    for (NnUint i = 0; i < args->nWorkers; ++i)
-        profiles[i + 1u] = speedProfileForAddress(args->workerHosts[i]);
-    auto isLive = [&](NnUint node) {
-        return liveNodes == nullptr || node >= liveNodes->size() || (*liveNodes)[node] != 0;
-    };
+    profiles[0] = profileForLocal(shape);
+    for (NnUint i = 0; i < args->nWorkers; ++i) {
+        const bool live = liveNodes == nullptr || (i + 1u) >= liveNodes->size() || (*liveNodes)[i + 1u] != 0;
+        profiles[i + 1u] = profileForHost(args->workerHosts[i], (int)args->workerPorts[i], live, shape);
+    }
     std::ostringstream classes;
     for (NnUint i = 0; i < nNodes; ++i) {
         if (i > 0u) classes << ',';
         classes << profiles[i].name;
     }
-    if (nNodes == 0u || nLayers == 0u) return std::string();
-    const NnUint base = nLayers >= nNodes ? 1u : 0u;
-    NnUint left = nLayers;
-    for (NnUint i = 0; i < nNodes && left > 0u; ++i) {
-        if (!isLive(i)) continue;
-        const NnUint give = std::min<NnUint>(base, left);
-        layers[i] = give;
-        left -= give;
+    const std::string ratios = assignSpeedPack(profiles, nLayers, liveNodes);
+    if (!ratios.empty()) {
+        std::printf("topology: speed-pack classes=%s ratios=%s\n", classes.str().c_str(), ratios.c_str());
+        std::fflush(stdout);
     }
-    std::vector<NnUint> order;
-    order.reserve(nNodes);
-    for (NnUint i = 0; i < nNodes; ++i) {
-        if (isLive(i)) order.push_back(i);
-    }
-    std::stable_sort(order.begin(), order.end(), [&](NnUint a, NnUint b) {
-        if (profiles[a].msPerLayer != profiles[b].msPerLayer)
-            return profiles[a].msPerLayer < profiles[b].msPerLayer;
-        return a < b;
-    });
-    for (NnUint index : order) {
-        if (left == 0u) break;
-        const NnUint room = profiles[index].cap > layers[index] ? profiles[index].cap - layers[index] : 0u;
-        const NnUint take = std::min<NnUint>(room, left);
-        layers[index] += take;
-        left -= take;
-    }
-    if (left > 0u && !order.empty()) layers[order[0]] += left;
-    std::ostringstream out;
-    for (NnUint i = 0; i < nNodes; ++i) {
-        if (i > 0u) out << '*';
-        out << "1@" << layers[i];
-    }
-    std::printf("⚖️  [auto-ratios] speed-pack classes=%s ratios=%s\n", classes.str().c_str(), out.str().c_str());
-    std::fflush(stdout);
-    return out.str();
+    return ratios;
 }
 
 static void probeDevicePool(const AppCliArgs *args) {
@@ -5962,10 +5961,12 @@ static void probeDevicePool(const AppCliArgs *args) {
     for (NnUint i = 0; i < args->nWorkers; ++i) {
         const bool up = probeWorkerReachable(args->workerHosts[i], (int)args->workerPorts[i], 300);
         if (up) {
-            std::printf("🟢 [pool] worker %s:%u is up\n", args->workerHosts[i], (unsigned)args->workerPorts[i]);
+            if (productLogLevel() >= 1)
+                std::printf("worker %s:%u is up\n", args->workerHosts[i], (unsigned)args->workerPorts[i]);
         } else {
             g_poolLive[i + 1u] = 0;
-            std::printf("⚪ [pool] worker %s:%u is offline; slot reserved\n", args->workerHosts[i], (unsigned)args->workerPorts[i]);
+            if (productLogLevel() >= 1)
+                std::printf("worker %s:%u is offline; slot reserved\n", args->workerHosts[i], (unsigned)args->workerPorts[i]);
         }
     }
     NnUint mask = 0u;
@@ -6054,7 +6055,7 @@ static void applyFailoverRestart(AppCliArgs *args) {
         args->ratiosStr = nullptr;
         g_restartUsedSpeedPack = false;
     } else {
-        g_failoverRatiosStorage = speedPackRatios(args, g_failoverRestart.nLayers, nullptr);
+        g_failoverRatiosStorage = speedPackRatios(args, g_failoverRestart.nLayers, nullptr, nullptr);
         args->ratiosStr = g_failoverRatiosStorage.empty()
             ? nullptr
             : const_cast<char *>(g_failoverRatiosStorage.c_str());
@@ -6066,7 +6067,101 @@ static void applyFailoverRestart(AppCliArgs *args) {
     g_failoverRestart.armed = false;
 }
 
+static int profileBackendFor(AppCliArgs::Backend backend) {
+    if (backend == AppCliArgs::BACKEND_CUDA) return PROFILE_CUDA;
+    if (backend == AppCliArgs::BACKEND_VULKAN) return PROFILE_VULKAN;
+    return PROFILE_CPU;
+}
+
+static void printSelectedDevice(const AppCliArgs *args) {
+    std::printf("device: backend=%s threads=%u", AppCliArgs::backendToString(args->backend), (unsigned)args->nThreads);
+    try {
+#if defined(DLLAMA_CUDA)
+        if (args->backend == AppCliArgs::BACKEND_CUDA) {
+            const int index = args->gpuIndex < 0 ? 0 : args->gpuIndex;
+            std::printf(" %s", nnCudaDeviceInfo((NnUint)index).c_str());
+        }
+#endif
+#if defined(DLLAMA_VULKAN)
+        if (args->backend == AppCliArgs::BACKEND_VULKAN) {
+            const int index = args->gpuIndex < 0 ? 0 : args->gpuIndex;
+            std::printf(" %s", nnVulkanDeviceInfo((NnUint)index).c_str());
+        }
+#endif
+    } catch (const std::exception &e) {
+        std::printf(" (%s)", e.what());
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
+static void resolveAutoBackend(AppCliArgs *args) {
+    if (args->backend == AppCliArgs::BACKEND_AUTO) {
+#if defined(DLLAMA_CUDA)
+        try {
+            if (nnCudaDeviceCount() > 0) {
+                args->backend = AppCliArgs::BACKEND_CUDA;
+                if (args->gpuIndex < 0) args->gpuIndex = 0;
+            }
+        } catch (const std::exception &) {}
+#endif
+#if defined(DLLAMA_VULKAN)
+        if (args->backend == AppCliArgs::BACKEND_AUTO) {
+            try {
+                if (nnVulkanDeviceCount() > 0) {
+                    args->backend = AppCliArgs::BACKEND_VULKAN;
+                    if (args->gpuIndex < 0) args->gpuIndex = 0;
+                }
+            } catch (const std::exception &) {}
+        }
+#endif
+        if (args->backend == AppCliArgs::BACKEND_AUTO)
+            args->backend = AppCliArgs::BACKEND_CPU;
+    }
+#if !defined(DLLAMA_VULKAN)
+    if (args->backend == AppCliArgs::BACKEND_VULKAN)
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+#endif
+#if !defined(DLLAMA_CUDA)
+    if (args->backend == AppCliArgs::BACKEND_CUDA)
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+#endif
+    publishProfileRuntime(profileBackendFor(args->backend), args->gpuIndex, args->nThreads);
+    printSelectedDevice(args);
+}
+
+void printAvailableDevices() {
+#if defined(DLLAMA_CUDA)
+    try {
+        const int count = nnCudaDeviceCount();
+        if (count <= 0) std::printf("CUDA: none\n");
+        for (int i = 0; i < count; ++i)
+            std::printf("%s\n", nnCudaDeviceInfo((NnUint)i).c_str());
+    } catch (const std::exception &e) {
+        std::printf("CUDA: unavailable (%s)\n", e.what());
+    }
+#else
+    std::printf("CUDA: not compiled\n");
+#endif
+#if defined(DLLAMA_VULKAN)
+    try {
+        const int count = nnVulkanDeviceCount();
+        if (count <= 0) std::printf("Vulkan: none\n");
+        for (int i = 0; i < count; ++i)
+            std::printf("%s\n", nnVulkanDeviceInfo((NnUint)i).c_str());
+    } catch (const std::exception &e) {
+        std::printf("Vulkan: unavailable (%s)\n", e.what());
+    }
+#else
+    std::printf("Vulkan: not compiled\n");
+#endif
+    const unsigned hwThreads = std::thread::hardware_concurrency();
+    std::printf("CPU: threads=%u\n", hwThreads == 0u ? 1u : hwThreads);
+    std::fflush(stdout);
+}
+
 static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    resolveAutoBackend(args);
     setNnPpFailoverHook(failoverBypassDeadNode);
     applyProcessMemoryLimit(args->memoryLimitBytes);
     if (args != nullptr && args->ioProfileLogPath != nullptr && args->ioProfileLogPath[0] != '\0') {
@@ -6076,6 +6171,12 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     }
     NnUint nNodes = args->nWorkers + 1;
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
+    if (!args->syncTypeExplicit && header.weightType == F_Q40 && header.syncType != F_Q80) {
+        args->syncType = F_Q80;
+        header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
+        std::printf("buffer: q80\n");
+        std::fflush(stdout);
+    }
     EdgeVisorAblationConfig ablationConfig = edgevisorAblationConfigFromSources(
         args->edgevisorAblationConfigPath,
         args->shadowKvModeStr,
@@ -6149,17 +6250,19 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
 
     if (args->ratiosStr == nullptr && args->nWorkers > 0u) {
         probeDevicePool(args);
-        autoRatiosStorage = speedPackRatios(args, header.nLayers, &g_poolLive);
+        const ModelShape packedShape = modelShapeFromHeader(header);
+        autoRatiosStorage = speedPackRatios(args, header.nLayers, &g_poolLive, &packedShape);
         if (!autoRatiosStorage.empty())
             args->ratiosStr = const_cast<char *>(autoRatiosStorage.c_str());
     } else if (args->ratiosStr != nullptr && !g_restartUsedSpeedPack) {
-        std::printf("⚖️  [manual-ratios] ratios=%s\n", args->ratiosStr);
+        std::printf("topology: ratios=%s\n", args->ratiosStr);
         std::fflush(stdout);
     }
     g_restartUsedSpeedPack = false;
 
     if(args->ratiosStr != nullptr){
-        printf("nNodes=%d\n", nNodes);
+        if (productLogLevel() >= 1)
+            printf("nNodes=%d\n", nNodes);
         std::vector<NnStageDef> stageDefs = parseStageDefs(args->ratiosStr, nNodes, header.nLayers);
         NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
 
@@ -6241,12 +6344,16 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     // Load weights
     if (args->ratiosStr != nullptr) {
         // [非均匀/PP 模式]：强制使用本地加载 (Local Loading)
-        printf("🚀 Local Loading Mode (Root): Loading weights locally...\n");
+        if (productLogLevel() >= 1)
+            printf("loading weights on root\n");
+        else
+            printf("loading weights\n");
         
         NnLocalWeightLoader localLoader(&executor, 0); 
         // 传入 0 作为 Root 的 nodeIndex
         loadLlmNetWeightUneven(args->modelPath, &net, &localLoader, planPtr.get(), 0);
-        printf("✅ Root: Weights loaded locally.\n");
+        if (productLogLevel() >= 1)
+            printf("root weights loaded\n");
 
     } else {
         // [均匀模式]：保持原有行为 (网络分发)
@@ -6537,6 +6644,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 }
 
 void runWorkerApp(AppCliArgs *args) {
+    resolveAutoBackend(args);
     setNnPpFailoverHook(failoverBypassDeadNode);
     applyProcessMemoryLimit(args->memoryLimitBytes);
     bool armAcceptTimeout = false;
@@ -6547,15 +6655,19 @@ void runWorkerApp(AppCliArgs *args) {
             networkPtr = args->listenUnixPath != nullptr
                 ? NnNetwork::serveUnix(args->listenUnixPath)
                 : NnNetwork::serve(args->port);
+        } catch (const NnProfileProbeException &) {
+            continue;
         } catch (const std::runtime_error &e) {
             if (std::strcmp(e.what(), "Accept timeout") == 0) {
-                std::printf("👋 [failover] worker exit: root did not reconnect\n");
+                std::printf("worker exit: root did not reconnect\n");
                 std::fflush(stdout);
                 return;
             }
             // A liveness probe connects and closes before the handshake. Relisten.
-            std::printf("🚨 [failover] handshake ended: %s\n", e.what());
-            std::fflush(stdout);
+            if (productLogLevel() >= 1) {
+                std::printf("handshake ended: %s\n", e.what());
+                std::fflush(stdout);
+            }
             continue;
         }
         armAcceptTimeout = false;
@@ -6697,7 +6809,10 @@ void runWorkerApp(AppCliArgs *args) {
 
         if (useLocalLoading) {
             // [Local Loading Mode]
-            printf("🚀 Worker %d: Local Loading Mode from %s\n", nodeConfig.nodeIndex, workerModelPath);
+            if (productLogLevel() >= 1)
+                printf("loading weights on worker %d from %s\n", nodeConfig.nodeIndex, workerModelPath);
+            else
+                printf("loading weights\n");
             
             // Reload header for temporary network construction
             LlmHeader header = loadLlmHeader((char*)workerModelPath, bootMaxSeqLen, bootSyncType);
@@ -6714,7 +6829,8 @@ void runWorkerApp(AppCliArgs *args) {
             loadLlmNetWeightUneven((char*)workerModelPath, &tempNet, &localLoader, planPtr.get(), nodeConfig.nodeIndex);
 
             releaseLlmNet(&tempNet);
-            printf("✅ Worker %d: Weights loaded locally.\n", nodeConfig.nodeIndex);
+            if (productLogLevel() >= 1)
+                printf("worker %d weights loaded\n", nodeConfig.nodeIndex);
 
         } else {
             // [Network Loading Mode] (Legacy)

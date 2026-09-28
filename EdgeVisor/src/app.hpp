@@ -32,6 +32,9 @@ public:
     NnUint nBatches;
     bool info;
     bool help;
+    bool listDevices;
+    bool syncTypeExplicit;
+    int logLevel;
     Backend backend;
     char *backendStr;
     NnSize memoryLimitBytes;
@@ -117,6 +120,8 @@ public:
     ~AppCliArgs();
 
 };
+
+void printAvailableDevices();
 
 bool resolvePpMigrationLayers(
     const PlanCommand &command,

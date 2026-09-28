@@ -8,6 +8,7 @@
 #include "llm.hpp"
 #include "tokenizer.hpp"
 #include "app.hpp"
+#include "product_log.hpp"
 #include "token_timing.hpp"
 #include <stdexcept>
 #include <cmath>
@@ -966,7 +967,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     }
 
     int token = inputTokens[pos];
-    printf("%s\n", effectivePrompt.c_str());
+    if (productLogLevel() >= 1)
+        printf("%s\n", effectivePrompt.c_str());
     const auto evalWallStart = std::chrono::steady_clock::now();
     NnUint microbatchId = 0u;
     for (;;) {
@@ -1086,24 +1088,19 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 
         NnUint evalTime = context->executor->getTotalTime(STEP_EXECUTE_OP);
         NnUint syncTime = context->executor->getTotalTime(STEP_SYNC_NODES);
-        printf("🔷️ Eval%5u ms Sync%5u ms | Sent%6zu kB Recv%6zu kB | (%d tokens)\n",
-            evalTime / 1000,
-            syncTime / 1000,
-            sentBytes / 1024,
-            recvBytes / 1024,
-            batchSize);
-        const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && vocabSize > 0u);
-        if (isFinalChunk) {
-            printf("🧪 [Root Logits] (eval batchIndex=%u) Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | Zero: %u/%u | NetDelta: S=%zu R=%zu\n",
-                (unsigned)statBatch,
-                statsOk ? "✅ OK" : "❌ FAIL",
-                minLogit, maxLogit, maxIndex,
-                (unsigned)zeroCount, (unsigned)vocabSize,
-                sentBytes, recvBytes);
-            printRootLogitsSplitStats("eval", pos, logitsRow, vocabSize);
-            debugSyncTopkTrace(logitsRow, vocabSize, "eval", pos, statBatch);
-        } else {
-            printf("🧪 [Root Logits] (eval) skipped (non-final prefill chunk)\n");
+        if (productLogLevel() >= 1) {
+            printf("eval %u ms sync %u ms (%d tokens)\n",
+                evalTime / 1000,
+                syncTime / 1000,
+                batchSize);
+            const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && vocabSize > 0u);
+            if (isFinalChunk) {
+                printf("logits eval valid=%s range=[%.2f, %.2f] maxIdx=%d\n",
+                    statsOk ? "ok" : "fail",
+                    minLogit, maxLogit, maxIndex);
+                printRootLogitsSplitStats("eval", pos, logitsRow, vocabSize);
+                debugSyncTopkTrace(logitsRow, vocabSize, "eval", pos, statBatch);
+            }
         }
         evalTotalTime += evalTime + syncTime + evalBubbleTime;
     }
@@ -1496,13 +1493,17 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 
         NnUint predTime = context->executor->getTotalTime(STEP_EXECUTE_OP);
         NnUint syncTime = context->executor->getTotalTime(STEP_SYNC_NODES);
-        printf("🔶 Pred%5u ms Sync%5u ms | pos=%u | Sent%6zu kB Recv%6zu kB | %s\n",
-            predTime / 1000,
-            syncTime / 1000,
-            (unsigned)pos,
-            sentBytes / 1024,
-            recvBytes / 1024,
-            delta == nullptr ? (eosType == EOS ? "[EOS]" : "") : delta);
+        if (productLogLevel() >= 1) {
+            printf("pred %u ms sync %u ms pos=%u | %s\n",
+                predTime / 1000,
+                syncTime / 1000,
+                (unsigned)pos,
+                delta == nullptr ? (eosType == EOS ? "[EOS]" : "") : delta);
+        } else if (delta != nullptr) {
+            printf("%s", delta);
+        } else if (eosType == EOS) {
+            printf("\n");
+        }
         fflush(stdout);
         if (tokenTimingPrint) {
             const auto tokenWallEnd = std::chrono::steady_clock::now();
@@ -1539,6 +1540,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     float predTotalTimeMs = predTotalTime / 1000.0;
     const double evalWallMs = std::chrono::duration<double, std::milli>(evalWallEnd - evalWallStart).count();
     const double predWallTimeMs = std::chrono::duration<double, std::milli>(predWallEnd - predWallStart).count();
+    if (productLogLevel() >= 1) {
     printf("\n");
     printf("Evaluation\n");
     printf("   nBatches: %d\n", context->args->nBatches);
@@ -1571,6 +1573,13 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             predWallTimeMs / (double)nPredTokens);
     } else {
         printf("   tokens/s: n/a\n");
+    }
+    } else if (nPredTokens > 0 && predWallTimeMs > 0.0) {
+        printf("\ntokens/s: %3.2f (%3.2f ms/tok)\n",
+            ((double)nPredTokens * 1000.0) / predWallTimeMs,
+            predWallTimeMs / (double)nPredTokens);
+    } else {
+        printf("\n");
     }
 
     if (context->args->benchmark && !perfAgg.empty()) {
@@ -2841,6 +2850,33 @@ static void chat(AppInferenceContext *context) {
     printf("(end of context)\n");
 }
 
+static void printCliUsage(const char *argv0) {
+    std::printf(
+        "Usage:\n"
+        "  %s --list-devices\n"
+        "  %s inference --model <file.m> --tokenizer <file.t> --prompt \"...\" --steps 32\n"
+        "  %s worker --port 9999 --model <file.m>\n"
+        "  %s inference --model <file.m> --tokenizer <file.t> --prompt \"...\" --steps 32 --workers <host:port>\n"
+        "\n"
+        "Options:\n"
+        "  --backend auto|cpu|vulkan|cuda   default auto: CUDA, then Vulkan, then CPU\n"
+        "  --list-devices                   print devices and exit\n"
+        "  --gpu-index N\n"
+        "  --nthreads N                     default: one thread per core\n"
+        "  --buffer-float-type f32|f16|q40|q80\n"
+        "                                   Q40 weights use q80 unless this is set\n"
+        "  --ratios 1@N*1@M                 omit to speed-pack. Lab machines use the built-in\n"
+        "                                   table; other machines are profiled first\n"
+        "  --workers host:port ...\n"
+        "  --port N                         worker listen port (default 9990)\n"
+        "  --verbose                        handshake, loading, and per-token detail\n"
+        "  --debug\n"
+        "\n"
+        "Build:\n"
+        "  make dllama                      enables CUDA and Vulkan when the toolchains exist\n",
+        argv0, argv0, argv0, argv0);
+}
+
 int main(int argc, char **argv) {
     initQuants();
     initSockets();
@@ -2848,11 +2884,17 @@ int main(int argc, char **argv) {
     int returnCode = EXIT_SUCCESS;
     try {
         AppCliArgs args = AppCliArgs::parse(argc, argv, true);
-        if (args.help) {
-            printf("Usage: %s <inference|chat|perplexity|worker> [options]\n", argv[0]);
+        if (args.listDevices) {
+            printAvailableDevices();
             returnCode = EXIT_SUCCESS;
+        } else if (args.help) {
+            printCliUsage(argv[0]);
+            returnCode = EXIT_SUCCESS;
+        } else if (args.mode == nullptr) {
+            throw std::runtime_error("Missing mode. Run with --help.");
         } else if (std::strcmp(args.mode, "inference") == 0) {
-            printf("nNodes=%d\n", args.nWorkers);
+            if (productLogLevel() >= 1)
+                printf("workers=%d\n", args.nWorkers);
             if (envFlagEnabled("DLLAMA_E2E_MATMUL_VIEW0_CHECK")) {
                 if (args.nWorkers != 0) {
                     throw std::runtime_error("DLLAMA_E2E_MATMUL_VIEW0_CHECK currently requires single-node run (--n-workers 0)");

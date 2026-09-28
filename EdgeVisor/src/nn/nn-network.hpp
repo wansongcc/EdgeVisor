@@ -46,6 +46,29 @@ public:
     NnSessionRestartException() : std::runtime_error("session restart") {}
 };
 
+// A speed-pack probe, not a root session. The worker answers and listens again.
+class NnProfileProbeException : public std::runtime_error {
+public:
+    NnProfileProbeException() : std::runtime_error("profile probe") {}
+};
+
+// One matmul plus a memory cap from a worker that is not in the lab table.
+// Returns false when the worker does not answer.
+bool queryWorkerSpeedProfile(
+    const char *host,
+    int port,
+    unsigned dim,
+    unsigned hiddenDim,
+    unsigned nHeads,
+    unsigned nKvHeads,
+    unsigned maxSeqLen,
+    unsigned nLayers,
+    int weightType,
+    double *msPerLayer,
+    unsigned *cap,
+    char *name,
+    unsigned nameBytes);
+
 // Returns true when the dead node's layers were already covered and the local
 // plan now skips that stage. The target node also enables those redundant layers.
 // replayActivation is set only for the send that just failed, so the dead layers

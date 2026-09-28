@@ -3,6 +3,7 @@
 
 #include <vulkan/vulkan.hpp>
 #include <vector>
+#include <string>
 #include <atomic>
 #include "nn-executor.hpp"
 #include "nn-cpu-ops.hpp"
@@ -207,5 +208,10 @@ public:
         NnUint rangeStart = 0u,
         NnUint rangeLen = 0u) override;
 };
+
+int nnVulkanDeviceCount();
+std::string nnVulkanDeviceInfo(NnUint gpuIndex);
+double nnVulkanProfileGemmMs(NnUint gpuIndex, int n);
+unsigned long long nnVulkanDeviceLocalBytes(NnUint gpuIndex);
 
 #endif

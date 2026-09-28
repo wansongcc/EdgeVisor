@@ -1,13 +1,21 @@
 #include "nn-vulkan.hpp"
+#include "product_log.hpp"
 #include "nn/io-profile.hpp"
 #include "ablation.hpp"
 #include "plan-command.hpp"
 #include "llm.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 #include <vector>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 #define DEBUG_VULKAN_BUFFERS false
 #define DEBUG_VULKAN_TRACE false
@@ -156,15 +164,16 @@ NnVulkanContext::NnVulkanContext(const NnUint gpuIndex) {
     assertDeviceExtensionSupport(physicalDevice, deviceExtension);
 
     vk::PhysicalDeviceProperties deviceProps = physicalDevice.getProperties();
-    printf("🌋 Device: %s\n", (char*)deviceProps.deviceName);
-    printf("🌋 DeviceApiVersion: %d.%d.%d\n", VK_VERSION_MAJOR(deviceProps.apiVersion), VK_VERSION_MINOR(deviceProps.apiVersion), VK_VERSION_PATCH(deviceProps.apiVersion));
-    printf("🌋 MaxComputeSharedMemory: %d kB\n", deviceProps.limits.maxComputeSharedMemorySize / 1024);
-    printf("🌋 NonCoherentAtomSize: %lu bytes\n", (NnSize)deviceProps.limits.nonCoherentAtomSize);
-
     vk::PhysicalDeviceMemoryProperties memoryProperties = physicalDevice.getMemoryProperties();
-    for (unsigned int h = 0; h < memoryProperties.memoryHeapCount; h++) {
-        if (memoryProperties.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
-            printf("🌋 Heap[%u]: %lu MB\n", h, ((NnSize)memoryProperties.memoryHeaps[h].size) / (1024 * 1024));
+    if (productLogLevel() >= 1) {
+        printf("🌋 Device: %s\n", (char*)deviceProps.deviceName);
+        printf("🌋 DeviceApiVersion: %d.%d.%d\n", VK_VERSION_MAJOR(deviceProps.apiVersion), VK_VERSION_MINOR(deviceProps.apiVersion), VK_VERSION_PATCH(deviceProps.apiVersion));
+        printf("🌋 MaxComputeSharedMemory: %d kB\n", deviceProps.limits.maxComputeSharedMemorySize / 1024);
+        printf("🌋 NonCoherentAtomSize: %lu bytes\n", (NnSize)deviceProps.limits.nonCoherentAtomSize);
+        for (unsigned int h = 0; h < memoryProperties.memoryHeapCount; h++) {
+            if (memoryProperties.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+                printf("🌋 Heap[%u]: %lu MB\n", h, ((NnSize)memoryProperties.memoryHeaps[h].size) / (1024 * 1024));
+        }
     }
 
     vk::PhysicalDeviceFeatures deviceFeatures = physicalDevice.getFeatures();
@@ -211,6 +220,191 @@ NnVulkanContext::~NnVulkanContext() {
     device.destroy();
     instance.destroy();
     VULKAN_TRACE("Context destroyed");
+}
+
+static vk::Instance createProfileInstance() {
+    vk::InstanceCreateFlags createInstanceFlags(0);
+    std::vector<const char*> instanceExtensions;
+    if (hasPortabilityExtension()) {
+#ifdef VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+        createInstanceFlags |= static_cast<vk::InstanceCreateFlags>(VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR);
+#endif
+        instanceExtensions.push_back("VK_KHR_portability_enumeration");
+    }
+    vk::ApplicationInfo appInfo {"EdgeVisor", 1, nullptr, 0, VK_API_VERSION_1_2};
+    vk::InstanceCreateInfo instanceCreateInfo(createInstanceFlags, &appInfo, {}, instanceExtensions);
+    return vk::createInstance(instanceCreateInfo);
+}
+
+int nnVulkanDeviceCount() {
+    vk::Instance instance = createProfileInstance();
+    const int count = (int)instance.enumeratePhysicalDevices().size();
+    instance.destroy();
+    return count;
+}
+
+std::string nnVulkanDeviceInfo(NnUint gpuIndex) {
+    vk::Instance instance = createProfileInstance();
+    const std::vector<vk::PhysicalDevice> devices = instance.enumeratePhysicalDevices();
+    if (gpuIndex >= devices.size()) {
+        instance.destroy();
+        throw std::runtime_error("Invalid Vulkan GPU index");
+    }
+    const vk::PhysicalDeviceProperties props = devices[gpuIndex].getProperties();
+    const vk::PhysicalDeviceMemoryProperties memory = devices[gpuIndex].getMemoryProperties();
+    unsigned long long heapBytes = 0;
+    for (unsigned h = 0; h < memory.memoryHeapCount; ++h) {
+        if (memory.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+            heapBytes += (unsigned long long)memory.memoryHeaps[h].size;
+    }
+    std::ostringstream out;
+    out << "Vulkan[" << gpuIndex << "]: " << (const char *)props.deviceName
+        << ", deviceLocal=" << (heapBytes / (1024ull * 1024ull)) << " MB";
+    instance.destroy();
+    return out.str();
+}
+
+unsigned long long nnVulkanDeviceLocalBytes(NnUint gpuIndex) {
+    vk::Instance instance = createProfileInstance();
+    const std::vector<vk::PhysicalDevice> devices = instance.enumeratePhysicalDevices();
+    if (gpuIndex >= devices.size()) {
+        instance.destroy();
+        throw std::runtime_error("Invalid Vulkan GPU index");
+    }
+    const vk::PhysicalDeviceMemoryProperties memory = devices[gpuIndex].getMemoryProperties();
+    unsigned long long heapBytes = 0;
+    for (unsigned h = 0; h < memory.memoryHeapCount; ++h) {
+        if (memory.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+            heapBytes += (unsigned long long)memory.memoryHeaps[h].size;
+    }
+    instance.destroy();
+    return heapBytes;
+}
+
+static std::vector<char> readProfileSpv() {
+    std::vector<std::string> paths;
+    paths.push_back("src/nn/vulkan/profile_gemm.spv");
+    paths.push_back("EdgeVisor/src/nn/vulkan/profile_gemm.spv");
+#if defined(__linux__)
+    char exe[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        std::string dir(exe);
+        const std::string::size_type slash = dir.find_last_of('/');
+        if (slash != std::string::npos) dir.resize(slash);
+        paths.push_back(dir + "/src/nn/vulkan/profile_gemm.spv");
+        paths.push_back(dir + "/../src/nn/vulkan/profile_gemm.spv");
+    }
+#endif
+    for (const std::string &path : paths) {
+        std::ifstream in(path.c_str(), std::ios::binary);
+        if (!in) continue;
+        return std::vector<char>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    throw std::runtime_error("profile_gemm.spv was not found next to the build");
+}
+
+double nnVulkanProfileGemmMs(NnUint gpuIndex, int n) {
+    if (n < 16) n = 16;
+    NnVulkanContext context(gpuIndex);
+    const std::vector<char> code = readProfileSpv();
+    vk::ShaderModuleCreateInfo shaderInfo(
+        vk::ShaderModuleCreateFlags(),
+        code.size(),
+        reinterpret_cast<const uint32_t *>(code.data()));
+    vk::ShaderModule shader = context.device.createShaderModule(shaderInfo);
+
+    const vk::DescriptorSetLayoutBinding bindings[3] = {
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+    };
+    vk::DescriptorSetLayoutCreateInfo setInfo(vk::DescriptorSetLayoutCreateFlags(), 3, bindings);
+    vk::DescriptorSetLayout setLayout = context.device.createDescriptorSetLayout(setInfo);
+    vk::PushConstantRange push(vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t));
+    vk::PipelineLayoutCreateInfo layoutInfo(vk::PipelineLayoutCreateFlags(), 1, &setLayout, 1, &push);
+    vk::PipelineLayout pipelineLayout = context.device.createPipelineLayout(layoutInfo);
+
+    vk::PipelineShaderStageCreateInfo stage(
+        vk::PipelineShaderStageCreateFlags(),
+        vk::ShaderStageFlagBits::eCompute,
+        shader,
+        "main");
+    vk::ComputePipelineCreateInfo pipelineInfo(vk::PipelineCreateFlags(), stage, pipelineLayout);
+    vk::Pipeline pipeline = context.device.createComputePipelines(nullptr, pipelineInfo).value.front();
+
+    const vk::DeviceSize bufferBytes = (vk::DeviceSize)n * (vk::DeviceSize)n * sizeof(float);
+    const uint32_t memoryType = findMemoryTypeIndex(
+        &context.physicalDevice,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    if (memoryType == MEMORY_TYPE_INDEX_NOT_FOUND)
+        throw std::runtime_error("Vulkan profile gemm needs host-visible memory");
+    std::pair<vk::Buffer, vk::DeviceMemory> bufferA = context.createRawBuffer(memoryType, bufferBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    std::pair<vk::Buffer, vk::DeviceMemory> bufferB = context.createRawBuffer(memoryType, bufferBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    std::pair<vk::Buffer, vk::DeviceMemory> bufferC = context.createRawBuffer(memoryType, bufferBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    float *mappedA = (float *)context.device.mapMemory(bufferA.second, 0, bufferBytes);
+    float *mappedB = (float *)context.device.mapMemory(bufferB.second, 0, bufferBytes);
+    for (size_t i = 0; i < (size_t)n * (size_t)n; ++i) {
+        mappedA[i] = 0.01f;
+        mappedB[i] = 0.02f;
+    }
+    context.device.unmapMemory(bufferA.second);
+    context.device.unmapMemory(bufferB.second);
+
+    vk::DescriptorPoolSize poolSize(vk::DescriptorType::eStorageBuffer, 3);
+    vk::DescriptorPoolCreateInfo poolInfo(vk::DescriptorPoolCreateFlags(), 1, 1, &poolSize);
+    vk::DescriptorPool pool = context.device.createDescriptorPool(poolInfo);
+    vk::DescriptorSetAllocateInfo allocInfo(pool, 1, &setLayout);
+    vk::DescriptorSet descriptorSet = context.device.allocateDescriptorSets(allocInfo).front();
+    const vk::DescriptorBufferInfo infos[3] = {
+        {bufferA.first, 0, bufferBytes},
+        {bufferB.first, 0, bufferBytes},
+        {bufferC.first, 0, bufferBytes},
+    };
+    vk::WriteDescriptorSet write(
+        descriptorSet, 0, 0, 3, vk::DescriptorType::eStorageBuffer, nullptr, infos, nullptr);
+    context.device.updateDescriptorSets(1, &write, 0, nullptr);
+
+    vk::CommandBufferAllocateInfo commandInfo(context.commandPool, vk::CommandBufferLevel::ePrimary, 1);
+    vk::CommandBuffer command = context.device.allocateCommandBuffers(commandInfo).front();
+    vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+    const uint32_t pushN = (uint32_t)n;
+    const uint32_t groups = (uint32_t)((n + 15) / 16);
+    auto record = [&]() {
+        command.begin(beginInfo);
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        command.pushConstants(pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pushN), &pushN);
+        command.dispatch(groups, groups, 1);
+        command.end();
+    };
+    record();
+    vk::SubmitInfo submit(0, nullptr, nullptr, 1, &command);
+    context.queue.submit(submit, nullptr);
+    context.queue.waitIdle();
+    const auto start = std::chrono::steady_clock::now();
+    const int iters = 3;
+    for (int i = 0; i < iters; ++i) {
+        command.reset();
+        record();
+        context.queue.submit(submit, nullptr);
+        context.queue.waitIdle();
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+    context.device.freeMemory(bufferA.second);
+    context.device.freeMemory(bufferB.second);
+    context.device.freeMemory(bufferC.second);
+    context.device.destroyBuffer(bufferA.first);
+    context.device.destroyBuffer(bufferB.first);
+    context.device.destroyBuffer(bufferC.first);
+    context.device.destroyDescriptorPool(pool);
+    context.device.destroyPipeline(pipeline);
+    context.device.destroyPipelineLayout(pipelineLayout);
+    context.device.destroyDescriptorSetLayout(setLayout);
+    context.device.destroyShaderModule(shader);
+    return ms / (double)iters;
 }
 
 std::pair<vk::Buffer, vk::DeviceMemory> NnVulkanContext::createRawBuffer(const uint32_t memoryTypeIndex, const vk::DeviceSize bufferSize, const vk::BufferUsageFlags usageFlags) {

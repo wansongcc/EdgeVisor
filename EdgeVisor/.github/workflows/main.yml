@@ -35,6 +35,7 @@ jobs:
           make nn-cpu-ops-test
           make tokenizer-test
           make failover-gate-test
+          make device-profile-test
       - name: nn-cpu-test
         run: ./nn-cpu-test
       - name: nn-cpu-ops-test
@@ -43,6 +44,8 @@ jobs:
         run: ./tokenizer-test
       - name: failover-gate-test
         run: ./failover-gate-test
+      - name: device-profile-test
+        run: ./device-profile-test
 
   build-windows:
     name: Windows
@@ -61,6 +64,7 @@ jobs:
           make nn-cpu-ops-test
           make tokenizer-test
           make failover-gate-test
+          make device-profile-test
       - name: nn-cpu-test
         run: ./nn-cpu-test
       - name: nn-cpu-ops-test
@@ -69,3 +73,5 @@ jobs:
         run: ./tokenizer-test
       - name: failover-gate-test
         run: ./failover-gate-test
+      - name: device-profile-test
+        run: ./device-profile-test

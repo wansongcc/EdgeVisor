@@ -230,9 +230,11 @@ static void validateStaticMemoryBudget(NnSize memoryLimitBytes, const NnNetConfi
     const NnSize requiredBytes = getNodeRequiredMemory(netConfig, nodeConfig);
     const NnSize safeLimitBytes = memoryLimitBytes - memoryLimitBytes / 10u;
     const NnSize headroomBytes = requiredBytes < memoryLimitBytes ? memoryLimitBytes - requiredBytes : 0u;
-    std::printf("📀 StaticRequiredMemory: %llu MiB | SafetyHeadroom: %llu MiB\n",
-        (unsigned long long)(requiredBytes / (1024 * 1024)),
-        (unsigned long long)(headroomBytes / (1024 * 1024)));
+    if (productLogLevel() >= 1) {
+        std::printf("static required memory: %llu MiB, headroom: %llu MiB\n",
+            (unsigned long long)(requiredBytes / (1024 * 1024)),
+            (unsigned long long)(headroomBytes / (1024 * 1024)));
+    }
     if (requiredBytes > safeLimitBytes) {
         throw std::runtime_error("Static graph memory exceeds 90% of --memory-limit-gib; increase the limit or reduce the model/sequence configuration");
     }
@@ -1341,7 +1343,8 @@ static NnUint inferRuntimeRedundantBoundaryLayers(const char *redundancyStr, NnU
 // 3. 逗号 ',' 分隔同一 Stage 内的 TP 节点比例
 // [修改] 解析多 Stage 格式，并支持按算力比例自动切分层数
 static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNodes, NnUint nLayers) {
-    printf("🔍 [DEBUG] parseStageDefs received: \"%s\"\n", ratiosStr);
+    if (productLogLevel() >= 1)
+        printf("parseStageDefs: %s\n", ratiosStr);
 
     // ---------------------------------------------------------
     // Ratios string formats (both supported; auto-detected):

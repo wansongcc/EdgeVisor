@@ -1875,7 +1875,8 @@ static NnNodeConfig buildLlmNodeInternal(
             // boundary set. Keep each takeover layer self-contained through
             // X so both single-layer and consecutive-layer takeover work.
             addRedundantWeightHolderForLayer(layerIndex, true, true, false);
-            printf("⚠️ [seg-build] Adding redundant weight holder for layer %u before startLayer %u\n", layerIndex, startLayer);
+            if (productLogLevel() >= 1)
+                printf("redundant weight holder for layer %u before startLayer %u\n", layerIndex, startLayer);
         }
     }
 
@@ -2690,11 +2691,13 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
             n.runtimeStageLayerPlan.layerRoleByStage.begin(),
             n.runtimeStageLayerPlan.layerRoleByStage.end(),
             RUNTIME_LAYER_REDUNDANT);
-        printf("🧩 [runtime-plan] static layer plan ready: layers=%u stages=%u activeMarks=%zu redundantMarks=%zu\n",
-            (unsigned)n.runtimeStageLayerPlan.nLayers,
-            (unsigned)n.runtimeStageLayerPlan.nStages,
-            activeMarks,
-            redundantMarks);
+        if (productLogLevel() >= 1) {
+            printf("runtime plan: layers=%u stages=%u active=%zu redundant=%zu\n",
+                (unsigned)n.runtimeStageLayerPlan.nLayers,
+                (unsigned)n.runtimeStageLayerPlan.nStages,
+                activeMarks,
+                redundantMarks);
+        }
 
         if (std::getenv("DLLAMA_RUNTIME_PLAN_PRINT") != nullptr) {
             for (NnUint stage = 0; stage < n.runtimeStageLayerPlan.nStages; ++stage) {
@@ -2800,9 +2803,10 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         const bool unlinked = prev == (NnUint)-1 && next == (NnUint)-1 && plan->nStages > 1u;
         isFirstStage = !unlinked && prev == (NnUint)-1;
         isLastStage = !unlinked && next == (NnUint)-1;
-        printf("   [PP] Node %u: Responsible for Layers %u-%u %s%s\n", 
-            nodeIndex, startLayer, endLayer, 
-            isFirstStage ? "[First]" : "", isLastStage ? "[Last]" : "");
+        if (productLogLevel() >= 1)
+            printf("node %u layers %u-%u %s%s\n",
+                nodeIndex, startLayer, endLayer,
+                isFirstStage ? "first " : "", isLastStage ? "last" : "");
     } else {
         // 如果找不到 Plan (或者纯 TP 模式)，默认负责所有层
         printf("   [PP] Node %u: No stage info found (assuming Full/TP mode)\n", nodeIndex);
@@ -2832,11 +2836,13 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
                 ++redundantLoadLayers;
             }
         }
-        printf("   [PP] Node %u: Runtime-role loading primary=%zu redundant=%zu\n",
-            nodeIndex, primaryLoadLayers, redundantLoadLayers);
+        if (productLogLevel() >= 1)
+            printf("node %u loading primary=%zu redundant=%zu\n",
+                nodeIndex, primaryLoadLayers, redundantLoadLayers);
     }
 
-    printf("💿 Loading weights for Node %u (Layers [%u, %u))...\n", nodeIndex, startLayer, endLayer);
+    if (productLogLevel() >= 1)
+        printf("loading weights for node %u layers [%u, %u)\n", nodeIndex, startLayer, endLayer);
 
     Timer timer;
     LlmHeader *h = net->header;
@@ -3004,9 +3010,10 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     if (diff != 0) {
         printf("⚠️ Warning: File pointer drift by %lld bytes (Padding or Error?)\n", diff);
     }
-    printf("💿 MappedWeightFile: %llu MiB / %llu MiB\n",
-        (unsigned long long)(mappedWeightBytes / (1024 * 1024)),
-        (unsigned long long)(h->fileSize / (1024 * 1024)));
+    if (productLogLevel() >= 1)
+        printf("mapped weights: %llu MiB / %llu MiB\n",
+            (unsigned long long)(mappedWeightBytes / (1024 * 1024)),
+            (unsigned long long)(h->fileSize / (1024 * 1024)));
     
     loader->finish();
 }

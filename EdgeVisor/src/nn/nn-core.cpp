@@ -2,6 +2,7 @@
     #define _USE_MATH_DEFINES
 #endif
 #include "nn-core.hpp"
+#include "product_log.hpp"
 #include "nn-quants.hpp"
 #include <cassert>
 #include <cstring>
@@ -486,7 +487,8 @@ NnSize getNodeRequiredMemory(const NnNetConfig *netConfig, const NnNodeConfig *n
 
 void printNodeRequiredMemory(NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
     const NnSize total = getNodeRequiredMemory(netConfig, nodeConfig);
-    printf("📀 RequiredMemory: %llu MB\n", (unsigned long long)(total / (1024 * 1024)));
+    if (productLogLevel() >= 1)
+        printf("required memory: %llu MB\n", (unsigned long long)(total / (1024 * 1024)));
 }
 
 Timer::Timer() {

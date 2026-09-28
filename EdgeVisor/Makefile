@@ -158,12 +158,12 @@ nn-cpu.o: src/nn/nn-cpu.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-test-runtime-stubs.o: src/nn/nn-test-runtime-stubs.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-nn-cpu-test: src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o
-	$(CXX) $(CXXFLAGS) src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
-nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o
-	$(CXX) $(CXXFLAGS) src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
-nn-slice-test: src/nn/nn-slice-test.cpp nn-quants.o nn-core.o
-	$(CXX) $(CXXFLAGS) src/nn/nn-slice-test.cpp nn-quants.o nn-core.o -o $@ $(LIBS)
+nn-cpu-test: src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o product-log.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o product-log.o -o $@ $(LIBS)
+nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o product-log.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o product-log.o -o $@ $(LIBS)
+nn-slice-test: src/nn/nn-slice-test.cpp nn-quants.o nn-core.o product-log.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-slice-test.cpp nn-quants.o nn-core.o product-log.o -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-cuda.o: src/nn/nn-cuda.cu
@@ -184,12 +184,12 @@ endif
 	$(GLSL_COMPILE)
 
 nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o ${DEPS}
-	$(CXX) $(CXXFLAGS) src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o -o $@ $(LIBS)
+	$(CXX) $(CXXFLAGS) src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o product-log.o -o $@ $(LIBS)
 endif
 
 ifeq ($(DLLAMA_CUDA),1)
-nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o
-	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o -o $@ $(LIBS)
+nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o product-log.o
+	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o product-log.o -o $@ $(LIBS)
 endif
 
 # llm
@@ -215,7 +215,7 @@ plan-command.o: src/plan-command.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 plan-controller.o: src/plan-controller.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o nn-cpu-ops.o tokenizer.o
+tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o nn-cpu-ops.o tokenizer.o product-log.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
 dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o

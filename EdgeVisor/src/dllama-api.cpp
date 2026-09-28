@@ -543,7 +543,9 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
 }
 
 static void server(AppInferenceContext *context) {
-    NnSocket serverSocket(createServerSocket(context->args->port));
+    const char *apiBind = std::getenv("DLLAMA_API_BIND");
+    if (apiBind == nullptr || apiBind[0] == '\0') apiBind = "127.0.0.1";
+    NnSocket serverSocket(createServerSocket(context->args->port, apiBind));
 
     TokenizerChatStops stops(context->tokenizer);
     const char *templateEos = selectChatTemplateEos(context->tokenizer, &stops, context->args->chatTemplateType);
@@ -551,7 +553,7 @@ static void server(AppInferenceContext *context) {
     EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
     ApiServer api(context->inference, context->tokenizer, context->sampler, context->network, context->args, context->header, &eosDetector, &templateGenerator);
 
-    printf("Server URL: http://127.0.0.1:%d/v1/\n", context->args->port);
+    printf("Server URL: http://%s:%d/v1/\n", apiBind, context->args->port);
 
     std::vector<Route> routes = {
         {

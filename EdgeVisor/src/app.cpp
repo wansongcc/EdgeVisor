@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "failover_gate.hpp"
 #include "nn/io-profile.hpp"
 #include "plan-controller.hpp"
 #include "dynamic/dynamic_layer.hpp"
@@ -456,6 +457,7 @@ static void maybeSeedPlanCommandFromLegacyEnv() {
 struct ReservedDevice {
     bool armed = false;
     bool joined = false;
+    int joinAttempts = 0;
     NnUint workerIndex = 0u;
     NnUint stageIndex = 0u;
     NnUint donorStage = 0u;
@@ -5402,8 +5404,7 @@ void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionP
 }
 
 bool WorkerLlmInference::tryReadControlPacket() {
-    const unsigned long maxAttempts = 10000;
-    if (!network->tryReadWithMaxAttempts(ROOT_SOCKET_INDEX, &controlPacket, sizeof(LlmControlPacket), maxAttempts))
+    if (!network->tryReadForMs(ROOT_SOCKET_INDEX, &controlPacket, sizeof(LlmControlPacket), 500))
         return false;
     if (controlPacket.batchSize == 0) {
         // Stop packet: position is ignored by design.
@@ -5749,8 +5750,17 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     }
     if (stageIndex == (NnUint)-1) {
         if (!g_armedTakeover.armed) return false;
-        if (myNodeIndex == g_armedTakeover.ownerNode)
+        if (myNodeIndex == g_armedTakeover.ownerNode) {
+            const NnUint pos = g_failoverExecutor == nullptr ? 0u : g_failoverExecutor->executionPosition();
+            if (g_failoverExecutor == nullptr ||
+                !g_failoverExecutor->shadowCovers(g_armedTakeover.begin, g_armedTakeover.end, pos)) {
+                std::printf("⚡ [failover] fast-path reject deadNode=%u reason=shadow-unfilled pos=%u\n",
+                    (unsigned)deadNodeIndex, (unsigned)pos);
+                std::fflush(stdout);
+                return false;
+            }
             enableArmedTakeoverLayers(replayActivation);
+        }
         std::printf("⚡ [failover] fast-path already bypassed deadNode=%u\n",
             (unsigned)deadNodeIndex);
         std::fflush(stdout);
@@ -5789,6 +5799,21 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     }
     const NnUint target = prev;
     const NnUint ownerNode = plan->stages[target].rootNodeIndex;
+    // The previous stage is the only one that can see whether shadow KV was
+    // written. If it was not, refuse before the plan changes so decode
+    // restarts instead of continuing on an empty cache. Other stages still
+    // update their own routing once the owner has accepted.
+    if (myNodeIndex == ownerNode) {
+        const NnUint pos = g_failoverExecutor == nullptr ? 0u : g_failoverExecutor->executionPosition();
+        if (g_failoverExecutor == nullptr ||
+            !g_failoverExecutor->shadowCovers(dead.startLayer, dead.endLayer, pos)) {
+            std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u layers=[%u,%u) reason=shadow-unfilled pos=%u\n",
+                (unsigned)deadNodeIndex, (unsigned)stageIndex,
+                (unsigned)dead.startLayer, (unsigned)dead.endLayer, (unsigned)pos);
+            std::fflush(stdout);
+            return false;
+        }
+    }
     g_armedTakeover.armed = true;
     g_armedTakeover.ownerNode = ownerNode;
     g_armedTakeover.begin = dead.startLayer;
@@ -5846,11 +5871,12 @@ static SpeedDeviceProfile speedProfileForAddress(const char *host) {
         if (std::strcmp(host, "192.168.137.13") == 0 || std::strcmp(host, "192.168.137.15") == 0)
             return {5.8, 22u, "nx"};
         if (std::strcmp(host, "192.168.137.16") == 0 || std::strcmp(host, "192.168.137.18") == 0)
-            return {7.4, 10u, "nano"};
+            return {7.4, 8u, "nano"};
         if (std::strcmp(host, "192.168.137.31") == 0)
             return {8.3, 11u, "laptop"};
     }
-    return {7.4, 10u, "unknown"};
+    // 10 primary layers plus the redundant boundary graph did not fit a Nano.
+    return {7.4, 8u, "unknown"};
 }
 
 static SpeedDeviceProfile localSpeedProfile() {
@@ -5993,6 +6019,9 @@ static void reserveOfflineSlice(NnUnevenPartitionPlan *plan) {
 }
 
 static void applyFailoverRestart(AppCliArgs *args) {
+    // The worker list is about to be compacted. A reserved index from the
+    // old list would join a different host.
+    g_reserved = ReservedDevice();
     g_failoverPromptStorage = g_failoverRestart.prompt;
     args->prompt = const_cast<char *>(g_failoverPromptStorage.c_str());
     if (g_failoverRestart.steps > 0u) args->steps = g_failoverRestart.steps;
@@ -6322,29 +6351,38 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
     accept.workerIndex = workerIndex;
     accept.peerPort = (NnUint)port;
     std::snprintf(accept.peerHost, sizeof(accept.peerHost), "%s", host);
-    std::vector<NnUint> acceptSockets;
-    for (NnUint i = 0; i < nWorkers && i < 32u; ++i) {
-        if ((onlineMask & (1u << i)) == 0u || i == workerIndex) continue;
-        if (!network->isSocketActive(i)) continue;
-        writeJoinPacket(network, i, accept);
-        acceptSockets.push_back(i);
-    }
-
     bool connected = false;
-    for (int attempt = 0; attempt < 8 && !connected; ++attempt) {
-        try {
-            connected = network->connectReservedWorker(workerIndex, host, port, nWorkers, context->args->workerHosts, context->args->workerPorts, onlineMask);
-        } catch (const std::runtime_error &err) {
-            std::printf("⚠️  [pool] connect attempt %d: %s\n", attempt + 1, err.what());
-            std::fflush(stdout);
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    try {
+        for (int attempt = 0; attempt < 8 && !connected; ++attempt) {
+            try {
+                connected = network->connectReservedWorker(workerIndex, host, port, nWorkers, context->args->workerHosts, context->args->workerPorts, onlineMask);
+            } catch (const std::runtime_error &err) {
+                std::printf("⚠️  [pool] connect attempt %d: %s\n", attempt + 1, err.what());
+                std::fflush(stdout);
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            }
         }
-    }
-    for (NnUint socketIndex : acceptSockets) network->readAck(socketIndex);
-    if (!connected) {
-        std::printf("⚠️  [pool] connect failed for worker %u\n", (unsigned)workerIndex);
+        if (connected) {
+            std::vector<NnUint> acceptSockets;
+            for (NnUint i = 0; i < nWorkers && i < 32u; ++i) {
+                if ((onlineMask & (1u << i)) == 0u || i == workerIndex) continue;
+                if (!network->isSocketActive(i)) continue;
+                writeJoinPacket(network, i, accept);
+                acceptSockets.push_back(i);
+            }
+            for (NnUint socketIndex : acceptSockets) network->readAck(socketIndex);
+        }
+    } catch (const std::runtime_error &err) {
+        std::printf("⚠️  [pool] join aborted: %s\n", err.what());
         std::fflush(stdout);
-        g_reserved.joined = true;
+        connected = false;
+    }
+    if (!connected) {
+        g_reserved.joinAttempts += 1;
+        std::printf("⚠️  [pool] connect failed for worker %u attempt=%d\n",
+            (unsigned)workerIndex, g_reserved.joinAttempts);
+        std::fflush(stdout);
+        if (g_reserved.joinAttempts >= 8) g_reserved.joined = true;
         return;
     }
 
@@ -6487,12 +6525,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         }
     } restore{args, savedHosts, savedPorts, savedWorkers, savedPrompt, savedRatios};
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
         try {
             runInferenceAppBody(args, handler);
             return;
         } catch (const NnSessionRestartException &) {
-            if (attempt == 1 || !g_failoverRestart.armed) throw;
+            if (attempt == 2 || !g_failoverRestart.armed) throw;
             applyFailoverRestart(args);
         }
     }
@@ -6503,7 +6541,7 @@ void runWorkerApp(AppCliArgs *args) {
     applyProcessMemoryLimit(args->memoryLimitBytes);
     bool armAcceptTimeout = false;
     while (true) {
-        nnSetAcceptTimeoutMs(armAcceptTimeout ? 15000 : -1);
+        nnSetAcceptTimeoutMs(armAcceptTimeout ? kRootReconnectWaitMs : -1);
         std::unique_ptr<NnNetwork> networkPtr;
         try {
             networkPtr = args->listenUnixPath != nullptr
@@ -6705,6 +6743,9 @@ void runWorkerApp(AppCliArgs *args) {
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
+        bool controlStalled = false;
+        bool inFlightReplayed = false;
+        std::chrono::steady_clock::time_point controlStalledAt{};
         
         while (true) {
             try {
@@ -6712,10 +6753,21 @@ void runWorkerApp(AppCliArgs *args) {
                     startTime = clock();
 
                 if (!inference.tryReadControlPacket()) {
-                    if (execution.batchSize > 0u && xPipeIndex < netConfig.nPipes && execution.pipes != nullptr) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!controlStalled) {
+                        controlStalled = true;
+                        controlStalledAt = now;
+                    }
+                    const auto stalledMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - controlStalledAt).count();
+                    // A live root sends the next control within a token time.
+                    // Waiting past that means this activation never reached the
+                    // next stage, so replay it once instead of holding forever.
+                    if (!inFlightReplayed && stalledMs >= 1000 &&
+                        execution.batchSize > 0u && xPipeIndex < netConfig.nPipes && execution.pipes != nullptr) {
                         const NnPipeConfig &xPipe = netConfig.pipes[xPipeIndex];
                         const NnSize xBytes = getBytes(xPipe.size.floatType, xPipe.size.x) * (NnSize)execution.batchSize;
-                        network->recoverPpIfNextOffline(planPtr.get(), nodeConfig.nodeIndex, execution.pipes[xPipeIndex], xBytes);
+                        if (network->recoverPpIfNextOffline(planPtr.get(), nodeConfig.nodeIndex, execution.pipes[xPipeIndex], xBytes))
+                            inFlightReplayed = true;
                     }
                     if (isTurboEnabled && !isFirstAttempt && clock() - startTime > CLOCKS_PER_SEC) {
                         network->setTurbo(false);
@@ -6725,6 +6777,8 @@ void runWorkerApp(AppCliArgs *args) {
                     isFirstAttempt = false;
                     continue;
                 }
+                controlStalled = false;
+                inFlightReplayed = false;
                 if (inference.isFinished)
                     break;
 

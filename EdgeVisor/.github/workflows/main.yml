@@ -4,10 +4,12 @@ on:
     branches:
       - main
       - feat/nn
+      - refactor/productize
   push:
     branches:
       - main
       - feat/nn
+      - refactor/productize
 jobs:
   build-linux:
     name: Linux
@@ -32,12 +34,15 @@ jobs:
           make nn-cpu-test
           make nn-cpu-ops-test
           make tokenizer-test
+          make failover-gate-test
       - name: nn-cpu-test
         run: ./nn-cpu-test
       - name: nn-cpu-ops-test
         run: ./nn-cpu-ops-test
       - name: tokenizer-test
         run: ./tokenizer-test
+      - name: failover-gate-test
+        run: ./failover-gate-test
 
   build-windows:
     name: Windows
@@ -55,9 +60,12 @@ jobs:
           make nn-cpu-test
           make nn-cpu-ops-test
           make tokenizer-test
+          make failover-gate-test
       - name: nn-cpu-test
         run: ./nn-cpu-test
       - name: nn-cpu-ops-test
         run: ./nn-cpu-ops-test
       - name: tokenizer-test
         run: ./tokenizer-test
+      - name: failover-gate-test
+        run: ./failover-gate-test

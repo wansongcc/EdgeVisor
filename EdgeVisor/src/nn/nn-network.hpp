@@ -17,7 +17,8 @@ int acceptSocket(int serverSocket);
 void setReuseAddr(int socket);
 void writeSocket(int socket, const void* data, NnSize size);
 void readSocket(int socket, void* data, NnSize size);
-int createServerSocket(int port);
+// bindHost nullptr listens on all interfaces. The HTTP API passes 127.0.0.1.
+int createServerSocket(int port, const char *bindHost = nullptr);
 int createUnixServerSocket(const char *path);
 void destroySocket(int serverSocket);
 
@@ -145,8 +146,14 @@ public:
     void writeAckWithPayload(const NnUint socketIndex, const void *payload, const NnSize payloadSize);
     void readAckWithPayload(const NnUint socketIndex, void *payload, const NnSize payloadSize);
     bool tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts);
+    // Returns false on timeout so a worker can notice a dead pipeline peer
+    // while it is waiting for the next control packet.
+    bool tryReadForMs(NnUint socketIndex, void *data, NnSize size, int timeoutMs);
     bool tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts);
-    void writeMany(NnUint n, NnSocketIo *ios);
+    // dropOffline: a dead peer is removed from this broadcast and the rest
+    // still receive the bytes once. Point-to-point writes keep the exception
+    // so a pipeline send can fail over.
+    void writeMany(NnUint n, NnSocketIo *ios, bool dropOffline = false);
     void writeAll(const void *data, NnSize size);
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);

@@ -207,10 +207,14 @@ private:
     NnUint bubbleShadowCursor;
     NnUint bubbleShadowDrainUs;
     std::vector<NnUint> bubbleShadowStepIndices;
+    // Exclusive end position whose shadow KV has been written, per layer.
+    std::vector<NnUint> shadowFilledThrough_;
     std::vector<NnByte> segmentSyncProfileKinds;
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
-    NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning);
+    NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning, bool chainLayers);
     bool isRedundantLayerActive(NnUint layerIndex) const;
+    void noteShadowFilled(NnUint layerIndex);
+    void replayRedundantLayer(NnUint layerIndex);
     void resetBubbleShadowStateForForward();
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
@@ -238,6 +242,8 @@ public:
     void setRedundantLayerEnabled(NnUint layerIndex, bool enabled);
     // Run enabled right-boundary layers, then copy the stage-output cache back to the PP send pipe.
     void spliceRedundantLayersIntoSend(NnUint beginLayer, NnUint endLayer);
+    NnUint executionPosition() const;
+    bool shadowCovers(NnUint beginLayer, NnUint endLayer, NnUint position) const;
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     bool isSegmentEnabled(NnUint segmentIndex) const;
     void setPpSyncEnabled(bool enabled);

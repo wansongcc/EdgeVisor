@@ -13,6 +13,7 @@ typedef SSIZE_T ssize_t;
 #include <sys/un.h>
 #endif
 #include "nn-network.hpp"
+#include "failover_gate.hpp"
 #include "nn/io-profile.hpp"
 #include "nn-core.hpp"
 #include <cassert>
@@ -376,11 +377,17 @@ static int envIntOr(const char *name, int fallback) {
 
 static inline void setTcpKeepAlive(int socket) {
 #ifndef _WIN32
-    const int idle = envIntOr("DLLAMA_TCP_KEEPIDLE_S", 1);
+    // 1s idle and a 4s user timeout mark a live peer dead. A 22-layer
+    // prefill on an integrated GPU stalls the CPU long enough that
+    // keepalive probes go unanswered, and the previous stage's socket
+    // is reset before the forward finishes. Probes start after 10s of
+    // idle, and unanswered TCP traffic is aborted at 20s. A process
+    // that exits still closes the socket immediately.
+    const int idle = envIntOr("DLLAMA_TCP_KEEPIDLE_S", 10);
     if (idle <= 0) return;
-    const int intvl = std::max(1, envIntOr("DLLAMA_TCP_KEEPINTVL_S", 1));
-    const int cnt = std::max(1, envIntOr("DLLAMA_TCP_KEEPCNT", 3));
-    int userMs = envIntOr("DLLAMA_TCP_USER_TIMEOUT_MS", (idle + intvl * cnt) * 1000);
+    const int intvl = std::max(1, envIntOr("DLLAMA_TCP_KEEPINTVL_S", 2));
+    const int cnt = std::max(1, envIntOr("DLLAMA_TCP_KEEPCNT", 5));
+    int userMs = envIntOr("DLLAMA_TCP_USER_TIMEOUT_MS", 20000);
     int on = 1;
     if (setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0) return;
     setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
@@ -1006,8 +1013,8 @@ static inline int connectSocket(char *host, int port) {
     return sock;
 }
 
-int createServerSocket(int port) {
-    const char *host = "0.0.0.0";
+int createServerSocket(int port, const char *bindHost) {
+    const char *host = (bindHost != nullptr && bindHost[0] != '\0') ? bindHost : "0.0.0.0";
     struct sockaddr_in serverAddr;
 
     int serverSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1709,6 +1716,29 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
     return false;
 }
 
+bool NnNetwork::tryReadForMs(NnUint socketIndex, void *data, NnSize size, int timeoutMs) {
+    assert(socketIndex < nSockets);
+#ifndef _WIN32
+    pollfd pfd{};
+    pfd.fd = sockets[socketIndex];
+    pfd.events = POLLIN;
+    int rc;
+    do {
+        rc = ::poll(&pfd, 1, timeoutMs);
+    } while (rc < 0 && errno == EINTR);
+    if (rc == 0) return false;
+    if (rc < 0) return false;
+    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 && (pfd.revents & POLLIN) == 0) {
+        const NnUint peer = peerNodeBySocket[socketIndex];
+        deactivateNode(peer, 0u);
+        throw NnPeerOfflineException(peer, "Socket closed");
+    }
+#else
+    (void)timeoutMs;
+#endif
+    return tryReadWithMaxAttempts(socketIndex, data, size, 10000ul);
+}
+
 bool NnNetwork::tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts) {
     assert(socketIndex >= 0 && socketIndex < nSockets);
     try {
@@ -1721,7 +1751,7 @@ bool NnNetwork::tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
     }
 }
 
-void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
+void NnNetwork::writeMany(NnUint n, NnSocketIo *ios, bool dropOffline) {
     {
         const unsigned long simDelayUs = getNetSimDelayUs();
         if (simDelayUs > 0ul) usleep(simDelayUs);
@@ -1779,12 +1809,14 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                     if (isOfflineErrno(SOCKET_LAST_ERRCODE)) {
                         const NnUint peer = peerNodeBySocket[io->socketIndex];
                         deactivateNode(peer, 0u);
+                        if (dropOffline) { io->size = 0; continue; }
                         throw NnPeerOfflineException(peer, "Socket write failed");
                     }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
                 } else if (s == 0) {
                     const NnUint peer = peerNodeBySocket[io->socketIndex];
                     deactivateNode(peer, 0u);
+                    if (dropOffline) { io->size = 0; continue; }
                     throw NnPeerOfflineException(peer, "Socket closed");
                 }
                 if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
@@ -1809,7 +1841,7 @@ void NnNetwork::writeAll(const void *data, NnSize size) {
         io->data = data;
         io->size = size;
     }
-    if (!ios.empty()) writeMany((NnUint)ios.size(), ios.data());
+    if (!ios.empty()) writeMany((NnUint)ios.size(), ios.data(), true);
 }
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
@@ -1924,9 +1956,69 @@ bool NnNetwork::isSocketActive(NnUint socketIndex) const {
     return socketIndex < nSockets && socketActive[socketIndex];
 }
 
+static int connectSocketWithin(const char *host, int port, int timeoutMs) {
+    if (host == nullptr || timeoutMs < 0) return -1;
+    char mutableHost[256];
+    std::snprintf(mutableHost, sizeof(mutableHost), "%s", host);
+    if (timeoutMs == 0) return connectSocket(mutableHost, port);
+#ifndef _WIN32
+    int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) return -1;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        destroySocket(fd);
+        return -1;
+    }
+    int rc = ::connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc != 0 && errno != EINPROGRESS && errno != EALREADY) {
+        destroySocket(fd);
+        return -1;
+    }
+    if (rc != 0) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        do {
+            rc = ::poll(&pfd, 1, timeoutMs);
+        } while (rc < 0 && errno == EINTR);
+        if (rc <= 0) {
+            destroySocket(fd);
+            return -1;
+        }
+        int soerr = 0;
+        socklen_t len = sizeof(soerr);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) < 0 || soerr != 0) {
+            destroySocket(fd);
+            return -1;
+        }
+    }
+    if (flags >= 0) fcntl(fd, F_SETFL, flags);
+    setTcpSocketOptionsIfSupported(fd);
+    return fd;
+#else
+    (void)timeoutMs;
+    return connectSocket(mutableHost, port);
+#endif
+}
+
 bool NnNetwork::acceptAndInstallPeer(NnUint myWorkerIndex, NnUint expectedPeerWorkerIndex) {
     if (listenFd < 0) return false;
-    const int fd = acceptSocket(listenFd);
+    const int savedTimeout = g_acceptTimeoutMs;
+    if (g_acceptTimeoutMs < 0) g_acceptTimeoutMs = kJoinAcceptTimeoutMs;
+    int fd = -1;
+    try {
+        fd = acceptSocket(listenFd);
+    } catch (const std::runtime_error &) {
+        g_acceptTimeoutMs = savedTimeout;
+        return false;
+    }
+    g_acceptTimeoutMs = savedTimeout;
     NnUint actualPeer = 0u;
     exchangeWorkerPeerIndex(fd, myWorkerIndex, &actualPeer);
     if (actualPeer != expectedPeerWorkerIndex) {
@@ -1949,7 +2041,8 @@ bool NnNetwork::acceptAndInstallPeer(NnUint myWorkerIndex, NnUint expectedPeerWo
 
 bool NnNetwork::connectAndInstallPeer(NnUint myWorkerIndex, NnUint peerWorkerIndex, const char *host, int port) {
     if (host == nullptr) return false;
-    const int fd = connectSocket(const_cast<char *>(host), port);
+    const int fd = connectSocketWithin(host, port, kJoinConnectTimeoutMs);
+    if (fd < 0) return false;
     NnUint actualPeer = 0u;
     exchangeWorkerPeerIndex(fd, myWorkerIndex, &actualPeer);
     if (actualPeer != peerWorkerIndex) {
@@ -1972,7 +2065,8 @@ bool NnNetwork::connectAndInstallPeer(NnUint myWorkerIndex, NnUint peerWorkerInd
 
 bool NnNetwork::connectReservedWorker(NnUint workerIndex, const char *host, int port, NnUint nPoolWorkers, char **hosts, NnUint *ports, NnUint onlineMask) {
     if (workerIndex >= nSockets || host == nullptr) return false;
-    const int fd = connectSocket(const_cast<char *>(host), port);
+    const int fd = connectSocketWithin(host, port, kJoinConnectTimeoutMs);
+    if (fd < 0) return false;
     writeSocket(fd, &nPoolWorkers, sizeof(nPoolWorkers));
     writeSocket(fd, &workerIndex, sizeof(workerIndex));
     for (NnUint j = 0; j < nPoolWorkers; j++) {
@@ -2083,13 +2177,14 @@ bool NnNetwork::recoverPpIfNextOffline(const NnUnevenPartitionPlan *plan, NnUint
     const NnUint nextNode = plan->stages[nextStageIndex].rootNodeIndex;
     if (!peerLooksOffline(nextNode)) return false;
     NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
-    // This pipe is the token that already completed. Replaying it makes the next
-    // stage sample that token again and shifts every later position.
-    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode, false)) return false;
-    std::printf("🔁 [failover] armed bypass deadNext=%u; holding activation\n",
-        (unsigned)nextNode);
+    // The caller waits long enough for a normal next control packet to arrive.
+    // Reaching here means the root is still blocked on this activation, so the
+    // downstream stage never got it. Apply the dead layers and send once.
+    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode, true)) return false;
+    sendPpToNext(this, myNodeIndex, pipe, nBytes, plan);
+    std::printf("🔁 [failover] resent in-flight activation deadNext=%u bytes=%zu\n",
+        (unsigned)nextNode, (size_t)nBytes);
     std::fflush(stdout);
-    (void)nBytes;
     return true;
 }
 

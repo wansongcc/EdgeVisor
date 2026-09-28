@@ -1,20 +1,21 @@
+import os
 import paramiko
 import time
 import threading
 import sys
 
-# Configuration
-# Workers list as per instructions
+# Hosts only. Authenticate with the agent's SSH keys.
+# If a password is required, set EDGEVISOR_SSH_PASSWORD in the environment.
+# Do not write passwords into this file.
 WORKERS = [
-    {"host": "192.168.182.11", "user": "cc", "password": "cc123"},
-    {"host": "192.168.182.12", "user": "cc", "password": "cc123"},
-    {"host": "192.168.182.13", "user": "cc", "password": "cc123"},
-    {"host": "192.168.182.15", "user": "jetson", "password": "yahboom"},
-    {"host": "192.168.182.17", "user": "jetson", "password": "yahboom"},
+    {"host": "192.168.182.11", "user": "cc"},
+    {"host": "192.168.182.12", "user": "cc"},
+    {"host": "192.168.182.13", "user": "cc"},
+    {"host": "192.168.182.15", "user": "jetson"},
+    {"host": "192.168.182.17", "user": "jetson"},
 ]
 
-# Root/Master node
-MASTER = {"host": "192.168.182.16", "user": "jetson", "password": "yahboom"}
+MASTER = {"host": "192.168.182.16", "user": "jetson"}
 
 # Common project path
 PROJECT_PATH = "~/yanhui/distributed-llama"
@@ -34,11 +35,15 @@ MASTER_CMD = (
     "--ratios \"1:1@20*3:3:2@8*1@8\""
 )
 
-def create_ssh_client(host, user, password):
+def create_ssh_client(host, user):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    password = os.environ.get("EDGEVISOR_SSH_PASSWORD")
     try:
-        client.connect(host, username=user, password=password, timeout=10)
+        if password:
+            client.connect(host, username=user, password=password, timeout=10)
+        else:
+            client.connect(host, username=user, timeout=10, look_for_keys=True, allow_agent=True)
         return client
     except Exception as e:
         print(f"Failed to connect to {host}: {e}")
@@ -63,10 +68,9 @@ def start_worker(worker_config, stop_event):
     """Starts a worker process and keeps it running until stop_event is set."""
     host = worker_config["host"]
     user = worker_config["user"]
-    password = worker_config["password"]
-    
+
     print(f"[{host}] Connecting...")
-    client = create_ssh_client(host, user, password)
+    client = create_ssh_client(host, user)
     if not client:
         return
 
@@ -120,7 +124,7 @@ def main():
     
     # 2. Run Master
     print("\n>>> Starting Master Node...")
-    master_client = create_ssh_client(MASTER["host"], MASTER["user"], MASTER["password"])
+    master_client = create_ssh_client(MASTER["host"], MASTER["user"])
     if master_client:
         try:
             print(f"[{MASTER['host']}] Executing inference...")

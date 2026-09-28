@@ -197,6 +197,9 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o
 	$(CXX) $(CXXFLAGS) $(filter-out %.hpp %.h, $^) -o $@ $(LIBS)
 
+failover-gate-test: src/test/test_failover_gate.cpp
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
 token-timing-test: src/test/test_token_timing.cpp token-timing.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 

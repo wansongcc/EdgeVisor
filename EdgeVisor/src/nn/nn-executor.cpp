@@ -1,4 +1,5 @@
 #include <atomic>
+#include "failover_gate.hpp"
 #include <cassert>
 #include <cstring>
 #include <exception>
@@ -515,7 +516,7 @@ NnExecutorException::NnExecutorException(const std::string message)
 
 NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *devices, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark)
     : netExecution(netExecution), nodeConfig(nodeConfig), segments(nodeConfig->nSegments), steps(), segmentKinds(), segmentRuntimeRoles(), segmentLayerIndex(), segmentHasExecOps(), segmentEnabled(nullptr), threads(nullptr)
-    , bubbleShadowThread(), bubbleShadowMutex(), lastBubbleShadowStats{}, lastSyncProfile{}, bubbleShadowAsyncRunning(false), bubbleShadowAsyncStarted(false), bubbleShadowStopRequested(false), bubbleShadowComplete(false), bubbleShadowCursor(0u), bubbleShadowDrainUs(0u), bubbleShadowStepIndices(), segmentSyncProfileKinds()
+    , bubbleShadowThread(), bubbleShadowMutex(), lastBubbleShadowStats{}, lastSyncProfile{}, bubbleShadowAsyncRunning(false), bubbleShadowAsyncStarted(false), bubbleShadowStopRequested(false), bubbleShadowComplete(false), bubbleShadowCursor(0u), bubbleShadowDrainUs(0u), bubbleShadowStepIndices(), shadowFilledThrough_(), segmentSyncProfileKinds()
 {
     NnUint maxNThreads = 0;
     for (NnExecutorDevice &d : *devices) {
@@ -902,7 +903,7 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantInternal(NnUint budgetUs
         bubbleShadowDrainUs = 0u;
         lastBubbleShadowStats = NnBubbleShadowStats{};
     }
-    return runBubbleShadowRedundantChunk(budgetUs, false, allowWhileRunning);
+    return runBubbleShadowRedundantChunk(budgetUs, false, allowWhileRunning, true);
 }
 
 NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
@@ -939,7 +940,44 @@ bool NnExecutor::isRedundantLayerActive(NnUint layerIndex) const {
     return false;
 }
 
-NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning) {
+void NnExecutor::noteShadowFilled(NnUint layerIndex) {
+    if (netExecution == nullptr) return;
+    const NnUint batch = std::max<NnUint>(netExecution->batchSize, 1u);
+    const NnUint end = netExecution->position + batch;
+    if (shadowFilledThrough_.size() <= layerIndex)
+        shadowFilledThrough_.resize((size_t)layerIndex + 1u, 0u);
+    if (end > shadowFilledThrough_[layerIndex]) shadowFilledThrough_[layerIndex] = end;
+}
+
+void NnExecutor::replayRedundantLayer(NnUint layerIndex) {
+    if (netExecution == nullptr || netExecution->batchSize == 0u) return;
+    const NnUint batchSize = netExecution->batchSize;
+    for (const NnExecutorStep &step : steps) {
+        if (step.type != STEP_EXECUTE_OP || step.segment == nullptr) continue;
+        if (step.segmentIndex >= segmentRuntimeRoles.size()) continue;
+        if (segmentRuntimeRoles[step.segmentIndex] != SEG_ROLE_REDUNDANT) continue;
+        if (step.segmentIndex >= segmentLayerIndex.size()) continue;
+        if (segmentLayerIndex[step.segmentIndex] < 0) continue;
+        if ((NnUint)segmentLayerIndex[step.segmentIndex] != layerIndex) continue;
+        step.segment->forward(step.arg0, 1u, 0u, batchSize);
+    }
+    noteShadowFilled(layerIndex);
+}
+
+NnUint NnExecutor::executionPosition() const {
+    return netExecution == nullptr ? 0u : netExecution->position;
+}
+
+bool NnExecutor::shadowCovers(NnUint beginLayer, NnUint endLayer, NnUint position) const {
+    return shadowHistoryCovers(
+        shadowFilledThrough_.empty() ? nullptr : shadowFilledThrough_.data(),
+        (unsigned)shadowFilledThrough_.size(),
+        beginLayer,
+        endLayer,
+        position);
+}
+
+NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning, bool chainLayers) {
     NnBubbleShadowStats stats{};
     if (!allowWhileRunning && context.isAlive.load()) {
         throw std::runtime_error("Cannot run bubble shadow work while executor is running");
@@ -1034,6 +1072,25 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, b
             step->segment->forward(step->arg0, 1u, 0u, batchSize);
             stats.opStepsExecuted += 1u;
         }
+
+        if (segmentIndex < segmentLayerIndex.size() && segmentLayerIndex[segmentIndex] >= 0) {
+            const int layer = segmentLayerIndex[segmentIndex];
+            noteShadowFilled((NnUint)layer);
+            int nextLayer = -1;
+            if (bubbleShadowCursor < (NnUint)bubbleShadowStepIndices.size()) {
+                const NnUint nextStep = bubbleShadowStepIndices[bubbleShadowCursor];
+                if (nextStep < (NnUint)steps.size()) {
+                    const NnUint nextSegment = steps[nextStep].segmentIndex;
+                    if (nextSegment < segmentLayerIndex.size())
+                        nextLayer = segmentLayerIndex[nextSegment];
+                }
+            }
+            // The next shadow layer reads the stage-output cache. Replay this
+            // layer's full redundant forward first so that cache is the real
+            // input of layer+1, not the original stage output again.
+            if (chainLayers && nextLayer == layer + 1)
+                replayRedundantLayer((NnUint)layer);
+        }
     }
 
     stats.uniqueLayers = (NnUint)visitedLayers.size();
@@ -1064,6 +1121,10 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantChunk(NnUint budgetUs, b
 }
 
 void NnExecutor::maybeStartBubbleShadowAsyncBeforeSync() {
+    // Shadow KV copies the stage cache into xBuffer. Doing that on another
+    // thread while the primary forward still owns xBuffer changes the token.
+    // Drain runs the same work after the forward returns.
+    return;
     if (!isBubbleShadowAsyncModeEnabled()) return;
     if (netExecution == nullptr || netExecution->batchSize == 0u || netExecution->nThreads != 1u) return;
 
@@ -1078,7 +1139,7 @@ void NnExecutor::maybeStartBubbleShadowAsyncBeforeSync() {
     bubbleShadowThread = std::thread([this]() {
         bool ok = true;
         try {
-            (void)this->runBubbleShadowRedundantChunk(0u, true, true);
+            (void)this->runBubbleShadowRedundantChunk(0u, true, true, false);
         } catch (const std::exception &e) {
             ok = false;
             std::printf("[bubble-shadow-kv] async error: %s\n", e.what());
@@ -1126,7 +1187,7 @@ void NnExecutor::drainBubbleShadowAsync() {
     if (!needsDrain) return;
 
     const auto start = std::chrono::high_resolution_clock::now();
-    (void)runBubbleShadowRedundantChunk(0u, false, true);
+    (void)runBubbleShadowRedundantChunk(0u, false, true, true);
     const unsigned long long drainUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - start).count();
     std::lock_guard<std::mutex> lock(bubbleShadowMutex);

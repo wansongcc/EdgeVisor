@@ -21,62 +21,44 @@
 
 ### 正在做什么
 
-EdgeVisor 是改过的 dllama，按流水线把一层层模型摊到多台机器上。现在用的是五台机器上已有的 Qwen3-14B（`qwen3_14b_q40`，40 层），不用 Llama 3.2 3B。
+五机 14B smoke 已经跑通。rog 做 CPU root，四台 Jetson 做 CUDA worker，从一开始都在线。模型仍是 Qwen3-14B Q40，没有改用 3B。
 
-当前这件事是五机 smoke：nano1、nano2、nx1、nx2 做 CUDA worker，rog 做 CPU root，确认五台能连上并正常生成 token。这不是中途把一台设备加入的测试，五台从一开始都在线。
+上一份交接里的失败原因已经查清，并且用改过默认超时的二进制复现通过。`nn-network.cpp` 的改动还没提交。五台 `dllama` 在跑完后已经退出。
 
-这次交接之前，用户要求的就是这个 smoke，以及把交接写进仓库。五机 smoke 没有生成出 token，进程已经停掉。用户还没有在此之后布置新的改代码任务。
+### 失败原因
 
-### 设备
+nano1 和 nx2 的连接一开始是通的。四台 worker 都完成了 mesh，40 层权重都加载成功，而且都收到了预填控制包 `Batch=12, Pos=0`。断线发生在第一次前向期间，不是建连失败。
 
-控制面是 ZeroTier，只用来 SSH。激活和 KV 走有线数据面 `192.168.137.0/24`。不要从数据面 SSH。故障注入会把数据网卡 down 掉。
+默认 TCP keepalive 是空闲 1 秒、间隔 1 秒、3 次，用户超时约 4 秒。自动切分把 22 层放在 nx2 上。nx2 在算这 22 层时，它和 nano1 之间已经没有新数据，内核把这条空闲连接判成对端死亡。nx2 日志是 `deactivated node=1 socket=1`，接着 `fast-path deadNode=1 ejectedStage=1 targetStage=0 layers=[1,2) replay=0`。后面是连锁：nx1 看到 nano2 关闭，root 看到 nx1 关闭，然后会话重开，rog 空转，一个 token 都没有。
 
-从这台 Windows 开发机可以用 SSH 别名登录，BatchMode 公钥可用。Jetson 用户是 `jetson`，rog 用户是 `cc`。
+每台 worker 日志开头的 `handshake ended: Socket closed` 是 root 探测时的那一次 accept，接着会重新监听。那不是这次断线。
 
-| 别名 | 控制面 | 数据面 | 代码目录 | 这次的角色 |
-| --- | --- | --- | --- | --- |
-| nano1 | 10.47.107.34 | 192.168.137.18 | `/home/jetson/cc/EdgeVisor` | CUDA worker |
-| nano2 | 10.47.215.50 | 192.168.137.16 | 同上 | CUDA worker |
-| nx1 | 10.47.145.51 | 192.168.137.13 | 同上 | CUDA worker |
-| nx2 | 10.47.235.49 | 192.168.137.15 | 同上 | CUDA worker |
-| rog | 10.47.72.162 | 192.168.137.31 | `/home/cc/EdgeVisor` | CPU root（avx2） |
+nx2 建执行器时仍有一次 `NvMapMemAlloc ... error 12`。权重随后加载成功，这次复跑也没有再因为这个报错停住。
 
-二进制是仓库里的 `EdgeVisor/dllama`。Jetson 编译用 `DLLAMA_CUDA=1 make dllama`。不要跑裸的 `make`，默认目标是 clean。rog 用 `make dllama`。
+旧日志还在：rog `/tmp/smoke-root.log`，四台 Jetson `/tmp/smoke-worker.log`。
 
-模型目录：Jetson 是 `/home/jetson/cc/models/qwen3_14b_q40/`，rog 是 `/home/cc/models/qwen3_14b_q40/`。权重文件 `dllama_model_qwen3_14b_q40.m` 约 11 GB，tokenizer 是同目录的 `dllama_tokenizer_qwen3_14b_q40.t`。词表大小 151669 对模型 151936 的警告是预期的，不是失败。
+### 这次怎么通过的
 
-这次 smoke 的 worker 顺序是 nano1、nx2、nano2、nx1，端口都是 9999。自动切分打出来的是 `1@1*1@1*1@22*1@1*1@15`：rog 1 层、nano1 1 层、nx2 22 层、nano2 1 层、nx1 15 层。
+`setTcpKeepAlive` 的默认改成空闲 30 秒、间隔 10 秒、6 次，用户超时 180 秒。环境变量名字没变，显式设置仍然覆盖默认值。五台都已用这份源码重新编译：Jetson 是 `make dllama DLLAMA_CUDA=1`，rog 是清掉旧的 `.o` 之后 `make dllama`（直接增量链接会撞上上次 Vulkan 留下的 `app.o`）。
 
-### 这次做了什么
+确认跑没有设置 `DLLAMA_TCP_*`。worker 顺序和端口与失败的那次相同：`192.168.137.18:9999 192.168.137.15:9999 192.168.137.16:9999 192.168.137.13:9999`，`--steps 28`，其余标志与上一份交接里的 root 命令相同。root 日志没有 `deactivated`。nx2 的 `/tmp/ft_smoke5b/w.log` 里 `deactivated` 次数是 0。生成文本是：
 
-没有在这次交接里新写功能代码。做了运行实验，然后写这份文件。
+`<think>Okay, the user asked, "The capital of France is..." I`
 
-设备中途加入此前已经跑通。Qwen3-14B 解码时把预留的 nx2（`192.168.137.15:9999`）拉进流水线，大约在 pos=43 加入，带 215 行 KV，后面的句子仍然连贯。跨过加入点的句子是 “epsilon for a long time”，后面的希腊字母续写是对的。`zeta` 被分成 `z` 和 `eta` 是 BPE，不是 KV 损坏。
+日志：rog `/tmp/ft_smoke5b/root.log`，四台 Jetson `/tmp/ft_smoke5b/w.log`。
 
-当时低序号 worker 会去拨 `127.0.0.1`。修复是让加入包带上对端数据面地址 `peerHost`。这套改动已经在远程提交 `fbcc67d`（Stop replaying a finished token when a covered stage drops.）里，包括 `peerHost`、executor 里同一次错误只登记一次、failover 增加 `replayActivation`，以及 `test_pp_tp.cpp` 里 `NnStageDef` 改成 `{}` 初始化。写这份文件时，nx1 的 HEAD 还停在 `7adcee8`，工作区里那 6 个源文件的内容和 `fbcc67d` 相同，只是 HEAD 还没快进；`test_pp_tp.cpp` 当时仍是旧内容。这份交接提交接在 `fbcc67d` 之上。另外四台机器未必已经是这个提交，动手前先看 `git status`。
-
-五机一起在线的 smoke 没有跑完，这次没有为它改代码。四台 worker 都连上了，40 层权重加载成功，提示词 `The capital of France is` 已经打印出来。随后 nx2 把 nano1 标成离线，日志是 `deactivated node=1 socket=1`，以及 `fast-path deadNode=1 ejectedStage=1 targetStage=0 layers=[1,2)`。当时 `ss` 显示 nano1 和 nx2 之间没有 TCP 连接，rog 到四台 worker、以及其它 worker 之间的连接还在。nx2 建 22 层执行器时有一次 `NvMapMemAlloc ... error 12`，随后仍打印了权重加载成功。rog 以大约 300% CPU 空转到约 9 分钟，一个 token 都没有。五台 `dllama` 都已停掉，并确认进程不在。
-
-日志还在机器上：rog 的 `/tmp/smoke-root.log`，四台 Jetson 的 `/tmp/smoke-worker.log`。
-
-root 命令是在 `/home/cc/EdgeVisor/EdgeVisor` 里跑的，没有加 `--info`，也没有设 memory limit：
-
-```
-./dllama inference --prompt "The capital of France is" --steps 16 --model /home/cc/models/qwen3_14b_q40/dllama_model_qwen3_14b_q40.m --tokenizer /home/cc/models/qwen3_14b_q40/dllama_tokenizer_qwen3_14b_q40.t --buffer-float-type q80 --nthreads 4 --max-seq-len 128 --workers 192.168.137.18:9999 192.168.137.15:9999 192.168.137.16:9999 192.168.137.13:9999
-```
-
-这次用的二进制是 2026-09-27 编的：Jetson 大约 16:04–16:05，rog 大约 01:04。源码内容和 `fbcc67d` 的主体一致。
+更早一次用环境变量把超时放到 180 秒、`--steps 16` 的跑也出了 `<think> Okay,`，日志在 `/tmp/ft_smoke5/`。那次二进制还是旧默认值。
 
 ### 仓库
 
 - 远程：`git@github.com:wansongcc/EdgeVisor.git`
-- 分支：`feat/device-fault-tolerance`
-- 这次只提交 `handsoff.md`
-- 不要提交 `EdgeVisor/src/._*` 和 `EdgeVisor/src/nn/._*`。那是 macOS 拷贝带出来的附属文件
+- 设备上的分支：`feat/device-fault-tolerance`，HEAD 曾是 `f7c52c4`。五台的 `EdgeVisor/src/nn/nn-network.cpp` 现在是未提交的超时改动。
+- 开发机上的 `/tmp/edgevisor_ft` 在 `refactor/productize`，同一处改动也还没提交。
+- 不要提交 `EdgeVisor/src/._*` 和 `EdgeVisor/src/nn/._*`。
 
 ### 下一步
 
-用户若说继续，就从这次失败的五机 smoke 接着查：第一步时为什么 nano1 和 nx2 之间的连接断了，以及怎样让五台连上并吐出连贯 token。先读上面的两处日志。不要改用 3B。原因没查清之前，不要把同一次实验再挂成长时间的 CPU 空转。
+用户若要留下这个修复，再提交 `nn-network.cpp`。没有新的失败要接着查。不要为了这次 smoke 再把超时改回 4 秒。
 
 ### 操作时注意
 

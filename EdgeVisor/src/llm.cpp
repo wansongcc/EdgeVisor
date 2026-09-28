@@ -2981,7 +2981,8 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         fileOffset += layerBytes;
 
         if (timer.elapsedMiliseconds() > 5000) {
-            printf("💿 Loaded %u/%u layers...\n", layerIndex + 1, h->nLayers);
+            if (productLogLevel() >= 1)
+                printf("loaded %u/%u layers\n", layerIndex + 1, h->nLayers);
             timer.reset();
         }
     }

@@ -6403,7 +6403,8 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
         network->resetStats();
         if (args->netTurbo) {
             network->setTurbo(true);
-            printf("🚁 Network is in non-blocking mode\n");
+            if (productLogLevel() >= 1)
+                printf("network is in non-blocking mode\n");
         }
     }
 
@@ -6910,7 +6911,8 @@ void runWorkerApp(AppCliArgs *args) {
                 if (args->netTurbo && !isTurboEnabled) {
                     network->setTurbo(true);
                     isTurboEnabled = true;
-                    printf("🚁 Network is in non-blocking mode\n");
+                    if (productLogLevel() >= 1)
+                        printf("network is in non-blocking mode\n");
                 }
 
                 LlmKvTransferHeader kvHdr{};

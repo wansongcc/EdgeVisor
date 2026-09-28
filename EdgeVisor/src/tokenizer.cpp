@@ -13,6 +13,7 @@
 #include "nn/nn-core.hpp"
 #include "nn/nn-cpu-ops.hpp"
 #include "tokenizer.hpp"
+#include "product_log.hpp"
 #if defined(__ARM_NEON)
     #include <arm_neon.h>
 #endif
@@ -603,7 +604,8 @@ ChatTemplateGenerator::ChatTemplateGenerator(const ChatTemplateType type, const 
     }
     this->eos = eos;
 
-    printf("⭐ Chat template: %s\n", chatTemplateTypeToString(this->type));
+    if (productLogLevel() >= 1)
+        printf("chat template: %s\n", chatTemplateTypeToString(this->type));
 }
 
 GeneratedChat ChatTemplateGenerator::generate(unsigned int nItems, ChatItem* items, bool appendGenerationPrompt) {
@@ -678,7 +680,8 @@ EosDetector::EosDetector(size_t nTokens, const int *tokens, const char** pieces,
     this->pieceSizes = new size_t[nTokens];
     for (size_t s = 0; s < nTokens; s++) {
         pieceSizes[s] = strlen(pieces[s]);
-        printf("🛑 Stop: %s\n", pieces[s]);
+        if (productLogLevel() >= 1)
+            printf("stop: %s\n", pieces[s]);
     }
     this->bufferPos = 0;
     this->bufferSize = 0;

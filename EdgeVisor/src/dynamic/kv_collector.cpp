@@ -1,6 +1,7 @@
 #include "dynamic/kv_collector.hpp"
 
 #include "app.hpp"
+#include "product_log.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -47,7 +48,8 @@ std::unique_ptr<RootKvCollector> RootKvCollector::start(RootLlmInference *infere
     if (pos >= 0 && layer >= 0) {
         std::fprintf(stderr, "[kv-collector] enabled, thread started (target pos=%d, layer=%d)\n", pos, layer);
     } else {
-        std::fprintf(stderr, "[kv-collector] enabled, waiting for migration arming from runtime/UDS\n");
+        if (productLogLevel() >= 1)
+            std::fprintf(stderr, "kv-collector waiting for migration arming\n");
     }
     return ctrl;
 #endif

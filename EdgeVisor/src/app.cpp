@@ -2674,7 +2674,8 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->runtimePlan = (net != nullptr) ? &net->runtimeStageLayerPlan : nullptr;
     std::string runtimeOwnershipReason;
     if (!initializeRuntimePrimaryOwnership(runtimePlan, runtimePrimaryOwnership, &runtimeOwnershipReason)) {
-        std::printf("⚠️  [runtime-primary-owner] initialization failed: %s\n", runtimeOwnershipReason.c_str());
+        if (productLogLevel() >= 1)
+            std::printf("runtime-primary-owner initialization failed: %s\n", runtimeOwnershipReason.c_str());
         std::fflush(stdout);
     }
     this->logitsSegmentIndices = findLogitsSegmentIndices(&net->nodeConfigs[0]);
@@ -2777,7 +2778,8 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
             migrationLayerListPinnedByEnv ? "yes" : "no");
         std::fflush(stdout);
     } else if (!this->ppMigrationEnabled) {
-        std::printf("ℹ️  [kv-migrate] PP migration is disabled (enable with --enable-pp-migration)\n");
+        if (productLogLevel() >= 1)
+            std::printf("pp migration is disabled\n");
         std::fflush(stdout);
     }
 
@@ -6291,7 +6293,10 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
             printPartitionPlanDebug(planPtr.get());
         }
     } else {
-        printf("⚖️  Even partitioning strategy enabled: ");
+        if (productLogLevel() >= 1)
+            printf("even partitioning\n");
+        else
+            printf("topology: single device\n");
         net = buildLlmNet(&header, nNodes, args->nBatches, args->maxActiveSeqs);
     }
     

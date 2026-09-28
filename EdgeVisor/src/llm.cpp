@@ -6,6 +6,7 @@
 #include "nn/nn-network.hpp"
 #include "mmap.hpp"
 #include "llm.hpp"
+#include "product_log.hpp"
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -2730,7 +2731,7 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
     assert(net->netConfig.nNodes == 1u);
 #else
     std::unique_ptr<MmapFile, void(*)(MmapFile *)> fdPtr(&file, closeMmapFile);
-    printf("💿 Loading weights...\n");
+    printf("loading weights\n");
 #endif
     Timer timer;
     NnByte *data = (NnByte *)file.data;
@@ -2774,7 +2775,8 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
     long long missingBytes = (long long)(b - data) - net->header->fileSize;
     if (missingBytes != 0u)
         throw std::runtime_error("Missing bytes in weight file: " + std::to_string(missingBytes));
-    printf("💿 Weights loaded\n");
+    if (productLogLevel() >= 1)
+        printf("weights loaded\n");
 
     loader->finish();
 }

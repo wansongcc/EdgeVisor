@@ -1148,13 +1148,15 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             NnUint zeroCount = 0u;
             computeLogitsStats(context->inference->logitsPipe, context->header->vocabSize,
                                hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
-            const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && context->header->vocabSize > 0u);
-            printf("🧪 [Root Logits] (pred) Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | Zero: %u/%u\n",
-                statsOk ? "✅ OK" : "❌ FAIL",
-                minLogit, maxLogit, maxIndex,
-                (unsigned)zeroCount, (unsigned)context->header->vocabSize);
-            printRootLogitsSplitStats("pred", pos, context->inference->logitsPipe, context->header->vocabSize);
-            debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
+            if (productLogLevel() >= 1) {
+                const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && context->header->vocabSize > 0u);
+                printf("logits pred valid=%s range=[%.2f, %.2f] maxIdx=%d zero=%u/%u\n",
+                    statsOk ? "ok" : "fail",
+                    minLogit, maxLogit, maxIndex,
+                    (unsigned)zeroCount, (unsigned)context->header->vocabSize);
+                printRootLogitsSplitStats("pred", pos, context->inference->logitsPipe, context->header->vocabSize);
+                debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
+            }
         }
 
         NnUint predBubbleTime = 0;

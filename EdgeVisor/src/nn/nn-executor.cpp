@@ -1,5 +1,6 @@
 #include <atomic>
 #include "failover_gate.hpp"
+#include "product_log.hpp"
 #include <cassert>
 #include <cstring>
 #include <exception>
@@ -609,8 +610,8 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
         int redundantLayer = -1;
         inferActiveAndRedundantLayer(segmentConfig, &activeLayer, &redundantLayer);
 
-        std::printf(
-            "🧱 [executor-init] node=%u segment=%u kind=%s role=%s enabled=%u activeLayer=%d redundantLayer=%d nOps=%u nSyncs=%u createExec=%u createSync=%u\n",
+        if (productLogLevel() >= 1) std::printf(
+            "executor-init node=%u segment=%u kind=%s role=%s enabled=%u activeLayer=%d redundantLayer=%d nOps=%u nSyncs=%u createExec=%u createSync=%u\n",
             (unsigned)(nodeConfig ? nodeConfig->nodeIndex : 0u),
             (unsigned)segmentIndex,
             segmentKindToString(segKind),

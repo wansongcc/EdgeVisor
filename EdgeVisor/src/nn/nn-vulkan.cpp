@@ -243,6 +243,43 @@ int nnVulkanDeviceCount() {
     return count;
 }
 
+static int vulkanDeviceScore(vk::PhysicalDeviceType type) {
+    if (type == vk::PhysicalDeviceType::eDiscreteGpu) return 3;
+    if (type == vk::PhysicalDeviceType::eIntegratedGpu) return 2;
+    if (type == vk::PhysicalDeviceType::eVirtualGpu) return 1;
+    return 0;
+}
+
+static unsigned long long vulkanDeviceLocalBytes(const vk::PhysicalDevice &device) {
+    const vk::PhysicalDeviceMemoryProperties memory = device.getMemoryProperties();
+    unsigned long long heapBytes = 0;
+    for (unsigned h = 0; h < memory.memoryHeapCount; ++h) {
+        if (memory.memoryHeaps[h].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+            heapBytes += (unsigned long long)memory.memoryHeaps[h].size;
+    }
+    return heapBytes;
+}
+
+int nnVulkanPreferredDeviceIndex() {
+    vk::Instance instance = createProfileInstance();
+    const std::vector<vk::PhysicalDevice> devices = instance.enumeratePhysicalDevices();
+    int best = 0;
+    int bestScore = -1;
+    unsigned long long bestBytes = 0;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const vk::PhysicalDeviceProperties props = devices[i].getProperties();
+        const int score = vulkanDeviceScore(props.deviceType);
+        const unsigned long long bytes = vulkanDeviceLocalBytes(devices[i]);
+        if (score > bestScore || (score == bestScore && bytes > bestBytes)) {
+            best = (int)i;
+            bestScore = score;
+            bestBytes = bytes;
+        }
+    }
+    instance.destroy();
+    return best;
+}
+
 std::string nnVulkanDeviceInfo(NnUint gpuIndex) {
     vk::Instance instance = createProfileInstance();
     const std::vector<vk::PhysicalDevice> devices = instance.enumeratePhysicalDevices();

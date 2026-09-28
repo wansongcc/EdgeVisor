@@ -6110,7 +6110,7 @@ static void resolveAutoBackend(AppCliArgs *args) {
             try {
                 if (nnVulkanDeviceCount() > 0) {
                     args->backend = AppCliArgs::BACKEND_VULKAN;
-                    if (args->gpuIndex < 0) args->gpuIndex = 0;
+                    if (args->gpuIndex < 0) args->gpuIndex = nnVulkanPreferredDeviceIndex();
                 }
             } catch (const std::exception &) {}
         }
@@ -6146,9 +6146,10 @@ void printAvailableDevices() {
 #if defined(DLLAMA_VULKAN)
     try {
         const int count = nnVulkanDeviceCount();
+        const int preferred = count > 0 ? nnVulkanPreferredDeviceIndex() : -1;
         if (count <= 0) std::printf("Vulkan: none\n");
         for (int i = 0; i < count; ++i)
-            std::printf("%s\n", nnVulkanDeviceInfo((NnUint)i).c_str());
+            std::printf("%s%s\n", nnVulkanDeviceInfo((NnUint)i).c_str(), i == preferred ? " [auto]" : "");
     } catch (const std::exception &e) {
         std::printf("Vulkan: unavailable (%s)\n", e.what());
     }

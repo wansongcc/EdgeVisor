@@ -210,6 +210,7 @@ public:
 };
 
 int nnVulkanDeviceCount();
+int nnVulkanPreferredDeviceIndex();
 std::string nnVulkanDeviceInfo(NnUint gpuIndex);
 double nnVulkanProfileGemmMs(NnUint gpuIndex, int n);
 unsigned long long nnVulkanDeviceLocalBytes(NnUint gpuIndex);

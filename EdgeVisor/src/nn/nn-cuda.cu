@@ -1287,6 +1287,67 @@ double nnCudaProfileGemmMs(NnUint gpuIndex, int n) {
     }
 }
 
+static double cudaGemvMs(cublasHandle_t handle, float *weight, float *input, float *output, int rows, int cols) {
+    if (rows < 1 || cols < 1) return 0.0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    NN_CUBLAS_CHECK(cublasSgemv(handle, CUBLAS_OP_N, rows, cols, &alpha, weight, rows, input, 1, &beta, output, 1));
+    NN_CUDA_CHECK(cudaDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    const int iters = 3;
+    for (int i = 0; i < iters; ++i) {
+        NN_CUBLAS_CHECK(cublasSgemv(handle, CUBLAS_OP_N, rows, cols, &alpha, weight, rows, input, 1, &beta, output, 1));
+    }
+    NN_CUDA_CHECK(cudaDeviceSynchronize());
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return ms / (double)iters;
+}
+
+double nnCudaProfileLayerMs(NnUint gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads) {
+    if (dim == 0u) return 0.0;
+    const unsigned hidden = hiddenDim == 0u ? dim : hiddenDim;
+    const unsigned heads = nHeads == 0u ? 1u : nHeads;
+    const unsigned kvHeads = nKvHeads == 0u ? heads : nKvHeads;
+    const unsigned kvDim = (unsigned)(((unsigned long long)dim / heads) * kvHeads);
+    const unsigned kv = kvDim == 0u ? dim : kvDim;
+    const unsigned long long shapes[4] = {
+        (unsigned long long)dim * dim,
+        (unsigned long long)kv * dim,
+        (unsigned long long)hidden * dim,
+        (unsigned long long)dim * hidden
+    };
+    unsigned long long maxElems = shapes[0];
+    for (int i = 1; i < 4; ++i) if (shapes[i] > maxElems) maxElems = shapes[i];
+    const unsigned maxVector = std::max(dim, std::max(hidden, kv));
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    float *weight = nullptr;
+    float *input = nullptr;
+    float *output = nullptr;
+    cublasHandle_t handle = nullptr;
+    try {
+        NN_CUDA_CHECK(cudaMalloc(&weight, (size_t)maxElems * sizeof(float)));
+        NN_CUDA_CHECK(cudaMalloc(&input, (size_t)maxVector * sizeof(float)));
+        NN_CUDA_CHECK(cudaMalloc(&output, (size_t)maxVector * sizeof(float)));
+        NN_CUDA_CHECK(cudaMemset(weight, 0, (size_t)maxElems * sizeof(float)));
+        NN_CUBLAS_CHECK(cublasCreate(&handle));
+        const double q = cudaGemvMs(handle, weight, input, output, (int)dim, (int)dim);
+        const double k = cudaGemvMs(handle, weight, input, output, (int)kv, (int)dim);
+        const double up = cudaGemvMs(handle, weight, input, output, (int)hidden, (int)dim);
+        const double down = cudaGemvMs(handle, weight, input, output, (int)dim, (int)hidden);
+        cublasDestroy(handle);
+        cudaFree(weight);
+        cudaFree(input);
+        cudaFree(output);
+        return 2.0 * q + 2.0 * k + 2.0 * up + down;
+    } catch (...) {
+        if (handle != nullptr) cublasDestroy(handle);
+        if (weight != nullptr) cudaFree(weight);
+        if (input != nullptr) cudaFree(input);
+        if (output != nullptr) cudaFree(output);
+        throw;
+    }
+}
+
 unsigned long long nnCudaFreeBytes(NnUint gpuIndex) {
     NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
     size_t freeBytes = 0;

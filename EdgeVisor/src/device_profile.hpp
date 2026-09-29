@@ -2,6 +2,7 @@
 #define DEVICE_PROFILE_HPP
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <string>
@@ -139,7 +140,103 @@ inline std::string assignSpeedPack(
     return out.str();
 }
 
+// Lab table cap, tightened by what this model fits in free memory.
+inline unsigned clampLayerCap(unsigned tableCap, unsigned long long freeBytes, const ModelShape &shape) {
+    const unsigned measured = estimateLayerCap(freeBytes, shape);
+    if (tableCap < 1u) return measured;
+    return std::min(tableCap, measured);
+}
+
+inline bool parsePackedCounts(const std::string &ratios, std::vector<unsigned> *counts) {
+    if (counts == nullptr || ratios.empty()) return false;
+    counts->clear();
+    std::string token;
+    for (std::size_t i = 0; i <= ratios.size(); ++i) {
+        const bool end = i == ratios.size() || ratios[i] == '*';
+        if (!end) {
+            token.push_back(ratios[i]);
+            continue;
+        }
+        if (token.size() < 3u || token[0] != '1' || token[1] != '@') return false;
+        char *stop = nullptr;
+        const unsigned long value = std::strtoul(token.c_str() + 2, &stop, 10);
+        if (stop == token.c_str() + 2 || *stop != '\0') return false;
+        counts->push_back((unsigned)value);
+        token.clear();
+    }
+    return !counts->empty();
+}
+
+inline std::string formatPackedCounts(const std::vector<unsigned> &counts) {
+    std::ostringstream out;
+    for (unsigned i = 0; i < counts.size(); ++i) {
+        if (i > 0u) out << '*';
+        out << "1@" << counts[i];
+    }
+    return out.str();
+}
+
+// Startup alloc failed on failedNode. That node's layer count can only shrink.
+// The freed layer moves to whichever other node still has room under its ceiling.
+inline bool relaxPackedRatios(
+    const std::string &ratios,
+    unsigned failedNode,
+    std::vector<unsigned> *ceilings,
+    std::string *out) {
+    if (ceilings == nullptr || out == nullptr) return false;
+    std::vector<unsigned> counts;
+    if (!parsePackedCounts(ratios, &counts)) return false;
+    if (failedNode >= counts.size() || counts[failedNode] <= 1u) return false;
+    std::vector<unsigned> caps = *ceilings;
+    if (caps.size() != counts.size()) caps.assign(counts.size(), 0xffffffffu);
+    counts[failedNode] -= 1u;
+    caps[failedNode] = counts[failedNode];
+    unsigned best = 0xffffffffu;
+    unsigned bestCount = 0xffffffffu;
+    for (unsigned i = 0; i < counts.size(); ++i) {
+        if (i == failedNode) continue;
+        const unsigned room = caps[i] == 0xffffffffu
+            ? 0xffffffffu
+            : (caps[i] > counts[i] ? caps[i] - counts[i] : 0u);
+        if (room == 0u) continue;
+        if (best == 0xffffffffu || counts[i] < bestCount) {
+            best = i;
+            bestCount = counts[i];
+        }
+    }
+    if (best == 0xffffffffu) return false;
+    counts[best] += 1u;
+    *ceilings = caps;
+    *out = formatPackedCounts(counts);
+    return true;
+}
+
+inline bool startupAllocFailure(const char *message) {
+    if (message == nullptr) return false;
+    return std::strstr(message, "out of memory") != nullptr
+        || std::strstr(message, "cudaMalloc") != nullptr
+        || std::strstr(message, "vkAllocate") != nullptr
+        || std::strstr(message, "Socket closed") != nullptr
+        || std::strstr(message, "Socket offline") != nullptr
+        || std::strstr(message, "Error reading from socket") != nullptr
+        || std::strstr(message, "Error writing to socket") != nullptr;
+}
+
+inline unsigned failedPackedNode(const char *message, const std::vector<unsigned> &counts) {
+    const bool local = message != nullptr && (
+        std::strstr(message, "out of memory") != nullptr
+        || std::strstr(message, "cudaMalloc") != nullptr
+        || std::strstr(message, "vkAllocate") != nullptr);
+    if (local || counts.size() < 2u) return 0u;
+    unsigned node = 1u;
+    for (unsigned i = 2u; i < counts.size(); ++i) {
+        if (counts[i] > counts[node]) node = i;
+    }
+    return node;
+}
+
 bool localKnownSpeedProfile(SpeedDeviceProfile *out);
+unsigned long long profileDeviceFreeBytes();
 void publishProfileRuntime(int backend, int gpuIndex, unsigned nThreads);
 void cacheSpeedProfile(const std::string &key, const SpeedDeviceProfile &profile);
 bool cachedSpeedProfile(const std::string &key, SpeedDeviceProfile *out);

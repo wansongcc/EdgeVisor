@@ -2869,6 +2869,8 @@ static void printCliUsage(const char *argv0) {
         "                                   Q40 weights use q80 unless this is set\n"
         "  --ratios 1@N*1@M                 omit to speed-pack. Lab machines use the built-in\n"
         "                                   table; other machines are profiled first\n"
+        "  --auto                           while running, move layers with dynamic TPOT\n"
+        "                                   and pipeline migration\n"
         "  --workers host:port ...\n"
         "  --port N                         worker listen port (default 9990)\n"
         "  --verbose                        handshake, loading, and per-token detail\n"

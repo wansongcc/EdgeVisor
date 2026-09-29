@@ -699,6 +699,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.enableKvAggregate = false;
     args.enablePpMigration = false;
     args.enableDynamicTpot = envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false);
+    args.autoRuntime = false;
     args.dynamicTpotProfile = nullptr;
     args.tpotWindowTokensStr = nullptr;
     args.tpotMinSamplesStr = nullptr;
@@ -871,6 +872,13 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 args.enableKvAggregate = true;
                 i += 1;
             }
+            continue;
+        }
+
+        if (std::strcmp(name, "--auto") == 0) {
+            args.autoRuntime = true;
+            args.enableDynamicTpot = true;
+            i += 1;
             continue;
         }
 
@@ -1178,19 +1186,18 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             schedulerConfig.maxPpLayerMove);
         if (args.planCtrlSocketPath == nullptr || args.planCtrlSocketPath[0] == '\0') {
             args.planCtrlSocketPath = (char *)"/tmp/dllama_plan.sock";
-            std::printf("⚠️  [tpot-auto] --enable-dynamic-tpot requires a plan UDS; using --plan-ctrl-socket %s\n",
-                args.planCtrlSocketPath);
-            std::fflush(stdout);
+            if (!args.autoRuntime)
+                std::printf("plan socket: %s\n", args.planCtrlSocketPath);
         }
         if (!args.enablePlanBarrier) {
             args.enablePlanBarrier = true;
-            std::printf("⚠️  [tpot-auto] --enable-dynamic-tpot requires --enable-plan-barrier; auto enabling\n");
-            std::fflush(stdout);
+            if (!args.autoRuntime)
+                std::printf("plan barrier enabled\n");
         }
         if (!args.enablePpMigration) {
             args.enablePpMigration = true;
-            std::printf("⚠️  [tpot-auto] --enable-dynamic-tpot requires --enable-pp-migration; auto enabling\n");
-            std::fflush(stdout);
+            if (!args.autoRuntime)
+                std::printf("pp migration enabled\n");
         }
         setenv("DLLAMA_DYNAMIC_TPOT_ENABLE", "1", 1);
         setenv("DLLAMA_PLAN_CTRL_SOCKET", args.planCtrlSocketPath, 1);
@@ -1200,8 +1207,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         if (args.nWorkers > 0u && !args.lastStageSampling) {
             args.lastStageSampling = true;
             setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
-            std::printf("[tpot-auto] auto enabling last-stage sampling for distributed PP\n");
-            std::fflush(stdout);
+            if (!args.autoRuntime)
+                std::printf("last-stage sampling enabled\n");
         }
     } else {
         setenv("DLLAMA_DYNAMIC_TPOT_ENABLE", "0", 1);
@@ -1230,16 +1237,20 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     }
     if (args.enablePpMigration && !args.enableKvAggregate) {
         args.enableKvAggregate = true;
-        std::printf("⚠️  [pp-migrate] --enable-pp-migration requires KV aggregate; auto enabling --enable-kv-aggregate\n");
-        std::fflush(stdout);
+        if (!args.autoRuntime)
+            std::printf("kv aggregate enabled\n");
     }
     if (args.enablePpMigration && !args.enableStageFullWeights && !args.enableStageFullWeightsExplicit) {
         args.enableStageFullWeights = true;
-        std::printf("⚠️  [pp-migrate] --enable-pp-migration requires stage full weights; auto enabling --enable-stage-full-weights\n");
-        std::fflush(stdout);
+        if (!args.autoRuntime)
+            std::printf("stage full weights enabled\n");
     } else if (args.enablePpMigration && !args.enableStageFullWeights) {
         std::printf("ℹ️  [pp-migrate] using explicitly bounded resident weights; "
                     "migration coverage is limited to --runtime-redundant-boundary-layers\n");
+        std::fflush(stdout);
+    }
+    if (args.autoRuntime) {
+        std::printf("runtime: pp-migration dynamic-tpot\n");
         std::fflush(stdout);
     }
     if (args.ioProfileLogPath != nullptr && args.ioProfileLogPath[0] != '\0') {
@@ -3733,7 +3744,7 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
 
         LlmKvAckBatchHeader abh{};
         bool haveAckHeader = false;
-        for (int skippedPerf = 0; skippedPerf < 4; ++skippedPerf) {
+        for (int skippedPerf = 0; skippedPerf < 32; ++skippedPerf) {
             if (!tryReadKvAckWithDeadline(network, (NnUint)socketIndex, &abh, sizeof(abh), ackTimeoutMs)) {
                 std::printf("⚠️  [kv-migrate] timeout waiting ack batch from node=%u timeoutMs=%d; abort migration\n",
                     (unsigned)ackNode,
@@ -3750,6 +3761,40 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
                 std::printf("⚠️  [kv-migrate] discarded stray unbatched ack while waiting batch from node=%u; check all nodes use the same dllama binary\n",
                     (unsigned)ackNode);
                 std::fflush(stdout);
+                continue;
+            }
+            if (abh.magic == LLM_WORKER_FRAME_MAGIC && abh.version == LLM_WORKER_FRAME_VERSION) {
+                static_assert(sizeof(LlmKvAckBatchHeader) == sizeof(LlmWorkerFrameHeader), "ack batch header must overlay a worker frame header");
+                LlmWorkerFrameHeader frame{};
+                frame.magic = abh.magic;
+                frame.version = abh.version;
+                frame.kind = abh.count;
+                frame.payloadBytes = abh.reserved;
+                if (frame.payloadBytes > 1024u * 1024u) break;
+                std::vector<char> payload(frame.payloadBytes);
+                if (!payload.empty() &&
+                        !tryReadKvAckWithDeadline(network, (NnUint)socketIndex, payload.data(), payload.size(), ackTimeoutMs)) {
+                    std::printf("⚠️  [kv-migrate] timeout draining worker frame from node=%u bytes=%u; abort migration\n",
+                        (unsigned)ackNode,
+                        (unsigned)frame.payloadBytes);
+                    std::fflush(stdout);
+                    return fail("timeout draining worker frame");
+                }
+                // The sampled token for this position is already on the socket:
+                // the worker sends it before it can read this control-only KV
+                // packet. Dropping it leaves tryReceiveLastStageSampledToken
+                // blocked, and the next forward never starts.
+                if (frame.kind == LLM_WORKER_FRAME_SAMPLED_TOKEN && payload.size() == sizeof(LlmSampledTokenPacket)) {
+                    LlmSampledTokenPacket sampled{};
+                    std::memcpy(&sampled, payload.data(), sizeof(sampled));
+                    workerSampleFrameCache[(NnUint)socketIndex].push_back(sampled);
+                } else if (frame.kind == LLM_WORKER_FRAME_PROFILE && payload.size() == sizeof(LlmPerfPacket)) {
+                    LlmPerfPacket packet{};
+                    std::memcpy(&packet, payload.data(), sizeof(packet));
+                    workerProfileFrameCache[(NnUint)socketIndex].push_back(packet);
+                } else if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
+                    consumeStageBypassAckFrame((NnUint)socketIndex, payload);
+                }
                 continue;
             }
             if (!isLikelyPerfPrefixFromAckHeader(abh, ackNode, header, plan)) break;
@@ -4212,14 +4257,29 @@ void RootLlmInference::collectDeferredProfile(const LlmPerfPacket &rootPacket, s
             }
             LlmWorkerFrameHeader frame{};
             std::vector<char> payload;
-            do {
+            bool gotProfile = false;
+            for (int frameTry = 0; frameTry < 8 && !gotProfile; ++frameTry) {
                 if (!readWorkerFrame(network, i, frame, payload, kvAckWaitTimeoutMs())) break;
-                if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) consumeStageBypassAckFrame(i, payload);
-            } while (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK);
-            if (frame.kind != LLM_WORKER_FRAME_PROFILE || payload.size() != sizeof(LlmPerfPacket)) continue;
-            LlmPerfPacket packet{};
-            std::memcpy(&packet, payload.data(), sizeof(packet));
-            out.push_back(packet);
+                if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
+                    consumeStageBypassAckFrame(i, payload);
+                    continue;
+                }
+                if (frame.kind == LLM_WORKER_FRAME_SAMPLED_TOKEN && payload.size() == sizeof(LlmSampledTokenPacket)) {
+                    LlmSampledTokenPacket sampled{};
+                    std::memcpy(&sampled, payload.data(), sizeof(sampled));
+                    workerSampleFrameCache[i].push_back(sampled);
+                    continue;
+                }
+                if (frame.kind == LLM_WORKER_FRAME_PROFILE && payload.size() == sizeof(LlmPerfPacket)) {
+                    LlmPerfPacket packet{};
+                    std::memcpy(&packet, payload.data(), sizeof(packet));
+                    out.push_back(packet);
+                    gotProfile = true;
+                    continue;
+                }
+                break;
+            }
+            if (!gotProfile) continue;
             } catch (const NnPeerOfflineException &e) {
                 network->deactivateNode(e.peerNodeIndex, 0u);
             }
@@ -5903,8 +5963,25 @@ static ModelShape modelShapeFromHeader(const LlmHeader &header) {
 
 static SpeedDeviceProfile profileForHost(const char *host, int port, bool live, const ModelShape *shape) {
     SpeedDeviceProfile profile = unknownSpeedProfile();
-    if (host != nullptr && knownSpeedProfile(host, &profile)) return profile;
     const std::string key = host == nullptr ? std::string("local") : std::string(host);
+    if (host != nullptr && knownSpeedProfile(host, &profile)) {
+        if (shape != nullptr && live) {
+            double ms = 0.0;
+            unsigned cap = 0;
+            char name[16];
+            std::memset(name, 0, sizeof(name));
+            if (queryWorkerSpeedProfile(host, port, shape->dim, shape->hiddenDim, shape->nHeads, shape->nKvHeads,
+                    shape->maxSeqLen, shape->nLayers, shape->weightType, &ms, &cap, name, sizeof(name))
+                    && cap > 0u) {
+                profile.cap = std::min(profile.cap, cap);
+            }
+            cacheSpeedProfile(key, profile);
+        } else {
+            SpeedDeviceProfile cached;
+            if (cachedSpeedProfile(key, &cached)) return cached;
+        }
+        return profile;
+    }
     if (cachedSpeedProfile(key, &profile)) return profile;
     if (!live || shape == nullptr || host == nullptr) return unknownSpeedProfile();
     double ms = 0.0;
@@ -5925,7 +6002,16 @@ static SpeedDeviceProfile profileForHost(const char *host, int port, bool live, 
 
 static SpeedDeviceProfile profileForLocal(const ModelShape *shape) {
     SpeedDeviceProfile profile = unknownSpeedProfile();
-    if (localKnownSpeedProfile(&profile)) return profile;
+    if (localKnownSpeedProfile(&profile)) {
+        if (shape != nullptr) {
+            profile.cap = clampLayerCap(profile.cap, profileDeviceFreeBytes(), *shape);
+            cacheSpeedProfile("local", profile);
+        } else {
+            SpeedDeviceProfile cached;
+            if (cachedSpeedProfile("local", &cached)) return cached;
+        }
+        return profile;
+    }
     if (cachedSpeedProfile("local", &profile)) return profile;
     if (shape == nullptr) return unknownSpeedProfile();
     profile = measureLocalProfile(*shape);
@@ -6642,13 +6728,31 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         }
     } restore{args, savedHosts, savedPorts, savedWorkers, savedPrompt, savedRatios};
 
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    std::vector<unsigned> layerCeilings;
+    std::string relaxedRatios;
+    int sessionAttempts = 0;
+    int memoryAttempts = 0;
+    while (sessionAttempts < 3) {
         try {
             runInferenceAppBody(args, handler);
             return;
         } catch (const NnSessionRestartException &) {
-            if (attempt == 2 || !g_failoverRestart.armed) throw;
+            if (sessionAttempts == 2 || !g_failoverRestart.armed) throw;
+            sessionAttempts += 1;
+            layerCeilings.clear();
             applyFailoverRestart(args);
+        } catch (const std::exception &error) {
+            if (savedRatios != nullptr || memoryAttempts >= 12 || !startupAllocFailure(error.what())) throw;
+            const char *current = args->ratiosStr;
+            std::vector<unsigned> counts;
+            if (current == nullptr || !parsePackedCounts(current, &counts)) throw;
+            const unsigned failed = failedPackedNode(error.what(), counts);
+            if (!relaxPackedRatios(current, failed, &layerCeilings, &relaxedRatios)) throw;
+            args->ratiosStr = const_cast<char *>(relaxedRatios.c_str());
+            std::printf("topology: ratios=%s\n", relaxedRatios.c_str());
+            std::fflush(stdout);
+            memoryAttempts += 1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
 }

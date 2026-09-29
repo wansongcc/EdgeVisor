@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer W { float w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+layout(push_constant) uniform PushConst { uint rows; uint cols; } pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.rows) return;
+    float sum = 0.0;
+    uint base = row * pc.cols;
+    for (uint col = 0; col < pc.cols; ++col)
+        sum += w[base + col] * x[col];
+    y[row] = sum;
+}

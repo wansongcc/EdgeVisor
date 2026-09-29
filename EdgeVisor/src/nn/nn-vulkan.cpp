@@ -318,10 +318,10 @@ unsigned long long nnVulkanDeviceLocalBytes(NnUint gpuIndex) {
     return heapBytes;
 }
 
-static std::vector<char> readProfileSpv() {
+static std::vector<char> readProfileSpv(const char *fileName) {
     std::vector<std::string> paths;
-    paths.push_back("src/nn/vulkan/profile_gemm.spv");
-    paths.push_back("EdgeVisor/src/nn/vulkan/profile_gemm.spv");
+    paths.push_back(std::string("src/nn/vulkan/") + fileName);
+    paths.push_back(std::string("EdgeVisor/src/nn/vulkan/") + fileName);
 #if defined(__linux__)
     char exe[4096];
     const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
@@ -330,8 +330,8 @@ static std::vector<char> readProfileSpv() {
         std::string dir(exe);
         const std::string::size_type slash = dir.find_last_of('/');
         if (slash != std::string::npos) dir.resize(slash);
-        paths.push_back(dir + "/src/nn/vulkan/profile_gemm.spv");
-        paths.push_back(dir + "/../src/nn/vulkan/profile_gemm.spv");
+        paths.push_back(dir + "/src/nn/vulkan/" + fileName);
+        paths.push_back(dir + "/../src/nn/vulkan/" + fileName);
     }
 #endif
     for (const std::string &path : paths) {
@@ -339,13 +339,13 @@ static std::vector<char> readProfileSpv() {
         if (!in) continue;
         return std::vector<char>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     }
-    throw std::runtime_error("profile_gemm.spv was not found next to the build");
+    throw std::runtime_error(std::string(fileName) + " was not found next to the build");
 }
 
 double nnVulkanProfileGemmMs(NnUint gpuIndex, int n) {
     if (n < 16) n = 16;
     NnVulkanContext context(gpuIndex);
-    const std::vector<char> code = readProfileSpv();
+    const std::vector<char> code = readProfileSpv("profile_gemm.spv");
     vk::ShaderModuleCreateInfo shaderInfo(
         vk::ShaderModuleCreateFlags(),
         code.size(),
@@ -442,6 +442,126 @@ double nnVulkanProfileGemmMs(NnUint gpuIndex, int n) {
     context.device.destroyDescriptorSetLayout(setLayout);
     context.device.destroyShaderModule(shader);
     return ms / (double)iters;
+}
+
+double nnVulkanProfileLayerMs(NnUint gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads) {
+    if (dim == 0u) return 0.0;
+    const unsigned hidden = hiddenDim == 0u ? dim : hiddenDim;
+    const unsigned heads = nHeads == 0u ? 1u : nHeads;
+    const unsigned kvHeads = nKvHeads == 0u ? heads : nKvHeads;
+    const unsigned kvDim = (unsigned)(((unsigned long long)dim / heads) * kvHeads);
+    const unsigned kv = kvDim == 0u ? dim : kvDim;
+    const unsigned long long shapes[4] = {
+        (unsigned long long)dim * dim,
+        (unsigned long long)kv * dim,
+        (unsigned long long)hidden * dim,
+        (unsigned long long)dim * hidden
+    };
+    unsigned long long maxElems = shapes[0];
+    for (int i = 1; i < 4; ++i) if (shapes[i] > maxElems) maxElems = shapes[i];
+    const unsigned maxVector = std::max(dim, std::max(hidden, kv));
+
+    NnVulkanContext context(gpuIndex);
+    const std::vector<char> code = readProfileSpv("profile_gemv.spv");
+    vk::ShaderModuleCreateInfo shaderInfo(
+        vk::ShaderModuleCreateFlags(),
+        code.size(),
+        reinterpret_cast<const uint32_t *>(code.data()));
+    vk::ShaderModule shader = context.device.createShaderModule(shaderInfo);
+    const vk::DescriptorSetLayoutBinding bindings[3] = {
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+    };
+    vk::DescriptorSetLayoutCreateInfo setInfo(vk::DescriptorSetLayoutCreateFlags(), 3, bindings);
+    vk::DescriptorSetLayout setLayout = context.device.createDescriptorSetLayout(setInfo);
+    vk::PushConstantRange push(vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t) * 2u);
+    vk::PipelineLayoutCreateInfo layoutInfo(vk::PipelineLayoutCreateFlags(), 1, &setLayout, 1, &push);
+    vk::PipelineLayout pipelineLayout = context.device.createPipelineLayout(layoutInfo);
+    vk::PipelineShaderStageCreateInfo stage(
+        vk::PipelineShaderStageCreateFlags(),
+        vk::ShaderStageFlagBits::eCompute,
+        shader,
+        "main");
+    vk::ComputePipelineCreateInfo pipelineInfo(vk::PipelineCreateFlags(), stage, pipelineLayout);
+    vk::Pipeline pipeline = context.device.createComputePipelines(nullptr, pipelineInfo).value.front();
+
+    uint32_t memoryType = findMemoryTypeIndex(&context.physicalDevice, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    if (memoryType == MEMORY_TYPE_INDEX_NOT_FOUND) {
+        memoryType = findMemoryTypeIndex(
+            &context.physicalDevice,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    if (memoryType == MEMORY_TYPE_INDEX_NOT_FOUND)
+        throw std::runtime_error("Vulkan layer profile needs a memory heap");
+    const vk::DeviceSize weightBytes = (vk::DeviceSize)maxElems * sizeof(float);
+    const vk::DeviceSize vectorBytes = (vk::DeviceSize)maxVector * sizeof(float);
+    std::pair<vk::Buffer, vk::DeviceMemory> bufferW = context.createRawBuffer(memoryType, weightBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    std::pair<vk::Buffer, vk::DeviceMemory> bufferX = context.createRawBuffer(memoryType, vectorBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    std::pair<vk::Buffer, vk::DeviceMemory> bufferY = context.createRawBuffer(memoryType, vectorBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+
+    vk::DescriptorPoolSize poolSize(vk::DescriptorType::eStorageBuffer, 3);
+    vk::DescriptorPoolCreateInfo poolInfo(vk::DescriptorPoolCreateFlags(), 1, 1, &poolSize);
+    vk::DescriptorPool pool = context.device.createDescriptorPool(poolInfo);
+    vk::DescriptorSetAllocateInfo allocInfo(pool, 1, &setLayout);
+    vk::DescriptorSet descriptorSet = context.device.allocateDescriptorSets(allocInfo).front();
+    const vk::DescriptorBufferInfo infos[3] = {
+        {bufferW.first, 0, weightBytes},
+        {bufferX.first, 0, vectorBytes},
+        {bufferY.first, 0, vectorBytes},
+    };
+    vk::WriteDescriptorSet write(descriptorSet, 0, 0, 3, vk::DescriptorType::eStorageBuffer, nullptr, infos, nullptr);
+    context.device.updateDescriptorSets(1, &write, 0, nullptr);
+
+    vk::CommandBufferAllocateInfo commandInfo(context.commandPool, vk::CommandBufferLevel::ePrimary, 1);
+    vk::CommandBuffer command = context.device.allocateCommandBuffers(commandInfo).front();
+    vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+    struct GemvPush { uint32_t rows; uint32_t cols; };
+    auto timeShape = [&](unsigned rows, unsigned cols) -> double {
+        GemvPush pushValue;
+        pushValue.rows = rows;
+        pushValue.cols = cols;
+        const uint32_t groups = (rows + 63u) / 64u;
+        auto record = [&]() {
+            command.begin(beginInfo);
+            command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+            command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+            command.pushConstants(pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pushValue), &pushValue);
+            command.dispatch(groups, 1, 1);
+            command.end();
+        };
+        record();
+        vk::SubmitInfo submit(0, nullptr, nullptr, 1, &command);
+        context.queue.submit(submit, nullptr);
+        context.queue.waitIdle();
+        const auto start = std::chrono::steady_clock::now();
+        const int iters = 3;
+        for (int i = 0; i < iters; ++i) {
+            command.reset();
+            record();
+            context.queue.submit(submit, nullptr);
+            context.queue.waitIdle();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        return ms / (double)iters;
+    };
+    const double q = timeShape(dim, dim);
+    const double k = timeShape(kv, dim);
+    const double up = timeShape(hidden, dim);
+    const double down = timeShape(dim, hidden);
+
+    context.device.freeMemory(bufferW.second);
+    context.device.freeMemory(bufferX.second);
+    context.device.freeMemory(bufferY.second);
+    context.device.destroyBuffer(bufferW.first);
+    context.device.destroyBuffer(bufferX.first);
+    context.device.destroyBuffer(bufferY.first);
+    context.device.destroyDescriptorPool(pool);
+    context.device.destroyPipeline(pipeline);
+    context.device.destroyPipelineLayout(pipelineLayout);
+    context.device.destroyDescriptorSetLayout(setLayout);
+    context.device.destroyShaderModule(shader);
+    return 2.0 * q + 2.0 * k + 2.0 * up + down;
 }
 
 std::pair<vk::Buffer, vk::DeviceMemory> NnVulkanContext::createRawBuffer(const uint32_t memoryTypeIndex, const vk::DeviceSize bufferSize, const vk::BufferUsageFlags usageFlags) {

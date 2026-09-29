@@ -82,6 +82,7 @@ public:
     bool enableKvAggregate; // Build KV aggregate pipes (KC/VC)
     bool enablePpMigration; // Enable PP layer migration control path
     bool enableDynamicTpot; // Enable root-side online TPOT scheduler
+    bool autoRuntime; // --auto: turn on dynamic TPOT and PP migration for this run
     char *dynamicTpotProfile;
     char *tpotWindowTokensStr;
     char *tpotMinSamplesStr;

@@ -52,7 +52,7 @@ public:
     NnProfileProbeException() : std::runtime_error("profile probe") {}
 };
 
-// One matmul plus a memory cap from a worker that is not in the lab table.
+// One decode layer (seven projections) plus a memory cap from a worker.
 // Returns false when the worker does not answer.
 bool queryWorkerSpeedProfile(
     const char *host,

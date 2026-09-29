@@ -213,6 +213,7 @@ int nnVulkanDeviceCount();
 int nnVulkanPreferredDeviceIndex();
 std::string nnVulkanDeviceInfo(NnUint gpuIndex);
 double nnVulkanProfileGemmMs(NnUint gpuIndex, int n);
+double nnVulkanProfileLayerMs(NnUint gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads);
 unsigned long long nnVulkanDeviceLocalBytes(NnUint gpuIndex);
 
 #endif

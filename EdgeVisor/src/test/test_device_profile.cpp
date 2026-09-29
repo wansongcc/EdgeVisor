@@ -47,6 +47,29 @@ int main() {
     const std::string solo = assignSpeedPack(profiles, 10u, &live);
     expect(solo == "1@10*1@0", "an offline device keeps its slot and receives no layers");
 
+    expect(clampLayerCap(22u, freeBytes, shape) == 4u, "a known machine uses the smaller model cap");
+    const unsigned long long roomy = (unsigned long long)((40.0 * perLayer) / 0.70);
+    expect(clampLayerCap(8u, roomy, shape) == 8u, "a known machine keeps the table cap when memory is larger");
+
+    std::vector<unsigned> ceilings;
+    std::string relaxed;
+    expect(relaxPackedRatios("1@22*1@14", 1u, &ceilings, &relaxed) && relaxed == "1@23*1@13",
+        "a worker that cannot allocate gives one layer to the root");
+    expect(relaxPackedRatios(relaxed, 1u, &ceilings, &relaxed) && relaxed == "1@24*1@12",
+        "the same worker can only shrink further");
+    std::vector<unsigned> rootCeilings;
+    expect(relaxPackedRatios("1@22*1@14", 0u, &rootCeilings, &relaxed) && relaxed == "1@21*1@15",
+        "a root allocation failure moves one layer to the other machine");
+    expect(!relaxPackedRatios("1@2*1@1", 1u, &rootCeilings, &relaxed),
+        "a one-layer slice is not shrunk");
+    expect(startupAllocFailure("cudaMalloc(&devicePointer, bufferSize) failed: out of memory (2)"),
+        "cuda alloc failure is retried");
+    expect(!startupAllocFailure("The number of prompt tokens is greater than the number of steps"),
+        "a prompt error is not an allocation failure");
+    std::vector<unsigned> packed;
+    expect(parsePackedCounts("1@22*1@14", &packed) && failedPackedNode("Socket closed", packed) == 1u,
+        "a closed worker socket shrinks the worker with the most layers");
+
     if (g_failures != 0) {
         std::fprintf(stderr, "%d device profile checks failed\n", g_failures);
         return 1;

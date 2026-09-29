@@ -11,6 +11,7 @@ int nnCudaDeviceCount();
 std::string nnCudaDeviceInfo(NnUint gpuIndex);
 void nnCudaPrintDeviceInfo(NnUint gpuIndex);
 double nnCudaProfileGemmMs(NnUint gpuIndex, int n);
+double nnCudaProfileLayerMs(NnUint gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads);
 unsigned long long nnCudaFreeBytes(NnUint gpuIndex);
 
 struct NnCudaLaunchConfig {

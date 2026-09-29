@@ -1,6 +1,4 @@
 #include "device_profile.hpp"
-#include "nn/llamafile/sgemm.hpp"
-#include "nn/nn-quants.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -85,18 +83,23 @@ static unsigned long long hostAvailableBytes() {
     return 4ull << 30;
 }
 
-static double cpuGemmMs(int n, unsigned nThreads) {
-    std::vector<float> a((size_t)n * (size_t)n, 0.01f);
-    std::vector<float> b((size_t)n * (size_t)n, 0.02f);
-    std::vector<float> c((size_t)n * (size_t)n, 0.0f);
+static double cpuGemvMs(unsigned rows, unsigned cols, unsigned nThreads) {
+    if (rows == 0u || cols == 0u) return 0.0;
+    std::vector<float> weight((size_t)rows * (size_t)cols, 0.01f);
+    std::vector<float> input(cols, 0.02f);
+    std::vector<float> output(rows, 0.0f);
     const unsigned nth = std::max(1u, nThreads);
     auto once = [&]() {
         std::vector<std::thread> threads;
         threads.reserve(nth);
         for (unsigned ith = 0; ith < nth; ++ith) {
             threads.emplace_back([&, ith]() {
-                llamafile_sgemm(n, n, n, a.data(), n, b.data(), n, c.data(), n,
-                    (int)ith, (int)nth, 0, F_32, F_32, F_32);
+                for (unsigned row = ith; row < rows; row += nth) {
+                    const float *rowData = weight.data() + (size_t)row * cols;
+                    float acc = 0.0f;
+                    for (unsigned col = 0; col < cols; ++col) acc += rowData[col] * input[col];
+                    output[row] = acc;
+                }
             });
         }
         for (unsigned ith = 0; ith < nth; ++ith) threads[ith].join();
@@ -109,57 +112,63 @@ static double cpuGemmMs(int n, unsigned nThreads) {
     return ms / (double)iters;
 }
 
-static double layerMsFromGemm(double gemmMs, int n, const ModelShape &shape) {
-    const double flops = 2.0 * (double)n * (double)n * (double)n;
-    if (!(gemmMs > 0.0) || !(flops > 0.0)) return 8.0;
-    const double flopsPerSec = flops / (gemmMs / 1000.0);
+static double cpuLayerMs(const ModelShape &shape) {
+    const unsigned dim = shape.dim;
+    const unsigned hidden = shape.hiddenDim == 0u ? dim : shape.hiddenDim;
     const unsigned heads = shape.nHeads == 0u ? 1u : shape.nHeads;
-    const double kvScale = (double)(shape.nKvHeads == 0u ? heads : shape.nKvHeads) / (double)heads;
-    const double layerFlops =
-        2.0 * (double)shape.dim * (double)shape.hiddenDim * 3.0 +
-        2.0 * (double)shape.dim * (double)shape.dim * (2.0 + 2.0 * kvScale);
-    double ms = layerFlops / flopsPerSec * 1000.0;
-    if (!(ms > 0.05)) ms = 0.05;
-    return ms;
+    const unsigned kvHeads = shape.nKvHeads == 0u ? heads : shape.nKvHeads;
+    const unsigned kvDim = (unsigned)(((unsigned long long)dim / heads) * kvHeads);
+    const unsigned kv = kvDim == 0u ? dim : kvDim;
+    return 2.0 * cpuGemvMs(dim, dim, g_threads)
+        + 2.0 * cpuGemvMs(kv, dim, g_threads)
+        + 2.0 * cpuGemvMs(hidden, dim, g_threads)
+        + cpuGemvMs(dim, hidden, g_threads);
+}
+
+unsigned long long profileDeviceFreeBytes() {
+    try {
+#if defined(DLLAMA_CUDA)
+        if (g_backend == PROFILE_CUDA) return nnCudaFreeBytes((unsigned)g_gpuIndex);
+#endif
+#if defined(DLLAMA_VULKAN)
+        if (g_backend == PROFILE_VULKAN) return nnVulkanDeviceLocalBytes((unsigned)g_gpuIndex);
+#endif
+    } catch (...) {
+        return hostAvailableBytes();
+    }
+    return hostAvailableBytes();
 }
 
 SpeedDeviceProfile measureLocalProfile(const ModelShape &shape) {
-    double gemmMs = 0.0;
+    if (shape.dim == 0u) return unknownSpeedProfile();
     unsigned long long freeBytes = hostAvailableBytes();
     const char *name = "cpu";
-    int n = 256;
-    bool measuredOnDevice = false;
+    double layerMs = 0.0;
     try {
 #if defined(DLLAMA_CUDA)
         if (g_backend == PROFILE_CUDA) {
-            n = 512;
-            gemmMs = nnCudaProfileGemmMs((unsigned)g_gpuIndex, n);
+            layerMs = nnCudaProfileLayerMs((unsigned)g_gpuIndex, shape.dim, shape.hiddenDim, shape.nHeads, shape.nKvHeads);
             freeBytes = nnCudaFreeBytes((unsigned)g_gpuIndex);
             name = "cuda";
-            measuredOnDevice = true;
-        }
+        } else
 #endif
 #if defined(DLLAMA_VULKAN)
         if (g_backend == PROFILE_VULKAN) {
-            n = 256;
-            gemmMs = nnVulkanProfileGemmMs((unsigned)g_gpuIndex, n);
+            layerMs = nnVulkanProfileLayerMs((unsigned)g_gpuIndex, shape.dim, shape.hiddenDim, shape.nHeads, shape.nKvHeads);
             freeBytes = nnVulkanDeviceLocalBytes((unsigned)g_gpuIndex);
             name = "vulkan";
-            measuredOnDevice = true;
-        }
+        } else
 #endif
-        if (!measuredOnDevice) {
-            gemmMs = cpuGemmMs(n, g_threads);
+        {
+            layerMs = cpuLayerMs(shape);
             freeBytes = hostAvailableBytes();
             name = "cpu";
         }
     } catch (...) {
         return unknownSpeedProfile();
     }
-    SpeedDeviceProfile profile = makeSpeedProfile(
-        layerMsFromGemm(gemmMs, n, shape),
-        estimateLayerCap(freeBytes, shape),
-        name);
+    if (!(layerMs > 0.0)) layerMs = 0.05;
+    SpeedDeviceProfile profile = makeSpeedProfile(layerMs, estimateLayerCap(freeBytes, shape), name);
     if (profile.cap < 1u) profile.cap = 1u;
     return profile;
 }

@@ -850,6 +850,12 @@ nlohmann::json makePpCommandRequest(uint32_t seq, const Candidate &candidate) {
     cmd["toNodeIndex"] = candidate.toNodeIndex;
     cmd["firstLayer"] = candidate.layerIndex;
     cmd["layerCount"] = ppCommandLayerCount(candidate);
+    // gainMs is already net of migration cost. The plan socket rejects a move
+    // that omits these estimates.
+    cmd["predictedBenefitMs"] = candidate.gainMs;
+    cmd["predictedCostMs"] = 0.0;
+    cmd["survivalProbability"] = 1.0;
+    cmd["safetyMarginMs"] = 0.0;
     return json{{"op", "set_pp_migration"}, {"cmd", cmd}};
 }
 
@@ -1152,7 +1158,9 @@ void DynamicTpotController::run() {
                     rt.stableWindows = 0u;
                     note = "migration_issued";
                 } else {
-                    note = "migration_issue_failed";
+                    static std::string issueFail;
+                    issueFail = std::string("migration_issue_failed:") + resp.value("reason", resp.value("error", std::string("unknown")));
+                    note = issueFail.c_str();
                 }
             } else {
                 const bool stable = tpotJitterStable(recentTpotWindows);

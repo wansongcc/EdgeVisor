@@ -17,22 +17,22 @@
 
 ## 当前交接
 
-更新时间：2026-09-28
+更新时间：2026-09-29
 
 ### 正在做什么
 
-EdgeVisor 产品化，分支 `refactor/productize`。阶段 0、阶段 1 用户已经认可通过。阶段 2 的三件代码已经写完，编过，也用 0.6B 跑通了两机，但这些代码还没提交。
+EdgeVisor 产品化，分支 `refactor/productize`。阶段 0、阶段 1 用户已经认可通过。阶段 2 的代码还没提交。用户要求补跑三件里的两件，并改了第三件的做法：陌生地址探测不要走 ZeroTier，清空速度表后仍用数据面 IP。名单外机器中途插入执行图，用户说不用管。
 
-用户明确放下的一件事先不要做：名单里没有的机器，不能在推理中途插入执行图。上线仍然只填开跑时 `--workers` 里预留的槽。用户说这件事留到以后做 mDNS 再考虑。
+三件都跑完了。跑完后 nx1、nx2 上没有 `dllama` 进程。
 
 ### 仓库和机器
 
 - 远程：`git@github.com:wansongcc/EdgeVisor.git`
-- 当前开发分支：`refactor/productize`。已推送的 HEAD 是 `45deaab`（默认日志收干净）。
-- 开发副本：`/tmp/edgevisor_ft`，分支 `refactor/productize`，没有 `origin` 这个 remote。推送用 `git push git@github.com:wansongcc/EdgeVisor.git HEAD:refactor/productize`。不要 `--set-upstream`，不要强推。
-- 这份副本里阶段 2 的改动是未提交的。`git status` 会看到 `app.cpp`、`app.hpp`、`device_profile.cpp`、`device_profile.hpp`、`dllama.cpp`、`nn-cuda.cu`、`nn-cuda.hpp`、`nn-network.hpp`、`nn-vulkan.cpp`、`nn-vulkan.hpp`、`test_device_profile.cpp`，以及未跟踪的 `EdgeVisor/src/nn/vulkan/profile_gemv.comp`。不要把这些和 `handsoff.md` 一起提交，除非用户明确要求提交代码。
+- 当前开发分支：`refactor/productize`。已推送的 HEAD 仍是 `45deaab`。阶段 2 源码还没提交。
+- 开发副本：`/tmp/edgevisor_ft`，分支 `refactor/productize`，没有 `origin`。推送用 `git push git@github.com:wansongcc/EdgeVisor.git HEAD:refactor/productize`。不要 `--set-upstream`，不要强推。
+- 这份交接写在 nx1 的 `/home/jetson/cc/EdgeVisor/handsoff.md`，那份仓库是 `feat/device-fault-tolerance`，不要在那个脏目录里改产品化代码。
 - 提交作者用环境变量，不要改 git config：`GIT_AUTHOR_NAME=Yanhui`、`GIT_AUTHOR_EMAIL=fromthefox@icloud.com`，committer 同样。
-- nx1 上的旧目录 `/home/jetson/cc/EdgeVisor` 是 `feat/device-fault-tolerance`，和这条产品化线不是同一份工作区。不要在那个脏目录里继续改产品化代码。
+- 阶段 2 未提交文件仍是 `app.cpp`、`app.hpp`、`device_profile.cpp`、`device_profile.hpp`、`dllama.cpp`、`nn-cuda.cu`、`nn-cuda.hpp`、`nn-network.hpp`、`nn-vulkan.cpp`、`nn-vulkan.hpp`、`test_device_profile.cpp`，以及未跟踪的 `EdgeVisor/src/nn/vulkan/profile_gemv.comp`。不要和 `handsoff.md` 一起提交，除非用户明确要求提交代码。
 
 五台设备，控制面走 ZeroTier，数据面是 `192.168.137.0/24`。SSH 走 ZeroTier，不要走数据面。
 
@@ -44,72 +44,41 @@ EdgeVisor 产品化，分支 `refactor/productize`。阶段 0、阶段 1 用户�
 | nano2，CUDA | `jetson@10.47.215.50` | `192.168.137.16` | `/home/jetson/cc/edgevisor_fresh` |
 | 笔记本，Vulkan | `cc@10.47.72.162` | `192.168.137.31` | `/home/cc/edgevisor_fresh` |
 
-阶段 2 的源码已经 rsync 进 nx1、nx2、笔记本的新目录，并且 `make dllama` 成功。nano1、nano2 的新目录还停在已推送的 `45deaab`，没有这批未提交改动。
+这次只用了 nx1 和 nx2。nano1、nano2 的新目录仍停在 `45deaab`，没有阶段 2 的未提交源码。
 
-密钥登录可用，`ssh -o BatchMode=yes`。不要重新创建或打印密码。
+### 这次跑完的结果
 
-### 阶段 0 和阶段 1
+模型都是 Qwen。0.6B 在 `edgevisor_fresh/EdgeVisor/models/qwen3_0.6b_q40/`。8B 在 `/home/jetson/cc/models/qwen3_8b_q40/`。提示词都是 `The capital of France is`。没有写 `--ratios`。跑完后 worker 已停。
 
-阶段 0 已在 `b9b029b`。快路径要求 token 一致；session restart 只要求句子连贯。中间层有缓存就跳过，没有缓存或者最后一台挂了就整句重开。API 只绑 `127.0.0.1`。这些不要退回去。
+1. `--auto` 短生成，2026-09-29 重跑。端口 18082。nx2 worker 用 0.6B，nx1 root 加 `--auto --steps 24`，worker 地址是数据面 `192.168.137.15:18082`。日志：nx1 `/tmp/edgevisor_auto_root.log`，nx2 `/tmp/edgevisor_auto_worker.log`。
 
-阶段 1 用户在 2026-09-28 认可通过。已推送的相关提交从 `6b620fb` 到 `45deaab`：`make dllama` 自动识别 CUDA/Vulkan；`--backend auto`；Q40 默认 q80；实验室地址走 speed-pack；默认日志只有设备、buffer、切分、加载、生成文本和 tokens/s。
+   结果：进程正常结束。日志有 `runtime: pp-migration dynamic-tpot`，切分仍是 `topology: speed-pack classes=nx,nx ratios=1@22*1@6`。生成过程中发生了一次挪层：`root migration route=0->1 layers=[21] layerCount=1`。文本是 `<think>` 后面的 “Okay, so the user is asking about the capital”，`tokens/s: 17.52`。语义连贯。
 
-五台都从空目录克隆过 `refactor/productize` 到上面的新目录，`make dllama` 成功。Jetson 自动选 CUDA。笔记本自动选 RTX 3060，不是核显。huggingface.co 从 nx1 超时，0.6B 是用 hf-mirror 下的。
+2. 清空速度表后的探测，仍走数据面，没有用 ZeroTier 地址。做法是让 `knownSpeedProfile` 直接 `return false`，在 nx1 上 `make dllama`，然后用 `192.168.137.15:18084` 跑 0.6B、`--steps 16`，没有 `--auto`。测完把这行 `return false` 删掉，nx1 又 `make dllama` 一次。源码里的实验室地址表现在是原样。日志：nx1 `/tmp/edgevisor_profile_root.log`，nx2 `/tmp/edgevisor_profile_worker.log`。
 
-单机 nx1，Qwen3-0.6B，日志 `/tmp/edgevisor_fresh_quiet.log`：
+   结果：进程正常结束。探测打出来的是 `profile: local cuda 0.85 ms/layer cap=28` 和 `profile: 192.168.137.15 cuda 1.28 ms/layer cap=28`。切分变成 `topology: speed-pack classes=cuda,cuda ratios=1@27*1@1`。文本是 `<think>` 后的 “Okay,”，`tokens/s: 9.59`。这证明空表时会按数据面地址现场计时，而不是查 5.8 ms / 22 层那张表。测到的毫秒数比实验室表小，因为计的是当前这个 0.6B 的一层投影，不是表里那组固定数字。
 
-```
-device: backend=cuda threads=8 ...
-buffer: q80
-topology: single device
-loading weights
-<think>
-Okay,
-tokens/s: 18.15 (55.10 ms/tok)
-```
+3. 8B 不写 `--ratios`。端口 18083。同一提示词，`--steps 16`。2026-09-28 夜里和 2026-09-29 早上各跑完一次，结果一样。日志：nx1 `/tmp/edgevisor_8b_root.log`，nx2 `/tmp/edgevisor_8b_worker.log`。早上这次是 `tokens/s: 3.97`。
 
-两机 nx1 + nx2，不传 `--ratios`，日志 `/tmp/edgevisor_fresh_two.log`：`topology: speed-pack classes=nx,nx ratios=1@22*1@6`，连贯句子，`tokens/s: 8.90`。当时的 worker 已经停掉。
+   切分一直是 `topology: speed-pack classes=nx,nx ratios=1@22*1@14`。没有出现第二次 `topology:`，也没有逐层退让。权重加载成功，生成了 `<think>` 后的 “Okay,”，worker 收到 prefill 和几次 decode 后正常 stop。所以这次 8B 在两台上装下了，退让那条路径没有被走到。更早一次旧二进制上 nx2 `cudaMalloc` 失败、需要 7231 MB 的情况，这次没有复现。
 
-### 阶段 2 已写进工作区、还没提交的内容
+### 没有做的
 
-1. 层数上限取实验室表和 `estimateLayerCap(空闲显存, 当前模型)` 的较小值。毫秒/层仍是 NX 5.8、Nano 7.4、笔记本 8.3。显存更大时表里的上限还在，所以 0.6B 两机仍然是 `1@22*1@6`。
-2. 陌生地址不再用一次小 GEMM 换算。在已经选定的 CUDA 或 Vulkan 上计时一层解码的七个投影（Q、K、V、O、gate、up、down）。Vulkan 着色器是 `EdgeVisor/src/nn/vulkan/profile_gemv.comp`。表里的地址探测失败时退回原数字。
-3. `--auto` 才打开动态 TPOT 和 PP migration。冷启动切分不变。默认日志会多一行 `runtime: pp-migration dynamic-tpot`。
-4. 自动切分在启动时如果 `cudaMalloc` 失败，或者 worker 在建图时断开（`Socket closed` 这一类），就从装不下的那台挪走一层再试，最多 12 次。用户写了 `--ratios` 时不改。
-
-`device-profile-test` 在本机和 nx1 上都打印了 `device profile checks passed`。
-
-阶段 2 源码上的两机复跑，2026-09-28，端口 18081，worker 已经停掉（最后停的是 pid 909407）：
-
-- nx2：`./dllama worker --port 18081 --model models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m`
-- nx1：同一模型，`--steps 32 --workers 192.168.137.15:18081`，没有 `--ratios`，也没有 `--auto`
-- 日志：nx1 `/tmp/edgevisor_p2_two.log`，nx2 `/tmp/edgevisor_p2_worker.log`
-- 结果：`EXIT:0`，`topology: speed-pack classes=nx,nx ratios=1@22*1@6`，生成了连贯句子，`tokens/s: 10.09`
-
-### 还没在机器上验证的
-
-- `--auto` 的完整推理。二进制里这个开关已经接上，没有跑过一轮会挪层的生成。
-- 陌生地址的层计时。这次两机用的是表内地址 `192.168.137.15`，不会走那条探测。要测的话用 nx2 的 ZeroTier 地址 `10.47.235.49`，它不在表里。数据面仍然优先，这个地址只为了触发探测。
-- 8B 装不下之后逐层退让。更早一次 Qwen3-8B 两机、旧二进制，speed-pack 分成 `1@22*1@14`，nx2 报需要 7231 MB，然后 `cudaMalloc` 失败。日志在 nx1 `/tmp/edgevisor_fresh_two.log` 被后来的 0.6B 覆盖过；当时 worker 日志是 `/tmp/edgevisor_fresh_worker.log`。新的退让逻辑只有单测，没有在 8B 上跑过。
-- nano1、nano2 还没有这批未提交源码。
-
-### 模型在哪
-
-- Qwen3-0.6B Q40：nx1 和 nx2 的 `edgevisor_fresh/EdgeVisor/models/qwen3_0.6b_q40/`。模型约 914MB，tokenizer 约 2.1MB。笔记本、nano1、nano2 没有这份。
-- Qwen3-8B Q40：四台 Jetson 的 `/home/jetson/cc/models/qwen3_8b_q40/`。笔记本没有。
-- Qwen3-14B Q40：Jetson `/home/jetson/cc/models/qwen3_14b_q40/`，笔记本 `/home/cc/models/qwen3_14b_q40/`。
+- 名单外的机器在推理中途插入执行图。用户说不用管。
+- 阶段 2 源码仍然没有提交。
+- 没有合并到 main。
 
 ### 下一步
 
 先问用户要不要把阶段 2 这批源码单独提交并推到 `refactor/productize`。用户没说提交之前，不要提交。
 
-提交之后，在 nx1 + nx2 上补三件还没跑的验证：`--auto` 一轮短生成、用 `10.47.235.49` 做一次陌生地址探测、8B 不写 `--ratios` 看装不下时会不会逐层退让并最终吐出文本。不要做名单外设备的中途加入。不要合并到 main。
+8B 这次装下了，所以还没有在真机上看到逐层退让。如果用户还想看退让，需要一次确实会 `cudaMalloc` 失败或建图时断开的启动，而不是把这次已经成功的 8B 命令再跑一遍。
 
 ### 操作时注意
 
-- 本机 shell 是 zsh。需要 `set -- $spec` 这种分词的脚本用 bash。远端管道不要用 `ssh -n` 去喂 heredoc；把脚本写成文件再执行。
+- 这台开发机的 shell 是 PowerShell。发给远端的双引号经常会被吃掉，带空格的 `--prompt` 要用远端单引号，否则会报 `Unknown option: capital`。
 - `--ratios` 在远端要加引号，否则 `1@16*` 会被当成通配。
-- 不要 `pgrep -af dllama`。停进程用 `pkill -9 -x dllama` 或杀掉明确的 pid。不要拆网卡。
+- 不要 `pgrep -af dllama`。停进程用明确的 pid，或 `pkill -9 -x dllama`。不要拆网卡。
 - `ssh -f` 或远端 `setsid ... &` 之后，本地 SSH 经常不退出。远端起来之后关掉卡住的本地 SSH。
-- 旧目录 `/home/jetson/cc/EdgeVisor` 里可能还有没提交的 TCP keepalive 改动。那是更早的 smoke，不是这批产品化改动。不要顺手提交进去。
+- 旧目录 `/home/jetson/cc/EdgeVisor` 是脏的，里面有和这次产品化无关的未提交文件，还有 `._*`。不要顺手提交进去。
 - 生成算不算成功，要看 token 语义，不能只看进程没崩。

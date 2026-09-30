@@ -68,30 +68,53 @@ inline bool knownSpeedProfile(const char *host, SpeedDeviceProfile *out) {
 
 // How many layers fit in freeBytes, leaving one layer of headroom for the
 // redundant boundary graph. Q40 weights (weightType == 2) sync in q80.
-inline unsigned estimateLayerCap(unsigned long long freeBytes, const ModelShape &shape) {
-    if (shape.dim == 0u || shape.hiddenDim == 0u) return 8u;
+inline unsigned kvDimOf(const ModelShape &shape) {
+    if (shape.dim == 0u) return 0u;
+    const unsigned heads = shape.nHeads == 0u ? 1u : shape.nHeads;
+    const unsigned kvHeads = shape.nKvHeads == 0u ? heads : shape.nKvHeads;
+    return (unsigned)(((unsigned long long)shape.dim / heads) * kvHeads);
+}
+
+inline double estimateLayerWeightBytes(const ModelShape &shape) {
     double bytesPerWeight = 4.0;
     if (shape.weightType == 2) bytesPerWeight = 18.0 / 32.0;
     else if (shape.weightType == 1) bytesPerWeight = 2.0;
     else if (shape.weightType == 3) bytesPerWeight = 34.0 / 32.0;
-    const unsigned heads = shape.nHeads == 0u ? 1u : shape.nHeads;
-    const unsigned kvHeads = shape.nKvHeads == 0u ? heads : shape.nKvHeads;
-    const unsigned kvDim = (unsigned)(((unsigned long long)shape.dim / heads) * kvHeads);
+    const unsigned kvDim = kvDimOf(shape);
     const unsigned long long params =
         2ull * shape.dim * shape.dim +
         2ull * shape.dim * kvDim +
         3ull * shape.dim * shape.hiddenDim;
-    const double weightBytes = (double)params * bytesPerWeight;
-    const unsigned seq = shape.maxSeqLen == 0u ? 2048u : shape.maxSeqLen;
-    const double syncBytes = (shape.weightType == 2) ? (34.0 / 32.0) : 2.0;
-    const double perLayer = weightBytes + (2.0 * (double)seq * (double)kvDim * syncBytes);
-    if (perLayer < 1.0) return shape.nLayers == 0u ? 8u : shape.nLayers;
+    return (double)params * bytesPerWeight;
+}
+
+inline unsigned capFromLayerBytes(unsigned long long freeBytes, double perLayer, unsigned nLayers) {
+    if (perLayer < 1.0) return nLayers == 0u ? 8u : nLayers;
     const double budget = (double)freeBytes * 0.70;
     if (budget <= perLayer) return 1u;
     unsigned cap = (unsigned)((budget - perLayer) / perLayer);
     if (cap < 1u) cap = 1u;
-    if (shape.nLayers > 0u && cap > shape.nLayers) cap = shape.nLayers;
+    if (nLayers > 0u && cap > nLayers) cap = nLayers;
     return cap;
+}
+
+inline unsigned estimateLayerCap(unsigned long long freeBytes, const ModelShape &shape) {
+    if (shape.dim == 0u || shape.hiddenDim == 0u) return 8u;
+    const unsigned seq = shape.maxSeqLen == 0u ? 2048u : shape.maxSeqLen;
+    const double syncBytes = (shape.weightType == 2) ? (34.0 / 32.0) : 2.0;
+    const double perLayer = estimateLayerWeightBytes(shape)
+        + (2.0 * (double)seq * (double)kvDimOf(shape) * syncBytes);
+    return capFromLayerBytes(freeBytes, perLayer, shape.nLayers);
+}
+
+// --auto keeps a full F32 K and V for every resident layer. The speed-pack cap
+// prices that KV at the sync width, so it admits copies that do not fit.
+inline unsigned estimateResidentLayerCap(unsigned long long freeBytes, const ModelShape &shape) {
+    if (shape.dim == 0u || shape.hiddenDim == 0u) return 8u;
+    const unsigned seq = shape.maxSeqLen == 0u ? 2048u : shape.maxSeqLen;
+    const double perLayer = estimateLayerWeightBytes(shape)
+        + (2.0 * (double)seq * (double)kvDimOf(shape) * 4.0);
+    return capFromLayerBytes(freeBytes, perLayer, shape.nLayers);
 }
 
 // Preserve pipeline order. Faster devices fill first, up to cap.
@@ -241,5 +264,58 @@ void publishProfileRuntime(int backend, int gpuIndex, unsigned nThreads);
 void cacheSpeedProfile(const std::string &key, const SpeedDeviceProfile &profile);
 bool cachedSpeedProfile(const std::string &key, SpeedDeviceProfile *out);
 SpeedDeviceProfile measureLocalProfile(const ModelShape &shape);
+
+// One pipeline boundary. leftHolds is how many of the right stage's layers
+// the left stage stores. rightHolds is the opposite direction.
+struct BoundaryOverlap {
+    unsigned leftHolds = 0u;
+    unsigned rightHolds = 0u;
+};
+
+// After the primary split, each stage may keep extra layers in the memory
+// cap that estimateLayerCap already computed (70% of free memory, one layer
+// of headroom). A stage with two neighbors spends that spare on both
+// boundaries. A stage is never emptied, so a neighbor with N primary layers
+// can donate at most N-1.
+inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
+    const std::vector<unsigned> &primary,
+    const std::vector<unsigned> &memoryCap) {
+    const unsigned n = (unsigned)std::min(primary.size(), memoryCap.size());
+    std::vector<unsigned> spare(n, 0u);
+    for (unsigned i = 0; i < n; ++i) {
+        spare[i] = memoryCap[i] > primary[i] ? memoryCap[i] - primary[i] : 0u;
+    }
+    std::vector<BoundaryOverlap> overlaps(n < 2u ? 0u : n - 1u);
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (unsigned boundary = 0u; boundary + 1u < n; ++boundary) {
+            const unsigned left = boundary;
+            const unsigned right = boundary + 1u;
+            const unsigned maxLeftHolds = primary[right] > 0u ? primary[right] - 1u : 0u;
+            const unsigned maxRightHolds = primary[left] > 0u ? primary[left] - 1u : 0u;
+            if (spare[left] > 0u && overlaps[boundary].leftHolds < maxLeftHolds) {
+                overlaps[boundary].leftHolds += 1u;
+                spare[left] -= 1u;
+                grew = true;
+            }
+            if (spare[right] > 0u && overlaps[boundary].rightHolds < maxRightHolds) {
+                overlaps[boundary].rightHolds += 1u;
+                spare[right] -= 1u;
+                grew = true;
+            }
+        }
+    }
+    return overlaps;
+}
+
+inline std::string formatBoundaryOverlap(const std::vector<BoundaryOverlap> &overlaps) {
+    std::ostringstream out;
+    for (size_t i = 0u; i < overlaps.size(); ++i) {
+        if (i > 0u) out << ';';
+        out << overlaps[i].leftHolds << ',' << overlaps[i].rightHolds;
+    }
+    return out.str();
+}
 
 #endif

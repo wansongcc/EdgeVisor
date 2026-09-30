@@ -67,7 +67,8 @@ bool queryWorkerSpeedProfile(
     double *msPerLayer,
     unsigned *cap,
     char *name,
-    unsigned nameBytes);
+    unsigned nameBytes,
+    unsigned long long *freeBytes);
 
 // Returns true when the dead node's layers were already covered and the local
 // plan now skips that stage. The target node also enables those redundant layers.

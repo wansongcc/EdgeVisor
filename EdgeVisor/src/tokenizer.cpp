@@ -297,6 +297,11 @@ char *Tokenizer::decode(int token) {
             return strBuffer;
         return nullptr;
     }
+    if (token < 0 || (unsigned int)token >= vocabSize || vocab == nullptr || vocabLength == nullptr) {
+        char message[96];
+        std::snprintf(message, sizeof(message), "tokenizer token out of range token=%d vocab=%u", token, vocabSize);
+        throw std::runtime_error(message);
+    }
 
     char *piece = vocab[token];
     int pieceLen = vocabLength[token];

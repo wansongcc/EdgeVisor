@@ -848,6 +848,11 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     std::string effectivePrompt = buildInferencePrompt(context, prompt, &stops);
     std::string generatedText;
     auto armSessionRestart = [&](NnUint peer) {
+        if (generatedText.empty()) {
+            std::printf("startup peer=%u offline, retreat\n", (unsigned)peer);
+            std::fflush(stdout);
+            throw std::runtime_error("Socket offline");
+        }
         std::printf("🔁 [failover] session-restart peer=%u\n", (unsigned)peer);
         std::fflush(stdout);
         failoverArmSessionRestart(effectivePrompt + generatedText, steps, context->header->nLayers);
@@ -2870,7 +2875,8 @@ static void printCliUsage(const char *argv0) {
         "  --ratios 1@N*1@M                 omit to speed-pack. Lab machines use the built-in\n"
         "                                   table; other machines are profiled first\n"
         "  --auto                           while running, move layers with dynamic TPOT\n"
-        "                                   and pipeline migration\n"
+        "                                   and pipeline migration. Overlap depth follows\n"
+        "                                   leftover memory unless it is set explicitly\n"
         "  --workers host:port ...\n"
         "  --port N                         worker listen port (default 9990)\n"
         "  --verbose                        handshake, loading, and per-token detail\n"

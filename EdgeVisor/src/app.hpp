@@ -97,6 +97,7 @@ public:
     char *planCtrlSocketPath; // UDS path used by plan controller and dynamic TPOT scheduler
     NnUint runtimeRedundantBoundaryLayers; // Runtime redundant boundary span in layers
     bool runtimeRedundantBoundaryLayersExplicit;
+    const char *boundaryDepthsStr; // "left,right;..." per pipeline boundary, or null
     bool runtimeActiveSegEnabled; // Default gate for primary segments
     bool runtimeRedundantSegEnabled; // Default gate for redundant segments
     char *runtimePrimarySkipLayersStr; // Comma-separated primary layers to disable, e.g. "14,15"
@@ -401,6 +402,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_BUBBLE_SHADOW_KV_DURING_FORWARD = 1u << 12,
     LLM_BOOTSTRAP_LAST_STAGE_SAMPLING = 1u << 10,
     LLM_BOOTSTRAP_HAS_IO_PROFILE_LOG = 1u << 11,
+    LLM_BOOTSTRAP_HAS_BOUNDARY_DEPTHS = 1u << 13,
 };
 
 typedef struct {
@@ -432,10 +434,11 @@ typedef struct {
     NnUint joinLayerBegin;
     NnUint joinLayerEnd;
     NnUint joinStageIndex;
+    NnUint boundaryDepthsLen; // bytes including '\\0' if present
 } LlmBootstrapPacket;
 
 static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endian
-static constexpr NnUint LLM_BOOTSTRAP_VERSION = 14u;
+static constexpr NnUint LLM_BOOTSTRAP_VERSION = 15u;
 
 static constexpr NnUint LLM_SAMPLED_TOKEN_MAGIC = 0x4b545344u; // 'DSTK' little-endian
 static constexpr NnUint LLM_SAMPLED_TOKEN_VERSION = 1u;

@@ -1234,6 +1234,7 @@ struct ProfileWireRequest {
 
 struct ProfileWireResponse {
     double msPerLayer;
+    uint64_t freeBytes;
     uint32_t cap;
     char name[16];
 };
@@ -1259,6 +1260,7 @@ static void serveProfileProbe(int fd) {
     ProfileWireResponse response;
     std::memset(&response, 0, sizeof(response));
     response.msPerLayer = profile.msPerLayer;
+    response.freeBytes = profileDeviceFreeBytes();
     response.cap = profile.cap;
     std::memcpy(response.name, profile.name, sizeof(response.name));
     writeSocket(fd, &response, sizeof(response));
@@ -1277,7 +1279,8 @@ bool queryWorkerSpeedProfile(
     double *msPerLayer,
     unsigned *cap,
     char *name,
-    unsigned nameBytes) {
+    unsigned nameBytes,
+    unsigned long long *freeBytes) {
     if (host == nullptr || msPerLayer == nullptr || cap == nullptr || name == nullptr || nameBytes == 0u)
         return false;
     char hostCopy[256];
@@ -1304,6 +1307,7 @@ bool queryWorkerSpeedProfile(
         if (response.msPerLayer > 0.0 && response.cap > 0u) {
             *msPerLayer = response.msPerLayer;
             *cap = response.cap;
+            if (freeBytes != nullptr) *freeBytes = response.freeBytes;
             std::snprintf(name, nameBytes, "%s", response.name);
             ok = true;
         }
@@ -2242,10 +2246,10 @@ void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const voi
             throw NnPeerOfflineException(targetNodeIndex, "PP peer hung up");
         }
 #endif
-    } else {
-        // Error or Self
-        printf("❌ Error: sendToNode target=%u my=%u invalid socket index\n", targetNodeIndex, myNodeIndex);
+    } else if (targetNodeIndex != myNodeIndex) {
+        throw NnPeerOfflineException(targetNodeIndex, "Socket offline");
     }
+
 }
 
 bool NnNetwork::peerLooksOffline(NnUint targetNodeIndex) const {
@@ -2298,9 +2302,10 @@ void NnNetwork::recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* d
     int socketIndex = getSocketIndexForNode(sourceNodeIndex, myNodeIndex);
     if (socketIndex >= 0) {
         read(socketIndex, data, size);
-    } else {
-        printf("❌ Error: recvFromNode source=%u my=%u invalid socket index\n", sourceNodeIndex, myNodeIndex);
+    } else if (sourceNodeIndex != myNodeIndex) {
+        throw NnPeerOfflineException(sourceNodeIndex, "Socket offline");
     }
+
 }
 
 static void syncWithRoot(

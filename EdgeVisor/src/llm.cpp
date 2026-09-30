@@ -2361,6 +2361,29 @@ static bool boundaryInList(const char *list, NnUint idx) {
     }
 }
 
+static bool parseBoundaryDepthSpec(const char *text, std::vector<std::pair<NnUint, NnUint> > &out) {
+    out.clear();
+    if (text == nullptr || text[0] == '\0') return false;
+    const char *p = text;
+    while (*p != '\0') {
+        char *end = nullptr;
+        const long left = std::strtol(p, &end, 10);
+        if (end == p || *end != ',') return false;
+        p = end + 1;
+        const long right = std::strtol(p, &end, 10);
+        if (end == p || left < 0 || right < 0) return false;
+        out.push_back(std::make_pair((NnUint)left, (NnUint)right));
+        p = end;
+        if (*p == ';') {
+            ++p;
+            if (*p == '\0') return false;
+        } else if (*p != '\0') {
+            return false;
+        }
+    }
+    return !out.empty();
+}
+
 RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *plan, NnUint nLayers) {
     RuntimeStageLayerPlan out;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages == 0u || nLayers == 0u) return out;
@@ -2413,6 +2436,31 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
         const NnUint end = std::min(st.endLayer, nLayers);
         for (NnUint l = begin; l < end; ++l) {
             out.setRole(st.stageIndex, l, RUNTIME_LAYER_PRIMARY);
+        }
+    }
+
+    {
+        std::vector<std::pair<NnUint, NnUint> > depths;
+        const char *spec = std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        if (parseBoundaryDepthSpec(spec, depths) && depths.size() + 1u == (size_t)plan->nStages) {
+            auto admitCopy = [&](NnUint stage, NnUint layer) {
+                if (layer < nLayers && out.getRole(stage, layer) == RUNTIME_LAYER_DISABLED) {
+                    out.setRole(stage, layer, RUNTIME_LAYER_REDUNDANT);
+                }
+            };
+            for (NnUint s = 0u; s + 1u < plan->nStages; ++s) {
+                const NnStageConfig &left = plan->stages[s];
+                const NnStageConfig &right = plan->stages[s + 1u];
+                const NnUint rightStart = std::min(right.startLayer, nLayers);
+                const NnUint leftEnd = std::min(left.endLayer, nLayers);
+                for (NnUint k = 0u; k < depths[s].first; ++k) {
+                    if (leftEnd + k < nLayers) admitCopy(left.stageIndex, leftEnd + k);
+                }
+                for (NnUint k = 0u; k < depths[s].second; ++k) {
+                    if (k < rightStart) admitCopy(right.stageIndex, rightStart - k - 1u);
+                }
+            }
+            return out;
         }
     }
 

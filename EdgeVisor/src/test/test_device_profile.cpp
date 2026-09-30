@@ -70,6 +70,55 @@ int main() {
     expect(parsePackedCounts("1@22*1@14", &packed) && failedPackedNode("Socket closed", packed) == 1u,
         "a closed worker socket shrinks the worker with the most layers");
 
+    std::vector<unsigned> primary;
+    std::vector<unsigned> memoryCap;
+    primary.push_back(22u);
+    primary.push_back(6u);
+    memoryCap.push_back(28u);
+    memoryCap.push_back(28u);
+    std::vector<BoundaryOverlap> overlaps = assignBoundaryOverlap(primary, memoryCap);
+    expect(overlaps.size() == 1u && overlaps[0].leftHolds == 5u && overlaps[0].rightHolds == 21u,
+        "spare memory fills both directions without emptying a stage");
+    expect(formatBoundaryOverlap(overlaps) == "5,21", "overlap is encoded left,right");
+
+    primary.clear();
+    memoryCap.clear();
+    primary.push_back(8u);
+    primary.push_back(8u);
+    memoryCap.push_back(8u);
+    memoryCap.push_back(20u);
+    overlaps = assignBoundaryOverlap(primary, memoryCap);
+    expect(overlaps.size() == 1u && overlaps[0].leftHolds == 0u && overlaps[0].rightHolds == 7u,
+        "a full small stage cannot receive copies, but its neighbor can");
+
+    primary.clear();
+    memoryCap.clear();
+    primary.push_back(10u);
+    primary.push_back(4u);
+    primary.push_back(10u);
+    memoryCap.push_back(14u);
+    memoryCap.push_back(6u);
+    memoryCap.push_back(14u);
+    overlaps = assignBoundaryOverlap(primary, memoryCap);
+    expect(overlaps.size() == 2u
+        && overlaps[0].leftHolds == 3u && overlaps[0].rightHolds == 1u
+        && overlaps[1].leftHolds == 1u && overlaps[1].rightHolds == 3u,
+        "a middle stage splits its spare across both boundaries");
+
+    ModelShape residentShape;
+    residentShape.dim = 5120u;
+    residentShape.hiddenDim = 17408u;
+    residentShape.nHeads = 40u;
+    residentShape.nKvHeads = 8u;
+    residentShape.maxSeqLen = 40960u;
+    residentShape.nLayers = 40u;
+    residentShape.weightType = 2;
+    const unsigned long long residentFree = 12ull << 30;
+    const unsigned syncCap = estimateLayerCap(residentFree, residentShape);
+    const unsigned residentCap = estimateResidentLayerCap(residentFree, residentShape);
+    expect(residentCap < syncCap && residentCap >= 1u,
+        "full F32 KV admits fewer resident layers than the sync-byte cap");
+
     if (g_failures != 0) {
         std::fprintf(stderr, "%d device profile checks failed\n", g_failures);
         return 1;

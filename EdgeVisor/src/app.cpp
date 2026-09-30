@@ -520,6 +520,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.primarySkipLayersLen = 0u;
     p.kvRedundancyLen = 0u;
     p.ioProfileLogLen = 0u;
+    p.boundaryDepthsLen = 0u;
 
     if (args->modelPath != nullptr) {
         p.flags |= LLM_BOOTSTRAP_HAS_MODEL_PATH;
@@ -541,6 +542,10 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
         p.flags |= LLM_BOOTSTRAP_HAS_IO_PROFILE_LOG;
         p.ioProfileLogLen = (NnUint)std::strlen(args->ioProfileLogPath) + 1u;
     }
+    if (args->boundaryDepthsStr != nullptr && args->boundaryDepthsStr[0] != '\0') {
+        p.flags |= LLM_BOOTSTRAP_HAS_BOUNDARY_DEPTHS;
+        p.boundaryDepthsLen = (NnUint)std::strlen(args->boundaryDepthsStr) + 1u;
+    }
     if (args->enableKvAggregate) {
         p.flags |= LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE;
     }
@@ -551,6 +556,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     if (p.primarySkipLayersLen > 0u) network->write(socketIndex, args->runtimePrimarySkipLayersStr, p.primarySkipLayersLen);
     if (p.kvRedundancyLen > 0u) network->write(socketIndex, args->kvRedundancyStr, p.kvRedundancyLen);
     if (p.ioProfileLogLen > 0u) network->write(socketIndex, args->ioProfileLogPath, p.ioProfileLogLen);
+    if (p.boundaryDepthsLen > 0u) network->write(socketIndex, args->boundaryDepthsStr, p.boundaryDepthsLen);
 }
 
 static LlmBootstrapPacket readBootstrapPacket(
@@ -559,7 +565,8 @@ static LlmBootstrapPacket readBootstrapPacket(
     std::string &ratiosStr,
     std::string &primarySkipLayersStr,
     std::string &kvRedundancyStr,
-    std::string &ioProfileLogPath) {
+    std::string &ioProfileLogPath,
+    std::string &boundaryDepthsStr) {
     LlmBootstrapPacket p;
     network->read(ROOT_SOCKET_INDEX, &p, sizeof(p));
     if (p.magic != LLM_BOOTSTRAP_MAGIC)
@@ -572,6 +579,7 @@ static LlmBootstrapPacket readBootstrapPacket(
     primarySkipLayersStr.clear();
     kvRedundancyStr.clear();
     ioProfileLogPath.clear();
+    boundaryDepthsStr.clear();
     if ((p.flags & LLM_BOOTSTRAP_HAS_MODEL_PATH) != 0u) {
         std::vector<char> buf(p.modelPathLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.modelPathLen);
@@ -596,6 +604,11 @@ static LlmBootstrapPacket readBootstrapPacket(
         std::vector<char> buf(p.ioProfileLogLen);
         network->read(ROOT_SOCKET_INDEX, buf.data(), p.ioProfileLogLen);
         ioProfileLogPath.assign(buf.data());
+    }
+    if ((p.flags & LLM_BOOTSTRAP_HAS_BOUNDARY_DEPTHS) != 0u) {
+        std::vector<char> buf(p.boundaryDepthsLen);
+        network->read(ROOT_SOCKET_INDEX, buf.data(), p.boundaryDepthsLen);
+        boundaryDepthsStr.assign(buf.data());
     }
     return p;
 }
@@ -716,6 +729,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         : nullptr;
     args.runtimeRedundantBoundaryLayers = 1u;
     args.runtimeRedundantBoundaryLayersExplicit = false;
+    args.boundaryDepthsStr = nullptr;
     args.runtimeActiveSegEnabled = true;
     args.runtimeRedundantSegEnabled = false;
     args.runtimePrimarySkipLayersStr = nullptr;
@@ -5473,7 +5487,10 @@ void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionP
 
     NnUint vocabSize = 0u;
     if (plan->vocabSplit.lengths != nullptr) {
-        for (NnUint node = 0u; node < plan->nNodes; ++node) vocabSize += plan->vocabSplit.lengths[node];
+        for (NnUint n = 0u; n < last.nNodes; ++n) {
+            const NnUint node = last.nodeIndices[n];
+            if (node < plan->nNodes) vocabSize += plan->vocabSplit.lengths[node];
+        }
     }
     if (vocabSize == 0u) return;
 
@@ -5961,6 +5978,98 @@ static ModelShape modelShapeFromHeader(const LlmHeader &header) {
     return shape;
 }
 
+static std::map<std::string, unsigned> g_memoryLayerCap;
+static std::string g_autoBoundaryDepths;
+
+static unsigned memoryLayerCap(const char *host, int port, const ModelShape &shape) {
+    const std::string key = host == nullptr ? std::string("local") : std::string(host);
+    const std::map<std::string, unsigned>::const_iterator found = g_memoryLayerCap.find(key);
+    if (found != g_memoryLayerCap.end()) return found->second;
+    if (host == nullptr) {
+        const unsigned cap = estimateResidentLayerCap(profileDeviceFreeBytes(), shape);
+        if (cap > 0u) g_memoryLayerCap[key] = cap;
+        return cap;
+    }
+    double ms = 0.0;
+    unsigned cap = 0u;
+    unsigned long long freeBytes = 0ull;
+    char name[16];
+    std::memset(name, 0, sizeof(name));
+    if (!queryWorkerSpeedProfile(host, port, shape.dim, shape.hiddenDim, shape.nHeads, shape.nKvHeads,
+            shape.maxSeqLen, shape.nLayers, shape.weightType, &ms, &cap, name, sizeof(name), &freeBytes) || cap == 0u) {
+        return 0u;
+    }
+    const unsigned resident = freeBytes > 0ull ? estimateResidentLayerCap(freeBytes, shape) : cap;
+    if (resident > 0u) g_memoryLayerCap[key] = resident;
+    return resident;
+}
+
+static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionPlan *plan, const LlmHeader &header) {
+    g_autoBoundaryDepths.clear();
+    if (args != nullptr) args->boundaryDepthsStr = nullptr;
+    if (args == nullptr || plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return;
+    if (!args->enablePpMigration && !bubbleShadowKvEnabled()) return;
+    if (args->runtimeRedundantBoundaryLayersExplicit) {
+        unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        return;
+    }
+    const char *pinned = std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+    if (pinned != nullptr && pinned[0] != '\0') {
+        g_autoBoundaryDepths = pinned;
+        args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
+        return;
+    }
+
+    const ModelShape shape = modelShapeFromHeader(header);
+    std::vector<unsigned> primary(plan->nStages, 0u);
+    std::vector<unsigned> caps(plan->nStages, 0u);
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        primary[s] = plan->stages[s].nLayers;
+        unsigned cap = 0xffffffffu;
+        bool any = false;
+        const NnUint nStageNodes = plan->stages[s].nNodes;
+        for (NnUint n = 0u; n < nStageNodes; ++n) {
+            const NnUint node = plan->stages[s].nodeIndices[n];
+            const char *host = nullptr;
+            int port = 0;
+            if (node > 0u && args->workerHosts != nullptr && (node - 1u) < args->nWorkers) {
+                host = args->workerHosts[node - 1u];
+                port = (int)args->workerPorts[node - 1u];
+            }
+            const unsigned nodeCap = memoryLayerCap(host, port, shape);
+            if (!any || nodeCap < cap) cap = nodeCap;
+            any = true;
+        }
+        caps[s] = any ? cap : 0u;
+    }
+
+    const std::vector<BoundaryOverlap> overlaps = assignBoundaryOverlap(primary, caps);
+    g_autoBoundaryDepths = formatBoundaryOverlap(overlaps);
+    if (g_autoBoundaryDepths.empty()) {
+        unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        return;
+    }
+    setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", g_autoBoundaryDepths.c_str(), 1);
+    args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
+    std::printf("redundancy:");
+    for (size_t i = 0u; i < overlaps.size(); ++i) {
+        std::printf(" %u->%u %u,%u", (unsigned)i, (unsigned)(i + 1u),
+            overlaps[i].leftHolds, overlaps[i].rightHolds);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+    if (std::getenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE") == nullptr) {
+        unsigned step = 1u;
+        for (size_t i = 0u; i < overlaps.size(); ++i) {
+            if (overlaps[i].leftHolds > step) step = overlaps[i].leftHolds;
+            if (overlaps[i].rightHolds > step) step = overlaps[i].rightHolds;
+        }
+        if (step > 64u) step = 64u;
+        const std::string stepText = std::to_string(step);
+        setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", stepText.c_str(), 1);
+    }
+}
+
 static SpeedDeviceProfile profileForHost(const char *host, int port, bool live, const ModelShape *shape) {
     SpeedDeviceProfile profile = unknownSpeedProfile();
     const std::string key = host == nullptr ? std::string("local") : std::string(host);
@@ -5968,11 +6077,13 @@ static SpeedDeviceProfile profileForHost(const char *host, int port, bool live, 
         if (shape != nullptr && live) {
             double ms = 0.0;
             unsigned cap = 0;
+            unsigned long long freeBytes = 0ull;
             char name[16];
             std::memset(name, 0, sizeof(name));
             if (queryWorkerSpeedProfile(host, port, shape->dim, shape->hiddenDim, shape->nHeads, shape->nKvHeads,
-                    shape->maxSeqLen, shape->nLayers, shape->weightType, &ms, &cap, name, sizeof(name))
+                    shape->maxSeqLen, shape->nLayers, shape->weightType, &ms, &cap, name, sizeof(name), &freeBytes)
                     && cap > 0u) {
+                g_memoryLayerCap[key] = freeBytes > 0ull ? estimateResidentLayerCap(freeBytes, *shape) : cap;
                 profile.cap = std::min(profile.cap, cap);
             }
             cacheSpeedProfile(key, profile);
@@ -5986,12 +6097,15 @@ static SpeedDeviceProfile profileForHost(const char *host, int port, bool live, 
     if (!live || shape == nullptr || host == nullptr) return unknownSpeedProfile();
     double ms = 0.0;
     unsigned cap = 0;
+    unsigned long long freeBytes = 0ull;
     char name[16];
     std::memset(name, 0, sizeof(name));
     if (!queryWorkerSpeedProfile(host, port, shape->dim, shape->hiddenDim, shape->nHeads, shape->nKvHeads,
-            shape->maxSeqLen, shape->nLayers, shape->weightType, &ms, &cap, name, sizeof(name))) {
+            shape->maxSeqLen, shape->nLayers, shape->weightType, &ms, &cap, name, sizeof(name), &freeBytes)) {
         profile = unknownSpeedProfile();
     } else {
+        const unsigned resident = freeBytes > 0ull ? estimateResidentLayerCap(freeBytes, *shape) : cap;
+        if (resident > 0u) g_memoryLayerCap[key] = resident;
         profile = makeSpeedProfile(ms, cap, name[0] == '\0' ? "measured" : name);
     }
     cacheSpeedProfile(key, profile);
@@ -6004,7 +6118,9 @@ static SpeedDeviceProfile profileForLocal(const ModelShape *shape) {
     SpeedDeviceProfile profile = unknownSpeedProfile();
     if (localKnownSpeedProfile(&profile)) {
         if (shape != nullptr) {
-            profile.cap = clampLayerCap(profile.cap, profileDeviceFreeBytes(), *shape);
+            const unsigned long long freeBytes = profileDeviceFreeBytes();
+            g_memoryLayerCap[std::string("local")] = estimateResidentLayerCap(freeBytes, *shape);
+            profile.cap = clampLayerCap(profile.cap, freeBytes, *shape);
             cacheSpeedProfile("local", profile);
         } else {
             SpeedDeviceProfile cached;
@@ -6031,6 +6147,16 @@ static std::string speedPackRatios(const AppCliArgs *args, NnUint nLayers, const
     for (NnUint i = 0; i < args->nWorkers; ++i) {
         const bool live = liveNodes == nullptr || (i + 1u) >= liveNodes->size() || (*liveNodes)[i + 1u] != 0;
         profiles[i + 1u] = profileForHost(args->workerHosts[i], (int)args->workerPorts[i], live, shape);
+    }
+    if (args->enableStageFullWeights) {
+        auto tighten = [&](unsigned index, const std::string &key) {
+            const std::map<std::string, unsigned>::const_iterator found = g_memoryLayerCap.find(key);
+            if (found != g_memoryLayerCap.end() && found->second > 0u && found->second < profiles[index].cap)
+                profiles[index].cap = found->second;
+        };
+        tighten(0u, std::string("local"));
+        for (NnUint i = 0; i < args->nWorkers; ++i)
+            tighten(i + 1u, std::string(args->workerHosts[i]));
     }
     std::ostringstream classes;
     for (NnUint i = 0; i < nNodes; ++i) {
@@ -6373,6 +6499,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
             createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim, kvRedundancyPerNode)
         ));
         reserveOfflineSlice(planPtr.get());
+        installAutoBoundaryDepths(args, planPtr.get(), header);
         
         // 使用 Uneven Builder (传入 planPtr)
         net = buildLlmNetUneven(&header, nNodes, args->nBatches, planPtr.get(), args->maxActiveSeqs);
@@ -6794,7 +6921,8 @@ void runWorkerApp(AppCliArgs *args) {
         std::string bootPrimarySkipLayers;
         std::string bootKvRedundancy;
         std::string bootIoProfileLogPath;
-        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers, bootKvRedundancy, bootIoProfileLogPath);
+        std::string bootBoundaryDepths;
+        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers, bootKvRedundancy, bootIoProfileLogPath, bootBoundaryDepths);
         if (!bootIoProfileLogPath.empty()) {
             setenv("DLLAMA_IO_PROFILE_LOG", bootIoProfileLogPath.c_str(), 1);
             dllamaIoProbeConfigure(bootIoProfileLogPath.c_str());
@@ -6859,6 +6987,11 @@ void runWorkerApp(AppCliArgs *args) {
             bootRuntimeActiveSegEnabled,
             bootRuntimeRedundantSegEnabled && !bubbleShadowKvEnabled(),
             bootPrimarySkipLayers.c_str());
+        if (!bootBoundaryDepths.empty()) {
+            setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", bootBoundaryDepths.c_str(), 1);
+        } else {
+            unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        }
 
         NnWorkerConfigReader configReader(network);
         NnNetConfig netConfig = configReader.readNet();
@@ -6960,7 +7093,10 @@ void runWorkerApp(AppCliArgs *args) {
             const NnStageConfig &last = planPtr->stages[planPtr->nStages - 1u];
             if (last.rootNodeIndex == nodeConfig.nodeIndex && planPtr->vocabSplit.lengths != nullptr) {
                 samplerVocabSize = 0u;
-                for (NnUint node = 0u; node < planPtr->nNodes; ++node) samplerVocabSize += planPtr->vocabSplit.lengths[node];
+                for (NnUint n = 0u; n < last.nNodes; ++n) {
+                    const NnUint node = last.nodeIndices[n];
+                    if (node < planPtr->nNodes) samplerVocabSize += planPtr->vocabSplit.lengths[node];
+                }
             } else {
                 samplerVocabSize = 0u;
             }

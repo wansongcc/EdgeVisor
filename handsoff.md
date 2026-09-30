@@ -16,21 +16,25 @@
 - 提交并推送到当前开发分支。远程若不能快进，先把这份提交接到远程分支之上再推，不要强推。
 
 ## 当前交接
+2026-09-30 17:48 CST。自动冗余分层已经写进 `refactor/productize` 并推送。五机 14B 的错 token 修完，重新跑通一句完整句子。nx1、nx2、nano1、nano2、笔记本上都没有 `dllama`。`18091` 没有在听。没有容器。
 
-2026-09-30 凌晨。阶段 2 按用户要求标成完成。源码提交 `797658e` 已推到 `refactor/productize`。nx1 `10.47.145.51` 和 nx2 `10.47.235.49` 上没有 `dllama`，没有 `gpu_hog`，没有 `mem_hold`。`18091` 没有在听。
-
-阶段 2 是这四件：层数上限取实验室表和空闲显存估计的较小值；陌生地址在数据面计时一层的七个投影；`--auto` 打开动态迁移，冷启动切分不变；启动时显存或断连装不下就逐层退让，最多 12 次。用户传了 `--ratios` 就不退让。
+现在在做的事：阶段 2 收尾里的自动冗余。主切分先定，每条边界左右两边各自用剩余显存放副本。一次运行里不再加副本。调度步长跟已放好的深度走。显式 `--runtime-redundant-boundary-layers` 仍是旧的统一跨度。
 
 已经定下来的结果：
 
-- 数据面陌生地址探测做过。nx2 `192.168.137.15` 是 `cuda 1.28 ms/layer cap=28`，切分 `1@27*1@1`。
-- 真实设备变慢会自动迁移，并且有正向收益。nx2 `/tmp/gpu_hog 4096` 在生成开始前就在跑，不是卡在第 12 条 token 之后才注入。一步 1 层：stage 1 到 0，layer 22，263.35 ms 到 240.69 ms。步长 2：layers 22 和 23，251.90 ms 到 200.16 ms，预测 53.49 ms，验证通过，层留下。再提议 layer 24 被拒绝，静态图没有这一层的冗余副本。一步 1 层日志 `/tmp/edgevisor_p2_auto.log`、`/tmp/edgevisor_p2_tpot.log`。步长 2 日志 `/tmp/edgevisor_p2_auto_fix4.log`、`/tmp/edgevisor_p2_tpot_fix4.log`。
-- 往后面的 stage 交层时，root 等 KV ack 不再丢掉采样帧，采样帧、profile 帧和 stage-bypass ack 进缓存。原来停在 `[kv-collector] layer=21 pos=21` 的 `route=0->1 layers=[20,21]` 能交完并继续出 token。人为 root 延迟那次变慢并回滚，那不是真实设备变慢。
-- 层数上限用 14B、不写 `--ratios`，打出切分就停，没有装权重。空闲约 12.6 GB 时是 `1@22*1@18`，表里的 22 生效。nx1 `/tmp/mem_hold` 占住 5 GiB 后，`cudaMemGetInfo` 剩 8573284352 字节，切分变成 `1@20*1@20`。14B 一层约 262 MB，70% 剩余显存只够 20 层。磁盘上留下的是第二次：`/tmp/edgevisor_cap_root.log`、`/tmp/mem_hold.log`。worker 是 `192.168.137.15:18091`。
-- 逐层退让不写 `--ratios`。`prlimit --as` 限制 root 地址空间，`cudaMemGetInfo` 仍看到满显存，所以第一次切分还是 0.6B 的 `1@22*1@6`。6 GiB、`--steps 16`：root 每次减 1 层。`1@14*1@14` 装上权重后前向仍 `out of memory`，再退到 `1@13*1@15`，生成结束，`tokens/s: 10.32 (96.90 ms/tok)`。日志 `/tmp/edgevisor_retreat_root.log`。同一晚 3 GiB 连退 12 次，停在 `1@10*1@18` 仍是 `cudaMalloc ... out of memory`，没有第 13 次；那次日志被这次盖掉了。
+- 副本按常驻层计价：`--auto` 的 KV 是 F32，不是同步字节。70% 空闲、留一层。上下文用 `--max-seq-len`，否则用模型文件的 seqLen。
+- 0.6B 两机（nx1+nx2，不写 `--ratios`）打出 `redundancy: 0->1 5,21`，短生成是连贯的思考。步长跟着深度，没有波动也会在开头窗口挪层。
+- 14B 五机原生上下文，顺序 nx1、nx2 `192.168.137.15`、笔记本 `192.168.137.31`、nano2 `192.168.137.16`、nano1 `192.168.137.18`，端口 `18091`。切分大约 `1@16*1@14*1@1*1@6*1@3`，冗余 `0->1 0,0  1->2 0,3  2->3 3,0  3->4 0,2`。两台 NX 的主层已经吃满常驻预算，所以 NX 之间是 `0,0`。
+- 修过的三件事：满权重切分收到常驻层上限；对端 socket 没了就抛 `Socket offline`，还没出字就走启动退让，出过字仍走会话重开；末级采样只加本 stage 自己的词表切分。之前把五个 stage 的词表加在一起，steps 48 解出 `token=456182 vocab=151669`。
+- 修好后再跑：`--steps 48`，提示 `What is the capital of France?`，退出码 0。正文是思考过程，说到法国首都是 Paris。`tokens/s: 2.98 (335.39 ms/tok)`。日志 `/tmp/edgevisor_14bfix4_root.log`（nx1）。有一行 `reject pp command route=4->3 reason=target stage lacks provisioned layer 37`，那是步长想搬没有副本的层，句子没有坏。更早的失败日志还在：`/tmp/edgevisor_14bfix_root.log`、`/tmp/edgevisor_14bfix2_root.log`、`/tmp/edgevisor_14bfix3_root.log`。
+- Vulkan 报的是设备本地堆总量，不是空闲。笔记本上的副本可能偏乐观。这次没有单独改。
 
-源码提交 `797658e89790b7ecdf6452daea6476171b51d6a1`，作者 Yanhui。说明是 Complete phase 2 layer caps, startup retreat, and automatic migration. 13 个文件，新文件是 `/home/jetson/cc/edgevisor_fresh/EdgeVisor/src/nn/vulkan/profile_gemv.comp`。推送 `c986cf7..797658e` 到 `origin/refactor/productize`（`git@github.com:wansongcc/EdgeVisor.git`）。nx1 的 `/home/jetson/cc/edgevisor_fresh/EdgeVisor/dllama` 是 2026-09-29 23:17 编的这份源码。nx2 的同名二进制仍是 2026-09-28 17:51，没有重编。
+源码提交 `261a14ec9372228a50ded9904dfeb1876fc44efc`，作者 Yanhui。说明是 Keep automatic overlap inside real KV memory and stop a dead peer from inventing tokens. 9 个文件：`EdgeVisor/src/app.cpp`、`app.hpp`、`device_profile.hpp`、`dllama.cpp`、`llm.cpp`、`nn/nn-network.cpp`、`nn/nn-network.hpp`、`test/test_device_profile.cpp`、`tokenizer.cpp`。推送 `5553911..261a14e` 到 `origin/refactor/productize`（`git@github.com:wansongcc/EdgeVisor.git`）。
 
-不要合到 main。不要做名单外的中途加入。nano1、nano2 这次没有同步。不要提交 `._*`。
+五台二进制都是 2026-09-30 17:43–17:45 编的这份源码。只有 nx1 `/home/jetson/cc/edgevisor_fresh` 的 git 在 `261a14e`。nx2、nano1、nano2、笔记本 `/home/cc/edgevisor_fresh` 的 git HEAD 仍是更早的提交（笔记本是 `45deaab`），源码是从 nx1 拷过去的，不是 git pull。笔记本只链 Vulkan。
 
-下一步：用户说「继续」之前不要开新实验。阶段 2 已经完成，没有写明的下一阶段。
+模型：14B 在 Jetson 是 `/home/jetson/cc/models/qwen3_14b_q40/`，笔记本是 `/home/cc/models/qwen3_14b_q40/`。worker 用 `setsid ./dllama worker --port 18091 --model <绝对路径>`。
+
+不要合到 main。不要开阶段 3。不要做名单外的中途加入。不要提交 `._*`。README 仍是旧的，这次没改。
+
+下一步：用户说「继续」之前不要开新实验。没有还在跑的进程。

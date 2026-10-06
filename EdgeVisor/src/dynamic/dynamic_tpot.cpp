@@ -5,6 +5,7 @@
 #include "dynamic/tpot_log.hpp"
 #include "json.hpp"
 #include "plan-command.hpp"
+#include "terminal_ui.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1116,6 +1117,20 @@ void DynamicTpotController::run() {
                                 std::chrono::steady_clock::now() - rt.metrics.startTime).count();
                         }
                         note = "verify_ok";
+                        if (rt.pending.candidate.kind == tpot::CandidateKind::PP_MOVE) {
+                            const double deltaMs = window.tpotMs - rt.pending.beforeTpotMs;
+                            char uiEvent[160];
+                            const uint32_t layer0 = rt.pending.candidate.layerIndex;
+                            const uint32_t layerN = rt.pending.candidate.layerCount > 0u
+                                ? layer0 + rt.pending.candidate.layerCount - 1u : layer0;
+                            std::snprintf(uiEvent, sizeof(uiEvent), "route %u->%u  layers %u-%u  %+.1f ms",
+                                rt.pending.candidate.fromStageIndex,
+                                rt.pending.candidate.toStageIndex,
+                                layer0, layerN, deltaMs);
+                            edgeVisorUiSetEvent(uiEvent);
+                            if (deltaMs < 0.0) edgeVisorUiMarkDegraded(rt.pending.candidate.fromStageIndex, false);
+                            edgeVisorUiEndMove();
+                        }
                     }
                     rt.pending.active = false;
                     rt.state = ControllerState::OBSERVE;
@@ -1157,6 +1172,15 @@ void DynamicTpotController::run() {
                     rt.state = ControllerState::VERIFY;
                     rt.stableWindows = 0u;
                     note = "migration_issued";
+                    if (best.kind == tpot::CandidateKind::PP_MOVE) {
+                        char uiEvent[160];
+                        const uint32_t layer0 = best.layerIndex;
+                        const uint32_t layerN = best.layerCount > 0u ? layer0 + best.layerCount - 1u : layer0;
+                        std::snprintf(uiEvent, sizeof(uiEvent), "stage %u degraded, moving layers %u-%u",
+                            best.fromStageIndex, layer0, layerN);
+                        edgeVisorUiMarkDegraded(best.fromStageIndex, true);
+                        edgeVisorUiBeginMove(best.fromStageIndex, best.toStageIndex, uiEvent);
+                    }
                 } else {
                     static std::string issueFail;
                     issueFail = std::string("migration_issue_failed:") + resp.value("reason", resp.value("error", std::string("unknown")));

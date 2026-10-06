@@ -217,7 +217,7 @@ inline bool relaxPackedRatios(
     unsigned best = 0xffffffffu;
     unsigned bestCount = 0xffffffffu;
     for (unsigned i = 0; i < counts.size(); ++i) {
-        if (i == failedNode) continue;
+        if (i == failedNode || counts[i] == 0u) continue;
         const unsigned room = caps[i] == 0xffffffffu
             ? 0xffffffffu
             : (caps[i] > counts[i] ? caps[i] - counts[i] : 0u);
@@ -246,6 +246,14 @@ inline bool startupAllocFailure(const char *message) {
 }
 
 inline unsigned failedPackedNode(const char *message, const std::vector<unsigned> &counts) {
+    if (message != nullptr) {
+        const char *peer = std::strstr(message, "peer=");
+        if (peer != nullptr) {
+            char *stop = nullptr;
+            const unsigned long named = std::strtoul(peer + 5, &stop, 10);
+            if (stop != peer + 5 && named < counts.size()) return (unsigned)named;
+        }
+    }
     const bool local = message != nullptr && (
         std::strstr(message, "out of memory") != nullptr
         || std::strstr(message, "cudaMalloc") != nullptr

@@ -69,6 +69,14 @@ int main() {
     std::vector<unsigned> packed;
     expect(parsePackedCounts("1@22*1@14", &packed) && failedPackedNode("Socket closed", packed) == 1u,
         "a closed worker socket shrinks the worker with the most layers");
+    std::vector<unsigned> five;
+    expect(parsePackedCounts("1@18*1@14*1@3*1@5*1@0", &five)
+        && failedPackedNode("Socket offline peer=1", five) == 1u,
+        "a named offline peer is the slice that shrinks");
+    std::vector<unsigned> reservedCeilings;
+    expect(relaxPackedRatios("1@18*1@14*1@3*1@5*1@0", 1u, &reservedCeilings, &relaxed)
+        && relaxed == "1@18*1@13*1@4*1@5*1@0",
+        "a reserved empty slot does not receive the freed layer");
 
     std::vector<unsigned> primary;
     std::vector<unsigned> memoryCap;

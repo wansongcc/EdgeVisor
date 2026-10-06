@@ -136,8 +136,8 @@ static NnSize loadRootTokenEmbeddingQ80Chunk(
 static bool lastStageSamplingPlanSupportedLlm(const NnUnevenPartitionPlan *plan) {
     if (!envFlagEnabledDefaultLlm("DLLAMA_LAST_STAGE_SAMPLING", false)) return false;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
-    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-    return last.nNodes > 0u && last.rootNodeIndex < plan->nNodes;
+    const NnStageConfig *last = pipelineTailStage(plan);
+    return last != nullptr && last->nNodes > 0u && last->rootNodeIndex < plan->nNodes;
 }
 
 static bool graphBuildDumpEnabled() {

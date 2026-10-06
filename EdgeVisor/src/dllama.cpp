@@ -10,6 +10,7 @@
 #include "app.hpp"
 #include "product_log.hpp"
 #include "token_timing.hpp"
+#include "terminal_ui.hpp"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -679,8 +680,8 @@ static void inferenceRunContinuousBatching(AppInferenceContext *context, const c
     const NnUnevenPartitionPlan *plan = context->inference->getPartitionPlan();
     bool planSupportsRemoteSampling = false;
     if (plan != nullptr && plan->nStages > 1u) {
-        const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-        planSupportsRemoteSampling = last.rootNodeIndex != 0u;
+        const NnStageConfig *last = pipelineTailStage(plan);
+        planSupportsRemoteSampling = last != nullptr && last->rootNodeIndex != 0u;
     }
     const bool useRemoteSampling = context->args->lastStageSampling && context->network != nullptr && planSupportsRemoteSampling;
     NnUint ppInflight = context->args->ppInflight != 0u ? context->args->ppInflight : nNodes;
@@ -851,7 +852,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         if (generatedText.empty()) {
             std::printf("startup peer=%u offline, retreat\n", (unsigned)peer);
             std::fflush(stdout);
-            throw std::runtime_error("Socket offline");
+            throw std::runtime_error(std::string("Socket offline peer=") + std::to_string((unsigned)peer));
         }
         std::printf("🔁 [failover] session-restart peer=%u\n", (unsigned)peer);
         std::fflush(stdout);
@@ -1123,6 +1124,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     const NnUint maxPos = std::min(context->header->seqLen, steps);
     // Root-side wall-clock prediction time includes the full prediction loop:
     // forward(), worker/profile waits, sampling/decoding, and token output/flush.
+    if (context->args->showTerminalUi) edgeVisorUiOpen();
     const auto predWallStart = std::chrono::steady_clock::now();
     for (; pos < maxPos; pos++) {
         const auto tokenWallStart = std::chrono::steady_clock::now();
@@ -1588,6 +1590,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     } else {
         printf("\n");
     }
+    edgeVisorUiClose();
 
     if (context->args->benchmark && !perfAgg.empty()) {
         printf("\n");

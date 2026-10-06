@@ -83,6 +83,7 @@ public:
     bool enablePpMigration; // Enable PP layer migration control path
     bool enableDynamicTpot; // Enable root-side online TPOT scheduler
     bool autoRuntime; // --auto: turn on dynamic TPOT and PP migration for this run
+    bool showTerminalUi;
     char *dynamicTpotProfile;
     char *tpotWindowTokensStr;
     char *tpotMinSamplesStr;

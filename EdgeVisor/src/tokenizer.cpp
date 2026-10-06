@@ -350,7 +350,8 @@ void Tokenizer::encode(char *text, int *tokens, int *nTokens, bool isStart, bool
         }
     }
 
-    assert(strLen == 0);
+    // A restarted prompt can end on a broken UTF-8 byte. Drop it and keep encoding.
+    strLen = 0;
 
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
     while (1) {

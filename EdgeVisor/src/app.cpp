@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "terminal_ui.hpp"
 #include "device_profile.hpp"
 #include "failover_gate.hpp"
 #include "product_log.hpp"
@@ -263,8 +264,8 @@ static bool lastStageSamplingEnabled() {
 static bool lastStageSamplingPlanSupported(const NnUnevenPartitionPlan *plan) {
     if (!lastStageSamplingEnabled()) return false;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
-    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
-    return last.nNodes > 0u && last.rootNodeIndex < plan->nNodes;
+    const NnStageConfig *last = pipelineTailStage(plan);
+    return last != nullptr && last->nNodes > 0u && last->rootNodeIndex < plan->nNodes;
 }
 
 static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name) {
@@ -713,6 +714,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.enablePpMigration = false;
     args.enableDynamicTpot = envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false);
     args.autoRuntime = false;
+    args.showTerminalUi = false;
     args.dynamicTpotProfile = nullptr;
     args.tpotWindowTokensStr = nullptr;
     args.tpotMinSamplesStr = nullptr;
@@ -892,6 +894,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         if (std::strcmp(name, "--auto") == 0) {
             args.autoRuntime = true;
             args.enableDynamicTpot = true;
+            i += 1;
+            continue;
+        }
+
+        if (std::strcmp(name, "--ui") == 0) {
+            args.showTerminalUi = true;
             i += 1;
             continue;
         }
@@ -2879,7 +2887,9 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
 
 bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *logit) {
     if (!lastStageSamplingPlanSupported(plan) || network == nullptr) return false;
-    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
+    const NnStageConfig *lastStage = pipelineTailStage(plan);
+    if (lastStage == nullptr) return false;
+    const NnStageConfig &last = *lastStage;
     const NnUint sourceNode = last.rootNodeIndex;
     if (sourceNode == 0u || sourceNode >= plan->nNodes) return false;
     const int socketIndex = network->getSocketIndexForNode(sourceNode, 0u);
@@ -4214,7 +4224,6 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex) {
         LlmWorkerFrameHeader frame{};
         std::vector<char> payload;
         if (!readWorkerFrame(network, socketIndex, frame, payload, 1)) return;
-        std::printf("🔁 [worker-frame] socket=%u kind=%u bytes=%u\n", (unsigned)socketIndex, (unsigned)frame.kind, (unsigned)frame.payloadBytes);
         if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
             consumeStageBypassAckFrame(socketIndex, payload);
         } else if (frame.kind == LLM_WORKER_FRAME_PROFILE && payload.size() == sizeof(LlmPerfPacket)) {
@@ -5115,6 +5124,16 @@ void RootLlmInference::forward(bool collectProfile) {
                     (unsigned)nextStageRootNode,
                     layersOss.str().c_str());
                 std::fflush(stdout);
+                if (!migrationLayers.empty() && fromStage != nullptr && toStage != nullptr) {
+                    char uiEvent[160];
+                    std::snprintf(uiEvent, sizeof(uiEvent), "route %u->%u  layers %u-%u",
+                        (unsigned)fromStage->stageIndex,
+                        (unsigned)toStage->stageIndex,
+                        (unsigned)migrationLayers.front(),
+                        (unsigned)migrationLayers.back());
+                    edgeVisorUiShiftLayers(fromStage->stageIndex, toStage->stageIndex,
+                        migrationLayers.front(), migrationLayers.back() + 1u, uiEvent);
+                }
             } else {
                 migrationLayers.clear();
                 std::printf("⚠️  [kv-migrate] reject pp command route=%u->%u reason=%s\n",
@@ -5482,7 +5501,9 @@ void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionP
     if (!lastStageSamplingPlanSupported(plan)) return;
     if (network == nullptr || execution == nullptr || logitsPipe == nullptr || lastStageSampler == nullptr) return;
     if (controlPacket.batchSize != 1u) return;
-    const NnStageConfig &last = plan->stages[plan->nStages - 1u];
+    const NnStageConfig *lastStage = pipelineTailStage(plan);
+    if (lastStage == nullptr) return;
+    const NnStageConfig &last = *lastStage;
     if (last.rootNodeIndex != localNodeIndex) return;
 
     NnUint vocabSize = 0u;
@@ -5872,6 +5893,11 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
         std::fflush(stdout);
         return true;
     }
+    if (myNodeIndex == 0u) {
+        char uiEvent[96];
+        std::snprintf(uiEvent, sizeof(uiEvent), "node %u offline", (unsigned)deadNodeIndex);
+        edgeVisorUiMarkOffline(stageIndex, uiEvent);
+    }
     const NnUint prev = getPpPrevStageIndex(plan, stageIndex);
     const NnUint next = getPpNextStageIndex(plan, stageIndex);
     if (prev == (NnUint)-1 && next == (NnUint)-1) {
@@ -5897,7 +5923,12 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     const NnStageConfig &dead = plan->stages[stageIndex];
     // Only the previous stage's shadow KV is the dead layer's real input.
     // The next stage's left-boundary cache is the dead stage's output.
-    if (!ppStageCoversLayers(roles, prev, dead.startLayer, dead.endLayer)) {
+    // A joined device borrows a slice the previous stage still has weights for.
+    // Hand that slice back and keep decoding.
+    const bool donorStillHolds =
+        plan->stages[prev].startLayer <= dead.startLayer &&
+        plan->stages[prev].endLayer >= dead.endLayer;
+    if (!donorStillHolds && !ppStageCoversLayers(roles, prev, dead.startLayer, dead.endLayer)) {
         std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u layers=[%u,%u) reason=partial-cover\n",
             (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)dead.startLayer, (unsigned)dead.endLayer);
         std::fflush(stdout);
@@ -5905,11 +5936,15 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     }
     const NnUint target = prev;
     const NnUint ownerNode = plan->stages[target].rootNodeIndex;
+    if (donorStillHolds && myNodeIndex == ownerNode && g_failoverExecutor != nullptr) {
+        for (NnUint layer = dead.startLayer; layer < dead.endLayer; ++layer)
+            g_failoverExecutor->setPrimaryLayerEnabled(layer, true);
+    }
     // The previous stage is the only one that can see whether shadow KV was
     // written. If it was not, refuse before the plan changes so decode
     // restarts instead of continuing on an empty cache. Other stages still
     // update their own routing once the owner has accepted.
-    if (myNodeIndex == ownerNode) {
+    if (!donorStillHolds && myNodeIndex == ownerNode) {
         const NnUint pos = g_failoverExecutor == nullptr ? 0u : g_failoverExecutor->executionPosition();
         if (g_failoverExecutor == nullptr ||
             !g_failoverExecutor->shadowCovers(dead.startLayer, dead.endLayer, pos)) {
@@ -5931,13 +5966,18 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
         std::fflush(stdout);
         return false;
     }
-    if (myNodeIndex == ownerNode)
+    if (!donorStillHolds && myNodeIndex == ownerNode)
         enableArmedTakeoverLayers(replayActivation);
     std::printf("⚡ [failover] fast-path deadNode=%u ejectedStage=%u targetStage=%u layers=[%u,%u) myNode=%u replay=%d\n",
         (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)target,
         (unsigned)dead.startLayer, (unsigned)dead.endLayer, (unsigned)myNodeIndex,
         replayActivation ? 1 : 0);
     std::fflush(stdout);
+    if (myNodeIndex == 0u) {
+        char uiEvent[96];
+        std::snprintf(uiEvent, sizeof(uiEvent), "node %u offline", (unsigned)deadNodeIndex);
+        edgeVisorUiMarkOffline(stageIndex, uiEvent);
+    }
     return true;
 }
 
@@ -6215,8 +6255,7 @@ static void reserveOfflineSlice(NnUnevenPartitionPlan *plan) {
     if (donor == 0xFFFFFFFFu) return;
     const NnStageConfig &src = plan->stages[donor];
     const NnUint room = src.nLayers;
-    NnUint take = room / 2u;
-    if (take < 1u) take = 1u;
+    NnUint take = 1u;
     if (take >= room) take = room - 1u;
     const NnUint begin = src.endLayer - take;
     const NnUint end = src.endLayer;
@@ -6378,7 +6417,108 @@ void printAvailableDevices() {
     std::fflush(stdout);
 }
 
+
+static std::string terminalNodeName(const AppCliArgs *args, NnUint node) {
+    if (node == 0u) return "root";
+    if (args == nullptr || args->workerHosts == nullptr || node - 1u >= args->nWorkers) return "node";
+    const char *host = args->workerHosts[node - 1u];
+    if (host == nullptr) return "node";
+    if (std::strcmp(host, "192.168.137.13") == 0) return "nx1";
+    if (std::strcmp(host, "192.168.137.15") == 0) return "nx2";
+    if (std::strcmp(host, "192.168.137.16") == 0) return "nano2";
+    if (std::strcmp(host, "192.168.137.18") == 0) return "nano1";
+    if (std::strcmp(host, "192.168.137.31") == 0) return "laptop";
+    return host;
+}
+
+
+static std::string layerSpanText(unsigned begin, unsigned end) {
+    if (end <= begin) return "";
+    std::ostringstream oss;
+    oss << "L" << begin << "-" << (end - 1u);
+    return oss.str();
+}
+
+static void appendShadow(std::string *dst, const std::string &span) {
+    if (dst == nullptr || span.empty()) return;
+    if (!dst->empty()) *dst += " ";
+    *dst += span;
+}
+
+static void fillTerminalShadow(std::vector<EdgeVisorUiStage> *stages) {
+    if (stages == nullptr || stages->size() < 2u || g_autoBoundaryDepths.empty()) return;
+    const std::string &text = g_autoBoundaryDepths;
+    size_t cursor = 0u;
+    unsigned boundary = 0u;
+    while (cursor < text.size() && boundary + 1u < stages->size()) {
+        unsigned left = 0u;
+        unsigned right = 0u;
+        int consumed = 0;
+        if (std::sscanf(text.c_str() + cursor, "%u,%u%n", &left, &right, &consumed) != 2 || consumed <= 0) break;
+        EdgeVisorUiStage &leftStage = (*stages)[boundary];
+        EdgeVisorUiStage &rightStage = (*stages)[boundary + 1u];
+        if (left > 0u && rightStage.layerEnd > rightStage.layerBegin) {
+            unsigned end = rightStage.layerBegin + left;
+            if (end > rightStage.layerEnd) end = rightStage.layerEnd;
+            appendShadow(&leftStage.shadow, layerSpanText(rightStage.layerBegin, end));
+        }
+        if (right > 0u && leftStage.layerEnd > leftStage.layerBegin) {
+            unsigned begin = leftStage.layerEnd > right ? leftStage.layerEnd - right : leftStage.layerBegin;
+            appendShadow(&rightStage.shadow, layerSpanText(begin, leftStage.layerEnd));
+        }
+        cursor += (size_t)consumed;
+        if (cursor < text.size() && text[cursor] == ';') cursor += 1u;
+        boundary += 1u;
+    }
+}
+
+static void refreshTerminalUi(const AppCliArgs *args, const NnUnevenPartitionPlan *plan, unsigned nLayers, const char *event) {
+    if (args == nullptr || !args->showTerminalUi) return;
+    edgeVisorUiEnable(true);
+    const NnUint nNodes = args->nWorkers + 1u;
+    std::vector<EdgeVisorUiStage> stages;
+    if (plan != nullptr && plan->stages != nullptr && plan->nStages > 0u) {
+        for (NnUint s = 0u; s < plan->nStages; ++s) {
+            const NnStageConfig &stage = plan->stages[s];
+            const bool live = stage.rootNodeIndex < g_poolLive.size() && g_poolLive[stage.rootNodeIndex] != 0;
+            EdgeVisorUiStage row;
+            row.name = terminalNodeName(args, stage.rootNodeIndex);
+            row.layerBegin = stage.startLayer;
+            row.layerEnd = stage.endLayer;
+            row.computing = live && stage.endLayer > stage.startLayer;
+            row.degraded = false;
+            stages.push_back(row);
+        }
+        fillTerminalShadow(&stages);
+    } else if (nLayers > 0u) {
+        EdgeVisorUiStage row;
+        row.name = "root";
+        row.layerBegin = 0u;
+        row.layerEnd = nLayers;
+        row.computing = true;
+        row.degraded = false;
+        stages.push_back(row);
+    }
+    std::vector<EdgeVisorUiDevice> devices;
+    for (NnUint node = 0u; node < nNodes; ++node) {
+        EdgeVisorUiDevice device;
+        device.name = terminalNodeName(args, node);
+        device.live = node >= g_poolLive.size() || g_poolLive[node] != 0;
+        device.inPipeline = false;
+        if (plan != nullptr && plan->stages != nullptr) {
+            for (NnUint s = 0u; s < plan->nStages && s < stages.size(); ++s) {
+                if (plan->stages[s].rootNodeIndex == node && stages[s].computing) device.inPipeline = true;
+            }
+        } else if (node == 0u) {
+            device.inPipeline = true;
+        }
+        devices.push_back(device);
+    }
+    edgeVisorUiPublish(devices, stages, event);
+}
+
 static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    if (args != nullptr && args->showTerminalUi) edgeVisorUiEnable(true);
     resolveAutoBackend(args);
     setNnPpFailoverHook(failoverBypassDeadNode);
     applyProcessMemoryLimit(args->memoryLimitBytes);
@@ -6424,7 +6564,8 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     std::unique_ptr<NnUnevenPartitionPlan> planPtr;
     std::vector<float> ratios;
     std::string warmupSelectedRatios;
-    std::string autoRatiosStorage;
+    // The retreat catch reads this pointer after this function unwinds.
+    static std::string autoRatiosStorage;
     NnUint warmupSelectedWorkers = args->nWorkers;
 
     // IMPORTANT: plan barrier affects graph construction (insertion of OP_PLAN_BARRIER/OP_PLAN_APPLY)
@@ -6632,6 +6773,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     context.nodeConfig = rootNodeConfig;
     g_joinNet = &net;
 
+    refreshTerminalUi(args, planPtr.get(), header.nLayers, "pipeline set");
     handler(&context);
     g_joinNet = nullptr;
 
@@ -6829,6 +6971,7 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
     g_reserved.joined = true;
     std::printf("✅ [pool] node=%u joined with %u kv rows\n", (unsigned)targetNode, (unsigned)headers.size());
     std::fflush(stdout);
+    refreshTerminalUi(context->args, plan, context->header != nullptr ? context->header->nLayers : 0u, "device joined the pipeline");
 }
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
@@ -7090,8 +7233,9 @@ void runWorkerApp(AppCliArgs *args) {
         const NnUint xPipeIndex = findPipeIndexByName(&netConfig, "X");
         std::unique_ptr<Sampler> lastStageSampler;
         if (bootLastStageSamplingEnabled && lastStageSamplingPlanSupported(planPtr.get())) {
-            const NnStageConfig &last = planPtr->stages[planPtr->nStages - 1u];
-            if (last.rootNodeIndex == nodeConfig.nodeIndex && planPtr->vocabSplit.lengths != nullptr) {
+            const NnStageConfig *lastStage = pipelineTailStage(planPtr.get());
+            const NnStageConfig &last = lastStage != nullptr ? *lastStage : planPtr->stages[planPtr->nStages - 1u];
+            if (lastStage != nullptr && last.rootNodeIndex == nodeConfig.nodeIndex && planPtr->vocabSplit.lengths != nullptr) {
                 samplerVocabSize = 0u;
                 for (NnUint n = 0u; n < last.nNodes; ++n) {
                     const NnUint node = last.nodeIndices[n];

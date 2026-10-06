@@ -795,6 +795,25 @@ NnUnevenPartitionPlan createPartitionPlan(
 );
 NnUint getPpPrevStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex);
 NnUint getPpNextStageIndex(const NnUnevenPartitionPlan *plan, NnUint stageIndex);
+
+// Logits belong to the linked stage at the end of the pipeline. A reserved
+// slot can still occupy stages[nStages - 1] without being that stage.
+inline const NnStageConfig *pipelineTailStage(const NnUnevenPartitionPlan *plan) {
+    if (plan == nullptr || plan->stages == nullptr || plan->nStages == 0u) return nullptr;
+    if (plan->ppNextStageIndex == nullptr || plan->ppPrevStageIndex == nullptr) {
+        for (NnUint s = plan->nStages; s > 0u; --s) {
+            if (plan->stages[s - 1u].nLayers > 0u) return &plan->stages[s - 1u];
+        }
+        return &plan->stages[plan->nStages - 1u];
+    }
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        const NnUint prev = plan->ppPrevStageIndex[s];
+        const NnUint next = plan->ppNextStageIndex[s];
+        const bool unlinked = prev == (NnUint)-1 && next == (NnUint)-1 && plan->nStages > 1u;
+        if (!unlinked && next == (NnUint)-1) return &plan->stages[s];
+    }
+    return nullptr;
+}
 bool applyPpStageBypass(NnUnevenPartitionPlan *plan, NnUint ejectedStageIndex, NnUint targetStageIndex);
 // Drop a stage out of the pipeline. Neighbors link to each other.
 void unlinkPpStage(NnUnevenPartitionPlan *plan, NnUint stageIndex);

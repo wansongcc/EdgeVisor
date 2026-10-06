@@ -16,25 +16,41 @@
 - 提交并推送到当前开发分支。远程若不能快进，先把这份提交接到远程分支之上再推，不要强推。
 
 ## 当前交接
-2026-09-30 17:48 CST。自动冗余分层已经写进 `refactor/productize` 并推送。五机 14B 的错 token 修完，重新跑通一句完整句子。nx1、nx2、nano1、nano2、笔记本上都没有 `dllama`。`18091` 没有在听。没有容器。
 
-现在在做的事：阶段 2 收尾里的自动冗余。主切分先定，每条边界左右两边各自用剩余显存放副本。一次运行里不再加副本。调度步长跟已放好的深度走。显式 `--runtime-redundant-boundary-layers` 仍是旧的统一跨度。
+## 可变交接
 
-已经定下来的结果：
+2026-10-06 15:05 CST。五机可视化演示脚本还没准备好，自测没有通过。不要告诉用户这个脚本可以手动跑。
 
-- 副本按常驻层计价：`--auto` 的 KV 是 F32，不是同步字节。70% 空闲、留一层。上下文用 `--max-seq-len`，否则用模型文件的 seqLen。
-- 0.6B 两机（nx1+nx2，不写 `--ratios`）打出 `redundancy: 0->1 5,21`，短生成是连贯的思考。步长跟着深度，没有波动也会在开头窗口挪层。
-- 14B 五机原生上下文，顺序 nx1、nx2 `192.168.137.15`、笔记本 `192.168.137.31`、nano2 `192.168.137.16`、nano1 `192.168.137.18`，端口 `18091`。切分大约 `1@16*1@14*1@1*1@6*1@3`，冗余 `0->1 0,0  1->2 0,3  2->3 3,0  3->4 0,2`。两台 NX 的主层已经吃满常驻预算，所以 NX 之间是 `0,0`。
-- 修过的三件事：满权重切分收到常驻层上限；对端 socket 没了就抛 `Socket offline`，还没出字就走启动退让，出过字仍走会话重开；末级采样只加本 stage 自己的词表切分。之前把五个 stage 的词表加在一起，steps 48 解出 `token=456182 vocab=151669`。
-- 修好后再跑：`--steps 48`，提示 `What is the capital of France?`，退出码 0。正文是思考过程，说到法国首都是 Paris。`tokens/s: 2.98 (335.39 ms/tok)`。日志 `/tmp/edgevisor_14bfix4_root.log`（nx1）。有一行 `reject pp command route=4->3 reason=target stage lacks provisioned layer 37`，那是步长想搬没有副本的层，句子没有坏。更早的失败日志还在：`/tmp/edgevisor_14bfix_root.log`、`/tmp/edgevisor_14bfix2_root.log`、`/tmp/edgevisor_14bfix3_root.log`。
-- Vulkan 报的是设备本地堆总量，不是空闲。笔记本上的副本可能偏乐观。这次没有单独改。
+现在在做的事：准备一个用户稍后在 Windows 上手动跑的五机 14B 演示。真实推理过程中，根节点终端要看到设备池、设备上线、设备下线、设备劣化、任务迁移、影子 KV。五台都要用。脚本还没跑通。
 
-源码提交 `261a14ec9372228a50ded9904dfeb1876fc44efc`，作者 Yanhui。说明是 Keep automatic overlap inside real KV memory and stop a dead peer from inventing tokens. 9 个文件：`EdgeVisor/src/app.cpp`、`app.hpp`、`device_profile.hpp`、`dllama.cpp`、`llm.cpp`、`nn/nn-network.cpp`、`nn/nn-network.hpp`、`test/test_device_profile.cpp`、`tokenizer.cpp`。推送 `5553911..261a14e` 到 `origin/refactor/productize`（`git@github.com:wansongcc/EdgeVisor.git`）。
+工作状态：失败后停着。没有正在跑的自测，不要再开一份长推理。
 
-五台二进制都是 2026-09-30 17:43–17:45 编的这份源码。只有 nx1 `/home/jetson/cc/edgevisor_fresh` 的 git 在 `261a14e`。nx2、nano1、nano2、笔记本 `/home/cc/edgevisor_fresh` 的 git HEAD 仍是更早的提交（笔记本是 `45deaab`），源码是从 nx1 拷过去的，不是 git pull。笔记本只链 Vulkan。
+机器上还留着什么：
 
-模型：14B 在 Jetson 是 `/home/jetson/cc/models/qwen3_14b_q40/`，笔记本是 `/home/cc/models/qwen3_14b_q40/`。worker 用 `setsid ./dllama worker --port 18091 --model <绝对路径>`。
+- nx2 pid `1072240`，已跑约 1 天 17 小时。命令是 `./dllama worker --port 18091 --model /home/jetson/cc/models/qwen3_14b_q40/dllama_model_qwen3_14b_q40.m`。状态 S，父进程 1，停在 `inet_csk_accept`。`0.0.0.0:18091` 正在听。日志 `/tmp/ui_demo_worker.log` 只有 189 字节，是 CUDA 设备行，里面没有 `Listening on`。没有 `gpu_hog`。用户说「继续」之前不要停它，也不要再起一个 worker。
+- nx1 没有 `dllama`，没有 tmux 会话 `evdemo`。`docker ps -q` 为空。
+- nano1、nano2、笔记本都没有 `dllama`。
 
-不要合到 main。不要开阶段 3。不要做名单外的中途加入。不要提交 `._*`。README 仍是旧的，这次没改。
+已经定下来的结论：
 
-下一步：用户说「继续」之前不要开新实验。没有还在跑的进程。
+- 编排在 Windows：`C:\Users\wuwzh\Desktop\Yanhui\20260925-1008\B01Proj\ui_live_demo.ps1`。这个目录不是 git 仓库。根节点命令在 nx1：`/home/jetson/cc/edgevisor_fresh/scripts/ui_live_demo_root.sh`。nx1 不能 SSH 到其他机器，编排不能写成从 nx1 往外 SSH。
+- 控制面是 ZeroTier `10.47.x`，激活和 KV 走 `192.168.137.0/24`。不要在数据面 SSH，不要把网卡 down。远程 `--ratios` 要加引号。PowerShell 会吃掉远程双引号；管道符必须留在 ssh 参数里面。不要用 `pgrep -af dllama`。停进程用 `pkill -x dllama` 或 `pkill -x gpu_hog`。
+- 顺序和地址：nx1 根 `192.168.137.13`，nx2 `.15`，笔记本 `.31`，nano2 `.16`，nano1 `.18`，端口都是 `18091`。14B 在 Jetson 是 `/home/jetson/cc/models/qwen3_14b_q40/`，笔记本是 `/home/cc/models/qwen3_14b_q40/`。演示先起 nx2、笔记本、nano2，把 nano1 留成唯一预留槽。
+- 2026-10-04 自测结果是 `timeline: FAIL pool`。面板画出来了，预留设备被画成离线，日志里没有 `reserved`。`EdgeVisorUiDevice` 和 `EdgeVisorUiStage` 的 bool 当时没有默认值。同一次后来在 `Tokenizer::encode` 的 `strLen == 0` 断言退出，没走到上线、迁移、下线。
+- 2026-10-04 21:43 头文件已写成 `bool offline = false` 等默认值。21:56 nx1 的 `EdgeVisor/dllama` 重新编过，`make dllama -j4` 退出码 0。worker 没重编。nx2 的 `dllama` 仍是 2026-09-30 17:44。
+- `/tmp/tok_try` 对 14B tokenizer 测过：裸句 `What is the capital of France?` 和 ChatML 包装后的字符串都能 encode。这只说明分词，不能说明五机演示已经通过。
+- 随后一次自测是 `timeline: FAIL listen nx2`。脚本在 90 秒里等日志出现 `Listening on`。现在这个 worker 已经在听 `18091`，日志里仍然没有这几个字。用这行日志判断“已在听”会误判。
+- 更早一份根日志是 `ratios=1@40*1@0*1@0*1@0*1@0`，当时 worker 还没起来。脚本后来要求 `ratios=` 里的 `1@0` 正好一个。那次自测没走到这里。
+- 上次跑通的 14B 切分大约 `1@16*1@14*1@1*1@6*1@3`，冗余 `0->1 0,0 1->2 0,3 2->3 3,0 3->4 0,2`。日志 `/tmp/edgevisor_14bfix4_root.log`。中间层的影子盖不住整段，杀掉 nano2 后 failover 常会 `partial-cover`。画面仍应先标出离线。
+- UI 只在根节点，靠 `--ui`。黄是预留，蓝是离线，红是劣化和迁移源，绿是迁入，品红是影子行。
+
+下一步：用户说「继续」时再做。先停 nx2 的 pid `1072240`，把“已在听”改成查端口，然后重跑 `powershell -ExecutionPolicy Bypass -File C:\Users\wuwzh\Desktop\Yanhui\20260925-1008\B01Proj\ui_live_demo.ps1 -SelfTest`。只有打出 `timeline: OK` 才能告诉用户脚本好了，以及从 `B01Proj` 怎么手动跑。没说继续，不要开这次长推理。
+
+约束：不要合到 main，不要开阶段 3，不要强推。不要提交下面这些未提交的 UI 改动，除非用户明确要求。不要提交 `._*`。
+
+相关 commit：HEAD 是 `8e9c03d`，和 `origin/refactor/productize` 一致。这次交接之前没有新的功能提交。未提交、且不要带进这次提交的文件：
+
+- 已修改：`EdgeVisor/Makefile`、`EdgeVisor/src/app.cpp`、`EdgeVisor/src/app.hpp`、`EdgeVisor/src/dllama.cpp`、`EdgeVisor/src/dynamic/dynamic_tpot.cpp`
+- 未跟踪：`EdgeVisor/src/terminal_ui.cpp`、`EdgeVisor/src/terminal_ui.hpp`、`EdgeVisor/src/terminal_ui_preview.cpp`、`EdgeVisor/ui-preview`、`scripts/ui_live_demo_root.sh`
+
+这次只提交 `handsoff.md`。

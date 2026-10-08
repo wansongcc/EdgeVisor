@@ -804,7 +804,11 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
     unsigned int eagainSpins = 0u;
     while (s > 0) {
         const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
-        ssize_t r = recv(socket, (char*)data, s, 0);
+        int recvFlags = 0;
+#ifdef MSG_DONTWAIT
+        if (maxAttempts > 0ul) recvFlags = MSG_DONTWAIT;
+#endif
+        ssize_t r = recv(socket, (char*)data, s, recvFlags);
         if (r < 0) {
             if (isEagainError()) {
                 if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
@@ -842,7 +846,11 @@ static inline bool tryPeekSocket(int socket, void *data, NnSize size, unsigned l
     const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
     unsigned int eagainSpins = 0u;
     while (true) {
-        ssize_t r = recv(socket, (char*)data, size, MSG_PEEK);
+        int recvFlags = MSG_PEEK;
+#ifdef MSG_DONTWAIT
+        if (maxAttempts > 0ul) recvFlags |= MSG_DONTWAIT;
+#endif
+        ssize_t r = recv(socket, (char*)data, size, recvFlags);
         if (r < 0) {
             if (isEagainError()) {
                 if (maxAttempts > 0) {
@@ -1551,6 +1559,7 @@ NnNetwork::~NnNetwork() {
 }
 
 void NnNetwork::setTurbo(bool enabled) {
+    turboEnabled = enabled;
     for (NnUint i = 0; i < nSockets; i++) {
         if (!socketActive[i]) continue;
         ::setNonBlocking(sockets[i], enabled);
@@ -1954,7 +1963,7 @@ void NnNetwork::writeAll(const void *data, NnSize size) {
     if (!ios.empty()) writeMany((NnUint)ios.size(), ios.data(), true);
 }
 
-void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
+void NnNetwork::readMany(NnUint n, NnSocketIo *ios, const std::function<void()> &onWait) {
     {
         const unsigned long simDelayUs = getNetSimDelayUs();
         if (simDelayUs > 0ul) usleep(simDelayUs);
@@ -1967,6 +1976,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     const unsigned long timeoutMs = getIoTimeoutMs();
     const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
     unsigned int eagainSpins = 0u;
+    long long lastWaitCheckMs = 0;
     for (NnUint i = 0; i < n; i++) {
         NnSocketIo *io = &ios[i];
         assert(io->socketIndex < nSockets);
@@ -1999,12 +2009,27 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                 if (blockedByEarlier) continue;
                 int socket = sockets[io->socketIndex];
                 const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
-                ssize_t r = recv(socket, (char*)io->data, io->size, 0);
+                int recvFlags = 0;
+#ifdef MSG_DONTWAIT
+                if (onWait) recvFlags = MSG_DONTWAIT;
+#endif
+                ssize_t r = recv(socket, (char*)io->data, io->size, recvFlags);
                 if (r < 0) {
                     if (isEagainError()) {
                         recordCommRecvEagain();
                         if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
-                        waitSocketReadyAfterEagain(socket, false, timeoutMs, startMs);
+                        if (onWait) {
+                            const long long now = nowMsSteady();
+                            if (now - lastWaitCheckMs >= 50) {
+                                onWait();
+                                lastWaitCheckMs = now;
+                            }
+                            // Poll in short windows: the expected result socket
+                            // may be healthy while an earlier PP hop has died.
+                            usleep(1000);
+                        } else {
+                            waitSocketReadyAfterEagain(socket, false, timeoutMs, startMs);
+                        }
                         backoffOnEagain(eagainSpins);
                         continue;
                     }
@@ -2142,6 +2167,7 @@ bool NnNetwork::acceptAndInstallPeer(NnUint myWorkerIndex, NnUint expectedPeerWo
     }
     if (sockets[socketIndex] >= 0) destroySocket(sockets[socketIndex]);
     sockets[socketIndex] = fd;
+    ::setNonBlocking(fd, turboEnabled);
     peerNodeBySocket[socketIndex] = actualPeer + 1u;
     socketActive[socketIndex] = true;
     NET_VLOG("⭕ Socket[%u]: late peer worker %u joined\n", socketIndex, actualPeer);
@@ -2166,6 +2192,7 @@ bool NnNetwork::connectAndInstallPeer(NnUint myWorkerIndex, NnUint peerWorkerInd
     }
     if (sockets[socketIndex] >= 0) destroySocket(sockets[socketIndex]);
     sockets[socketIndex] = fd;
+    ::setNonBlocking(fd, turboEnabled);
     peerNodeBySocket[socketIndex] = actualPeer + 1u;
     socketActive[socketIndex] = true;
     NET_VLOG("⭕ Socket[%u]: connected late to worker %u\n", socketIndex, actualPeer);
@@ -2192,6 +2219,7 @@ bool NnNetwork::connectReservedWorker(NnUint workerIndex, const char *host, int 
     writeAckPacket(fd);
     if (sockets[workerIndex] >= 0) destroySocket(sockets[workerIndex]);
     sockets[workerIndex] = fd;
+    ::setNonBlocking(fd, turboEnabled);
     peerNodeBySocket[workerIndex] = workerIndex + 1u;
     socketActive[workerIndex] = true;
     NET_VLOG("⭕ Socket[%u]: reserved worker is online\n", workerIndex);
@@ -2241,7 +2269,7 @@ void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const voi
         pollfd pfd{};
         pfd.fd = fd;
         pfd.events = POLLIN;
-        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLERR) != 0) {
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP)) != 0) {
             deactivateNode(targetNodeIndex, 0u);
             throw NnPeerOfflineException(targetNodeIndex, "PP peer hung up");
         }
@@ -2269,7 +2297,7 @@ bool NnNetwork::peerLooksOffline(NnUint targetNodeIndex) const {
     pollfd pfd{};
     pfd.fd = fd;
     pfd.events = POLLIN;
-    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLERR) != 0)
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP)) != 0)
         return true;
 #else
     (void)targetNodeIndex;
@@ -2290,7 +2318,9 @@ bool NnNetwork::recoverPpIfNextOffline(const NnUnevenPartitionPlan *plan, NnUint
     // The caller waits long enough for a normal next control packet to arrive.
     // Reaching here means the root is still blocked on this activation, so the
     // downstream stage never got it. Apply the dead layers and send once.
-    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode, true)) return false;
+    deactivateNode(nextNode, myNodeIndex);
+    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode, true))
+        throw NnPeerOfflineException(nextNode, "PP peer offline without ready shadow cache");
     sendPpToNext(this, myNodeIndex, pipe, nBytes, plan);
     std::printf("🔁 [failover] resent in-flight activation deadNext=%u bytes=%zu\n",
         (unsigned)nextNode, (size_t)nBytes);
@@ -2438,7 +2468,8 @@ static void syncNodeSlices(
     const NnStageConfig *stage, // 指定同步组
     NnSliceTag forcedTag, // disambiguate split kind when needed
     NnUint totalElements = 0, // [New] Total elements for Q80 matching
-    NnUint nRows = 1 // batch rows to exchange in one duplex phase
+    NnUint nRows = 1, // batch rows to exchange in one duplex phase
+    const std::function<void()> &onWait = {}
 ) {
     // ---------------------------------------------------------
     // 0. [核心修改] 确定当前组的 Root 身份
@@ -2677,7 +2708,7 @@ static void syncNodeSlices(
                     batchIos.push_back(io);
                 }
             }
-            network->readMany((NnUint)batchIos.size(), batchIos.data());
+            network->readMany((NnUint)batchIos.size(), batchIos.data(), onWait);
         }
     } else {
         // All-gather exchange.
@@ -3323,7 +3354,19 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements, execution->batchSize);
             }else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeStr = "SYNC_LOGITS";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements, execution->batchSize);
+                std::function<void()> onWait;
+                if (nodeConfig->nodeIndex == 0u && threadIndex == 0u && plan != nullptr) {
+                    onWait = [this]() {
+                        for (NnUint p = 0u; p < netConfig->nPipes; ++p) {
+                            const NnPipeConfig &x = netConfig->pipes[p];
+                            if (x.name == nullptr || std::strcmp(x.name, "X") != 0) continue;
+                            network->recoverPpIfNextOffline(plan, 0u, execution->pipes[p],
+                                getBytes(x.size.floatType, x.size.x) * execution->batchSize);
+                            break;
+                        }
+                    };
+                }
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements, execution->batchSize, onWait);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT) {
                 syncTypeStr = "SYNC_STAGE_LOGITS";
                 syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, forcedTag, totalElements, execution->batchSize);

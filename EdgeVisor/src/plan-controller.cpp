@@ -805,6 +805,13 @@ void PlanUdsController::run() {
                 const json &jcmd = req.at("cmd");
 
                 PlanCommand cmd = decodePpMigrationCommand(jcmd);
+                std::string admissionReason;
+                if (inference_ == nullptr || !inference_->validatePpMigrationCommand(cmd, &admissionReason)) {
+                    resp = json{{"ok", false}, {"rejected", true},
+                        {"reason", admissionReason.empty() ? "inference not available" : admissionReason},
+                        {"ppMigration", true}};
+                    writeLine(cfd, resp.dump()); ::close(cfd); continue;
+                }
 
                 const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();
                 if (cfg.disablePipelineBalancer) {

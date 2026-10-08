@@ -503,7 +503,8 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
     ControllerRuntime &rt,
     const NnUnevenPartitionPlan *plan,
     const WindowSummary &window,
-    const json &status) {
+    const json &status,
+    const RuntimePrimaryOwnership &ownership) {
     std::vector<tpot::StageSnapshot> out;
     if (plan == nullptr || plan->stages == nullptr) return out;
 
@@ -522,6 +523,14 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
         stage.startLayer = stageCfg.startLayer;
         stage.endLayer = stageCfg.endLayer;
         stage.nLayers = stageCfg.nLayers != 0u ? stageCfg.nLayers : (stageCfg.endLayer - stageCfg.startLayer);
+        if (ownership.nLayers > 0u && ownership.nStages == plan->nStages) {
+            stage.startLayer = ownership.nLayers; stage.endLayer = 0u; stage.nLayers = 0u;
+            for (NnUint layer = 0u; layer < ownership.ownerByLayer.size(); ++layer) {
+                if (ownership.ownerByLayer[layer] != stage.stageIndex) continue;
+                stage.startLayer = std::min(stage.startLayer, layer);
+                stage.endLayer = layer + 1u; ++stage.nLayers;
+            }
+        }
         stage.softCapacity = rt.softCapacityByStage.count(stage.stageIndex) != 0u
             ? rt.softCapacityByStage[stage.stageIndex]
             : stage.nLayers;
@@ -574,7 +583,14 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
         }
         out.push_back(stage);
     }
-    return out;
+    // Reserved slots can join between stages while retaining their original IDs.
+    // Candidate neighbors must follow the active chain, not numeric stage order.
+    std::vector<tpot::StageSnapshot> ordered;
+    for (NnUint stage = 0u, visits = 0u; stage != (NnUint)-1 && visits < plan->nStages; ++visits) {
+        for (const auto &snapshot : out) if (snapshot.stageIndex == stage) ordered.push_back(snapshot);
+        stage = getPpNextStageIndex(plan, stage);
+    }
+    return ordered;
 }
 
 static bool commitAppliedStageBypass(ControllerRuntime &rt, const json &status) {
@@ -989,7 +1005,7 @@ void DynamicTpotController::run() {
                     }
                 }
             }
-            std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status);
+            std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status, inference_->getRuntimePrimaryOwnershipSnapshot());
             if (!rt.hasCommittedPpLayout) {
                 rt.committedPpLayout = stages;
                 rt.authoritativePpLayout = stages;
@@ -1028,7 +1044,30 @@ void DynamicTpotController::run() {
                 rt.topologyFenceGeneration = 0ull;
             }
             tpot::Candidate bestTp = tpot::bestTpCandidate(stages, rt.cfg);
-            tpot::Candidate bestPp = tpot::bestPpCandidate(stages, window.tpotMs, rt.cfg);
+            tpot::Candidate bestPp;
+            bestPp.kind = tpot::CandidateKind::PP_MOVE;
+            bestPp.reason = "no provisioned PP candidate";
+            for (size_t i = 0u; i + 1u < stages.size(); ++i) {
+                for (int direction = 0; direction < 2; ++direction) {
+                    const auto &source = stages[i + (direction == 0 ? 0u : 1u)];
+                    const auto &target = stages[i + (direction == 0 ? 1u : 0u)];
+                    const NnUint maxMove = source.nLayers > 1u
+                        ? std::min(rt.cfg.maxPpLayerMove, source.nLayers - 1u) : 0u;
+                    for (NnUint count = 1u; count <= maxMove; ++count) {
+                        auto candidate = tpot::ppCandidateForMove(source, target, count, rt.cfg);
+                        if (!candidate.valid) continue;
+                        PlanCommand command = makeEmptyPlanCommand();
+                        command.version = DLLAMA_PLAN_CMD_VERSION_V2;
+                        command.mode = PLAN_CMD_MODE_NEXT_BARRIER;
+                        command.fromNodeIndex = candidate.fromNodeIndex;
+                        command.toNodeIndex = candidate.toNodeIndex;
+                        command.triggerLayer = candidate.layerIndex;
+                        command.reserved0 = candidate.layerCount;
+                        if (!inference_->validatePpMigrationCommand(command)) continue;
+                        bestPp = tpot::betterCandidate(bestPp, candidate);
+                    }
+                }
+            }
             bestPp = rt.ppLayoutGuard.filter(bestPp);
             tpot::Candidate best = tpot::betterCandidate(bestTp, bestPp);
 

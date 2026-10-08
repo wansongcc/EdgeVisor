@@ -694,7 +694,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.benchmarkConcurrentRequests = 1u;
     args.seed = (unsigned long long)time(nullptr);
     args.chatTemplateType = TEMPLATE_UNKNOWN;
-    args.maxSeqLen = 0;
+    // Native model windows can eagerly allocate more KV than edge GPUs hold.
+    // Keep the product default bounded; an explicit 0 retains the native window.
+    args.maxSeqLen = 4096u;
     args.netTurbo = true;
     args.gpuIndex = -1;
     args.gpuSegmentFrom = -1;
@@ -1100,7 +1102,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         } else if (std::strcmp(name, "--chat-template") == 0) {
             args.chatTemplateType = parseChatTemplateType(value);
         } else if (std::strcmp(name, "--max-seq-len") == 0) {
-            args.maxSeqLen = (unsigned int)atoi(value);
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long requested = std::strtoul(value, &end, 10);
+            if (errno == ERANGE || value[0] == '-' || end == value || *end != '\0' || requested > 0xfffffffful)
+                throw std::runtime_error("--max-seq-len must be a non-negative token count (0 uses the model window)");
+            args.maxSeqLen = (NnUint)requested;
         } else if (std::strcmp(name, "--gpu-index") == 0) {
             args.gpuIndex = atoi(value);
         } else if (std::strcmp(name, "--gpu-segments") == 0) {
@@ -2424,7 +2431,7 @@ bool resolvePpMigrationLayers(
         ? command.triggerLayer
         : 0xFFFFFFFFu;
     if (firstLayer == 0xFFFFFFFFu) {
-        if (toStage->stageIndex < fromStage->stageIndex) {
+        if (getPpPrevStageIndex(plan, fromStage->stageIndex) == toStage->stageIndex) {
             firstLayer = fromStage->startLayer;
         } else {
             if (count > fromStage->endLayer - fromStage->startLayer) {
@@ -2465,7 +2472,8 @@ bool resolvePpMigrationLayers(
 bool initializeRuntimePrimaryOwnership(
     const RuntimeStageLayerPlan *provisionMap,
     RuntimePrimaryOwnership &ownership,
-    std::string *reason) {
+    std::string *reason,
+    const NnUnevenPartitionPlan *activePlan) {
     ownership = {};
     if (provisionMap == nullptr || provisionMap->nLayers == 0u || provisionMap->nStages == 0u) {
         if (reason != nullptr) *reason = "missing runtime provision map";
@@ -2477,6 +2485,9 @@ bool initializeRuntimePrimaryOwnership(
     for (NnUint layer = 0u; layer < ownership.nLayers; ++layer) {
         NnUint owner = (NnUint)-1;
         for (NnUint stage = 0u; stage < ownership.nStages; ++stage) {
+            if (activePlan != nullptr && stage != 0u &&
+                    getPpPrevStageIndex(activePlan, stage) == (NnUint)-1 &&
+                    getPpNextStageIndex(activePlan, stage) == (NnUint)-1) continue;
             if (provisionMap->getRole(stage, layer) != RUNTIME_LAYER_PRIMARY) continue;
             if (owner != (NnUint)-1) {
                 if (reason != nullptr) *reason = "runtime provision has non-unique primary owner for layer " + std::to_string(layer);
@@ -2565,18 +2576,22 @@ NnUint ppStartLayerSwitchFlag(
     const RuntimeStageLayerPlan *runtimePlan,
     NnUint fromStageIndex,
     NnUint toStageIndex,
-    NnUint boundaryLayer) {
+    NnUint boundaryLayer,
+    const NnUnevenPartitionPlan *activePlan) {
     if (runtimePlan == nullptr || fromStageIndex >= runtimePlan->nStages ||
             toStageIndex >= runtimePlan->nStages || boundaryLayer >= runtimePlan->nLayers) {
         return 0u;
     }
     const RuntimeLayerRole fromRole = runtimePlan->getRole(fromStageIndex, boundaryLayer);
     const RuntimeLayerRole toRole = runtimePlan->getRole(toStageIndex, boundaryLayer);
-    if (toStageIndex < fromStageIndex && fromRole == RUNTIME_LAYER_PRIMARY &&
+    const bool movingForward = activePlan != nullptr
+        ? getPpNextStageIndex(activePlan, fromStageIndex) == toStageIndex
+        : toStageIndex > fromStageIndex;
+    if (!movingForward && fromRole == RUNTIME_LAYER_PRIMARY &&
             toRole == RUNTIME_LAYER_REDUNDANT) {
         return LLM_LAYER_SWITCH_NEW_PP_START;
     }
-    if (toStageIndex > fromStageIndex && fromRole == RUNTIME_LAYER_REDUNDANT &&
+    if (movingForward && fromRole == RUNTIME_LAYER_REDUNDANT &&
             toRole == RUNTIME_LAYER_PRIMARY) {
         return LLM_LAYER_SWITCH_RESTORE_PP_START;
     }
@@ -2696,6 +2711,9 @@ static std::vector<NnUint> findLogitsSegmentIndices(const NnNodeConfig *nodeConf
 }
 
 RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled, bool ppMigrationEnabled) {
+    this->xPipeIndex = net->xPipeIndex;
+    const NnPipeConfig &xPipe = net->netConfig.pipes[net->xPipeIndex];
+    this->xRowBytes = getBytes(xPipe.size.floatType, xPipe.size.x);
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
     this->positionPipe = (float *)execution->pipes[net->positionPipeIndex];
@@ -2709,7 +2727,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->plan = plan;
     this->runtimePlan = (net != nullptr) ? &net->runtimeStageLayerPlan : nullptr;
     std::string runtimeOwnershipReason;
-    if (!initializeRuntimePrimaryOwnership(runtimePlan, runtimePrimaryOwnership, &runtimeOwnershipReason)) {
+    if (!initializeRuntimePrimaryOwnership(runtimePlan, runtimePrimaryOwnership, &runtimeOwnershipReason, plan)) {
         if (productLogLevel() >= 1)
             std::printf("runtime-primary-owner initialization failed: %s\n", runtimeOwnershipReason.c_str());
         std::fflush(stdout);
@@ -2885,6 +2903,47 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
     }
 }
 
+RuntimePrimaryOwnership RootLlmInference::getRuntimePrimaryOwnershipSnapshot() const {
+    std::lock_guard<std::mutex> lock(runtimeOwnershipMutex);
+    return runtimePrimaryOwnership;
+}
+
+bool RootLlmInference::validatePpMigrationCommand(const PlanCommand &command, std::string *reason) const {
+    if (!ppMigrationEnabled) {
+        if (reason != nullptr) *reason = "PP migration is disabled";
+        return false;
+    }
+    std::vector<NnUint> layers;
+    if (!resolvePpMigrationLayers(command, plan, runtimePlan, layers, reason)) return false;
+    const NnUint sourceNode = planCommandHasMoveList(command) ? command.moves[0].fromNodeIndex : command.fromNodeIndex;
+    const NnStageConfig *source = findStageForNodeLocal(plan, sourceNode);
+    if (source == nullptr) return false;
+    std::lock_guard<std::mutex> lock(runtimeOwnershipMutex);
+    NnUint ownedCount = 0u;
+    for (NnUint owner : runtimePrimaryOwnership.ownerByLayer) if (owner == source->stageIndex) ++ownedCount;
+    for (NnUint layer : layers) {
+        if (layer >= runtimePrimaryOwnership.ownerByLayer.size() ||
+                runtimePrimaryOwnership.ownerByLayer[layer] != source->stageIndex) {
+            if (reason != nullptr) *reason = "source does not currently own the requested layer";
+            return false;
+        }
+    }
+    if (layers.size() >= ownedCount) {
+        if (reason != nullptr) *reason = "PP migration would empty the current source stage";
+        return false;
+    }
+    return true;
+}
+
+void RootLlmInference::recordReservedJoin(NnUint donorStage, NnUint newStage, NnUint begin, NnUint end) {
+    std::vector<NnUint> layers;
+    for (NnUint layer = begin; layer < end; ++layer) layers.push_back(layer);
+    std::string reason;
+    std::lock_guard<std::mutex> lock(runtimeOwnershipMutex);
+    if (!applyRuntimePrimaryOwnershipMove(runtimePrimaryOwnership, donorStage, newStage, layers, &reason))
+        throw std::runtime_error("Reserved join ownership commit failed: " + reason);
+}
+
 bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *logit) {
     if (!lastStageSamplingPlanSupported(plan) || network == nullptr) return false;
     const NnStageConfig *lastStage = pipelineTailStage(plan);
@@ -2895,35 +2954,26 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
     const int socketIndex = network->getSocketIndexForNode(sourceNode, 0u);
     if (socketIndex < 0) return false;
 
-    pumpWorkerFrames((NnUint)socketIndex);
-    if (!workerSampleFrameCache[(NnUint)socketIndex].empty()) {
-        const LlmSampledTokenPacket packet = workerSampleFrameCache[(NnUint)socketIndex].front();
-        workerSampleFrameCache[(NnUint)socketIndex].pop_front();
-        token = packet.token;
-        if (logit != nullptr) *logit = packet.logit;
-        return true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kvAckWaitTimeoutMs());
+    for (;;) {
+        pumpWorkerFrames((NnUint)socketIndex);
+        auto &samples = workerSampleFrameCache[(NnUint)socketIndex];
+        if (!samples.empty()) {
+            const LlmSampledTokenPacket packet = samples.front();
+            samples.pop_front();
+            if (packet.magic != LLM_SAMPLED_TOKEN_MAGIC || packet.version != LLM_SAMPLED_TOKEN_VERSION ||
+                    packet.position != controlPacket.position || packet.nodeIndex != sourceNode)
+                throw std::runtime_error("Unexpected sampled token identity or position");
+            token = packet.token;
+            if (logit != nullptr) *logit = packet.logit;
+            return true;
+        }
+        network->recoverPpIfNextOffline(plan, 0u, execution->pipes[xPipeIndex],
+            xRowBytes * execution->batchSize);
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("Timeout waiting for the pipeline tail sampled token");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-
-    LlmWorkerFrameHeader frame{};
-    std::vector<char> payload;
-    do {
-        if (!readWorkerFrame(network, (NnUint)socketIndex, frame, payload, kvAckWaitTimeoutMs())) return false;
-        if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) consumeStageBypassAckFrame((NnUint)socketIndex, payload);
-    } while (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK);
-    if (frame.kind != LLM_WORKER_FRAME_SAMPLED_TOKEN || payload.size() != sizeof(LlmSampledTokenPacket)) return false;
-    LlmSampledTokenPacket packet{};
-    std::memcpy(&packet, payload.data(), sizeof(packet));
-    if (packet.magic != LLM_SAMPLED_TOKEN_MAGIC || packet.version != LLM_SAMPLED_TOKEN_VERSION) {
-        std::printf("⚠️  [last-stage-sampling] unexpected packet magic=0x%08x version=%u fromNode=%u\n",
-            (unsigned)packet.magic,
-            (unsigned)packet.version,
-            (unsigned)sourceNode);
-        std::fflush(stdout);
-        return false;
-    }
-    token = packet.token;
-    if (logit != nullptr) *logit = packet.logit;
-    return true;
 }
 
 void RootLlmInference::setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments) {
@@ -2953,7 +3003,7 @@ void RootLlmInference::maybeApplyShiftedPpStartForStageMove(
     if (fromStage == nullptr || toStage == nullptr) return;
     const NnUint highestLayer = *std::max_element(switchLayers.begin(), switchLayers.end());
     const NnUint flag = ppStartLayerSwitchFlag(
-        runtimePlan, fromStage->stageIndex, toStage->stageIndex, highestLayer);
+        runtimePlan, fromStage->stageIndex, toStage->stageIndex, highestLayer, plan);
     const NnUint shiftedStartLayer = highestLayer + 1u;
     if (flag == LLM_LAYER_SWITCH_NEW_PP_START && selfIsSource &&
             shiftedStartLayer < fromStage->endLayer) {
@@ -4036,7 +4086,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
             runtimePlan,
             switchFromStage->stageIndex,
             switchToStage->stageIndex,
-            ppStartBoundaryLayer);
+            ppStartBoundaryLayer, plan);
     }
     for (NnUint layer : switchLayers) {
         LlmLayerSwitchPacket switchPkt{};
@@ -4078,6 +4128,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
 }
 
 void RootLlmInference::recordPpMigrationApplied() {
+    std::lock_guard<std::mutex> ownershipLock(runtimeOwnershipMutex);
     ++ppMigrationAppliedGeneration;
     ppMigrationAppliedFromNodeIndex = migrationFromNodeIndex;
     ppMigrationAppliedToNodeIndex = nextStageRootNode;
@@ -4178,6 +4229,7 @@ void RootLlmInference::tryVerifyStageBypassAcks() {
     if (stageBypassPendingGeneration == 0u || stageBypassExpectedAckNodes.empty()) return;
     for (NnUint node : stageBypassExpectedAckNodes) if (stageBypassAckCache.count(node) == 0u) return;
     std::string ownershipReason;
+    std::lock_guard<std::mutex> ownershipLock(runtimeOwnershipMutex);
     if (!applyRuntimePrimaryOwnershipMove(
             runtimePrimaryOwnership,
             stageBypassAppliedEjectedStage,
@@ -4223,7 +4275,8 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex) {
         }
         LlmWorkerFrameHeader frame{};
         std::vector<char> payload;
-        if (!readWorkerFrame(network, socketIndex, frame, payload, 1)) return;
+        if (!readWorkerFrame(network, socketIndex, frame, payload, kvAckWaitTimeoutMs()))
+            throw std::runtime_error("Incomplete worker frame payload");
         if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
             consumeStageBypassAckFrame(socketIndex, payload);
         } else if (frame.kind == LLM_WORKER_FRAME_PROFILE && payload.size() == sizeof(LlmPerfPacket)) {
@@ -4791,7 +4844,7 @@ void RootLlmInference::forward(bool collectProfile) {
                     runtimePlan,
                     switchFromStage->stageIndex,
                     switchToStage->stageIndex,
-                    ppStartBoundaryLayer);
+                    ppStartBoundaryLayer, plan);
             }
             for (NnUint layer : switchLayers) {
                 LlmLayerSwitchPacket switchPkt{};
@@ -5289,7 +5342,7 @@ void RootLlmInference::forward(bool collectProfile) {
         const NnStageConfig *toStage = findStageForNodeLocal(plan, nextStageRootNode);
         const bool migrateToLaterStage =
             fromStage != nullptr && toStage != nullptr &&
-            toStage->stageIndex > fromStage->stageIndex;
+            getPpNextStageIndex(plan, fromStage->stageIndex) == toStage->stageIndex;
 
         if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) {
             auto t0 = std::chrono::steady_clock::now();
@@ -6748,10 +6801,17 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     std::unique_ptr<DynamicTpotController> tpotCtrl;
     std::unique_ptr<RootKvCollector> kvCollector;
     kvCollector = RootKvCollector::start(&inference);
-    if (planSock != nullptr && planSock[0] != '\0') {
-        dynCtrl = DynamicLayerController::start(std::string(planSock), &inference);
-        tpotCtrl = DynamicTpotController::start(std::string(planSock), &inference);
-    }
+    auto startDynamicControllers = [&]() {
+        if (planSock != nullptr && planSock[0] != '\0') {
+            dynCtrl = DynamicLayerController::start(std::string(planSock), &inference);
+            tpotCtrl = DynamicTpotController::start(std::string(planSock), &inference);
+        }
+    };
+    // A join bootstraps the provisioned graph, not a graph after PP migration.
+    // Keep that graph stable until its reserved slot and KV have committed.
+    if (!g_reserved.armed) startDynamicControllers();
+    else if (args->enableDynamicTpot)
+        std::printf("[pool] dynamic scheduling deferred until the reserved worker joins\n");
 
     if (network != nullptr) {
         network->resetStats();
@@ -6771,6 +6831,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     context.network = network;
     context.executor = &executor;
     context.nodeConfig = rootNodeConfig;
+    context.startDynamicControllers = startDynamicControllers;
     g_joinNet = &net;
 
     refreshTerminalUi(args, planPtr.get(), header.nLayers, "pipeline set");
@@ -6927,6 +6988,9 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
         }
     }
 
+    const size_t expectedRows = (size_t)(g_reserved.layerEnd - g_reserved.layerBegin) * (size_t)position;
+    if (headers.size() != expectedRows)
+        throw std::runtime_error("Reserved worker KV history is incomplete");
     if (!headers.empty()) {
         LlmControlPacket ctrl{};
         ctrl.batchSize = 1u;
@@ -6942,6 +7006,25 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
             network->write(workerIndex, ks[i].data(), ks[i].size() * sizeof(float));
             network->write(workerIndex, vs[i].data(), vs[i].size() * sizeof(float));
         }
+
+        // The control-only transfer responds with KABT + KVAK records, not
+        // worker frames. Consume and validate all of them before exposing the
+        // slot to decoding/profiling; otherwise the next frame pump is misaligned.
+        LlmKvAckBatchHeader ackBatch{};
+        if (!tryReadKvAckWithDeadline(network, workerIndex, &ackBatch, sizeof(ackBatch), kvAckWaitTimeoutMs()) ||
+                ackBatch.magic != LLM_KV_ACK_BATCH_MAGIC || ackBatch.version != LLM_KV_ACK_BATCH_VERSION ||
+                ackBatch.count != headers.size())
+            throw std::runtime_error("Reserved worker did not acknowledge the complete KV history");
+        for (size_t i = 0u; i < headers.size(); ++i) {
+            LlmKvAckPacket ack{};
+            if (!tryReadKvAckWithDeadline(network, workerIndex, &ack, sizeof(ack), kvAckWaitTimeoutMs()) ||
+                    ack.magic != LLM_KV_ACK_MAGIC || ack.version != LLM_KV_ACK_VERSION ||
+                    ack.fromNodeIndex != targetNode || ack.toNodeIndex != 0u ||
+                    ack.layerIndex != headers[i].layerIndex || ack.position != headers[i].position)
+                throw std::runtime_error("Reserved worker KV acknowledgement does not match the transferred row");
+        }
+    } else {
+        throw std::runtime_error("Reserved worker cannot join without its prior KV history");
     }
 
     LlmDeviceJoinPacket insert{};
@@ -6967,8 +7050,11 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
             context->executor->setPrimaryLayerEnabled(layer, false);
         }
     }
+    context->inference->recordReservedJoin(g_reserved.donorStage, g_reserved.stageIndex,
+        g_reserved.layerBegin, g_reserved.layerEnd);
     g_poolLive[g_reserved.stageIndex] = 1;
     g_reserved.joined = true;
+    if (context->startDynamicControllers) context->startDynamicControllers();
     std::printf("✅ [pool] node=%u joined with %u kv rows\n", (unsigned)targetNode, (unsigned)headers.size());
     std::fflush(stdout);
     refreshTerminalUi(context->args, plan, context->header != nullptr ? context->header->nLayers : 0u, "device joined the pipeline");

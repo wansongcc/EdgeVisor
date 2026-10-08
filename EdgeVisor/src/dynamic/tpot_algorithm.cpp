@@ -78,7 +78,7 @@ static double migrationCostPerToken(double costMs, int expectedRemainingTokens) 
 
 static double ppBoundaryDeltaOutMs(const StageSnapshot &source, const StageSnapshot &target, const SchedulerConfig &cfg) {
     double measured = 0.0;
-    if (target.stageIndex > source.stageIndex) {
+    if (target.startLayer >= source.endLayer) {
         measured = source.rightBoundaryLayerMs;
     } else {
         measured = source.leftBoundaryLayerMs;
@@ -123,7 +123,7 @@ Candidate ppCandidateForMove(
     c.thresholdMs = ppLocalGainThresholdMs(source, target, cfg);
     c.valid = c.gainMs > c.thresholdMs;
     c.reason = c.valid ? "" : "gain below threshold";
-    if (target.stageIndex > source.stageIndex) {
+    if (target.startLayer >= source.endLayer) {
         c.layerIndex = source.endLayer - layerCount;
     } else {
         c.layerIndex = source.startLayer;
@@ -362,7 +362,6 @@ bool applyPpMove(std::vector<StageSnapshot> &stages, const Candidate &candidate)
     const bool forward = fromPosition + 1u == toPosition;
     const bool reverse = toPosition + 1u == fromPosition;
     if (!forward && !reverse) return false;
-    if (forward != (candidate.toStageIndex > candidate.fromStageIndex)) return false;
 
     if (from->endLayer < from->startLayer || k > from->endLayer - from->startLayer) return false;
     if (forward) {
@@ -420,9 +419,9 @@ bool commitStageBypassLayout(
 
     const bool forward = targetPos > ejectedPos;
     if (forward) {
-        if (targetStageIndex <= ejectedStageIndex || from.endLayer != to.startLayer) return false;
+        if (from.endLayer != to.startLayer) return false;
     } else {
-        if (targetStageIndex >= ejectedStageIndex || to.endLayer != from.startLayer) return false;
+        if (to.endLayer != from.startLayer) return false;
     }
 
     StageSnapshot merged = to;

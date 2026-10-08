@@ -669,6 +669,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.isAlive.store(false);
     context.batchSize = 0u;
     context.position = 0u;
+    std::memset(context.totalTime, 0, sizeof(context.totalTime));
     if (benchmark)
         context.timer = new Timer();
     else
@@ -899,10 +900,10 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundantInternal(NnUint budgetUs
 
     {
         std::lock_guard<std::mutex> lock(bubbleShadowMutex);
-        bubbleShadowCursor = 0u;
-        bubbleShadowComplete = false;
-        bubbleShadowDrainUs = 0u;
-        lastBubbleShadowStats = NnBubbleShadowStats{};
+        // forward() resets this cursor once per token and may already drain
+        // the work. Re-running from cursor zero would start with the cache
+        // advanced by the preceding redundant layer and corrupt KV history.
+        if (bubbleShadowComplete) return lastBubbleShadowStats;
     }
     return runBubbleShadowRedundantChunk(budgetUs, false, allowWhileRunning, true);
 }

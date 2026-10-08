@@ -80,6 +80,16 @@ static bool sameStages(const std::vector<tpot::StageSnapshot> &a, const std::vec
 }
 
 int main() {
+    {
+        // A reserved slot retains ID 2 when inserted before the tail with ID 1.
+        tpot::SchedulerConfig cfg; cfg.minPpGainMs = 0.0; cfg.ppRiskMarginMs = 0.0;
+        std::vector<tpot::StageSnapshot> joined{stage(0, 0, 0, 21, 1.0),
+            stage(2, 2, 21, 1, 1.0), stage(1, 1, 22, 6, 100.0)};
+        auto move = tpot::ppCandidateForMove(joined[2], joined[1], 1u, cfg);
+        require(move.valid && move.layerIndex == 22u, "joined tail moves its first layer to predecessor");
+        require(tpot::applyPpMove(joined, move), "joined IDs do not define migration direction");
+        require(joined[1].endLayer == 23u && joined[2].startLayer == 23u, "joined layout stays contiguous");
+    }
     tpot::SchedulerConfig cfg;
     require(near(cfg.loadPenaltyBeta, 0.0), "load penalty defaults to zero");
     require(near(cfg.ppGainRatio, 0.03), "PP gain ratio defaults to three percent");

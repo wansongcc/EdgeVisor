@@ -240,7 +240,7 @@ mmap-range-test: src/test/test_mmap_range.cpp
 weight-chunking-test: src/test/test_weight_chunking.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
-app-cli-test: src/test/test_app_cli.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+app-cli-test: src/test/test_app_cli.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 # --- (您的新测试目标) ---
@@ -267,3 +267,6 @@ uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp terminal-ui.o nn-quants.
 
 # Include auto-generated dependency files (created by -MMD).
 -include $(wildcard *.d)
+
+pp-failover-network-test: src/test/test_pp_failover_network.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -o $@ $(LIBS)

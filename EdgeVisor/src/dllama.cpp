@@ -1551,12 +1551,15 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     const double predWallTimeMs = std::chrono::duration<double, std::milli>(predWallEnd - predWallStart).count();
     if (productLogLevel() >= 1) {
     printf("\n");
+    if (context->args->benchmark) {
     printf("Evaluation\n");
     printf("   nBatches: %d\n", context->args->nBatches);
     printf("    nTokens: %d\n", nEvalTokens);
-    printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
-        (nEvalTokens * 1000) / evalTotalTimeMs,
-        evalTotalTimeMs / ((float) nEvalTokens));
+    if (nEvalTokens > 0 && evalTotalTimeMs > 0.0f)
+        printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
+            (nEvalTokens * 1000) / evalTotalTimeMs, evalTotalTimeMs / ((float) nEvalTokens));
+    else printf("   tokens/s: n/a\n");
+    }
     printf("Evaluation (root wall-clock)\n");
     printf("    nTokens: %d\n", nEvalTokens);
     if (nEvalTokens > 0 && evalWallMs > 0.0) {
@@ -1565,6 +1568,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     } else {
         printf("   tokens/s: n/a\n");
     }
+    if (context->args->benchmark) {
     printf("Prediction\n");
     printf("    nTokens: %d\n", nPredTokens);
     if (nPredTokens > 0 && predTotalTimeMs > 0.0f) {
@@ -1573,6 +1577,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             predTotalTimeMs / ((float) nPredTokens));
     } else {
         printf("   tokens/s: n/a\n");
+    }
     }
     printf("Prediction (root wall-clock)\n");
     printf("    nTokens: %d\n", nPredTokens);
@@ -2873,6 +2878,7 @@ static void printCliUsage(const char *argv0) {
         "  --list-devices                   print devices and exit\n"
         "  --gpu-index N\n"
         "  --nthreads N                     default: one thread per core\n"
+        "  --max-seq-len N                  default 4096; 0 uses the model window\n"
         "  --buffer-float-type f32|f16|q40|q80\n"
         "                                   Q40 weights use q80 unless this is set\n"
         "  --ratios 1@N*1@M                 omit to speed-pack. Lab machines use the built-in\n"

@@ -146,7 +146,8 @@ struct RuntimePrimaryOwnership {
 bool initializeRuntimePrimaryOwnership(
     const RuntimeStageLayerPlan *provisionMap,
     RuntimePrimaryOwnership &ownership,
-    std::string *reason = nullptr);
+    std::string *reason = nullptr,
+    const NnUnevenPartitionPlan *activePlan = nullptr);
 bool applyRuntimePrimaryOwnershipMove(
     RuntimePrimaryOwnership &ownership,
     NnUint fromStageIndex,
@@ -164,7 +165,8 @@ NnUint ppStartLayerSwitchFlag(
     const RuntimeStageLayerPlan *runtimePlan,
     NnUint fromStageIndex,
     NnUint toStageIndex,
-    NnUint boundaryLayer);
+    NnUint boundaryLayer,
+    const NnUnevenPartitionPlan *activePlan = nullptr);
 
 typedef struct {
     NnUint position;
@@ -512,6 +514,9 @@ public:
     const std::string& getStageBypassFailureReason() const { return stageBypassFailureReason; }
     const std::vector<NnUint>& getStageBypassExpectedAckNodes() const { return stageBypassExpectedAckNodes; }
     const std::vector<NnUint>& getStageBypassReceivedAckNodes() const { return stageBypassReceivedAckNodes; }
+    RuntimePrimaryOwnership getRuntimePrimaryOwnershipSnapshot() const;
+    bool validatePpMigrationCommand(const PlanCommand &command, std::string *reason = nullptr) const;
+    void recordReservedJoin(NnUint donorStage, NnUint newStage, NnUint begin, NnUint end);
     bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
@@ -542,6 +547,8 @@ private:
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
+    NnUint xPipeIndex = 0u;
+    NnSize xRowBytes = 0u;
     float *kvAggKPipe = nullptr;
     float *kvAggVPipe = nullptr;
     LlmHeader *header;
@@ -553,6 +560,7 @@ private:
     const NnUnevenPartitionPlan* plan = nullptr;
     const RuntimeStageLayerPlan* runtimePlan = nullptr;
     RuntimePrimaryOwnership runtimePrimaryOwnership;
+    mutable std::mutex runtimeOwnershipMutex;
     bool skipLogits_ = false;
     std::vector<NnUint> logitsSegmentIndices;
     mutable std::mutex lastPerfMutex;
@@ -733,6 +741,7 @@ typedef struct {
     NnNetwork *network;
     NnExecutor *executor;
     NnNodeConfig *nodeConfig;
+    std::function<void()> startDynamicControllers;
 } AppInferenceContext;
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));

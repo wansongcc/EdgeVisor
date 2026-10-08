@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <functional>
 
 #define ROOT_SOCKET_INDEX 0
 
@@ -122,6 +123,7 @@ private:
     int *sockets;
     NnUint *peerNodeBySocket;
     bool *socketActive;
+    bool turboEnabled = false;
     NnSize *sentBytes;
     NnSize *recvBytes;
     bool commProfileEnabled = false;
@@ -179,7 +181,9 @@ public:
     // so a pipeline send can fail over.
     void writeMany(NnUint n, NnSocketIo *ios, bool dropOffline = false);
     void writeAll(const void *data, NnSize size);
-    void readMany(NnUint n, NnSocketIo *ios);
+    // Result gathers can watch the upstream PP hop while the live tail is idle.
+    // The callback never consumes bytes from the result stream.
+    void readMany(NnUint n, NnSocketIo *ios, const std::function<void()> &onWait = {});
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
     void sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size);
     // True when the live socket to targetNodeIndex has already been reset.

@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "nn/nn-config-builder.hpp"
 #include "dynamic/dynamic_tpot.hpp"
 #include "dynamic/tpot_algorithm.hpp"
 #include "json.hpp"
@@ -87,7 +88,65 @@ static bool rejectsEnvironmentMaxPpLayerMove(const char *text) {
     return false;
 }
 
+static void testReservedMigrationAdmission() {
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 3u;
+    plan.stages = new NnStageConfig[3];
+    plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, (NnUint)-1};
+    plan.ppNextStageIndex = new NnUint[3]{1u, (NnUint)-1, (NnUint)-1};
+    const NnUint starts[] = {0u, 4u, 3u}, ends[] = {4u, 6u, 4u};
+    for (NnUint i = 0u; i < 3u; ++i) {
+        auto &stage = plan.stages[i]; stage.stageIndex = stage.rootNodeIndex = i;
+        stage.startLayer = starts[i]; stage.endLayer = ends[i]; stage.nLayers = ends[i]-starts[i];
+        stage.nNodes = 1u; stage.nodeIndices = new NnUint[1]{i};
+    }
+    NnNetConfigBuilder builder(3u, 1u);
+    builder.addPipe("X", size2D(F_32, 1u, 1u));
+    LlmHeader header{}; header.nLayers = 6u; header.seqLen = 32u;
+    LlmNet net{}; net.header = &header; net.netConfig = builder.build();
+    net.nodeConfigs = new NnNodeConfig[3]{};
+    auto &roles = net.runtimeStageLayerPlan;
+    roles.nLayers = 6u; roles.nStages = 3u; roles.layerRoleByStage.assign(18u, RUNTIME_LAYER_DISABLED);
+    for (NnUint i = 0u; i < 4u; ++i) roles.setRole(0u, i, RUNTIME_LAYER_PRIMARY);
+    roles.setRole(1u, 4u, RUNTIME_LAYER_PRIMARY); roles.setRole(1u, 5u, RUNTIME_LAYER_PRIMARY);
+    roles.setRole(2u, 3u, RUNTIME_LAYER_PRIMARY); roles.setRole(2u, 2u, RUNTIME_LAYER_REDUNDANT);
+    {
+        NnNetExecution execution(1u, &net.netConfig);
+        RootLlmInference inference(&net, &execution, nullptr, nullptr, &plan, false, true);
+        PlanCommand cmd = makeEmptyPlanCommand(); cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+        cmd.mode = PLAN_CMD_MODE_NEXT_BARRIER; cmd.fromNodeIndex = 0u; cmd.toNodeIndex = 2u;
+        cmd.triggerLayer = 2u; cmd.reserved0 = 1u;
+        assert(!inference.validatePpMigrationCommand(cmd)); // not on the active chain yet
+        assert(applyPpStageInsert(&plan, 2u, 0u));
+        inference.recordReservedJoin(0u, 2u, 3u, 4u);
+        assert(inference.validatePpMigrationCommand(cmd));
+        PlanCommand missing = cmd; missing.fromNodeIndex = 1u; missing.triggerLayer = 4u;
+        assert(!inference.validatePpMigrationCommand(missing)); // target has no weights
+        inference.recordReservedJoin(0u, 2u, 2u, 3u);
+        assert(!inference.validatePpMigrationCommand(cmd)); // source no longer owns it
+    }
+    delete[] net.nodeConfigs; releaseNetConfig(&net.netConfig);
+}
+
 int main() {
+    testReservedMigrationAdmission();
+    {
+        char program[] = "dllama", action[] = "inference", flag[] = "--max-seq-len";
+        char *defaults[] = {program, action};
+        assert(parseArgs(2, defaults).maxSeqLen == 4096u);
+        for (const char *text : {"0", "512", "8192"}) {
+            char value[32]; std::snprintf(value, sizeof(value), "%s", text);
+            char *argv[] = {program, action, flag, value};
+            assert(parseArgs(4, argv).maxSeqLen == std::strtoul(text, nullptr, 10));
+        }
+        for (const char *text : {"-1", "4096x", "", "4294967296", "999999999999999999999999"}) {
+            char value[64]; std::snprintf(value, sizeof(value), "%s", text);
+            char *argv[] = {program, action, flag, value};
+            bool rejected = false;
+            try { (void)parseArgs(4, argv); } catch (...) { rejected = true; }
+            assert(rejected);
+        }
+    }
     static_assert(sizeof(PlanCommand) == 1336u, "PlanCommand wire layout must remain unchanged");
     {
         char arg0[] = "dllama";
@@ -114,6 +173,27 @@ int main() {
         assert(rejected);
     }
 
+    {
+        RuntimeStageLayerPlan provision;
+        provision.nLayers = 2u; provision.nStages = 3u;
+        provision.layerRoleByStage.assign(6u, RUNTIME_LAYER_DISABLED);
+        provision.setRole(0u, 0u, RUNTIME_LAYER_PRIMARY);
+        provision.setRole(1u, 1u, RUNTIME_LAYER_PRIMARY);
+        provision.setRole(2u, 0u, RUNTIME_LAYER_PRIMARY); // offline reservation overlaps donor
+        NnUnevenPartitionPlan plan; plan.nStages = 3u;
+        plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, (NnUint)-1};
+        plan.ppNextStageIndex = new NnUint[3]{1u, (NnUint)-1, (NnUint)-1};
+        RuntimePrimaryOwnership ownership;
+        assert(!initializeRuntimePrimaryOwnership(&provision, ownership));
+        assert(initializeRuntimePrimaryOwnership(&provision, ownership, nullptr, &plan));
+        assert(ownership.ownerByLayer[0] == 0u);
+        assert(applyRuntimePrimaryOwnershipMove(ownership, 0u, 2u, std::vector<NnUint>{0u}));
+        assert(ownership.ownerByLayer[0] == 2u);
+        plan.ppNextStageIndex[0] = 2u; plan.ppPrevStageIndex[1] = 2u;
+        plan.ppNextStageIndex[2] = 1u; plan.ppPrevStageIndex[2] = 0u;
+        provision.setRole(2u, 1u, RUNTIME_LAYER_REDUNDANT);
+        assert(ppStartLayerSwitchFlag(&provision, 1u, 2u, 1u, &plan) == LLM_LAYER_SWITCH_NEW_PP_START);
+    }
     clearTpotEnvironment();
     {
         const dllama::dynamic_tpot::SchedulerConfig cfg =

@@ -249,10 +249,6 @@ static bool bubbleShadowKvDuringForwardEnabled() {
     return bubbleShadowKvEnabled() && envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD", true);
 }
 
-static bool bubbleShadowKvAsyncEnabled() {
-    return bubbleShadowKvEnabled() && envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", true);
-}
-
 static bool bubbleShadowKvLogEnabled() {
     return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_LOG", false);
 }
@@ -277,11 +273,10 @@ static NnUint findPipeIndexByName(const NnNetConfig *netConfig, const char *name
     return (NnUint)-1;
 }
 
-static NnBubbleShadowStats runBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize, bool forceSynchronous) {
+static NnBubbleShadowStats runBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
     NnBubbleShadowStats stats{};
     if (!bubbleShadowKvEnabled() || executor == nullptr) return stats;
-    const bool asyncMode = !forceSynchronous && executor->isBubbleShadowAsyncModeEnabled();
-    stats = asyncMode ? executor->getLastBubbleShadowStats() : executor->runBubbleShadowRedundant(0u);
+    stats = executor->runBubbleShadowRedundant(0u);
     if (bubbleShadowKvLogEnabled()) {
         std::printf(
             "🫧 [bubble-shadow-kv] who=%s node=%u pos=%u batch=%u mode=%s segments=%u attn=%u ffn=%u other=%u layers=%u ops=%u skipped_sync=%u budget_hit=%u completed=%u drain_us=%u elapsed_us=%llu\n",
@@ -289,7 +284,7 @@ static NnBubbleShadowStats runBubbleShadowKv(NnExecutor *executor, const char *w
             (unsigned)nodeIndex,
             (unsigned)position,
             (unsigned)batchSize,
-            asyncMode ? "async" : "sync",
+            "sync",
             (unsigned)stats.segmentsVisited,
             (unsigned)stats.attnSegments,
             (unsigned)stats.ffnSegments,
@@ -308,14 +303,14 @@ static NnBubbleShadowStats runBubbleShadowKv(NnExecutor *executor, const char *w
 
 static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
     if (!bubbleShadowKvDuringForwardEnabled()) return {};
-    return runBubbleShadowKv(executor, who, nodeIndex, position, batchSize, false);
+    return runBubbleShadowKv(executor, who, nodeIndex, position, batchSize);
 }
 
 static NnBubbleShadowStats runToolWindowBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
     // Tool-window work is deliberately synchronous: it must be completed and
     // profiled before the root releases the tool result.  Its elapsed time is
     // charged against that round's fixed tool-wait budget in dllama.cpp.
-    return runBubbleShadowKv(executor, who, nodeIndex, position, batchSize, true);
+    return runBubbleShadowKv(executor, who, nodeIndex, position, batchSize);
 }
 
 static bool parseEnvInt(const char *name, int &out) {
@@ -504,9 +499,8 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
         if (bubbleShadowKvDuringForwardEnabled()) {
             p.flags |= LLM_BOOTSTRAP_BUBBLE_SHADOW_KV_DURING_FORWARD;
         }
-        if (!bubbleShadowKvAsyncEnabled()) {
-            p.flags |= LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC;
-        }
+        // Keep the legacy wire bit set for older workers: shadow KV is synchronous.
+        p.flags |= LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC;
     }
     if (args->lastStageSampling) {
         p.flags |= LLM_BOOTSTRAP_LAST_STAGE_SAMPLING;
@@ -645,11 +639,18 @@ const char *AppCliArgs::backendToString(AppCliArgs::Backend backend) {
 }
 
 void AppCliArgs::applyBackendThreadDefaults() {
-    // Vulkan compute runs only on thread 0. A thread per CPU core adds
-    // busy-wait barriers without parallelizing GPU work. TP stages may
-    // raise this default later when parallel peer exchanges are needed.
-    if (!nThreadsExplicit && backend == BACKEND_VULKAN)
+    // Shadow KV shares scratch buffers and only supports a single executor
+    // thread, on every backend. Workers reapply this after receiving bootstrap.
+    if (bubbleShadowKvEnabled()) {
+        if (nThreadsExplicit && nThreads != 1u)
+            throw std::runtime_error("Shadow KV requires --nthreads 1; remove the explicit thread count or disable DLLAMA_BUBBLE_SHADOW_KV");
         nThreads = 1u;
+    } else if (!nThreadsExplicit) {
+        // Recompute the baseline so a worker relistening without shadow KV
+        // does not retain the preceding session's single-thread setting.
+        const unsigned hw = std::thread::hardware_concurrency();
+        nThreads = backend == BACKEND_VULKAN ? 1u : (hw == 0u ? 1u : hw);
+    }
 }
 
 AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
@@ -2008,7 +2009,7 @@ static NnUint resolveStagePeerCount(const NnUnevenPartitionPlan *plan, NnUint my
 // threads cut the per-token sync time on TP topologies. Pure-PP (single-node
 // stages) keeps 1 thread, where extra threads only add overhead.
 static void autoTuneThreads(AppCliArgs *args, const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint nNodes) {
-    if (args->nThreadsExplicit || args->nThreads != 1u) return;
+    if (bubbleShadowKvEnabled() || args->nThreadsExplicit || args->nThreads != 1u) return;
     if (args->backend != AppCliArgs::BACKEND_VULKAN && args->backend != AppCliArgs::BACKEND_CUDA) return;
     const NnUint peers = resolveStagePeerCount(plan, myNodeIndex, nNodes);
     if (peers == 0u) return;
@@ -7232,11 +7233,8 @@ void runWorkerApp(AppCliArgs *args) {
                 "DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD",
                 (boot.flags & LLM_BOOTSTRAP_BUBBLE_SHADOW_KV_DURING_FORWARD) != 0u ? "1" : "0",
                 1);
-            if ((boot.flags & LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC) != 0u) {
-                setenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", "0", 1);
-            } else {
-                unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
-            }
+            // Legacy async settings are accepted but do not launch background work.
+            setenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", "0", 1);
         } else {
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
             unsetenv("DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD");
@@ -7247,6 +7245,11 @@ void runWorkerApp(AppCliArgs *args) {
         } else {
             unsetenv("DLLAMA_LAST_STAGE_SAMPLING");
         }
+
+        const NnUint previousThreads = args->nThreads;
+        args->applyBackendThreadDefaults();
+        if (args->nThreads != previousThreads) printSelectedDevice(args);
+        publishProfileRuntime(profileBackendFor(args->backend), args->gpuIndex, args->nThreads);
 
         // Set enable plan barrier flag from bootstrap packet
         setEnablePlanBarrier(bootEnablePlanBarrier);

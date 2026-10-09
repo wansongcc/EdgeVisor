@@ -129,6 +129,7 @@ static void testReservedMigrationAdmission() {
 }
 
 int main() {
+    unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
     testReservedMigrationAdmission();
     {
         char program[] = "dllama", action[] = "inference";
@@ -146,6 +147,38 @@ int main() {
         args.backend = AppCliArgs::BACKEND_VULKAN;
         args.applyBackendThreadDefaults();
         assert(args.nThreadsExplicit && args.nThreads == 16u);
+    }
+    {
+        char program[] = "dllama", action[] = "worker";
+        char *defaults[] = {program, action};
+        for (AppCliArgs::Backend backend : {AppCliArgs::BACKEND_CPU, AppCliArgs::BACKEND_CUDA, AppCliArgs::BACKEND_VULKAN}) {
+            AppCliArgs args = parseArgs(2, defaults);
+            const NnUint hardwareThreads = args.nThreads;
+            args.backend = backend;
+            args.applyBackendThreadDefaults(); // initial worker startup
+            setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1); // root bootstrap arrives later
+            args.applyBackendThreadDefaults();
+            assert(args.nThreads == 1u && !args.nThreadsExplicit);
+            unsetenv("DLLAMA_BUBBLE_SHADOW_KV"); // next session on the same worker
+            args.applyBackendThreadDefaults();
+            assert(args.nThreads == (backend == AppCliArgs::BACKEND_VULKAN ? 1u : hardwareThreads));
+
+            char flag[] = "--nthreads", one[] = "1", many[] = "2";
+            setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
+            char *allowed[] = {program, action, flag, one};
+            args = parseArgs(4, allowed); args.backend = backend;
+            args.applyBackendThreadDefaults();
+            assert(args.nThreadsExplicit && args.nThreads == 1u);
+            char *unsupported[] = {program, action, flag, many};
+            args = parseArgs(4, unsupported); args.backend = backend;
+            bool rejected = false;
+            try { args.applyBackendThreadDefaults(); }
+            catch (const std::runtime_error &error) {
+                rejected = std::strstr(error.what(), "Shadow KV requires --nthreads 1") != nullptr;
+            }
+            assert(rejected);
+            unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
+        }
     }
     {
         char program[] = "dllama", action[] = "inference", flag[] = "--max-seq-len";

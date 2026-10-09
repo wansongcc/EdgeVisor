@@ -153,7 +153,6 @@ typedef struct {
     NnUint nodeIndex;
     NnExecutorSyncProfile *syncProfile;
     const NnByte *segmentSyncProfileKinds;
-    NnExecutor *owner;
 } NnExecutorContext;
 
 typedef struct {
@@ -196,13 +195,9 @@ private:
     std::unique_ptr<std::atomic_uint8_t[]> segmentEnabled;
     NnExecutorThread *threads;
     NnExecutorContext context;
-    std::thread bubbleShadowThread;
     mutable std::mutex bubbleShadowMutex;
     NnBubbleShadowStats lastBubbleShadowStats;
     NnExecutorSyncProfile lastSyncProfile;
-    bool bubbleShadowAsyncRunning;
-    bool bubbleShadowAsyncStarted;
-    bool bubbleShadowStopRequested;
     bool bubbleShadowComplete;
     NnUint bubbleShadowCursor;
     NnUint bubbleShadowDrainUs;
@@ -211,22 +206,18 @@ private:
     std::vector<NnUint> shadowFilledThrough_;
     std::vector<NnByte> segmentSyncProfileKinds;
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
-    NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool stopOnRequest, bool allowWhileRunning, bool chainLayers);
+    NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool allowWhileRunning);
     bool isRedundantLayerActive(NnUint layerIndex) const;
     void noteShadowFilled(NnUint layerIndex);
     void replayRedundantLayer(NnUint layerIndex);
     void resetBubbleShadowStateForForward();
+    void drainBubbleShadowKv();
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
     ~NnExecutor();
     void loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight);
     void forward();
     NnBubbleShadowStats runBubbleShadowRedundant(NnUint budgetUs);
-    bool isBubbleShadowAsyncModeEnabled() const;
-    void maybeStartBubbleShadowAsyncBeforeSync();
-    void joinBubbleShadowAsync();
-    void pauseBubbleShadowAsyncAfterSync();
-    void drainBubbleShadowAsync();
     NnBubbleShadowStats getLastBubbleShadowStats() const;
     NnExecutorSyncProfile getLastSyncProfile() const;
     // CPU-only today: update partition plan used for PNTR_BATCHED_SLICE resolution.

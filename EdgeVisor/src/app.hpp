@@ -399,6 +399,7 @@ enum LlmBootstrapFlags : NnUint {
     LLM_BOOTSTRAP_ENABLE_KV_AGGREGATE = 1u << 6,
     LLM_BOOTSTRAP_HAS_KV_REDUNDANCY = 1u << 7,
     LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV = 1u << 8,
+    // Legacy wire bit retained for interoperability; shadow work is synchronous.
     LLM_BOOTSTRAP_DISABLE_BUBBLE_SHADOW_KV_ASYNC = 1u << 9,
     // Enable bubble ShadowKV after normal forward passes.  When clear, the
     // redundant graph is still materialized but work is reserved for explicit

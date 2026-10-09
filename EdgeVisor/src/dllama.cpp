@@ -848,13 +848,14 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
     std::string effectivePrompt = buildInferencePrompt(context, prompt, &stops);
     std::string generatedText;
-    auto armSessionRestart = [&](NnUint peer) {
-        if (generatedText.empty()) {
+    auto armSessionRestart = [&](NnUint peer, bool timedOut = false) {
+        if (generatedText.empty() && !timedOut) {
             std::printf("startup peer=%u offline, retreat\n", (unsigned)peer);
             std::fflush(stdout);
             throw std::runtime_error(std::string("Socket offline peer=") + std::to_string((unsigned)peer));
         }
-        std::printf("🔁 [failover] session-restart peer=%u\n", (unsigned)peer);
+        std::printf("🔁 [failover] session-restart peer=%u reason=%s\n", (unsigned)peer,
+            timedOut ? "timeout" : "offline");
         std::fflush(stdout);
         failoverArmSessionRestart(effectivePrompt + generatedText, steps, context->header->nLayers);
         throw NnSessionRestartException();
@@ -864,6 +865,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             context->inference->forward();
         } catch (const NnPeerOfflineException &e) {
             armSessionRestart(e.peerNodeIndex);
+        } catch (const NnPeerTimeoutException &e) {
+            armSessionRestart(e.peerNodeIndex, true);
         }
     };
 
@@ -1143,6 +1146,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 context->inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr);
         } catch (const NnPeerOfflineException &e) {
             armSessionRestart(e.peerNodeIndex);
+        } catch (const NnPeerTimeoutException &e) {
+            armSessionRestart(e.peerNodeIndex, true);
         }
 
         // In pred stage batchSize==1. Always compute logits stats for debugging.

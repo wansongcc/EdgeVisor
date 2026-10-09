@@ -340,12 +340,9 @@ static bool tryReadKvAckWithDeadline(NnNetwork *network, NnUint socketIndex, voi
     if (timeoutMs <= 0) {
         return network->tryReadWithMaxAttempts(socketIndex, data, size, 0ul);
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    do {
-        if (network->tryReadWithMaxAttempts(socketIndex, data, size, 1000ul)) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (std::chrono::steady_clock::now() < deadline);
-    return false;
+    // Bound the entire read, including a sender that stalls after a partial
+    // payload. An outer retry cannot bound an inner partial blocking read.
+    return network->tryReadForMs(socketIndex, data, size, timeoutMs);
 }
 
 static void drainStrayKvAckRemainder(NnNetwork *network, NnUint socketIndex) {
@@ -2951,12 +2948,11 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
     const NnStageConfig &last = *lastStage;
     const NnUint sourceNode = last.rootNodeIndex;
     if (sourceNode == 0u || sourceNode >= plan->nNodes) return false;
-    const int socketIndex = network->getSocketIndexForNode(sourceNode, 0u);
-    if (socketIndex < 0) return false;
+    const int socketIndex = network->getSocketIndexForNode(sourceNode, 0u, true);
+    if (socketIndex < 0) throw NnPeerOfflineException(sourceNode, "Pipeline tail socket missing");
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kvAckWaitTimeoutMs());
     for (;;) {
-        pumpWorkerFrames((NnUint)socketIndex);
         auto &samples = workerSampleFrameCache[(NnUint)socketIndex];
         if (!samples.empty()) {
             const LlmSampledTokenPacket packet = samples.front();
@@ -2968,10 +2964,14 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
             if (logit != nullptr) *logit = packet.logit;
             return true;
         }
+        if (!network->isSocketActive((NnUint)socketIndex))
+            throw NnPeerOfflineException(sourceNode, "Pipeline tail socket offline");
+        pumpWorkerFrames((NnUint)socketIndex);
+        if (!samples.empty()) continue;
         network->recoverPpIfNextOffline(plan, 0u, execution->pipes[xPipeIndex],
             xRowBytes * execution->batchSize);
         if (std::chrono::steady_clock::now() >= deadline)
-            throw std::runtime_error("Timeout waiting for the pipeline tail sampled token");
+            throw NnPeerTimeoutException(sourceNode, "Timeout waiting for the pipeline tail sampled token");
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -4270,13 +4270,14 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex) {
         LlmWorkerFrameHeader peek{};
         if (!network->tryPeekWithMaxAttempts(socketIndex, &peek, sizeof(peek), 1ul)) return;
         if (peek.magic != LLM_WORKER_FRAME_MAGIC || peek.version != LLM_WORKER_FRAME_VERSION) {
-            std::printf("⚠️  [worker-frame] socket=%u invalid magic=0x%08x version=%u\n", (unsigned)socketIndex, (unsigned)peek.magic, (unsigned)peek.version);
-            return;
+            throw std::runtime_error("Invalid worker frame magic or version");
         }
+        if (peek.payloadBytes > 1024u * 1024u)
+            throw std::runtime_error("Worker frame payload exceeds limit");
         LlmWorkerFrameHeader frame{};
         std::vector<char> payload;
         if (!readWorkerFrame(network, socketIndex, frame, payload, kvAckWaitTimeoutMs()))
-            throw std::runtime_error("Incomplete worker frame payload");
+            throw NnPeerTimeoutException(network->getPeerNodeIndex(socketIndex), "Timeout reading worker frame payload");
         if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
             consumeStageBypassAckFrame(socketIndex, payload);
         } else if (frame.kind == LLM_WORKER_FRAME_PROFILE && payload.size() == sizeof(LlmPerfPacket)) {
@@ -4286,8 +4287,11 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex) {
             LlmSampledTokenPacket packet{}; std::memcpy(&packet, payload.data(), sizeof(packet));
             workerSampleFrameCache[socketIndex].push_back(packet);
         } else {
-            std::printf("⚠️  [worker-frame] socket=%u reject kind=%u bytes=%u\n", (unsigned)socketIndex, (unsigned)frame.kind, (unsigned)frame.payloadBytes);
+            throw std::runtime_error("Invalid worker frame kind or payload size");
         }
+        // Let the caller consume this complete frame before probing EOF. A
+        // tail may send its final token and close immediately afterwards.
+        return;
     }
 }
 

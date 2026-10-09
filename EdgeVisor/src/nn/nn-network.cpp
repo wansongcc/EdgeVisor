@@ -795,14 +795,16 @@ void writeSocket(int socket, const void *data, NnSize size) {
     }
 }
 
-static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned long maxAttempts) {
+static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned long maxAttempts, unsigned long deadlineMs = 0ul) {
     // maxAttempts = 0 means infinite attempts
     const bool ioProfile = dllamaIoProbeEnabled();
-    const unsigned long timeoutMs = getIoTimeoutMs();
+    const unsigned long timeoutMs = deadlineMs > 0ul ? deadlineMs : getIoTimeoutMs();
     const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
     NnSize s = size;
     unsigned int eagainSpins = 0u;
     while (s > 0) {
+        if (timeoutMs > 0ul && nowMsSteady() - startMs >= (long long)timeoutMs)
+            throw NnTransferSocketException(ETIMEDOUT, "Socket read deadline exceeded");
         const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         int recvFlags = 0;
 #ifdef MSG_DONTWAIT
@@ -870,6 +872,15 @@ static inline bool tryPeekSocket(int socket, void *data, NnSize size, unsigned l
             throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket closed");
         }
         if ((NnSize)r >= size) return true;
+#ifndef _WIN32
+        // A closed peer cannot complete this prefix. MSG_PEEK otherwise keeps
+        // returning the same short buffer forever without ever observing EOF.
+        pollfd pfd{}; pfd.fd = socket; pfd.events = POLLIN;
+        struct tcp_info info{}; socklen_t infoLen = sizeof(info);
+        if ((poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR)) != 0) ||
+                (getsockopt(socket, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && tcpStateIsDead(info.tcpi_state)))
+            throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket closed with incomplete prefix");
+#endif
         if (maxAttempts > 0) {
             maxAttempts--;
             if (maxAttempts == 0) return false;
@@ -1837,6 +1848,7 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 
 bool NnNetwork::tryReadForMs(NnUint socketIndex, void *data, NnSize size, int timeoutMs) {
     assert(socketIndex < nSockets);
+    const long long startMs = nowMsSteady();
 #ifndef _WIN32
     pollfd pfd{};
     pfd.fd = sockets[socketIndex];
@@ -1855,7 +1867,21 @@ bool NnNetwork::tryReadForMs(NnUint socketIndex, void *data, NnSize size, int ti
 #else
     (void)timeoutMs;
 #endif
-    return tryReadWithMaxAttempts(socketIndex, data, size, 10000ul);
+    try {
+        const long long remainingMs = timeoutMs - (nowMsSteady() - startMs);
+        if (timeoutMs > 0 && remainingMs <= 0) return false;
+        if (!tryReadSocket(sockets[socketIndex], data, size, 10000ul,
+                remainingMs > 0 ? (unsigned long)remainingMs : 0ul)) return false;
+        recvBytes[socketIndex] += size;
+        recordCommRecv(size);
+        return true;
+    } catch (const NnTransferSocketException &error) {
+        const NnUint peer = peerNodeBySocket[socketIndex];
+        if (error.code == ETIMEDOUT) throw NnPeerTimeoutException(peer, error.what());
+        if (error.code != NN_PEER_OFFLINE) throw;
+        deactivateNode(peer, 0u);
+        throw NnPeerOfflineException(peer, error.what());
+    }
 }
 
 bool NnNetwork::tryPeekWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts) {
@@ -2077,14 +2103,19 @@ void NnNetwork::resetStats() {
     }
 }
 
-int NnNetwork::getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const {
+int NnNetwork::getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex, bool includeInactive) const {
     (void)myNodeIndex;
     for (NnUint i = 0; i < nSockets; ++i) {
-        if (socketActive[i] && peerNodeBySocket[i] == targetNodeIndex) {
+        if ((socketActive[i] || includeInactive) && peerNodeBySocket[i] == targetNodeIndex) {
             return (int)i;
         }
     }
     return -1;
+}
+
+NnUint NnNetwork::getPeerNodeIndex(NnUint socketIndex) const {
+    assert(socketIndex < nSockets);
+    return peerNodeBySocket[socketIndex];
 }
 
 bool NnNetwork::isSocketActive(NnUint socketIndex) const {
@@ -2252,26 +2283,9 @@ void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const voi
         // the kernel buffer and the reset shows up on the next call. PP has to know
         // before this step finishes, or the downstream stage reads the next token.
 #ifndef _WIN32
-        const int fd = sockets[socketIndex];
-        int soerr = 0;
-        socklen_t soerrLen = sizeof(soerr);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen) == 0 && soerr != 0 && isOfflineErrno(soerr)) {
+        if (peerLooksOffline(targetNodeIndex)) {
             deactivateNode(targetNodeIndex, 0u);
-            throw NnPeerOfflineException(targetNodeIndex, "PP peer reset");
-        }
-        struct tcp_info info;
-        std::memset(&info, 0, sizeof(info));
-        socklen_t infoLen = sizeof(info);
-        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLen) == 0 && tcpStateIsDead(info.tcpi_state)) {
-            deactivateNode(targetNodeIndex, 0u);
-            throw NnPeerOfflineException(targetNodeIndex, "PP peer not established");
-        }
-        pollfd pfd{};
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP)) != 0) {
-            deactivateNode(targetNodeIndex, 0u);
-            throw NnPeerOfflineException(targetNodeIndex, "PP peer hung up");
+            throw NnPeerOfflineException(targetNodeIndex, "PP peer closed");
         }
 #endif
     } else if (targetNodeIndex != myNodeIndex) {
@@ -2285,6 +2299,11 @@ bool NnNetwork::peerLooksOffline(NnUint targetNodeIndex) const {
     const int socketIndex = getSocketIndexForNode(targetNodeIndex, 0u);
     if (socketIndex < 0) return false;
     const int fd = sockets[socketIndex];
+    // FIN/HUP can coexist with unread results. Drain those through the frame
+    // reader before declaring the socket unusable; a truncated frame still
+    // raises offline/timeout rather than becoming a fabricated token.
+    char buffered;
+    if (recv(fd, &buffered, 1u, MSG_PEEK | MSG_DONTWAIT) > 0) return false;
     int soerr = 0;
     socklen_t soerrLen = sizeof(soerr);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen) == 0 && soerr != 0 && isOfflineErrno(soerr))

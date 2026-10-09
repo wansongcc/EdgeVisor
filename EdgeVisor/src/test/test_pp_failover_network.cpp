@@ -1,6 +1,7 @@
 #include "nn/nn-network.hpp"
 #include "nn/nn-config-builder.hpp"
 #include "nn/nn-executor.hpp"
+#include "app.hpp"
 #include <cassert>
 #include <chrono>
 #include <cstdio>
@@ -11,6 +12,88 @@
 
 static unsigned calls;
 static bool covered;
+
+// Exercise the real root frame reader without model weights or a GPU.
+// fault: 1=stalled payload, 2=no response, 3=bad identity, 4=bad header,
+// 5=profile collector observes EOF after caching a complete sample,
+// 6=closed partial header, 7=stalled partial header.
+static void testTailFrameClose(bool turbo, bool complete, bool profileFirst, unsigned fault = 0u) {
+    const bool stalled = fault == 1u || fault == 2u || fault == 7u;
+    setenv("DLLAMA_KV_ACK_TIMEOUT_MS", "100", 1);
+    if (stalled) unsetenv("DLLAMA_IO_TIMEOUT_MS");
+    int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    std::vector<NnSocket> sockets; sockets.emplace_back(pair[0]);
+    std::vector<NnUint> peers{1u};
+    NnNetwork network(&sockets, &peers); network.resetStats(); network.setTurbo(turbo);
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 2u; plan.stages = new NnStageConfig[2];
+    for (NnUint i = 0u; i < 2u; ++i) {
+        auto &s = plan.stages[i]; s.stageIndex = s.rootNodeIndex = i;
+        s.startLayer = i; s.endLayer = i + 1u; s.nLayers = s.nNodes = 1u;
+        s.nodeIndices = new NnUint[1]{i};
+    }
+    NnNetConfigBuilder builder(2u, 1u);
+    builder.addPipe("X", size2D(F_32, 1u, 1u));
+    LlmHeader header{}; header.nLayers = 2u; header.seqLen = 32u;
+    LlmNet net{}; net.header = &header; net.netConfig = builder.build();
+    net.nodeConfigs = new NnNodeConfig[2]{};
+    {
+        NnNetExecution execution(1u, &net.netConfig);
+        RootLlmInference inference(&net, &execution, nullptr, &network, &plan, true, false);
+        inference.setBatchSize(1u); inference.setPosition(7u);
+        LlmWorkerFrameHeader frame{};
+        frame.magic = LLM_WORKER_FRAME_MAGIC; frame.version = LLM_WORKER_FRAME_VERSION;
+        if (profileFirst) {
+            frame.kind = LLM_WORKER_FRAME_PROFILE; frame.payloadBytes = sizeof(LlmPerfPacket);
+            LlmPerfPacket perf{}; perf.position = 7u; perf.nodeIndex = 1u;
+            assert(send(pair[1], &frame, sizeof(frame), 0) == sizeof(frame));
+            assert(send(pair[1], &perf, sizeof(perf), 0) == sizeof(perf));
+        }
+        frame.kind = LLM_WORKER_FRAME_SAMPLED_TOKEN; frame.payloadBytes = sizeof(LlmSampledTokenPacket);
+        if (fault == 4u) frame.magic = 0u;
+        LlmSampledTokenPacket sample{};
+        sample.magic = LLM_SAMPLED_TOKEN_MAGIC; sample.version = LLM_SAMPLED_TOKEN_VERSION;
+        sample.position = 7u; sample.nodeIndex = 1u; sample.token = 123u;
+        if (fault == 3u) sample.position = 6u;
+        const size_t bytes = complete ? sizeof(sample) : sizeof(sample) / 2u;
+        if (fault != 2u) {
+            const size_t headerBytes = fault >= 6u ? sizeof(frame) / 2u : sizeof(frame);
+            assert(send(pair[1], &frame, headerBytes, 0) == (ssize_t)headerBytes);
+            if (fault < 6u) assert(send(pair[1], &sample, bytes, 0) == (ssize_t)bytes);
+        }
+        if (!stalled) close(pair[1]);
+        if (complete && !stalled) assert(!network.peerLooksOffline(1u));
+        if (fault == 5u) {
+            std::vector<LlmPerfPacket> perf;
+            inference.collectDeferredProfile(LlmPerfPacket{}, perf);
+            assert(!network.isSocketActive(0u));
+        }
+        NnUint token = 0u; bool offline = false, timeout = false, invalid = false;
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            assert(inference.tryReceiveLastStageSampledToken(token, nullptr));
+            assert(complete && token == 123u && (fault == 0u || fault == 5u));
+        } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
+        catch (const NnPeerTimeoutException &e) { timeout = true; assert(e.peerNodeIndex == 1u); }
+        catch (const std::runtime_error &) { invalid = true; }
+        assert(offline == (!complete && !stalled));
+        assert(timeout == stalled);
+        assert(invalid == (fault == 3u || fault == 4u));
+        assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+        if (stalled) { assert(network.isSocketActive(0u)); close(pair[1]); }
+        if (complete && !stalled && !invalid) {
+            // The result belongs to this token even if EOF follows it. The next
+            // position must discover the dead tail, never reuse this token.
+            inference.setPosition(8u); offline = false;
+            try { inference.tryReceiveLastStageSampledToken(token, nullptr); }
+            catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
+            assert(offline);
+        }
+    }
+    delete[] net.nodeConfigs; releaseNetConfig(&net.netConfig);
+    unsetenv("DLLAMA_KV_ACK_TIMEOUT_MS");
+    setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
+}
 static void testBoundedFrameProbe(bool turbo) {
     int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     std::vector<NnSocket> sockets; sockets.emplace_back(pair[0]);
@@ -141,9 +224,16 @@ static void testShadowOnce(const char *async) {
 }
 int main() {
     setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
+    setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+    testTailFrameClose(false, true, false); testTailFrameClose(true, true, true);
+    testTailFrameClose(false, false, false); testTailFrameClose(true, false, true);
+    testTailFrameClose(false, false, false, 1u); testTailFrameClose(true, true, false, 2u);
+    testTailFrameClose(false, true, false, 3u); testTailFrameClose(true, true, false, 4u);
+    testTailFrameClose(true, true, false, 5u);
+    testTailFrameClose(false, false, false, 6u); testTailFrameClose(true, false, false, 7u);
     testBoundedFrameProbe(false); testBoundedFrameProbe(true);
     testBufferedSend(true, false); testBufferedSend(true, true);
     testBufferedSend(false, false); testBufferedSend(false, true);
     testShadowOnce("0"); testShadowOnce("1");
-    std::puts("PP buffered-send recovery, uncovered rejection and once-per-token shadow KV passed");
+    std::puts("PP recovery, buffered tail frames, bounded timeouts, protocol rejection and shadow KV passed");
 }

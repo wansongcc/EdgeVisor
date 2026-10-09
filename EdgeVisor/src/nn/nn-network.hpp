@@ -47,6 +47,14 @@ public:
     NnSessionRestartException() : std::runtime_error("session restart") {}
 };
 
+// A local deadline is recoverable, but is not proof that the peer is offline.
+class NnPeerTimeoutException : public std::runtime_error {
+public:
+    NnUint peerNodeIndex;
+    NnPeerTimeoutException(NnUint peer, const std::string &message)
+        : std::runtime_error(message), peerNodeIndex(peer) {}
+};
+
 // A speed-pack probe, not a root session. The worker answers and listens again.
 class NnProfileProbeException : public std::runtime_error {
 public:
@@ -196,7 +204,10 @@ public:
     bool isCommProfileEnabled() const;
     void recordSyncStepComplete();
     void recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size);
-    int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const;
+    // includeInactive is only for consuming results already buffered by the
+    // frame reader; new transfers must still use an active socket.
+    int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex, bool includeInactive = false) const;
+    NnUint getPeerNodeIndex(NnUint socketIndex) const;
     bool isSocketActive(NnUint socketIndex) const;
     bool deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex);
     void resetStats();

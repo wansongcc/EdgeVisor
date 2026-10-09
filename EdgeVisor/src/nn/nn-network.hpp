@@ -196,11 +196,9 @@ public:
     void sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size);
     // True when the live socket to targetNodeIndex has already been reset.
     bool peerLooksOffline(NnUint targetNodeIndex) const;
-    // The PP send can return before the peer's reset is visible. If that next
-    // hop is dead while this node waits for the next control packet, splice and
-    // send the current activation to the bypass target. One-shot: after the
-    // plan rewires, the new next hop is a live socket.
-    bool recoverPpIfNextOffline(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnByte *pipe, NnSize nBytes);
+    // A dead next hop while waiting for results makes buffered delivery
+    // ambiguous. Throw for session restart; do not replay the activation.
+    void checkPpNextWhileWaiting(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex);
     bool isCommProfileEnabled() const;
     void recordSyncStepComplete();
     void recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size);

@@ -2324,27 +2324,21 @@ bool NnNetwork::peerLooksOffline(NnUint targetNodeIndex) const {
     return false;
 }
 
-bool NnNetwork::recoverPpIfNextOffline(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnByte *pipe, NnSize nBytes) {
-    if (plan == nullptr || pipe == nullptr || nBytes == 0u || g_ppFailover == nullptr) return false;
+void NnNetwork::checkPpNextWhileWaiting(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex) {
+    if (plan == nullptr) return;
     NnUint slot = 0u;
     const NnStageConfig *myStage = ppStageForNode(plan, myNodeIndex, &slot);
-    if (myStage == nullptr || myStage->rootNodeIndex != myNodeIndex) return false;
+    if (myStage == nullptr || myStage->rootNodeIndex != myNodeIndex) return;
     const NnUint nextStageIndex = getPpNextStageIndex(plan, slot);
-    if (nextStageIndex == (NnUint)-1 || nextStageIndex >= plan->nStages) return false;
+    if (nextStageIndex == (NnUint)-1 || nextStageIndex >= plan->nStages) return;
     const NnUint nextNode = plan->stages[nextStageIndex].rootNodeIndex;
-    if (!peerLooksOffline(nextNode)) return false;
-    NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
-    // The caller waits long enough for a normal next control packet to arrive.
-    // Reaching here means the root is still blocked on this activation, so the
-    // downstream stage never got it. Apply the dead layers and send once.
+    if (getSocketIndexForNode(nextNode, myNodeIndex) >= 0 && !peerLooksOffline(nextNode)) return;
+    // A successful buffered send does not prove whether the dead stage
+    // forwarded this token. The tail may already be computing its result.
+    // Replaying here can enqueue a second activation where the downstream
+    // reader expects the next control packet. Restart on ambiguous delivery.
     deactivateNode(nextNode, myNodeIndex);
-    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode, true))
-        throw NnPeerOfflineException(nextNode, "PP peer offline without ready shadow cache");
-    sendPpToNext(this, myNodeIndex, pipe, nBytes, plan);
-    std::printf("🔁 [failover] resent in-flight activation deadNext=%u bytes=%zu\n",
-        (unsigned)nextNode, (size_t)nBytes);
-    std::fflush(stdout);
-    return true;
+    throw NnPeerOfflineException(nextNode, "PP delivery is ambiguous after a buffered send; restart required");
 }
 
 void NnNetwork::recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size) {
@@ -2986,13 +2980,25 @@ static void recvPpFromPrev(NnNetwork *network, NnUint myNodeIndex, NnByte *buffe
 
 static void syncPpSend(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, 
                        const NnUnevenPartitionPlan *plan) {
-    try {
-        sendPpToNext(network, myNodeIndex, buffer, nBytes, plan);
-    } catch (const NnPeerOfflineException &offline) {
-        NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
-        if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex, true)) throw;
-        sendPpToNext(network, myNodeIndex, buffer, nBytes, plan);
+    NnUint slot = 0u;
+    const NnStageConfig *stage = ppStageForNode(plan, myNodeIndex, &slot);
+    if (stage != nullptr && stage->rootNodeIndex == myNodeIndex) {
+        const NnUint next = getPpNextStageIndex(plan, slot);
+        if (next != (NnUint)-1 && next < plan->nStages) {
+            const NnUint peer = plan->stages[next].rootNodeIndex;
+            if (network->getSocketIndexForNode(peer, myNodeIndex) < 0 || network->peerLooksOffline(peer)) {
+                // No bytes for this token have been sent yet, so replaying
+                // the dead layers and routing this activation is unambiguous.
+                network->deactivateNode(peer, myNodeIndex);
+                if (g_ppFailover == nullptr ||
+                    !g_ppFailover(const_cast<NnUnevenPartitionPlan *>(plan), myNodeIndex, peer, true))
+                    throw NnPeerOfflineException(peer, "PP peer offline without ready shadow cache");
+            }
+        }
     }
+    // Once write starts, an error or post-write EOF is ambiguous. Let the
+    // caller restart instead of retrying an activation that may be delivered.
+    sendPpToNext(network, myNodeIndex, buffer, nBytes, plan);
 }
 
 static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, 
@@ -3375,15 +3381,7 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncTypeStr = "SYNC_LOGITS";
                 std::function<void()> onWait;
                 if (nodeConfig->nodeIndex == 0u && threadIndex == 0u && plan != nullptr) {
-                    onWait = [this]() {
-                        for (NnUint p = 0u; p < netConfig->nPipes; ++p) {
-                            const NnPipeConfig &x = netConfig->pipes[p];
-                            if (x.name == nullptr || std::strcmp(x.name, "X") != 0) continue;
-                            network->recoverPpIfNextOffline(plan, 0u, execution->pipes[p],
-                                getBytes(x.size.floatType, x.size.x) * execution->batchSize);
-                            break;
-                        }
-                    };
+                    onWait = [this]() { network->checkPpNextWhileWaiting(plan, 0u); };
                 }
                 syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipe, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, forcedTag, totalElements, execution->batchSize, onWait);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_TO_STAGE_ROOT) {

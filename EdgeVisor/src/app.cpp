@@ -2977,8 +2977,7 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
             throw NnPeerOfflineException(sourceNode, "Pipeline tail socket offline");
         pumpWorkerFrames((NnUint)socketIndex);
         if (!samples.empty()) continue;
-        network->recoverPpIfNextOffline(plan, 0u, execution->pipes[xPipeIndex],
-            xRowBytes * execution->batchSize);
+        network->checkPpNextWhileWaiting(plan, 0u);
         if (std::chrono::steady_clock::now() >= deadline)
             throw NnPeerTimeoutException(sourceNode, "Timeout waiting for the pipeline tail sampled token");
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -7366,7 +7365,6 @@ void runWorkerApp(AppCliArgs *args) {
         }
 
         const NnUint logitsPipeIndex = findPipeIndexByName(&netConfig, "LG");
-        const NnUint xPipeIndex = findPipeIndexByName(&netConfig, "X");
         std::unique_ptr<Sampler> lastStageSampler;
         if (bootLastStageSamplingEnabled && lastStageSamplingPlanSupported(planPtr.get())) {
             const NnStageConfig *lastStage = pipelineTailStage(planPtr.get());
@@ -7390,7 +7388,6 @@ void runWorkerApp(AppCliArgs *args) {
         bool isTurboEnabled = false;
         clock_t startTime;
         bool controlStalled = false;
-        bool inFlightReplayed = false;
         std::chrono::steady_clock::time_point controlStalledAt{};
         
         while (true) {
@@ -7405,16 +7402,11 @@ void runWorkerApp(AppCliArgs *args) {
                         controlStalledAt = now;
                     }
                     const auto stalledMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - controlStalledAt).count();
-                    // A live root sends the next control within a token time.
-                    // Waiting past that means this activation never reached the
-                    // next stage, so replay it once instead of holding forever.
-                    if (!inFlightReplayed && stalledMs >= 1000 &&
-                        execution.batchSize > 0u && xPipeIndex < netConfig.nPipes && execution.pipes != nullptr) {
-                        const NnPipeConfig &xPipe = netConfig.pipes[xPipeIndex];
-                        const NnSize xBytes = getBytes(xPipe.size.floatType, xPipe.size.x) * (NnSize)execution.batchSize;
-                        if (network->recoverPpIfNextOffline(planPtr.get(), nodeConfig.nodeIndex, execution.pipes[xPipeIndex], xBytes))
-                            inFlightReplayed = true;
-                    }
+                    // A dead next hop does not prove the activation was lost:
+                    // it may already be computing downstream. Restart rather
+                    // than enqueueing a duplicate on the control stream.
+                    if (stalledMs >= 1000 && execution.batchSize > 0u)
+                        network->checkPpNextWhileWaiting(planPtr.get(), nodeConfig.nodeIndex);
                     if (isTurboEnabled && !isFirstAttempt && clock() - startTime > CLOCKS_PER_SEC) {
                         network->setTurbo(false);
                         isTurboEnabled = false;
@@ -7424,7 +7416,6 @@ void runWorkerApp(AppCliArgs *args) {
                     continue;
                 }
                 controlStalled = false;
-                inFlightReplayed = false;
                 if (inference.isFinished)
                     break;
 

@@ -190,14 +190,13 @@ static bool bypass(NnUnevenPartitionPlan *plan, NnUint self, NnUint dead, bool r
     return covered && applyPpStageBypass(plan, 1u, 0u);
 }
 
-// Reproduce a successful buffered PP send followed by a dead middle hop,
-// while the root is waiting on a different, healthy tail socket.
-static void testBufferedSend(bool cacheReady, bool turbo) {
+// A dead middle hop can have already forwarded the token. A result wait
+// cannot distinguish that from a lost activation, so it must never resend.
+static void testBufferedSend(bool alreadyDelivered, bool turbo) {
     int middle[2], tail[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, tail) == 0);
-    std::vector<NnSocket> sockets;
-    sockets.reserve(2);
+    std::vector<NnSocket> sockets; sockets.reserve(2u);
     sockets.emplace_back(middle[0]); sockets.emplace_back(tail[0]);
     std::vector<NnUint> peers{1u, 2u};
     NnNetwork network(&sockets, &peers);
@@ -214,32 +213,74 @@ static void testBufferedSend(bool cacheReady, bool turbo) {
     }
     int activation = 17, result = 0;
     network.write(0u, &activation, sizeof(activation));
-    // Drain the buffered send, then close: the send has already succeeded.
-    int discarded; assert(recv(middle[1], &discarded, sizeof(discarded), MSG_WAITALL) == sizeof(discarded));
-    assert(discarded == activation); close(middle[1]);
-    calls = 0u; covered = cacheReady; setNnPpFailoverHook(bypass);
+    int consumed; assert(recv(middle[1], &consumed, sizeof(consumed), MSG_WAITALL) == sizeof(consumed));
+    assert(consumed == activation); close(middle[1]);
+    calls = 0u; covered = true; setNnPpFailoverHook(bypass);
     std::thread worker;
-    if (cacheReady) worker = std::thread([&]() {
-        int received;
-        assert(recv(tail[1], &received, sizeof(received), MSG_WAITALL) == sizeof(received));
-        assert(received == activation);
+    if (alreadyDelivered) worker = std::thread([&]() {
+        // This stage already has the activation and is computing; delaying
+        // the result does not authorize another copy on its control socket.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         const int answer = 12345;
-        // Partial reads must preserve their position across recovery checks.
-        assert(send(tail[1], &answer, 1, 0) == 1);
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        assert(send(tail[1], (const char *)&answer+1, sizeof(answer)-1, 0) == sizeof(answer)-1);
+        assert(send(tail[1], &answer, sizeof(answer), 0) == sizeof(answer));
     });
     NnSocketIo io{1u, &result, sizeof(result)};
     bool offline = false;
     try {
-        network.readMany(1u, &io, [&]() {
-            network.recoverPpIfNextOffline(&plan, 0u, (NnByte *)&activation, sizeof(activation));
-        });
+        network.readMany(1u, &io, [&]() { network.checkPpNextWhileWaiting(&plan, 0u); });
     } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
-    if (cacheReady) { worker.join(); assert(!offline && result == 12345); }
-    else assert(offline);
-    assert(calls == 1u);
+    if (worker.joinable()) worker.join();
+    assert(offline && calls == 0u && getPpNextStageIndex(&plan, 0u) == 1u);
+    int duplicate;
+    assert(recv(tail[1], &duplicate, sizeof(duplicate), MSG_DONTWAIT) == -1);
     setNnPpFailoverHook(nullptr); close(tail[1]);
+}
+
+// When the peer is dead before any bytes for this token are sent, the normal
+// PP synchronizer can take over and send exactly once with ready shadow KV.
+static void testBeforePpSend(bool cacheReady, bool turbo, bool alreadyInactive = false) {
+    int middle[2], tail[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, tail) == 0);
+    std::vector<NnSocket> sockets; sockets.reserve(2u);
+    sockets.emplace_back(middle[0]); sockets.emplace_back(tail[0]);
+    std::vector<NnUint> peers{1u, 2u};
+    NnNetwork network(&sockets, &peers); network.resetStats(); network.setTurbo(turbo);
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 3u; plan.stages = new NnStageConfig[3];
+    plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, 1u};
+    plan.ppNextStageIndex = new NnUint[3]{1u, 2u, (NnUint)-1};
+    for (NnUint i = 0u; i < 3u; ++i) {
+        auto &s = plan.stages[i]; s.stageIndex = s.rootNodeIndex = i;
+        s.startLayer = i; s.endLayer = i+1u; s.nLayers = s.nNodes = 1u;
+        s.nodeIndices = new NnUint[1]{i};
+    }
+    NnNetConfigBuilder builder(3u, 1u);
+    NnUint pipe = builder.addPipe("X", size2D(F_32, 1u, 1u));
+    NnNodeConfigBuilder nodeBuilder(0u);
+    NnSegmentConfigBuilder segment; segment.addSync(pipe, SYNC_PP_SEND);
+    nodeBuilder.addSegment(segment.build());
+    NnNetConfig config = builder.build(); NnNodeConfig node = nodeBuilder.build();
+    {
+        NnNetExecution execution(1u, &config); execution.setBatchSize(1u);
+        *(float *)execution.pipes[pipe] = 17.0f;
+        NnNetworkNodeSynchronizer synchronizer(&network, &execution, &config, &node, &plan, false);
+        calls = 0u; covered = cacheReady; setNnPpFailoverHook(bypass);
+        close(middle[1]);
+        if (alreadyInactive) network.deactivateNode(1u, 0u);
+        bool offline = false;
+        try { synchronizer.sync(0u, 1u, 0u); }
+        catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
+        assert(offline == !cacheReady && calls == 1u);
+        float received;
+        if (cacheReady) {
+            assert(recv(tail[1], &received, sizeof(received), MSG_WAITALL) == sizeof(received));
+            assert(received == 17.0f);
+        }
+        assert(recv(tail[1], &received, sizeof(received), MSG_DONTWAIT) == -1);
+    }
+    setNnPpFailoverHook(nullptr); close(tail[1]);
+    releaseNetConfig(&config); releaseNodeConfig(&node);
 }
 class CountingSegment : public NnDeviceSegment {
     unsigned &count;
@@ -303,6 +344,9 @@ int main() {
     testBoundedFrameProbe(false); testBoundedFrameProbe(true);
     testBufferedSend(true, false); testBufferedSend(true, true);
     testBufferedSend(false, false); testBufferedSend(false, true);
+    testBeforePpSend(true, false); testBeforePpSend(true, true);
+    testBeforePpSend(false, false); testBeforePpSend(false, true);
+    testBeforePpSend(true, false, true); testBeforePpSend(false, true, true);
     testShadowOnce("0"); testShadowOnce("1");
     std::puts("PP recovery, buffered tail frames, bounded timeouts, protocol rejection and shadow KV passed");
 }

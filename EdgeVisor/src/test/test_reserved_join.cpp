@@ -1,5 +1,5 @@
 // Model-backed acceptance entry point. Reuse the production CLI/decode loop,
-// but let the test controller start a reserved worker after bootstrap and
+// but let the test controller change worker availability after bootstrap and
 // before the very first token. No timing sleeps are inserted in production.
 #define main edgeVisorCliMain
 #include "../dllama.cpp"
@@ -30,7 +30,7 @@ static void awaitReservedWorker(AppInferenceContext *context) {
             throw std::runtime_error("Reserved join controller did not release decode");
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    std::puts("[acceptance] stale command cleared; one prompt token; worker started before decode position 0");
+    std::puts("[acceptance] stale command cleared; one prompt token; controller released decode position 0");
     inference(context);
 }
 

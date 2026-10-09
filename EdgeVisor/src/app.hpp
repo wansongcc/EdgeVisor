@@ -519,6 +519,8 @@ public:
     bool validatePpMigrationCommand(const PlanCommand &command, std::string *reason = nullptr) const;
     void recordReservedJoin(NnUint donorStage, NnUint newStage, NnUint begin, NnUint end);
     bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
+    // Control ACKs share a stream with profiles and sampled-token frames.
+    void waitWorkerControlAck(NnUint socketIndex, int timeoutMs);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
     void setSkipLogits(bool skip);
@@ -544,7 +546,7 @@ private:
     void consumeStageBypassAckFrame(NnUint socketIndex, const std::vector<char> &payload);
     void tryVerifyStageBypassAcks();
     void pollStageBypassAckFrames();
-    void pumpWorkerFrames(NnUint socketIndex);
+    void pumpWorkerFrames(NnUint socketIndex, int timeoutMs = -1);
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;

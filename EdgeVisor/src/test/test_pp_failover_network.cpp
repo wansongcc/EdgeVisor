@@ -13,6 +13,72 @@
 static unsigned calls;
 static bool covered;
 
+// A worker uninvolved in KV installation may still have profile/sample
+// frames queued before the raw precommit ACK. Keep both frames for decode.
+// fault: 1=no ACK, 2=partial frame header, 3=partial payload, 4=invalid ACK.
+static void testControlAckFrames(bool turbo, unsigned fault = 0u) {
+    unsetenv("DLLAMA_IO_TIMEOUT_MS");
+    setenv("DLLAMA_KV_ACK_TIMEOUT_MS", "180000", 1);
+    int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    std::vector<NnSocket> sockets; sockets.emplace_back(pair[0]);
+    std::vector<NnUint> peers{1u}; NnNetwork network(&sockets, &peers);
+    std::vector<NnSocket> workerSockets; workerSockets.emplace_back(pair[1]);
+    std::vector<NnUint> workerPeers{0u}; NnNetwork worker(&workerSockets, &workerPeers);
+    network.resetStats(); worker.resetStats();
+    network.setTurbo(turbo);
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 2u; plan.stages = new NnStageConfig[2];
+    for (NnUint i = 0u; i < 2u; ++i) {
+        auto &s = plan.stages[i]; s.stageIndex = s.rootNodeIndex = i;
+        s.startLayer = i; s.endLayer = i + 1u; s.nLayers = s.nNodes = 1u;
+        s.nodeIndices = new NnUint[1]{i};
+    }
+    NnNetConfigBuilder builder(2u, 1u); builder.addPipe("X", size2D(F_32, 1u, 1u));
+    LlmHeader header{}; header.nLayers = 2u; header.seqLen = 32u;
+    LlmNet net{}; net.header = &header; net.netConfig = builder.build();
+    net.nodeConfigs = new NnNodeConfig[2]{};
+    {
+        NnNetExecution execution(1u, &net.netConfig);
+        RootLlmInference inference(&net, &execution, nullptr, &network, &plan, true, false);
+        inference.setBatchSize(1u); inference.setPosition(7u);
+        LlmWorkerFrameHeader frame{LLM_WORKER_FRAME_MAGIC, LLM_WORKER_FRAME_VERSION,
+            LLM_WORKER_FRAME_PROFILE, sizeof(LlmPerfPacket)};
+        LlmPerfPacket perf{}; perf.position = 7u; perf.nodeIndex = 1u;
+        if (fault != 1u && fault != 4u) {
+            const size_t headerBytes = fault == 2u ? sizeof(frame) / 2u : sizeof(frame);
+            worker.write(0u, &frame, headerBytes);
+            if (fault != 2u) worker.write(0u, &perf, fault == 3u ? sizeof(perf) / 2u : sizeof(perf));
+        }
+        if (fault == 0u) {
+            LlmSampledTokenPacket sample{};
+            sample.magic = LLM_SAMPLED_TOKEN_MAGIC; sample.version = LLM_SAMPLED_TOKEN_VERSION;
+            sample.position = 7u; sample.nodeIndex = 1u; sample.token = 123u;
+            frame.kind = LLM_WORKER_FRAME_SAMPLED_TOKEN; frame.payloadBytes = sizeof(sample);
+            worker.write(0u, &frame, sizeof(frame)); worker.write(0u, &sample, sizeof(sample));
+            worker.writeAck(0u);
+        } else if (fault == 4u) {
+            const NnUint invalid = 0u; worker.write(0u, &invalid, sizeof(invalid));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        bool timeout = false, invalid = false;
+        try { inference.waitWorkerControlAck(0u, 100); }
+        catch (const NnPeerTimeoutException &e) { timeout = true; assert(e.peerNodeIndex == 1u); }
+        catch (const std::runtime_error &) { invalid = true; }
+        assert(timeout == (fault >= 1u && fault <= 3u));
+        assert(invalid == (fault == 4u));
+        assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+        if (fault == 0u) {
+            NnUint token = 0u; assert(inference.tryReceiveLastStageSampledToken(token, nullptr));
+            assert(token == 123u);
+            std::vector<LlmPerfPacket> profiles;
+            inference.collectDeferredProfile(LlmPerfPacket{}, profiles);
+            assert(profiles.size() == 2u && profiles[1].nodeIndex == 1u && profiles[1].position == 7u);
+        }
+    }
+    delete[] net.nodeConfigs; releaseNetConfig(&net.netConfig);
+    unsetenv("DLLAMA_KV_ACK_TIMEOUT_MS"); setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
+}
+
 // Exercise the real root frame reader without model weights or a GPU.
 // fault: 1=stalled payload, 2=no response, 3=bad identity, 4=bad header,
 // 5=profile collector observes EOF after caching a complete sample,
@@ -225,6 +291,9 @@ static void testShadowOnce(const char *async) {
 int main() {
     setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
     setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+    for (unsigned fault = 0u; fault <= 4u; ++fault) {
+        testControlAckFrames(false, fault); testControlAckFrames(true, fault);
+    }
     testTailFrameClose(false, true, false); testTailFrameClose(true, true, true);
     testTailFrameClose(false, false, false); testTailFrameClose(true, false, true);
     testTailFrameClose(false, false, false, 1u); testTailFrameClose(true, true, false, 2u);

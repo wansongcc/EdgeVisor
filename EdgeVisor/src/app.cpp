@@ -4005,7 +4005,7 @@ bool RootLlmInference::verifyPendingLayerSwitchPrecommit() {
     logRootControlSend(probe);
     network->writeAll(&probe, sizeof(probe));
     for (NnUint socket = 0u; socket < network->nSockets; ++socket) {
-        network->readAckWithTimeout(socket, 1000ul);
+        waitWorkerControlAck(socket, 1000);
     }
     std::printf("🧯 [e5-precommit] workers_acknowledged=%u status=ok\n", (unsigned)network->nSockets);
     std::fflush(stdout);
@@ -4271,7 +4271,34 @@ void RootLlmInference::pollStageBypassAckFrames() {
     }
 }
 
-void RootLlmInference::pumpWorkerFrames(NnUint socketIndex) {
+void RootLlmInference::waitWorkerControlAck(NnUint socketIndex, int timeoutMs) {
+    if (network == nullptr || timeoutMs <= 0)
+        throw std::runtime_error("Invalid worker control ACK wait");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        const int remainingMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remainingMs <= 0)
+            throw NnPeerTimeoutException(network->getPeerNodeIndex(socketIndex), "Timeout waiting for worker control ACK");
+        NnUint prefix = 0u;
+        if (network->tryPeekWithMaxAttempts(socketIndex, &prefix, sizeof(prefix), 1ul)) {
+            if (prefix != LLM_WORKER_FRAME_MAGIC) {
+                // The full four-byte ACK is available. Let the transport
+                // validate it; arbitrary non-frame bytes are never skipped.
+                network->readAckWithTimeout(socketIndex, (unsigned long)remainingMs);
+                return;
+            }
+            // A non-target worker can still have this token's profile/sample
+            // queued when the KV target has already acknowledged its rows.
+            // Cache those frames before consuming the precommit ACK, using
+            // this barrier's deadline rather than the much longer KV timeout.
+            pumpWorkerFrames(socketIndex, remainingMs);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void RootLlmInference::pumpWorkerFrames(NnUint socketIndex, int timeoutMs) {
     if (network == nullptr || !network->isSocketActive(socketIndex)) return;
     for (;;) {
         LlmWorkerFrameHeader peek{};
@@ -4283,7 +4310,7 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex) {
             throw std::runtime_error("Worker frame payload exceeds limit");
         LlmWorkerFrameHeader frame{};
         std::vector<char> payload;
-        if (!readWorkerFrame(network, socketIndex, frame, payload, kvAckWaitTimeoutMs()))
+        if (!readWorkerFrame(network, socketIndex, frame, payload, timeoutMs > 0 ? timeoutMs : kvAckWaitTimeoutMs()))
             throw NnPeerTimeoutException(network->getPeerNodeIndex(socketIndex), "Timeout reading worker frame payload");
         if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
             consumeStageBypassAckFrame(socketIndex, payload);

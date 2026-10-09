@@ -4129,19 +4129,18 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
 
 void RootLlmInference::recordPpMigrationApplied() {
     std::lock_guard<std::mutex> ownershipLock(runtimeOwnershipMutex);
-    ++ppMigrationAppliedGeneration;
-    ppMigrationAppliedFromNodeIndex = migrationFromNodeIndex;
-    ppMigrationAppliedToNodeIndex = nextStageRootNode;
-    ppMigrationAppliedLayers = migrationLayers;
     const NnStageConfig *fromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
     const NnStageConfig *toStage = findStageForNodeLocal(plan, nextStageRootNode);
     std::string ownershipReason;
     if (fromStage == nullptr || toStage == nullptr || !applyRuntimePrimaryOwnershipMove(
             runtimePrimaryOwnership, fromStage->stageIndex, toStage->stageIndex, migrationLayers, &ownershipReason)) {
-        std::printf("⚠️  [runtime-primary-owner] PP commit failed: %s\n",
-            ownershipReason.empty() ? "invalid PP route" : ownershipReason.c_str());
-        std::fflush(stdout);
+        throw std::runtime_error("PP ownership commit rejected: " +
+            (ownershipReason.empty() ? std::string("invalid PP route") : ownershipReason));
     }
+    ++ppMigrationAppliedGeneration;
+    ppMigrationAppliedFromNodeIndex = migrationFromNodeIndex;
+    ppMigrationAppliedToNodeIndex = nextStageRootNode;
+    ppMigrationAppliedLayers = migrationLayers;
 }
 
 void RootLlmInference::recordStageBypassApplied(
@@ -6575,6 +6574,9 @@ static void refreshTerminalUi(const AppCliArgs *args, const NnUnevenPartitionPla
 }
 
 static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    // Controllers from the previous context have been destroyed. A cached
+    // migration describes that context's ownership and cannot cross restart.
+    planCommandCache().clear();
     if (args != nullptr && args->showTerminalUi) edgeVisorUiEnable(true);
     resolveAutoBackend(args);
     setNnPpFailoverHook(failoverBypassDeadNode);
@@ -7097,7 +7099,9 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
             runInferenceAppBody(args, handler);
             return;
         } catch (const NnSessionRestartException &) {
-            if (sessionAttempts == 2 || !g_failoverRestart.armed) throw;
+            if (sessionAttempts == 2)
+                throw std::runtime_error("Session restart limit reached after 2 retries");
+            if (!g_failoverRestart.armed) throw;
             sessionAttempts += 1;
             layerCeilings.clear();
             applyFailoverRestart(args);
@@ -7123,6 +7127,9 @@ void runWorkerApp(AppCliArgs *args) {
     applyProcessMemoryLimit(args->memoryLimitBytes);
     bool armAcceptTimeout = false;
     while (true) {
+        // Workers relisten in the same process after a root restart. Their
+        // executor/ownership is rebuilt too, so discard the old command.
+        planCommandCache().clear();
         nnSetAcceptTimeoutMs(armAcceptTimeout ? kRootReconnectWaitMs : -1);
         std::unique_ptr<NnNetwork> networkPtr;
         try {

@@ -271,10 +271,18 @@ uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp terminal-ui.o nn-quants.
 pp-failover-network-test: src/test/test_pp_failover_network.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -o $@ $(LIBS)
 
+# Optional model-backed test; controller synchronization is confined to this
+# executable. Build in CI, run on devices with user-prepared model files.
+reserved-join-test: src/test/test_reserved_join.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+	$(CXX) $(CXXFLAGS) src/test/test_reserved_join.cpp $(filter %.o,$^) -o $@ $(LIBS)
+
+delayed-sample-worker-test: src/test/test_delayed_sample.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -Wl,--wrap=send -o $@ $(LIBS)
+
 # Model-free Linux acceptance gate. GPU builds run the same host-side tests.
 CHECK_TESTS := nn-cpu-test nn-cpu-ops-test tokenizer-test app-cli-test \
  dynamic-tpot-test failover-gate-test token-timing-test device-profile-test \
  pp-failover-network-test
 .PHONY: check
-check: $(CHECK_TESTS)
+check: $(CHECK_TESTS) reserved-join-test delayed-sample-worker-test
 	@set -e; for test in $(CHECK_TESTS); do ./$$test; done

@@ -64,7 +64,7 @@ Explicit ratios skip automatic placement/profiling. Their layer counts must sum 
 
 ## Joining and failure recovery
 
-Normally the root samples tokens after gathering the last stage's logits. `--auto` enables dynamic placement/migration and last-stage sampling; results and profiling return to the root over framed messages.
+Normally the root samples tokens after gathering the last stage's logits. `--auto` enables dynamic placement/migration and last-stage sampling; results and profiling return to the root over framed messages. Dynamic mode sets `DLLAMA_KV_ACK_TIMEOUT_MS` and `DLLAMA_IO_TIMEOUT_MS` to 180000 ms when they are unset. Override the former to change KV/frame and sampled-token wait deadlines; these deadlines do not provide a watchdog for GPU execution.
 
 - A failed middle stage can be bypassed when its predecessor has both the complete redundant weights and ready shadow KV history. Otherwise the root restarts from the prompt plus text already generated. Shadow KV is opt-in (`DLLAMA_BUBBLE_SHADOW_KV=1`), currently requires `--nthreads 1` on participating stages, and needs enough `--runtime-redundant-boundary-layers` to cover the entire failed stage. Weight overlap alone does not make the cache ready.
 - A failed final stage uses session restart. A sampled-token wait timeout also requests a restart; a local timeout does not prove the device is offline. The CLI allows at most two session restarts. Complete buffered results are consumed before EOF; truncated results cause recovery, while invalid frame headers or token identities remain errors. Restart can change subsequent tokens; it is not seamless cache recovery.

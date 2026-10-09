@@ -25,7 +25,7 @@ You need `g++` and `make`, plus the development tools for your GPU backend. Pyth
 
 `./dllama --list-devices` prints the compiled backends and exits. The default backend is `auto`: CUDA, then Vulkan, then CPU. `--backend cpu` forces CPU. CPU and CUDA default to the hardware thread count. Vulkan starts with one executor thread because GPU computation runs on thread 0; tensor-parallel stages may automatically use more threads for peer exchanges. An explicit `--nthreads N` takes precedence. Q40 weights use q80 activation buffers by default; these are separate from the KV cache.
 
-For a single GPU or a pipeline stage with one device, `--nthreads 1` can reduce executor overhead, especially when the GPU is shared with other jobs. A successful memory allocation does not guarantee predictable latency under competing GPU workloads.
+For CUDA on a single GPU or a pipeline stage with one device, `--nthreads 1` can reduce executor overhead. On Vulkan, increasing the thread count for a single-device stage can add substantial synchronization overhead even with an idle GPU. A successful memory allocation does not guarantee predictable latency under competing GPU workloads.
 
 Default output includes the device, buffer choice, generated text, and root wall-clock tokens/s. `--verbose` adds handshake and per-token detail. Execution timing requires `--benchmark` (or the profiling enabled by `--auto`).
 

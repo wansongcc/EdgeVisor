@@ -120,6 +120,7 @@ public:
 
     static AppCliArgs parse(int argc, char **argv, bool hasMode);
     static const char *backendToString(Backend backend);
+    void applyBackendThreadDefaults();
     ~AppCliArgs();
 
 };

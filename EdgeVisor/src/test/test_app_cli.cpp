@@ -131,6 +131,23 @@ static void testReservedMigrationAdmission() {
 int main() {
     testReservedMigrationAdmission();
     {
+        char program[] = "dllama", action[] = "inference";
+        char *defaults[] = {program, action};
+        for (AppCliArgs::Backend backend : {AppCliArgs::BACKEND_CPU, AppCliArgs::BACKEND_CUDA, AppCliArgs::BACKEND_VULKAN}) {
+            AppCliArgs args = parseArgs(2, defaults);
+            const NnUint hardwareThreads = args.nThreads;
+            args.backend = backend; // exercise defaults after auto backend resolution
+            args.applyBackendThreadDefaults();
+            assert(args.nThreads == (backend == AppCliArgs::BACKEND_VULKAN ? 1u : hardwareThreads));
+        }
+        char flag[] = "--nthreads", count[] = "16";
+        char *explicitThreads[] = {program, action, flag, count};
+        AppCliArgs args = parseArgs(4, explicitThreads);
+        args.backend = AppCliArgs::BACKEND_VULKAN;
+        args.applyBackendThreadDefaults();
+        assert(args.nThreadsExplicit && args.nThreads == 16u);
+    }
+    {
         char program[] = "dllama", action[] = "inference", flag[] = "--max-seq-len";
         char *defaults[] = {program, action};
         assert(parseArgs(2, defaults).maxSeqLen == 4096u);

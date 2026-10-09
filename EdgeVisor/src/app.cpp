@@ -644,6 +644,14 @@ const char *AppCliArgs::backendToString(AppCliArgs::Backend backend) {
     }
 }
 
+void AppCliArgs::applyBackendThreadDefaults() {
+    // Vulkan compute runs only on thread 0. A thread per CPU core adds
+    // busy-wait barriers without parallelizing GPU work. TP stages may
+    // raise this default later when parallel peer exchanges are needed.
+    if (!nThreadsExplicit && backend == BACKEND_VULKAN)
+        nThreads = 1u;
+}
+
 AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     AppCliArgs args;
     args.info = false;
@@ -6438,6 +6446,7 @@ static void resolveAutoBackend(AppCliArgs *args) {
     if (args->backend == AppCliArgs::BACKEND_CUDA)
         throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
 #endif
+    args->applyBackendThreadDefaults();
     publishProfileRuntime(profileBackendFor(args->backend), args->gpuIndex, args->nThreads);
     printSelectedDevice(args);
 }

@@ -2882,7 +2882,7 @@ static void printCliUsage(const char *argv0) {
         "  --backend auto|cpu|vulkan|cuda   default auto: CUDA, then Vulkan, then CPU\n"
         "  --list-devices                   print devices and exit\n"
         "  --gpu-index N\n"
-        "  --nthreads N                     default: one thread per core\n"
+        "  --nthreads N                     default: hardware threads for CPU/CUDA; 1 for Vulkan PP\n"
         "  --max-seq-len N                  default 4096; 0 uses the model window\n"
         "  --buffer-float-type f32|f16|q40|q80\n"
         "                                   Q40 weights use q80 unless this is set\n"

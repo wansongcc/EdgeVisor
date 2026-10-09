@@ -1,0 +1,33 @@
+name: main
+on:
+  pull_request:
+    branches:
+      - main
+      - feat/nn
+      - refactor/productize
+  push:
+    branches:
+      - main
+      - feat/nn
+      - refactor/productize
+jobs:
+  build-linux:
+    name: Linux
+    runs-on: ${{matrix.runner}}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+      - name: Dependencies
+        id: dependencies
+        run: sudo apt-get update && sudo apt-get install build-essential
+      - name: Build and run Linux acceptance tests
+        run: make -j2 DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama check

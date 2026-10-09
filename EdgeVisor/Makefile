@@ -270,3 +270,11 @@ uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp terminal-ui.o nn-quants.
 
 pp-failover-network-test: src/test/test_pp_failover_network.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -o $@ $(LIBS)
+
+# Model-free Linux acceptance gate. GPU builds run the same host-side tests.
+CHECK_TESTS := nn-cpu-test nn-cpu-ops-test tokenizer-test app-cli-test \
+ dynamic-tpot-test failover-gate-test token-timing-test device-profile-test \
+ pp-failover-network-test
+.PHONY: check
+check: $(CHECK_TESTS)
+	@set -e; for test in $(CHECK_TESTS); do ./$$test; done

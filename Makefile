@@ -1,4 +1,4 @@
-.PHONY: dllama clean
+.PHONY: dllama clean check
 .DEFAULT_GOAL := dllama
 
 dllama:
@@ -6,3 +6,6 @@ dllama:
 
 clean:
 	$(MAKE) -C EdgeVisor clean
+
+check:
+	$(MAKE) -C EdgeVisor check

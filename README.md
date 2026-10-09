@@ -67,7 +67,11 @@ Explicit ratios skip automatic placement/profiling. Their layer counts must sum 
 Normally the root samples tokens after gathering the last stage's logits. `--auto` enables dynamic placement/migration and last-stage sampling; results and profiling return to the root over framed messages.
 
 - A failed middle stage can be bypassed when its predecessor has both the complete redundant weights and ready shadow KV history. Otherwise the root restarts from the prompt plus text already generated. Shadow KV is opt-in (`DLLAMA_BUBBLE_SHADOW_KV=1`), currently requires `--nthreads 1` on participating stages, and needs enough `--runtime-redundant-boundary-layers` to cover the entire failed stage. Weight overlap alone does not make the cache ready.
-- A failed final stage uses session restart. Restart can change subsequent tokens; it is not seamless cache recovery.
+- A failed final stage uses session restart. A sampled-token wait timeout also requests a restart; a local timeout does not prove the device is offline. The CLI allows at most two session restarts. Complete buffered results are consumed before EOF; truncated results cause recovery, while invalid frame headers or token identities remain errors. Restart can change subsequent tokens; it is not seamless cache recovery.
 - An unavailable worker listed at startup may keep a reserved slot. When it becomes reachable, it loads weights and the complete preceding KV history, acknowledges that history, and joins between tokens. Dynamic scheduling waits for this join to commit, then resumes using the active pipeline order and updated layer ownership. This is reserved-slot joining, not arbitrary hot-add of an unlisted device.
 
 Older guides in `docs/archive/` describe experiments and may not match current behavior.
+
+## Validation
+
+From the repository root, `make -j2 DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama check` builds the CPU binary and runs the model-free Linux acceptance suite. GitHub Actions runs this gate on x86-64 and ARM64. CUDA/Vulkan and live joining/recovery need device tests with a model and tokenizer prepared by the user; see `docs/test_records/` for the tested configurations and limits.

@@ -835,6 +835,7 @@ static void inferenceRunContinuousBatching(AppInferenceContext *context, const c
 }
 
 static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, NnUint steps) {
+    ExperimentTraceSpan generationTrace("generation", {{"requested_steps", steps}});
     if (prompt == nullptr)
         throw std::runtime_error("Prompt is required");
     if (steps == 0)
@@ -978,6 +979,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     int token = inputTokens[pos];
     if (productLogLevel() >= 1)
         printf("%s\n", effectivePrompt.c_str());
+    ExperimentTraceSpan prefillTrace("prefill", {{"prompt_tokens", nInputTokens}});
     const auto evalWallStart = std::chrono::steady_clock::now();
     NnUint microbatchId = 0u;
     for (;;) {
@@ -1114,6 +1116,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         evalTotalTime += evalTime + syncTime + evalBubbleTime;
     }
     const auto evalWallEnd = std::chrono::steady_clock::now();
+    prefillTrace.end();
     context->inference->setSkipLogits(false);
 
     // 生成阶段的起始 token 应该是 prompt 的最后一个 token（位置为 nInputTokens-1）
@@ -1128,8 +1131,10 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     // Root-side wall-clock prediction time includes the full prediction loop:
     // forward(), worker/profile waits, sampling/decoding, and token output/flush.
     if (context->args->showTerminalUi) edgeVisorUiOpen();
+    ExperimentTraceSpan decodeTrace("decode");
     const auto predWallStart = std::chrono::steady_clock::now();
     for (; pos < maxPos; pos++) {
+        ExperimentTraceSpan tokenTrace("token", {{"position", pos}});
         const auto tokenWallStart = std::chrono::steady_clock::now();
         maybeJoinReservedDevice(context, pos);
         context->inference->setPosition(pos);
@@ -1519,6 +1524,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             printf("\n");
         }
         fflush(stdout);
+        experimentTracePoint("token_emitted", {{"position", pos}, {"token", token}});
         if (tokenTimingPrint) {
             const auto tokenWallEnd = std::chrono::steady_clock::now();
             const double tokenWallMs = std::chrono::duration<double, std::milli>(tokenWallEnd - tokenWallStart).count();
@@ -1547,6 +1553,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
     }
     const auto predWallEnd = std::chrono::steady_clock::now();
+    decodeTrace.end();
 
     NnUint nEvalTokens = nInputTokens - 1;
     NnUint nPredTokens = pos - nEvalTokens;

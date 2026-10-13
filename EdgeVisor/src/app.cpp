@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "token_timing.hpp"
 #include "terminal_ui.hpp"
 #include "device_profile.hpp"
 #include "failover_gate.hpp"
@@ -3306,6 +3307,7 @@ bool RootLlmInference::collectSourceStageKvTransfers(
     NnUint *queuedRows,
     uint64_t *sourceTransferBytes,
     NnUint startPos) {
+    ExperimentTraceSpan exportTrace("kv_export", {{"position", endPos}});
     if (exportedRows != nullptr) *exportedRows = 0u;
     if (queuedRows != nullptr) *queuedRows = 0u;
     if (sourceTransferBytes != nullptr) *sourceTransferBytes = 0u;
@@ -3746,6 +3748,7 @@ bool RootLlmInference::collectHeadKvTransfers(
 }
 
 bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes) {
+    ExperimentTraceSpan installTrace("kv_install_ack");
     if (targetTransferBytes != nullptr) *targetTransferBytes = 0u;
     if (network == nullptr) return false;
 
@@ -4033,6 +4036,7 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
 }
 
 bool RootLlmInference::verifyPendingLayerSwitchPrecommit() {
+    ExperimentTraceSpan readyTrace("kv_precommit_verify");
     if (network == nullptr) return false;
     // E5 test-only fault: fail after candidate KV installation but before any
     // binding write.  Unlike dropping the shared data-plane link, this
@@ -4054,6 +4058,7 @@ bool RootLlmInference::verifyPendingLayerSwitchPrecommit() {
 }
 
 bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
+    ExperimentTraceSpan switchTrace("binding_switch_ack");
     if (network == nullptr) return false;
     std::vector<NnUint> switchLayers;
     bool stageBypass = false;
@@ -4190,6 +4195,9 @@ void RootLlmInference::recordPpMigrationApplied() {
     ppMigrationAppliedFromNodeIndex = migrationFromNodeIndex;
     ppMigrationAppliedToNodeIndex = nextStageRootNode;
     ppMigrationAppliedLayers = migrationLayers;
+    experimentTracePoint("ownership_committed", {{"generation", ppMigrationAppliedGeneration},
+        {"position", controlPacket.position}, {"from_node", migrationFromNodeIndex},
+        {"to_node", nextStageRootNode}, {"layers", migrationLayers}});
 }
 
 void RootLlmInference::recordStageBypassApplied(
@@ -4813,6 +4821,7 @@ bool RootLlmInference::recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUi
 }
 
 void RootLlmInference::forward(bool collectProfile) {
+    ExperimentTraceSpan forwardTrace("forward", {{"position", controlPacket.position}, {"batch_size", controlPacket.batchSize}});
     pollStageBypassAckFrames();
     lastBubbleShadowStats = {};
     bool sendKvTransfer = false;
@@ -5443,6 +5452,9 @@ void RootLlmInference::forward(bool collectProfile) {
         }
         const NnUint endPos = std::min((NnUint)asyncKvCollectPos, (header->seqLen > 0u) ? (header->seqLen - 1u) : 0u);
         const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
+        ExperimentTraceSpan migrationTrace("migration", {{"position", endPos},
+            {"kv_frontier_count", endPos + 1u}, {"from_node", migrationFromNodeIndex},
+            {"to_node", nextStageRootNode}, {"layers", migrationLayers}});
         auto tStall0 = std::chrono::steady_clock::now();
         bool applyOk = false;
         uint64_t stateBytes = 0u;
@@ -5585,6 +5597,11 @@ void RootLlmInference::forward(bool collectProfile) {
         } else {
             resetPendingKvMigrationState("candidate preparation did not complete");
         }
+        experimentTracePoint("migration_result", {{"applied", applyOk},
+            {"position", endPos}, {"kv_frontier_count", endPos + 1u},
+            {"from_node", migrationFromNodeIndex}, {"to_node", nextStageRootNode},
+            {"layers", migrationLayers}, {"state_bytes", stateBytes},
+            {"recompute_units", recomputeUnits}, {"fallback_reason", fallbackReason}});
         std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu layers=%u posRange=[0,%u]\n",
             toString(ablationCfg.shadowKvMode),
             applyOk ? "ok" : "fail",
@@ -6686,6 +6703,8 @@ static void refreshTerminalUi(const AppCliArgs *args, const NnUnevenPartitionPla
 }
 
 static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
+    experimentTraceNewContext();
+    ExperimentTraceSpan loadingTrace("loading");
     // Controllers from the previous context have been destroyed. A cached
     // migration describes that context's ownership and cannot cross restart.
     planCommandCache().clear();
@@ -6953,7 +6972,10 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     g_joinNet = &net;
 
     refreshTerminalUi(args, planPtr.get(), header.nLayers, "pipeline set");
+    loadingTrace.end();
+    experimentTracePoint("runtime_context_ready", {{"nodes", nNodes}, {"seq_len", header.seqLen}});
     handler(&context);
+    requireExperimentTraceHealthy();
     g_joinNet = nullptr;
 
     inference.finish();

@@ -19,7 +19,7 @@ PORT = 19393
 SOURCE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 def configure(path, output, source_root):
-    global HOST, LABEL, BASE, MODEL, TOKENIZER, USER, OUT, NAMES, PORT, SOURCE_ROOT
+    global HOST, LABEL, BASE, MODEL, TOKENIZER, USER, OUT, NAMES, IPS, PORT, SOURCE_ROOT
     config = json.loads(pathlib.Path(path).read_text())
     HOST = config['host']
     LABEL = config['label']
@@ -28,6 +28,7 @@ def configure(path, output, source_root):
     TOKENIZER = config['tokenizer']
     USER = config['user']
     NAMES = config['containers']
+    IPS = []
     PORT = int(config.get('port', 19393))
     assert re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.@-]*', HOST)
     assert re.fullmatch('[A-Za-z0-9_.-]+', LABEL)
@@ -65,6 +66,7 @@ def validate():
     _, binary = remote('sha256sum ' + shlex.quote(BASE + '/source/EdgeVisor/dllama'))
     (OUT / 'source_manifest.json').write_text(json.dumps(actual, indent=2))
     (OUT / 'binary.sha256').write_text(binary)
+    IPS.clear()
     gpu_uuids = []
     for i, name in enumerate(NAMES):
         _, s = remote(shlex.join(['docker', 'inspect', name]))
@@ -138,7 +140,8 @@ def save(name, result, txt):
 
 def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
           prompt='List 20 detailed facts about Paris. Number each fact.',
-          env=None, extra_args=(), plan_schedule=(), expect_migrations=None, ratios='1@7*1@7*1@7*1@7'):
+          env=None, extra_args=(), plan_schedule=(), expect_migrations=None, ratios='1@7*1@7*1@7*1@7', trace_run_id=None):
+    assert re.fullmatch('[A-Za-z0-9_.-]+', name)
     for i in range(4):
         reset(i)
     if kind:
@@ -159,7 +162,9 @@ def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
         if auto:
             args += ['--auto']
         args += list(extra_args)
-        env = env or {}
+        env = dict(env or {})
+        if trace_run_id is not None:
+            env.update(EDGEVISOR_RUN_ID=trace_run_id, EDGEVISOR_TRACE_PATH='/out/' + name + '.trace.jsonl')
         assert all(re.fullmatch('(DLLAMA|EDGEVISOR)_[A-Z0-9_]+', key) for key in env)
         environment = ['DLLAMA_TOKEN_TIMING_PRINT=1', 'DLLAMA_PLAN_CTRL_SOCKET=/tmp/' + name + '.sock']
         environment += [key + '=' + str(value) for key, value in env.items()]
@@ -219,6 +224,12 @@ def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
                 proc.communicate(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.terminate()
+        _, root_log = node(0, 'cat /out/' + name + '.log 2>/dev/null || true', check=False)
+        (OUT / (name + '.log')).write_text(root_log)
+        if trace_run_id is not None:
+            code, trace = node(0, 'cat /out/' + name + '.trace.jsonl', check=False)
+            if code == 0:
+                (OUT / (name + '.trace.jsonl')).write_text(trace)
         for i in started:
             stop_worker(i, name)
             _, txt = node(i, 'cat /out/' + name + '.log')

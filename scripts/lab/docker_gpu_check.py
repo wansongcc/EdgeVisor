@@ -138,7 +138,7 @@ def save(name, result, txt):
 
 def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
           prompt='List 20 detailed facts about Paris. Number each fact.',
-          env=None, extra_args=(), plan_schedule=()):
+          env=None, extra_args=(), plan_schedule=(), expect_migrations=None, ratios='1@7*1@7*1@7*1@7'):
     for i in range(4):
         reset(i)
     if kind:
@@ -155,12 +155,12 @@ def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
             started.append(i)
         args = ['./dllama', 'inference', '--model', MODEL, '--tokenizer', TOKENIZER, '--prompt', prompt, '--steps', str(steps), '--nthreads', '1', '--backend', 'cuda', '--max-seq-len', '512', '--temperature', '0', '--seed', '42']
         if distributed:
-            args += ['--ratios', '1@7*1@7*1@7*1@7', '--workers', *[ip + ':' + str(PORT) for ip in IPS[1:]]]
+            args += ['--ratios', ratios, '--workers', *[ip + ':' + str(PORT) for ip in IPS[1:]]]
         if auto:
             args += ['--auto']
         args += list(extra_args)
         env = env or {}
-        assert all(re.fullmatch('[A-Z][A-Z0-9_]*', key) for key in env)
+        assert all(re.fullmatch('(DLLAMA|EDGEVISOR)_[A-Z0-9_]+', key) for key in env)
         environment = ['DLLAMA_TOKEN_TIMING_PRINT=1', 'DLLAMA_PLAN_CTRL_SOCKET=/tmp/' + name + '.sock']
         environment += [key + '=' + str(value) for key, value in env.items()]
         command = 'echo $$ > /out/' + name + '.root.pid; exec env ' + shlex.join(environment) + ' timeout -k 5 150 stdbuf -oL -eL ' + shlex.join(args) + ' > /out/' + name + '.log 2>&1'
@@ -196,6 +196,9 @@ def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
         wall = re.findall('\\[token-e2e\\].*wall=([0-9.]+)ms', txt)
         tps = re.findall('tokens/s:\\s*([0-9.]+)', txt)
         result = {'case': name, 'exit_code': proc.returncode, 'total_wall_s': round(time.monotonic() - start, 3), 'generated_tokens': len(ts), 'token_wall_mean_ms': sum(map(float, wall)) / len(wall) if wall else None, 'reported_tokens_per_s': float(tps[-1]) if tps else None, 'tail_shape': kind, 'auto': auto, 'events': events, 'session_restarts': txt.count('[failover] session-restart workers='), 'stderr': stderr}
+        migrations = re.findall(r'\[kv-migrate\] recover mode=(\S+) status=(\S+).*layers=(\d+) posRange=\[0,(\d+)\]', txt)
+        result['migrations'] = [{'mode': mode, 'status': status, 'layers': int(count), 'kv_frontier_count': int(end) + 1}
+                                for mode, status, count, end in migrations]
         (OUT / (name + '.command.txt')).write_text(command)
         save(name, result, txt)
         assert result['exit_code'] == 0 and len(ts) >= 1, txt[-2000:]
@@ -203,6 +206,10 @@ def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
             assert events and result['session_restarts'] == 1, txt[-2000:]
         else:
             assert result['session_restarts'] == 0, txt[-2000:]
+        if expect_migrations is not None:
+            assert len(result['migrations']) == expect_migrations, result
+            assert all(item['status'] == 'ok' for item in result['migrations']), result
+            assert next_plan == len(plan_schedule), (next_plan, plan_schedule)
         return (ts, result)
     finally:
         if proc is not None and proc.poll() is None:

@@ -16,7 +16,7 @@ static bool covered;
 // A worker uninvolved in KV installation may still have profile/sample
 // frames queued before the raw precommit ACK. Keep both frames for decode.
 // fault: 1=no ACK, 2=partial frame header, 3=partial payload, 4=invalid ACK.
-static void testControlAckFrames(bool turbo, unsigned fault = 0u) {
+static void testControlAckFrames(bool turbo, unsigned fault = 0u, bool kvExport = false) {
     unsetenv("DLLAMA_IO_TIMEOUT_MS");
     setenv("DLLAMA_KV_ACK_TIMEOUT_MS", "180000", 1);
     int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
@@ -55,13 +55,28 @@ static void testControlAckFrames(bool turbo, unsigned fault = 0u) {
             sample.position = 7u; sample.nodeIndex = 1u; sample.token = 123u;
             frame.kind = LLM_WORKER_FRAME_SAMPLED_TOKEN; frame.payloadBytes = sizeof(sample);
             worker.write(0u, &frame, sizeof(frame)); worker.write(0u, &sample, sizeof(sample));
-            worker.writeAck(0u);
+            if (kvExport) {
+                LlmKvExportResponseHeader response{};
+                response.magic = LLM_KV_EXPORT_RESPONSE_MAGIC; response.version = LLM_KV_EXPORT_RESPONSE_VERSION;
+                response.requestId = 19u; response.fromNodeIndex = 1u;
+                worker.write(0u, &response, sizeof(response));
+            } else worker.writeAck(0u);
         } else if (fault == 4u) {
-            const NnUint invalid = 0u; worker.write(0u, &invalid, sizeof(invalid));
+            if (kvExport) {
+                LlmKvExportResponseHeader invalid{}; worker.write(0u, &invalid, sizeof(invalid));
+            } else {
+                const NnUint invalid = 0u; worker.write(0u, &invalid, sizeof(invalid));
+            }
         }
         const auto start = std::chrono::steady_clock::now();
         bool timeout = false, invalid = false;
-        try { inference.waitWorkerControlAck(0u, 100); }
+        try {
+            if (kvExport) {
+                LlmKvExportResponseHeader response{};
+                inference.waitKvExportResponseHeader(0u, response, 100);
+                assert(response.requestId == 19u && response.fromNodeIndex == 1u);
+            } else inference.waitWorkerControlAck(0u, 100);
+        }
         catch (const NnPeerTimeoutException &e) { timeout = true; assert(e.peerNodeIndex == 1u); }
         catch (const std::runtime_error &) { invalid = true; }
         assert(timeout == (fault >= 1u && fault <= 3u));
@@ -401,6 +416,7 @@ int main() {
     setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
     for (unsigned fault = 0u; fault <= 4u; ++fault) {
         testControlAckFrames(false, fault); testControlAckFrames(true, fault);
+        testControlAckFrames(false, fault, true); testControlAckFrames(true, fault, true);
     }
     testTailFrameClose(false, true, false); testTailFrameClose(true, true, true);
     testTailFrameClose(false, false, false); testTailFrameClose(true, false, true);

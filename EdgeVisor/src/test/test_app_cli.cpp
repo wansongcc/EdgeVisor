@@ -440,6 +440,25 @@ int main() {
     assert(resolvePpMigrationLayers(exact, &rangePlan, &runtimePlan, exactLayers, &rangeReason));
     assert((exactLayers == std::vector<NnUint>{6u, 7u}));
 
+    RuntimePrimaryOwnership liveOwnership;
+    assert(initializeRuntimePrimaryOwnership(&runtimePlan, liveOwnership));
+    assert(applyRuntimePrimaryOwnershipMove(liveOwnership, 0u, 1u, forwardLayers));
+    PlanCommand exactReturn = exact;
+    exactReturn.fromNodeIndex = 1u; exactReturn.toNodeIndex = 0u; exactReturn.reserved0 = 4u;
+    assert(resolvePpMigrationLayers(exactReturn, &rangePlan, &runtimePlan,
+        reverseLayers, &rangeReason, &liveOwnership));
+    assert(reverseLayers == forwardLayers); // Return the current edge, not original layers 8..11.
+    PlanCommand interior = reverse;
+    interior.triggerLayer = 8u;
+    assert(!resolvePpMigrationLayers(interior, &rangePlan, &runtimePlan,
+        reverseLayers, &rangeReason, &liveOwnership));
+    assert(rangeReason.find("boundary") != std::string::npos);
+    assert(applyRuntimePrimaryOwnershipMove(liveOwnership, 1u, 0u, forwardLayers));
+    liveOwnership.ownerByLayer[15u] = 0u;
+    assert(!resolvePpMigrationLayers(exact, &rangePlan, &runtimePlan,
+        exactLayers, &rangeReason, &liveOwnership));
+    assert(rangeReason.find("contiguous") != std::string::npos);
+
     assert(ppStartLayerSwitchFlag(&runtimePlan, 1u, 0u, 11u) ==
         LLM_LAYER_SWITCH_NEW_PP_START);
     assert(ppStartLayerSwitchFlag(&runtimePlan, 0u, 1u, 11u) ==

@@ -127,12 +127,14 @@ public:
 
 void printAvailableDevices();
 
+struct RuntimePrimaryOwnership;
 bool resolvePpMigrationLayers(
     const PlanCommand &command,
     const NnUnevenPartitionPlan *plan,
     const RuntimeStageLayerPlan *runtimePlan,
     std::vector<NnUint> &layers,
-    std::string *reason = nullptr);
+    std::string *reason = nullptr,
+    const RuntimePrimaryOwnership *ownership = nullptr);
 
 // Mutable primary ownership is intentionally distinct from the immutable
 // runtime provision map.  PP moves change ownership only after their switch
@@ -522,6 +524,7 @@ public:
     bool tryReceiveLastStageSampledToken(NnUint &token, float *logit = nullptr);
     // Control ACKs share a stream with profiles and sampled-token frames.
     void waitWorkerControlAck(NnUint socketIndex, int timeoutMs);
+    void waitKvExportResponseHeader(NnUint socketIndex, LlmKvExportResponseHeader &response, int timeoutMs);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
     void setSkipLogits(bool skip);
@@ -547,7 +550,7 @@ private:
     void consumeStageBypassAckFrame(NnUint socketIndex, const std::vector<char> &payload);
     void tryVerifyStageBypassAcks();
     void pollStageBypassAckFrames();
-    void pumpWorkerFrames(NnUint socketIndex, int timeoutMs = -1);
+    void pumpWorkerFrames(NnUint socketIndex, int timeoutMs = -1, bool stopAtControl = false);
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
@@ -579,6 +582,7 @@ private:
     mutable std::mutex asyncKvRowsMutex;
     std::mutex kvTransferMutex;
     std::vector<PendingKvTransferItem> pendingKvTransfers;
+    std::vector<PendingKvTransferItem> pendingLocalKvTransfers;
     bool waitingKvAck = false;
     // P2 BackgroundPreCopy baseline state (DLLAMA_BACKGROUND_PRECOPY=1):
     // the candidate migration layers' KV is copied to the destination in the

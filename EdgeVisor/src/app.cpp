@@ -2399,7 +2399,8 @@ bool resolvePpMigrationLayers(
     const NnUnevenPartitionPlan *plan,
     const RuntimeStageLayerPlan *runtimePlan,
     std::vector<NnUint> &layers,
-    std::string *reason) {
+    std::string *reason,
+    const RuntimePrimaryOwnership *ownership) {
     layers.clear();
     auto reject = [&](const std::string &message) {
         layers.clear();
@@ -2430,25 +2431,52 @@ bool resolvePpMigrationLayers(
     }
 
     const NnUint count = command.reserved0 > 0u ? command.reserved0 : 1u;
+    NnUint sourceBegin = fromStage->startLayer;
+    NnUint sourceEnd = fromStage->endLayer;
+    const bool reverseRoute = getPpPrevStageIndex(plan, fromStage->stageIndex) == toStage->stageIndex;
+    if (ownership != nullptr) {
+        if (ownership->nLayers != runtimePlan->nLayers || ownership->ownerByLayer.size() != ownership->nLayers)
+            return reject("invalid current ownership snapshot");
+        auto ownedRange = [&](NnUint stage, NnUint &begin, NnUint &end) {
+            begin = ownership->nLayers; end = 0u;
+            NnUint owned = 0u;
+            for (NnUint layer = 0u; layer < ownership->nLayers; ++layer) {
+                if (ownership->ownerByLayer[layer] != stage) continue;
+                begin = std::min(begin, layer); end = layer + 1u; ++owned;
+            }
+            return owned > 0u && end - begin == owned;
+        };
+        NnUint targetBegin = 0u, targetEnd = 0u;
+        if (!ownedRange(fromStage->stageIndex, sourceBegin, sourceEnd) ||
+                !ownedRange(toStage->stageIndex, targetBegin, targetEnd))
+            return reject("PP stages must currently own contiguous nonempty ranges");
+        if ((reverseRoute && targetEnd != sourceBegin) || (!reverseRoute && sourceEnd != targetBegin))
+            return reject("current ownership does not follow the active PP chain");
+        if (count >= sourceEnd - sourceBegin)
+            return reject("PP migration would empty the current source stage");
+    }
     // NEXT_BARRIER dynamic PP commands reuse triggerLayer as an exact
     // firstLayer on the wire. EXACT keeps its legacy trigger semantics and
-    // derives the migration range from the static stage boundary.
+    // derives the migration range from the current stage boundary when an
+    // ownership snapshot is supplied (the production admission/apply paths).
     NnUint firstLayer = command.mode == PLAN_CMD_MODE_NEXT_BARRIER
         ? command.triggerLayer
         : 0xFFFFFFFFu;
     if (firstLayer == 0xFFFFFFFFu) {
-        if (getPpPrevStageIndex(plan, fromStage->stageIndex) == toStage->stageIndex) {
-            firstLayer = fromStage->startLayer;
+        if (reverseRoute) {
+            firstLayer = sourceBegin;
         } else {
-            if (count > fromStage->endLayer - fromStage->startLayer) {
+            if (count > sourceEnd - sourceBegin) {
                 return reject("layer count exceeds static source range");
             }
-            firstLayer = fromStage->endLayer - count;
+            firstLayer = sourceEnd - count;
         }
     }
     if (firstLayer >= runtimePlan->nLayers || count > runtimePlan->nLayers - firstLayer) {
         return reject("PP layer range is outside runtime plan");
     }
+    if (ownership != nullptr && firstLayer != (reverseRoute ? sourceBegin : sourceEnd - count))
+        return reject("PP migration must move the current adjacent boundary, not interior layers");
 
     bool allSourcePrimary = true;
     for (NnUint offset = 0u; offset < count; ++offset) {
@@ -2920,7 +2948,8 @@ bool RootLlmInference::validatePpMigrationCommand(const PlanCommand &command, st
         return false;
     }
     std::vector<NnUint> layers;
-    if (!resolvePpMigrationLayers(command, plan, runtimePlan, layers, reason)) return false;
+    const RuntimePrimaryOwnership snapshot = getRuntimePrimaryOwnershipSnapshot();
+    if (!resolvePpMigrationLayers(command, plan, runtimePlan, layers, reason, &snapshot)) return false;
     const NnUint sourceNode = planCommandHasMoveList(command) ? command.moves[0].fromNodeIndex : command.fromNodeIndex;
     const NnStageConfig *source = findStageForNodeLocal(plan, sourceNode);
     if (source == nullptr) return false;
@@ -3061,6 +3090,10 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
                 it.header.position == pos &&
                 it.header.targetNodeIndex == targetNode) return true;
         }
+        for (const auto &it : pendingLocalKvTransfers) {
+            if (it.header.layerIndex == layer && it.header.position == pos && it.header.targetNodeIndex == targetNode)
+                return true;
+        }
         return false;
     };
 
@@ -3087,15 +3120,11 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
     bool queuedAny = false;
     bool localAppliedAny = false;
     for (NnUint targetNode : targetNodes) {
+        if (exists(layerIndex, position, targetNode)) continue;
         if (targetNode == 0u) {
-            if (executor != nullptr) {
-                const bool localOk = executor->applyTransferredKvRow(layerIndex, position, kRow, vRow, rangeStart, rangeLen);
-                if (localOk) localAppliedAny = true;
-            }
-            continue;
-        }
-        if (exists(layerIndex, position, targetNode)) {
-            continue;
+            if (executor == nullptr || !executor->applyTransferredKvRow(layerIndex, position, kRow, vRow, rangeStart, rangeLen))
+                return KV_TRANSFER_SUBMIT_INVALID_ROW;
+            localAppliedAny = true;
         }
 
         PendingKvTransferItem item;
@@ -3110,7 +3139,8 @@ RootLlmInference::KvTransferSubmitStatus RootLlmInference::submitBoundaryKvTrans
         item.header.rangeLen = rangeLen;
         item.kRow = kRow;
         item.vRow = vRow;
-        pendingKvTransfers.push_back(std::move(item));
+        if (targetNode == 0u) pendingLocalKvTransfers.push_back(std::move(item));
+        else pendingKvTransfers.push_back(std::move(item));
         queuedAny = true;
     }
 
@@ -3128,6 +3158,7 @@ void RootLlmInference::resetPendingKvMigrationState(const char *reason) {
     {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
         pendingKvTransfers.clear();
+        pendingLocalKvTransfers.clear();
         waitingKvAck = false;
         waitingKvAckExpectedCount = 0u;
         waitingKvAckLayers.clear();
@@ -3150,7 +3181,7 @@ bool RootLlmInference::abortPendingPpMigrationForTransportFailure(const char *re
     bool hadPendingState = false;
     {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
-        hadPendingState = !pendingKvTransfers.empty() || waitingKvAck || !pendingLayerSwitchLayers.empty() ||
+        hadPendingState = !pendingKvTransfers.empty() || !pendingLocalKvTransfers.empty() || waitingKvAck || !pendingLayerSwitchLayers.empty() ||
             asyncKvCollectPos >= 0;
     }
 
@@ -3381,7 +3412,7 @@ bool RootLlmInference::collectSourceStageKvTransfers(
             if (socketIndex < 0) continue;
 
             LlmKvExportResponseHeader resp{};
-            network->read((NnUint)socketIndex, &resp, sizeof(resp));
+            waitKvExportResponseHeader((NnUint)socketIndex, resp, kvAckWaitTimeoutMs());
             for (int skippedPerf = 0;
                  skippedPerf < 4 &&
                  (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
@@ -3391,7 +3422,7 @@ bool RootLlmInference::collectSourceStageKvTransfers(
                  isLikelyPerfPrefixFromExportHeader(resp, node, header, plan);
                  ++skippedPerf) {
                 drainPerfPacketTailAfterPrefix(network, (NnUint)socketIndex, sizeof(resp), "kv export response", node);
-                network->read((NnUint)socketIndex, &resp, sizeof(resp));
+                waitKvExportResponseHeader((NnUint)socketIndex, resp, kvAckWaitTimeoutMs());
             }
             if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
                 resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
@@ -3605,7 +3636,7 @@ bool RootLlmInference::collectHeadKvTransfers(
         std::fflush(stdout);
 
         LlmKvExportResponseHeader resp{};
-        network->read((NnUint)socketIndex, &resp, sizeof(resp));
+        waitKvExportResponseHeader((NnUint)socketIndex, resp, kvAckWaitTimeoutMs());
         for (int skippedPerf = 0;
              skippedPerf < 4 &&
              (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
@@ -3615,7 +3646,7 @@ bool RootLlmInference::collectHeadKvTransfers(
              isLikelyPerfPrefixFromExportHeader(resp, fromNode, header, plan);
              ++skippedPerf) {
             drainPerfPacketTailAfterPrefix(network, (NnUint)socketIndex, sizeof(resp), "head kv export response", fromNode);
-            network->read((NnUint)socketIndex, &resp, sizeof(resp));
+            waitKvExportResponseHeader((NnUint)socketIndex, resp, kvAckWaitTimeoutMs());
         }
         if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC ||
             resp.version != LLM_KV_EXPORT_RESPONSE_VERSION ||
@@ -3724,10 +3755,12 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
     std::vector<PendingKvTransferItem> kvTransfers;
     {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
-        if (pendingKvTransfers.empty() || waitingKvAck) return false;
+        if ((pendingKvTransfers.empty() && pendingLocalKvTransfers.empty()) || waitingKvAck) return false;
 
         kvTransfers = pendingKvTransfers;
+        kvTransfers.insert(kvTransfers.end(), pendingLocalKvTransfers.begin(), pendingLocalKvTransfers.end());
         pendingKvTransfers.clear();
+        pendingLocalKvTransfers.clear();
         waitingKvAck = true;
         waitingKvAckExpectedCount = (NnUint)kvTransfers.size();
         waitingKvAckLayers.clear();
@@ -3760,11 +3793,19 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
     };
 
     std::map<NnUint, std::vector<const PendingKvTransferItem *>> transfersByTarget;
+    NnUint localInstalledCount = 0u;
+    NnUint localInstalledPos = 0u;
+    std::vector<NnUint> localInstalledLayers;
     for (const auto &it : kvTransfers) {
-        if (it.header.targetNodeIndex == 0u) continue;
+        if (it.header.targetNodeIndex == 0u) {
+            ++localInstalledCount;
+            localInstalledPos = std::max(localInstalledPos, it.header.position);
+            appendUniqueLayer(localInstalledLayers, it.header.layerIndex);
+            continue;
+        }
         transfersByTarget[it.header.targetNodeIndex].push_back(&it);
     }
-    if (transfersByTarget.empty()) {
+    if (transfersByTarget.empty() && localInstalledCount == 0u) {
         return fail("no remote target nodes for kv transfer");
     }
 
@@ -3806,11 +3847,11 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
     }
 
     const NnStageConfig *targetStage = findStageForNodeLocal(plan, nextStageRootNode);
-    NnUint validAckCountInc = 0u;
-    std::vector<NnUint> ackedLayersInc;
+    NnUint validAckCountInc = localInstalledCount;
+    std::vector<NnUint> ackedLayersInc = localInstalledLayers;
     std::vector<NnUint> nodeAckInc(waitingKvAckNodes.size(), 0u);
-    NnUint ackPos = 0u;
-    bool ackPosSet = false;
+    NnUint ackPos = localInstalledPos;
+    bool ackPosSet = localInstalledCount != 0u;
 
     for (size_t ni = 0u; ni < waitingKvAckNodes.size(); ++ni) {
         if (ni >= waitingKvAckNodeExpected.size() || ni >= waitingKvAckNodeReceived.size()) continue;
@@ -4298,11 +4339,41 @@ void RootLlmInference::waitWorkerControlAck(NnUint socketIndex, int timeoutMs) {
     }
 }
 
-void RootLlmInference::pumpWorkerFrames(NnUint socketIndex, int timeoutMs) {
+void RootLlmInference::waitKvExportResponseHeader(NnUint socketIndex, LlmKvExportResponseHeader &response, int timeoutMs) {
+    if (network == nullptr || timeoutMs <= 0) throw std::runtime_error("Invalid KV export response wait");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        const int remaining = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0)
+            throw NnPeerTimeoutException(network->getPeerNodeIndex(socketIndex), "Timeout waiting for KV export response");
+        NnUint magic = 0u;
+        if (network->tryPeekWithMaxAttempts(socketIndex, &magic, sizeof(magic), 1ul)) {
+            if (magic == LLM_WORKER_FRAME_MAGIC) {
+                // The tail samples before handling this control-only export.
+                // Cache its frames, then leave the raw KV response intact.
+                pumpWorkerFrames(socketIndex, remaining, true);
+            } else {
+                if (!network->tryReadForMs(socketIndex, &response, sizeof(response), remaining))
+                    throw NnPeerTimeoutException(network->getPeerNodeIndex(socketIndex), "Timeout reading KV export response header");
+                if ((response.magic != LLM_KV_EXPORT_RESPONSE_MAGIC || response.version != LLM_KV_EXPORT_RESPONSE_VERSION) &&
+                        !isLikelyPerfPrefixFromExportHeader(response, network->getPeerNodeIndex(socketIndex), header, plan))
+                    throw std::runtime_error("Invalid KV export response header");
+                return;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void RootLlmInference::pumpWorkerFrames(NnUint socketIndex, int timeoutMs, bool stopAtControl) {
     if (network == nullptr || !network->isSocketActive(socketIndex)) return;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+        timeoutMs > 0 ? timeoutMs : kvAckWaitTimeoutMs());
     for (;;) {
         LlmWorkerFrameHeader peek{};
         if (!network->tryPeekWithMaxAttempts(socketIndex, &peek, sizeof(peek), 1ul)) return;
+        if (stopAtControl && peek.magic != LLM_WORKER_FRAME_MAGIC) return;
         if (peek.magic != LLM_WORKER_FRAME_MAGIC || peek.version != LLM_WORKER_FRAME_VERSION) {
             throw std::runtime_error("Invalid worker frame magic or version");
         }
@@ -4310,7 +4381,9 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex, int timeoutMs) {
             throw std::runtime_error("Worker frame payload exceeds limit");
         LlmWorkerFrameHeader frame{};
         std::vector<char> payload;
-        if (!readWorkerFrame(network, socketIndex, frame, payload, timeoutMs > 0 ? timeoutMs : kvAckWaitTimeoutMs()))
+        const int remaining = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0 || !readWorkerFrame(network, socketIndex, frame, payload, remaining))
             throw NnPeerTimeoutException(network->getPeerNodeIndex(socketIndex), "Timeout reading worker frame payload");
         if (frame.kind == LLM_WORKER_FRAME_STAGE_BYPASS_ACK) {
             consumeStageBypassAckFrame(socketIndex, payload);
@@ -5194,7 +5267,8 @@ void RootLlmInference::forward(bool collectProfile) {
             std::string rangeReason;
             migrationLayers.clear();
             const bool canApplyRoute = validRoute &&
-                resolvePpMigrationLayers(pc, plan, runtimePlan, migrationLayers, &rangeReason);
+                resolvePpMigrationLayers(pc, plan, runtimePlan, migrationLayers, &rangeReason,
+                    &runtimePrimaryOwnership);
 
             if (canApplyRoute) {
                 migrationFromNodeIndex = routeFromNode;
@@ -5508,6 +5582,8 @@ void RootLlmInference::forward(bool collectProfile) {
             migrationAckPos = (int)endPos;
             migrationAckLayer = !migrationLayers.empty() ? (int)migrationLayers.back() : migrationAckLayer;
             recordPpMigrationApplied();
+        } else {
+            resetPendingKvMigrationState("candidate preparation did not complete");
         }
         std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu layers=%u posRange=[0,%u]\n",
             toString(ablationCfg.shadowKvMode),

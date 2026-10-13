@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -43,7 +44,7 @@ def load_ablation_config(path: Path | None) -> Dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a looping LangGraph agent with a swappable LLM backend.")
+    parser = argparse.ArgumentParser(description="Run an autonomous tool loop or an explicitly scripted system workflow.")
     parser.add_argument(
         "--backend",
         choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo", "edgevisor_lingualinked", "edgevisor_ablation"],
@@ -54,7 +55,8 @@ def main() -> int:
         type=Path,
         default=Path(__file__).resolve().parent / "episodes" / "multi_tool_loop_episode.json",
     )
-    parser.add_argument("--out-root", type=Path, default=Path("/home/byh/B01/agent_bench_results"))
+    parser.add_argument("--out-root", type=Path, default=Path(os.environ.get("EDGE_RESULTS", str(Path.cwd() / "results/agent_bench"))))
+    parser.add_argument("--execution-mode", choices=["autonomous", "scripted"], default=None)
     parser.add_argument("--cuda-visible", default="0,1,2")
     parser.add_argument("--edge-worker-gpus", default="1", help="Comma-separated worker GPU indices for EdgeVisor.")
     parser.add_argument("--edge-ratios", default="1:1")
@@ -136,6 +138,8 @@ def main() -> int:
     args = parser.parse_args()
 
     episode = load_episode(args.episode)
+    if args.execution_mode is not None:
+        episode["execution_mode"] = args.execution_mode
     if args.disable_episode_dynamic_plan:
         episode = dict(episode)
         episode.pop("edgevisor_dynamic_plan", None)

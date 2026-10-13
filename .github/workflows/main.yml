@@ -32,7 +32,9 @@ jobs:
         id: dependencies
         run: sudo apt-get update && sudo apt-get install build-essential
       - name: Build and run Linux acceptance tests
-        run: make -j2 DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama check
+        run: |
+          make -j2 DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama check
+          make -C EdgeVisor -j2 DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama-api
 
       - name: Validate experiment evidence gates
         run: python3 -m unittest discover -s scripts/experiments/tests -v

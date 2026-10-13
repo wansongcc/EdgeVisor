@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import operator
 import re
 import time
@@ -33,10 +34,21 @@ _UNARY_OPS = {
 def _eval_expr(node: ast.AST) -> float:
     if isinstance(node, ast.Expression):
         return _eval_expr(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        if not math.isfinite(node.value) or abs(node.value) > 1e12:
+            raise ToolError("calculator operand exceeds budget")
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        return _BIN_OPS[type(node.op)](_eval_expr(node.left), _eval_expr(node.right))
+        left, right = _eval_expr(node.left), _eval_expr(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > 12:
+            raise ToolError("calculator exponent exceeds budget")
+        try:
+            value = _BIN_OPS[type(node.op)](left, right)
+        except (ArithmeticError, ValueError) as error:
+            raise ToolError(str(error)) from error
+        if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 1e18:
+            raise ToolError("calculator result exceeds budget")
+        return value
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_eval_expr(node.operand))
     raise ToolError(f"unsupported calculator expression node: {type(node).__name__}")
@@ -44,7 +56,14 @@ def _eval_expr(node: ast.AST) -> float:
 
 def calculator(expression: str) -> str:
     """Evaluate a simple arithmetic expression without exposing Python eval."""
-    tree = ast.parse(expression, mode="eval")
+    if not isinstance(expression, str) or len(expression) > 256:
+        raise ToolError("calculator expression exceeds budget")
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as error:
+        raise ToolError("invalid calculator expression") from error
+    if sum(1 for _ in ast.walk(tree)) > 64:
+        raise ToolError("calculator AST exceeds budget")
     value = _eval_expr(tree)
     if isinstance(value, float) and value.is_integer():
         return str(int(value))

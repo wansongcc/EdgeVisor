@@ -1,6 +1,6 @@
 {
   "id": "agentic_shadowkv_smoke_loop",
-  "description": "Short loop-schema agent episode for Shadow KV smoke tests with two required tool calls.",
+  "description": "Controlled scripted system experiment; excluded from autonomous task quality.",
   "max_llm_turns": 6,
   "max_tokens": 64,
   "min_tool_calls": 2,
@@ -35,5 +35,6 @@
         "ffnMove": 256
       }
     ]
-  }
+  },
+  "execution_mode": "scripted"
 }

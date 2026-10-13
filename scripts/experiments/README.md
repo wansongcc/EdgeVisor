@@ -77,3 +77,43 @@ Legacy textual timing and agent reports do not become valid paper evidence
 merely by wrapping them in a new manifest. Continuous token lineage, autonomous
 quality, isolated preparation budgets, transaction fencing, fair baselines and
 paired independent episode analysis remain separate implementation/gate stages.
+
+## Serial API and real tool gates
+
+```bash
+python3 scripts/experiments/api_session_gate.py \
+  --config /path/to/lab_config.json --build-evidence /path/to/build \
+  --output /path/to/new-api-evidence
+python3 scripts/experiments/agent_tool_gate.py \
+  --config /path/to/lab_config.json --build-evidence /path/to/build \
+  --output /path/to/new-agent-evidence
+```
+
+API tests use real models with prefill batch=1 on single GPU, four-node root
+sampling and four-node tail sampling. They check canonical cold vs warm
+continuation, changed/sessionless histories, capacity/invalid input isolation,
+request seed/temperature/top-p resets and streaming. Use an explicit
+`edgevisor_session_id` to permit KV reuse. The response `edgevisor` metadata
+reports runtime context, lineage, generation, consumed KV row count and pending
+sampled input. Only one serial KV owner exists; switching sessions re-prefills.
+A sampled output is never counted as already consumed KV. This is not a
+concurrent multi-session KV implementation.
+
+The autonomous runner needs only Python's standard library. It executes model
+chosen tools, records their real start/end, parses complete single JSON objects
+strictly and scores against references only after generation. It does not
+supply target arguments or target answers to the model. Failed output remains
+failed. Without an objective checker, quality stays unknown. The small live
+calculator gate is a protocol/lineage diagnostic; it is not a task-suite quality
+result. Keep prompt/protocol failures as separate retained trials.
+
+`agent_bench.runtime_loop.run_loop_episode` now defaults to `autonomous`.
+`execution_mode=scripted` explicitly selects the existing LangGraph controlled
+workflow and still needs its optional dependencies. Its forced workflow result
+is labeled `scripted_workflow_completed`; it cannot populate autonomous task
+success. Two existing forced ablation episodes are labeled scripted. Existing
+legacy latency summaries remain separate from the new raw interval evidence.
+Tool latency measured on the client includes actual local tool execution; it
+cannot be subtracted from root process timestamps or presented as device energy.
+Preparation overlap/budgets and broad task-quality/paired-episode experiments
+remain following stages.

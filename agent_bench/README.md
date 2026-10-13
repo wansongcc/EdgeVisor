@@ -1,3 +1,33 @@
+# Agent benchmark modes
+
+The loop entry point now defaults to `autonomous`: the model chooses tool
+arguments and the final answer; strict parsing never reconstructs partial JSON
+or supplies reference answers. Tool calls execute real code and retain their
+actual intervals. Without an objective answer checker, task quality is unknown.
+
+Set `execution_mode: scripted` in an episode, or `--execution-mode scripted`,
+to select the historical controlled LangGraph workflow. Forced ablation episodes
+are explicitly marked scripted. Their workflow completion is not autonomous
+quality; legacy timing summaries are not the new raw interval schema.
+
+The autonomous runner uses the standard library; scripted mode needs the
+optional dependencies in `requirements.txt`. Use user-prepared models and set
+`EDGE_MODEL`, `EDGE_TOKENIZER` and, if needed, `EDGE_DLLAMA`/`EDGE_DLLAMA_API`.
+Backend defaults resolve from this checkout; `B01_ROOT` remains an optional
+legacy experiment-directory override. `--out-root` or `EDGE_RESULTS` selects
+results; the default is `results/agent_bench` under the working directory.
+
+For four owned Docker GPUs, use the model-backed API and tool gates documented
+in [`scripts/experiments/README.md`](../scripts/experiments/README.md). They check
+continuous token lineage, real tool execution and actual failures. The tiny
+calculator case is a correctness diagnostic, not an aggregate quality result.
+
+The remainder describes the historical harness and lab-specific recipes. Its
+three-GPU restriction and `/home/byh` paths do not apply to the separate four-T4
+Docker fixture.
+
+---
+
 # Agent Bench
 
 This directory contains a minimal LangGraph-based agent episode runner for

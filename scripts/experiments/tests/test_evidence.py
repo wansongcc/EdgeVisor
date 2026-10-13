@@ -112,6 +112,21 @@ class RecordingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verify_artifacts(path)
 
+    def test_client_script_change_cannot_seal_as_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'code'
+            (root/'scripts/lab').mkdir(parents=True)
+            script = root/'scripts/lab/check.py'
+            script.write_text('version = 1')
+            path = Path(directory)/'run'
+            run = RunRecorder(path, {}, source_root=root)
+            script.write_text('version = 2')
+            with self.assertRaises(ValueError): run.seal('passed')
+            self.assertTrue(run.closed)
+            manifest = json.loads((path/'manifest.json').read_text())
+            self.assertEqual(manifest['status'], 'rejected')
+            self.assertNotEqual(manifest['client_source']['sha256'], manifest['client_source_end']['sha256'])
+
     def test_missing_sensor_is_not_zero(self):
         self.assertEqual(measurement(unit='W'), {'value': None, 'status': 'not_observed', 'unit': 'W'})
         self.assertEqual(measurement(0, 'measured', 'W')['value'], 0)

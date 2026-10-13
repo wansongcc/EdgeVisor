@@ -8,7 +8,7 @@ from pathlib import Path
 from statistics import quantiles
 from typing import Any, Dict, List, Optional, TypedDict
 
-from langgraph.graph import END, StateGraph
+from agent_bench.autonomous import run_autonomous_episode
 
 from agent_bench.backends import Backend, GenerationResult
 from agent_bench.tools import TOOL_SCHEMAS, ToolError, run_tool
@@ -432,6 +432,7 @@ def _clean_argument_value(key: str, value: Any) -> Any:
 
 
 def build_loop_graph():
+    from langgraph.graph import END, StateGraph
     graph = StateGraph(LoopState)
 
     def generate_action(state: LoopState) -> LoopState:
@@ -757,6 +758,11 @@ def _collect_ablation_event_metrics(llm_events: List[Dict[str, Any]]) -> Dict[st
 
 
 def run_loop_episode(episode: Dict[str, Any], backend: Backend, out_dir: Path) -> Dict[str, Any]:
+    mode = episode.get("execution_mode", "autonomous")
+    if mode == "autonomous":
+        return run_autonomous_episode(episode, backend, out_dir)
+    if mode != "scripted":
+        raise ValueError("execution_mode must be autonomous or scripted")
     out_dir.mkdir(parents=True, exist_ok=True)
     app = build_loop_graph()
     started_at = time.perf_counter()
@@ -851,9 +857,12 @@ def run_loop_episode(episode: Dict[str, Any], backend: Backend, out_dir: Path) -
             and not failed_llm_events
         ),
     }
+    agent_metrics["scripted_workflow_completed"] = agent_metrics.pop("task_success")
+    agent_metrics.update(execution_mode="scripted", autonomous_quality_eligible=False, task_success=None)
     agent_metrics.update(ablation_metric_totals)
     trace = {
         "episode_id": episode["id"],
+        "execution_mode": "scripted",
         "backend": backend.name,
         "events": events,
         "messages": final_state.get("messages", []),

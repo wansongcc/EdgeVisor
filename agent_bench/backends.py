@@ -11,13 +11,15 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
-ROOT = Path(os.environ.get("B01_ROOT", "/home/byh/B01"))
-EDGE_PROJECT = Path(os.environ.get("EDGE_PROJECT", str(ROOT / "EdgeVisor")))
+LOCAL_PROJECT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("B01_ROOT", str(LOCAL_PROJECT.parent)))
+EDGE_PROJECT = Path(os.environ.get("EDGE_PROJECT", str(ROOT / "EdgeVisor") if "B01_ROOT" in os.environ else str(LOCAL_PROJECT)))
 EDGE_ENGINE = Path(os.environ.get("EDGE_ENGINE", str(EDGE_PROJECT / "EdgeVisor")))
 EDGE_DLLAMA = Path(os.environ.get("EDGE_DLLAMA", str(EDGE_ENGINE / "dllama")))
 EDGE_DLLAMA_API = Path(os.environ.get("EDGE_DLLAMA_API", str(EDGE_ENGINE / "dllama-api")))
@@ -1677,6 +1679,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         self._persistent_out_dir: Optional[Path] = None
         self._session_started_at_ms = 0.0
         self._session_generation_count = 0
+        self._api_session_id = uuid.uuid4().hex
 
     def close(self) -> None:
         for proxy in list(self._persistent_proxies):
@@ -1940,12 +1943,15 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             "temperature": 0,
             "seed": 1,
             "stream": False,
+            "edgevisor_session_id": self._api_session_id,
         }
         start = time.perf_counter()
         rc = 0
         content = ""
+        lineage_metadata: Dict[str, Any] = {}
         try:
             resp = self._http_json("POST", "/v1/chat/completions", payload, timeout_s=self.timeout_s)
+            lineage_metadata = resp.get("edgevisor", {}) if isinstance(resp, dict) else {}
             choices = resp.get("choices", []) if isinstance(resp, dict) else []
             if choices and isinstance(choices[0], dict):
                 message = choices[0].get("message", {})
@@ -1959,6 +1965,8 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             plan_thread.join(timeout=float((dynamic_plan or {}).get("consume_timeout_s", 20.0)) + 5.0)
             dynamic_events = list(plan_box.get("events", []))
         metrics = self._collect_persistent_metrics(wall_ms=wall_ms, rc=rc)
+        metrics["api_token_lineage"] = lineage_metadata
+        metrics["persistent_cache_hit"] = int(lineage_metadata.get("cached_input_tokens", 0)) > 0
         if self.last_plan is not None:
             metrics["exo_plan"] = self.last_plan
         return GenerationResult(

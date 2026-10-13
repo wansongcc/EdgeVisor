@@ -1,0 +1,15 @@
+{
+  "host": "yhs1",
+  "label": "YOUR_RUN_ID",
+  "remote_base": "/home/YOUR_USER/edgevisor_lab/YOUR_RUN_ID",
+  "model": "/models/model.m",
+  "tokenizer": "/models/tokenizer.t",
+  "user": "REMOTE_UID:REMOTE_GID",
+  "containers": [
+    "edgevisor-node0-YOUR_RUN_ID",
+    "edgevisor-node1-YOUR_RUN_ID",
+    "edgevisor-node2-YOUR_RUN_ID",
+    "edgevisor-node3-YOUR_RUN_ID"
+  ],
+  "port": 19393
+}

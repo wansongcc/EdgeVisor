@@ -190,7 +190,21 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_PRECOMMIT_PROBE = 1u << 8, // control-only liveness ACK before a PP binding hand-off
     LLM_CTRL_TOOL_WINDOW_SHADOW = 1u << 9, // execute actual redundant ShadowKV work during a control-only tool window
     LLM_CTRL_DEVICE_JOIN = 1u << 10,
+    LLM_CTRL_SAMPLING_CONFIG = 1u << 11,
 };
+// Serialized only after an exclusive control-only sampling packet. All nodes
+// ACK after their executor history reset, before any token in the new request.
+static const NnUint LLM_SAMPLING_CONFIG_MAGIC = 0x53434E46u;
+struct LlmSamplingConfig {
+    NnUint magic;
+    NnUint version;
+    uint64_t generationId;
+    unsigned long long seed;
+    float temperature;
+    float topP;
+    NnUint resetKvLineage;
+};
+
 
 static constexpr NnUint LLM_DEVICE_JOIN_MAGIC = 0x4e4f4a44u; // 'DJON'
 static constexpr NnUint LLM_DEVICE_JOIN_VERSION = 1u;
@@ -527,6 +541,7 @@ public:
     void waitKvExportResponseHeader(NnUint socketIndex, LlmKvExportResponseHeader &response, int timeoutMs);
     // Non-final prefill chunks skip the end-segment logits compute+gather
     // (their logits are never consumed); broadcast to workers via control flags.
+    void configureGenerationSampling(float temperature, float topP, unsigned long long seed, uint64_t generationId, bool resetKvLineage);
     void setSkipLogits(bool skip);
     bool hasAsyncKvCollector() const;
     bool tryPopAsyncKvRow(RootKvAggRowPacket &packet);
@@ -725,6 +740,8 @@ private:
     NnNetExecution *execution;
     NnNetwork *network;
     Sampler *lastStageSampler;
+    bool pendingKvLineageReset = false;
+    uint64_t samplingGenerationId = 0;
     NnUint logitsPipeIndex = (NnUint)-1;
     NnUint localNodeIndex = 0u;
     LlmControlPacket controlPacket;
@@ -736,6 +753,7 @@ private:
     std::deque<std::pair<LlmKvExportRequestHeader, std::vector<NnUint>>> pendingKvExportRequests;
 public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex, NnUint logitsPipeIndex, Sampler *lastStageSampler);
+    bool consumeKvLineageReset() { const bool reset = pendingKvLineageReset; pendingKvLineageReset = false; return reset; }
     bool isSkipLogits() const { return (controlPacket.flags & LLM_CTRL_SKIP_LOGITS) != 0u; }
     bool tryReadControlPacket();
 };

@@ -234,6 +234,7 @@ public:
     // Run enabled right-boundary layers, then copy the stage-output cache back to the PP send pipe.
     void spliceRedundantLayersIntoSend(NnUint beginLayer, NnUint endLayer);
     NnUint executionPosition() const;
+    void resetShadowKvHistory();
     bool shadowCovers(NnUint beginLayer, NnUint endLayer, NnUint position) const;
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     bool isSegmentEnabled(NnUint segmentIndex) const;

@@ -998,8 +998,10 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         // Non-final prefill chunks never consume logits: skip the end-segment
         // vocab matmul + logits gather entirely (all nodes stay consistent
         // via the control-packet flag).
-        const bool isFinalChunk = (remainingTokens <= (long)batchSize);
-        context->inference->setSkipLogits(!context->args->lastStageSampling && !isFinalChunk);
+        // Decode consumes the last prompt token in its own forward; no prefill
+        // logits are sampled. This also keeps the tail RNG unchanged in prefill.
+        const bool isFinalChunk = remainingTokens <= (long)batchSize;
+        context->inference->setSkipLogits(true);
         const auto microbatchWallStart = std::chrono::steady_clock::now();
         forwardOrRestart();
         const auto microbatchWallEnd = std::chrono::steady_clock::now();

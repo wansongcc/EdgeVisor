@@ -280,9 +280,12 @@ delayed-sample-worker-test: src/test/test_delayed_sample.cpp src/dllama.cpp term
 	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -Wl,--wrap=send -o $@ $(LIBS)
 
 # Model-free Linux acceptance gate. GPU builds run the same host-side tests.
-CHECK_TESTS := nn-cpu-test nn-cpu-ops-test tokenizer-test app-cli-test \
+CHECK_TESTS := api-token-ledger-test nn-cpu-test nn-cpu-ops-test tokenizer-test app-cli-test \
  dynamic-tpot-test failover-gate-test token-timing-test device-profile-test \
  pp-failover-network-test
 .PHONY: check
 check: $(CHECK_TESTS) reserved-join-test delayed-sample-worker-test
 	@set -e; for test in $(CHECK_TESTS); do ./$$test; done
+
+api-token-ledger-test: src/test/test_api_token_ledger.cpp src/api-token-ledger.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LIBS)

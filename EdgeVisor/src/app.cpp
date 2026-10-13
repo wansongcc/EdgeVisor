@@ -2723,6 +2723,36 @@ static bool getHeadMigrationTargetRangeLocal(
     return true;
 }
 
+void RootLlmInference::configureGenerationSampling(float temperature, float topP,
+        unsigned long long seed, uint64_t generationId, bool resetKvLineage) {
+    if (!std::isfinite(temperature) || temperature < 0 || !std::isfinite(topP) || topP <= 0 || topP > 1 || generationId == 0)
+        throw std::invalid_argument("Invalid generation sampling parameters");
+    ExperimentTraceSpan samplingTrace("sampling_config_ack", {{"generation_id", generationId}, {"reset_kv_lineage", resetKvLineage}});
+    if (resetKvLineage) {
+        planCommandCache().clear();
+        resetPendingKvMigrationState("new API token lineage");
+        tokenHistory.clear();
+        if (executor != nullptr) executor->resetShadowKvHistory();
+    }
+    if (network != nullptr) {
+        LlmControlPacket control{};
+        control.batchSize = 1u;
+        control.flags = LLM_CTRL_CONTROL_ONLY | LLM_CTRL_SAMPLING_CONFIG;
+        LlmSamplingConfig sampling{};
+        sampling.magic = LLM_SAMPLING_CONFIG_MAGIC; sampling.version = 1u;
+        sampling.generationId = generationId; sampling.seed = seed;
+        sampling.temperature = temperature; sampling.topP = topP;
+        sampling.resetKvLineage = resetKvLineage ? 1u : 0u;
+        network->writeAll(&control, sizeof(control));
+        network->writeAll(&sampling, sizeof(sampling));
+        for (NnUint socket = 0; socket < network->nSockets; ++socket)
+            if (network->isSocketActive(socket)) waitWorkerControlAck(socket, kvAckWaitTimeoutMs());
+    }
+    // Queued earlier samples are drained by the ACK demultiplexer before clearing.
+    workerSampleFrameCache.clear();
+    workerProfileFrameCache.clear();
+}
+
 void RootLlmInference::setSkipLogits(bool skip) {
     skipLogits_ = skip;
 }
@@ -5682,6 +5712,7 @@ WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *net
 }
 
 void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionPlan *plan) {
+    if ((controlPacket.flags & LLM_CTRL_SKIP_LOGITS) != 0u) return;
     if (!lastStageSamplingPlanSupported(plan)) return;
     if (network == nullptr || execution == nullptr || logitsPipe == nullptr || lastStageSampler == nullptr) return;
     if (controlPacket.batchSize != 1u) return;
@@ -5722,6 +5753,21 @@ bool WorkerLlmInference::tryReadControlPacket() {
         printf("📨 [Worker] Recv Control: Batch=0 (stop)\n");
         isFinished = true;
         return true;
+    }
+
+    if ((controlPacket.flags & LLM_CTRL_SAMPLING_CONFIG) != 0u) {
+        if (controlPacket.flags != (LLM_CTRL_CONTROL_ONLY | LLM_CTRL_SAMPLING_CONFIG) || controlPacket.batchSize != 1u)
+            throw NnExecutorException("Sampling configuration requires an exclusive control packet");
+        LlmSamplingConfig sampling{};
+        network->read(ROOT_SOCKET_INDEX, &sampling, sizeof(sampling));
+        if (sampling.magic != LLM_SAMPLING_CONFIG_MAGIC || sampling.version != 1u ||
+                sampling.generationId <= samplingGenerationId || sampling.resetKvLineage > 1u ||
+                !std::isfinite(sampling.temperature) || sampling.temperature < 0 ||
+                !std::isfinite(sampling.topP) || sampling.topP <= 0 || sampling.topP > 1)
+            throw NnExecutorException("Invalid sampling configuration packet");
+        if (lastStageSampler != nullptr) lastStageSampler->setParams(sampling.temperature, sampling.topP, sampling.seed);
+        samplingGenerationId = sampling.generationId;
+        pendingKvLineageReset = sampling.resetKvLineage != 0u;
     }
 
     // Optional PlanCommand packet piggybacked after control packet.
@@ -7524,6 +7570,8 @@ void runWorkerApp(AppCliArgs *args) {
                         printf("network is in non-blocking mode\n");
                 }
 
+                if (inference.consumeKvLineageReset()) executor.resetShadowKvHistory();
+
                 LlmKvTransferHeader kvHdr{};
                 std::vector<float> kvK;
                 std::vector<float> kvV;
@@ -7724,6 +7772,8 @@ void runWorkerApp(AppCliArgs *args) {
                         toolWindowBubbleStats = runToolWindowBubbleShadowKv(&executor, "tool-window-worker", nodeConfig.nodeIndex, inference.position(), inference.batchSize());
                     }
                     inference.flushPendingKvAck();
+                    if ((inference.flags() & LLM_CTRL_SAMPLING_CONFIG) != 0u)
+                        network->writeAck(ROOT_SOCKET_INDEX);
                     if ((inference.flags() & LLM_CTRL_PROFILE) != 0u) {
                         LlmPerfPacket p{};
                         p.position = inference.position();

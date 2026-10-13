@@ -518,6 +518,12 @@ int Sampler::sample(float* logits) {
     return next;
 }
 
+void Sampler::setParams(float temp, float topP, unsigned long long seed) {
+    temperature = temp;
+    topp = topP;
+    rngState = seed;
+}
+
 void Sampler::setTemp(float temp) {
     this->temperature = temp;
 }

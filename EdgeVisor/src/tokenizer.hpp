@@ -86,6 +86,7 @@ public:
     Sampler(int vocab_size, float temperature, float topp, unsigned long long rngSeed);
     ~Sampler();
     int sample(float *logits);
+    void setParams(float temp, float topP, unsigned long long rngSeed);
     void setTemp(float temp);
     void setSeed(unsigned long long rngSeed);
 };

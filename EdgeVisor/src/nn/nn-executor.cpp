@@ -900,6 +900,15 @@ NnBubbleShadowStats NnExecutor::runBubbleShadowRedundant(NnUint budgetUs) {
     return runBubbleShadowRedundantInternal(budgetUs, false);
 }
 
+void NnExecutor::resetShadowKvHistory() {
+    std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+    std::fill(shadowFilledThrough_.begin(), shadowFilledThrough_.end(), 0u);
+    lastBubbleShadowStats = NnBubbleShadowStats{};
+    bubbleShadowComplete = bubbleShadowStepIndices.empty();
+    bubbleShadowCursor = 0u;
+    bubbleShadowDrainUs = 0u;
+}
+
 void NnExecutor::resetBubbleShadowStateForForward() {
     std::lock_guard<std::mutex> lock(bubbleShadowMutex);
     lastBubbleShadowStats = NnBubbleShadowStats{};

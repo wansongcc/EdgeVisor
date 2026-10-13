@@ -11,6 +11,9 @@
 #include <csignal>
 #include <thread>
 #include <chrono>
+#include <cmath>
+#include "api-token-ledger.hpp"
+#include "token_timing.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -80,7 +83,7 @@ public:
 
         if (req.body.size() > 0) {
             // printf("body: %s\n", req.body.c_str());
-            req.parsedJson = json::parse(req.body);
+            req.parsedJson = json::parse(req.body, nullptr, false);
         }
         return req;
     }
@@ -216,9 +219,9 @@ public:
         writeSocket(serverSocket, data.c_str(), data.size());
     }
 
-    void writeJson(std::string json) {
+    void writeJson(std::string json, int status = 200) {
         std::ostringstream buffer;
-        buffer << "HTTP/1.1 200 OK\r\n"
+        buffer << "HTTP/1.1 " << status << (status == 200 ? " OK" : " Bad Request") << "\r\n"
             << "Access-Control-Allow-Origin: *\r\n"
             << "Content-Type: application/json; charset=utf-8\r\n"
             << "Connection: close\r\n"
@@ -274,17 +277,19 @@ public:
     }
 };
 
-void writeChatCompletionChunk(HttpRequest &request, const std::string &delta, const bool stop){
+void writeChatCompletionChunk(HttpRequest &request, const std::string &delta, const bool stop, const json *metadata = nullptr, const char *finishReason = "stop"){
     ChunkChoice choice;
     if (stop) {
-        choice.finish_reason = "stop";
+        choice.finish_reason = finishReason;
     } else {
         choice.delta = ChatMessageDelta("assistant", delta);
     }
     ChatCompletionChunk chunk = ChatCompletionChunk(choice);
 
     std::ostringstream buffer;
-    buffer << "data: " << ((json)chunk).dump() << "\r\n\r\n";
+    json payload = chunk;
+    if (metadata != nullptr) payload["edgevisor"] = *metadata;
+    buffer << "data: " << payload.dump() << "\r\n\r\n";
     request.writeStreamChunk(buffer.str());
 
     if (stop) {
@@ -293,237 +298,203 @@ void writeChatCompletionChunk(HttpRequest &request, const std::string &delta, co
     }
 }
 
-class NaiveCacheItem {
-public:
-    pos_t endPos;
-    ChatMessage message;
-    NaiveCacheItem(pos_t endPos, ChatMessage message) {
-        this->endPos = endPos;
-        this->message = message;
-    }
-};
-
-class NaiveCache {
-private:
-    std::vector<NaiveCacheItem> cache;
-public:
-    void push(NaiveCacheItem item) {
-        cache.push_back(item);
-    }
-
-    void clear() {
-        cache.clear();
-    }
-
-    bool resolveDeltaPrompt(std::vector<ChatMessage>& messages, pos_t& startPos) {
-        size_t cacheSize = cache.size();
-        if (cacheSize == 0)
-            return false;
-        if (messages.size() > cacheSize) {
-            size_t i = 0;
-            while (i < cacheSize) {
-                if (
-                    cache[i].message.role != messages[i].role ||
-                    cache[i].message.content != messages[i].content
-                ) break;
-                i++;
-            }
-            if (i == cacheSize) {
-                startPos = cache[i - 1].endPos;
-                messages.erase(messages.begin(), messages.begin() + i);
-                printf("🐤 Found naive cache for %zu messages, pos=%d\n", i, startPos);
-                return true;
-            }
-        }
-        cache.clear();
-        return false;
-    }
-};
-
 class ApiServer {
-private:
     RootLlmInference *inference;
     Tokenizer *tokenizer;
     Sampler *sampler;
     NnNetwork *network;
     AppCliArgs *args;
     LlmHeader *header;
-    EosDetector *eosDetector;
     ChatTemplateGenerator *templateGenerator;
-    NaiveCache naiveCache;
+    ApiTokenLedger ledger;
+    uint64_t generationId = 0;
 
-public:
-    ApiServer(RootLlmInference *inference, Tokenizer *tokenizer, Sampler *sampler, NnNetwork *network, AppCliArgs *args, LlmHeader *header, EosDetector *eosDetector, ChatTemplateGenerator *templateGenerator) {
-        this->inference = inference;
-        this->tokenizer = tokenizer;
-        this->sampler = sampler;
-        this->network = network;
-        this->args = args;
-        this->header = header;
-        this->eosDetector = eosDetector;
-        this->templateGenerator = templateGenerator;
-    }
-
-    void complete(HttpRequest& request) {
-        InferenceParams params = parseRequest(request);
-
-        pos_t startPos = 0;
-        std::vector<ChatMessage> deltaPrompt = params.messages;
-        naiveCache.resolveDeltaPrompt(deltaPrompt, startPos);
-
-        size_t nInputItems = deltaPrompt.size();
-        std::unique_ptr<ChatItem[]> inputItemsPtr(new ChatItem[nInputItems]);
-        ChatItem *inputItems = inputItemsPtr.get();
-        for (size_t i = 0; i < nInputItems; i++) {
-            inputItems[i].role = deltaPrompt[i].role;
-            inputItems[i].message = deltaPrompt[i].content;
+    InferenceParams parseRequest(HttpRequest &request) {
+        const json &body = request.parsedJson;
+        if (!body.is_object() || !body.contains("messages") || !body["messages"].is_array() || body["messages"].empty())
+            throw std::invalid_argument("messages must be a nonempty array");
+        for (const auto &message : body["messages"]) {
+            if (!message.is_object() || !message.contains("role") || !message["role"].is_string() ||
+                    !message.contains("content") || !message["content"].is_string())
+                throw std::invalid_argument("Each message requires string role and content");
+            const std::string role = message["role"].get<std::string>();
+            const bool toolRoleSupported = args->chatTemplateType == TEMPLATE_LLAMA3 || args->chatTemplateType == TEMPLATE_CHATML ||
+                (args->chatTemplateType == TEMPLATE_UNKNOWN && tokenizer->chatTemplate != nullptr &&
+                    (std::strstr(tokenizer->chatTemplate, "<|start_header_id|>") != nullptr ||
+                     std::strstr(tokenizer->chatTemplate, "<|im_start|>") != nullptr));
+            if (role != "system" && role != "user" && role != "assistant" && !(role == "tool" && toolRoleSupported))
+                throw std::invalid_argument("Unsupported message role for this chat template");
         }
-
-        GeneratedChat inputPrompt = templateGenerator->generate(nInputItems, inputItems, true);
-        printf("🔹%s🔸", inputPrompt.content);
-
-        int nPromptTokens;
-        std::unique_ptr<int[]> promptTokensPtr(new int[inputPrompt.length + 2]);
-        int *promptTokens = promptTokensPtr.get();
-        bool isStart = startPos == 0;
-        tokenizer->encode((char*)inputPrompt.content, promptTokens, &nPromptTokens, isStart, true);
-
-        pos_t promptEndPos = startPos + nPromptTokens - 1;
-        if (promptEndPos > header->seqLen)
-            promptEndPos = header->seqLen;
-
-        pos_t maxPredPos = params.max_tokens > 0 ? (promptEndPos + params.max_tokens) : header->seqLen;
-        if (maxPredPos > header->seqLen)
-            maxPredPos = header->seqLen;
-
-        for (size_t j = 0; j < deltaPrompt.size(); j++) {
-            naiveCache.push(NaiveCacheItem(promptEndPos, deltaPrompt[j]));
-        }
-
-        std::string buffer;
-
-        if (params.stream)
-            request.writeStreamStartChunk();
-        if (inputPrompt.publicPrompt != nullptr) {
-            if (params.stream)
-                writeChatCompletionChunk(request, inputPrompt.publicPrompt, false);
-            buffer += inputPrompt.publicPrompt;
-        }
-
-        NnUint pos = startPos;
-        int token;
-        for (NnUint i = 0; ;) {
-            long remainingTokens = promptEndPos - pos;
-            if (remainingTokens <= 0)
-                break;
-
-            NnUint batchSize = remainingTokens < args->nBatches
-                ? remainingTokens
-                : args->nBatches;
-
-            inference->setBatchSize(batchSize);
-            inference->setPosition(pos);
-            for (NnUint j = 0; j < batchSize; j++)
-                inference->setToken(j, promptTokens[i + j]);
-
-            inference->forward();
-
-            i += batchSize;
-            pos += batchSize;
-            token = promptTokens[i + 1];
-        }
-
-        inference->setBatchSize(1);
-        tokenizer->resetDecoder();
-        eosDetector->reset();
-
-        for (; pos < maxPredPos;) {
-            inference->setPosition(pos);
-            inference->setToken(0, token);
-            inference->forward();
-
-            NnUint lastStageToken = 0u;
-            if (args->lastStageSampling &&
-                network != nullptr &&
-                inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr)) {
-                token = (int)lastStageToken;
-            } else {
-                token = sampler->sample(inference->logitsPipe);
-            }
-
-            char *piece = tokenizer->decode(token);
-            EosDetectorType eosType = eosDetector->append(token, piece);
-
-            if (piece != nullptr) {
-                printf("%s", piece);
-                fflush(stdout);
-            }
-
-            if (eosType == NOT_EOS || eosType == EOS) {
-                char *delta = eosDetector->getDelta();
-                if (delta != nullptr) {
-                    std::string deltaStr(delta);
-                    if (params.stream)
-                        writeChatCompletionChunk(request, deltaStr, false);
-                    buffer += deltaStr;
-                }
-                eosDetector->reset();
-            }
-            pos++;
-            if (eosType == EOS) break;
-        }
-
-        ChatMessage chatMessage("assistant", buffer);
-        if (pos == header->seqLen) {
-            naiveCache.clear();
-        } else {
-            naiveCache.push(NaiveCacheItem(pos, chatMessage));
-        }
-
-        if (params.stream) {
-            writeChatCompletionChunk(request, "", true);
-        } else {
-            int nCompletionTokens = pos - promptEndPos;
-            ChatUsage usage(nPromptTokens, nCompletionTokens, nPromptTokens + nCompletionTokens);
-            Choice choice(chatMessage);
-            ChatCompletion completion(choice, usage);
-            std::string chatJson = ((json)completion).dump();
-            request.writeJson(chatJson);
-        }
-        printf("🔶\n");
-        fflush(stdout);
-    }
-
-private:
-    InferenceParams parseRequest(HttpRequest& request) {
         InferenceParams params;
-        params.temperature = args->temperature;
-        params.top_p = args->topp;
-        params.seed = args->seed;
-        params.stream = false;
         params.messages = parseChatMessages(request.parsedJson["messages"]);
-        params.max_tokens = -1;
-
-        if (request.parsedJson.contains("stream")) {
-            params.stream = request.parsedJson["stream"].get<bool>();
+        params.temperature = body.value("temperature", args->temperature);
+        params.top_p = body.value("top_p", args->topp);
+        if (body.contains("seed") && (!body["seed"].is_number_integer() ||
+                (!body["seed"].is_number_unsigned() && body["seed"].get<int64_t>() < 0)))
+            throw std::invalid_argument("seed must be a nonnegative integer");
+        params.seed = body.value("seed", args->seed);
+        params.stream = body.value("stream", false);
+        if (body.contains("max_tokens")) {
+            const auto &limit = body["max_tokens"];
+            if (!limit.is_number_integer() ||
+                    (!limit.is_number_unsigned() && limit.get<int64_t>() <= 0) ||
+                    limit.get<uint64_t>() == 0 || limit.get<uint64_t>() > header->seqLen)
+                throw std::invalid_argument("max_tokens must be an integer within context capacity");
         }
-        if (request.parsedJson.contains("temperature")) {
-            params.temperature = request.parsedJson["temperature"].template get<float>();
+        params.max_tokens = body.value("max_tokens", -1);
+        if (!std::isfinite(params.temperature) || params.temperature < 0 ||
+                !std::isfinite(params.top_p) || params.top_p <= 0 || params.top_p > 1)
+            throw std::invalid_argument("temperature must be nonnegative and top_p must be in (0,1]");
+        if (body.contains("stop") && !body["stop"].is_null()) {
+            if (body["stop"].is_string()) params.stop.push_back(body["stop"].get<std::string>());
+            else params.stop = body["stop"].get<std::vector<std::string>>();
         }
-        if (request.parsedJson.contains("seed")) {
-            params.seed = request.parsedJson["seed"].template get<unsigned long long>();
-            sampler->setSeed(params.seed);
-        }
-        if (request.parsedJson.contains("max_tokens")) {
-            params.max_tokens = request.parsedJson["max_tokens"].template get<int>();
-        }
-        if (request.parsedJson.contains("stop")) {
-            params.stop = request.parsedJson["stop"].template get<std::vector<std::string>>();
-        } else {
-            const std::string defaultStop = "<|eot_id|>";
-            params.stop = std::vector<std::string>{defaultStop};
-        }
+        if (params.stop.size() > 16) throw std::invalid_argument("At most 16 stop strings are supported");
+        for (const auto &stop : params.stop)
+            if (stop.empty() || stop.size() > 4096) throw std::invalid_argument("Invalid stop string length");
         return params;
+    }
+
+    void completePrepared(HttpRequest &request, const InferenceParams &params,
+            const std::string &sessionId, const std::vector<int> &promptTokens,
+            const std::string &publicPrompt) {
+        const auto start = ledger.begin(sessionId, promptTokens);
+        const uint64_t generation = ++generationId;
+        struct Guard {
+            ApiTokenLedger &ledger;
+            bool done;
+            explicit Guard(ApiTokenLedger &value) : ledger(value), done(false) {}
+            ~Guard() { if (!done) ledger.invalidate(); }
+        } guard{ledger};
+        ExperimentTraceSpan generationTrace("api_generation", {{"session_id", sessionId},
+            {"lineage_id", start.lineage}, {"generation_id", generation},
+            {"cached_input_tokens", start.cachedTokens}, {"reset_reason", start.resetReason}});
+        sampler->setParams(params.temperature, params.top_p, params.seed);
+        inference->configureGenerationSampling(params.temperature, params.top_p, params.seed,
+                                               generation, !start.resetReason.empty());
+        const NnUint promptEnd = (NnUint)promptTokens.size() - 1u;
+        const NnUint maxPred = params.max_tokens > 0 ? promptEnd + (NnUint)params.max_tokens : header->seqLen;
+        NnUint pos = (NnUint)start.cachedTokens;
+        std::vector<int> consumed(promptTokens.begin(), promptTokens.begin() + promptEnd);
+        TokenizerChatStops stops(tokenizer);
+        std::vector<int> stopIds = tokenizer->eosTokenIds;
+        std::vector<const char *> stopPieces(stops.stops, stops.stops + stops.nStops);
+        int maxStopLength = stops.maxStopLength;
+        for (const auto &stop : params.stop) {
+            stopIds.push_back(-1); stopPieces.push_back(stop.c_str());
+            maxStopLength = std::max(maxStopLength, (int)stop.size());
+        }
+        EosDetector detector(stopIds.size(), stopIds.data(), stopPieces.data(), maxStopLength, maxStopLength);
+        std::string buffer = publicPrompt;
+        if (params.stream) {
+            request.writeStreamStartChunk();
+            if (!publicPrompt.empty()) writeChatCompletionChunk(request, publicPrompt, false);
+        }
+        {
+            ExperimentTraceSpan prefillTrace("prefill", {{"generation_id", generation},
+                {"prompt_tokens", promptTokens.size()}, {"start_position", pos}});
+            inference->setSkipLogits(true);
+            while (pos < promptEnd) {
+                const NnUint batch = std::min<NnUint>(args->nBatches, promptEnd - pos);
+                inference->setBatchSize(batch); inference->setPosition(pos);
+                for (NnUint index = 0; index < batch; ++index) inference->setToken(index, promptTokens[pos + index]);
+                inference->forward(); pos += batch;
+            }
+            inference->setSkipLogits(false);
+        }
+        int token = promptTokens.back();
+        bool stopped = false;
+        EosDetectorType eosType = NOT_EOS;
+        inference->setBatchSize(1); tokenizer->resetDecoder();
+        {
+            ExperimentTraceSpan decodeTrace("decode", {{"generation_id", generation}});
+            for (; pos < maxPred; ++pos) {
+                ExperimentTraceSpan tokenTrace("token", {{"generation_id", generation}, {"position", pos}});
+                inference->setPosition(pos); inference->setToken(0, token);
+                inference->forward();
+                consumed.push_back(token);
+                NnUint tailToken = 0u;
+                token = args->lastStageSampling && network != nullptr &&
+                        inference->tryReceiveLastStageSampledToken(tailToken, nullptr)
+                    ? (int)tailToken : sampler->sample(inference->logitsPipe);
+                eosType = detector.append(token, tokenizer->decode(token));
+                if (eosType == NOT_EOS || eosType == EOS) {
+                    const char *delta = detector.getDelta();
+                    if (delta != nullptr) {
+                        buffer += delta;
+                        if (params.stream) writeChatCompletionChunk(request, delta, false);
+                    }
+                    detector.reset();
+                }
+                experimentTracePoint("token_emitted", {{"generation_id", generation}, {"position", pos}, {"token", token}});
+                if (eosType == EOS) { stopped = true; ++pos; break; }
+            }
+            if (!stopped && eosType == MAYBE_EOS) {
+                const char *pending = detector.getDelta();
+                if (pending != nullptr) {
+                    buffer += pending;
+                    if (params.stream) writeChatCompletionChunk(request, pending, false);
+                }
+            }
+        }
+        ledger.finish(consumed);
+        const json metadata = {{"runtime_context_key", experimentRuntimeContextKey()}, {"session_id", sessionId}, {"lineage_id", start.lineage},
+            {"generation_id", generation}, {"temperature", params.temperature}, {"top_p", params.top_p},
+            {"seed", params.seed}, {"cached_input_tokens", start.cachedTokens},
+            {"start_position", start.cachedTokens}, {"new_prefill_tokens", promptEnd - start.cachedTokens},
+            {"kv_frontier_count", consumed.size()}, {"pending_input_token", token},
+            {"reset_reason", start.resetReason}, {"status", "completed"}};
+        experimentTracePoint("api_generation_complete", metadata);
+        generationTrace.end(); requireExperimentTraceHealthy();
+        guard.done = true;
+        if (params.stream) writeChatCompletionChunk(request, "", true, &metadata, stopped ? "stop" : "length");
+        else {
+            ChatMessage message("assistant", buffer);
+            Choice choice(message); choice.finish_reason = stopped ? "stop" : "length";
+            const int count = pos - promptEnd;
+            ChatCompletion completion(choice, ChatUsage(promptTokens.size(), count, promptTokens.size() + count));
+            json response = completion; response["edgevisor"] = metadata;
+            request.writeJson(response.dump());
+        }
+    }
+public:
+    ApiServer(RootLlmInference *inference, Tokenizer *tokenizer, Sampler *sampler,
+            NnNetwork *network, AppCliArgs *args, LlmHeader *header,
+            EosDetector *, ChatTemplateGenerator *templateGenerator)
+        : inference(inference), tokenizer(tokenizer), sampler(sampler), network(network),
+          args(args), header(header), templateGenerator(templateGenerator) {}
+
+    void complete(HttpRequest &request) {
+        InferenceParams params;
+        std::string session;
+        std::vector<int> tokens;
+        std::string publicPrompt;
+        // Validate before sending a stream header or touching any live KV history.
+        try {
+            params = parseRequest(request);
+            session = request.parsedJson.value("edgevisor_session_id", std::string());
+            if (session.size() > 256) throw std::invalid_argument("edgevisor_session_id is too long");
+            std::vector<ChatItem> items(params.messages.size());
+            for (size_t index = 0; index < items.size(); ++index) {
+                items[index].role = params.messages[index].role; items[index].message = params.messages[index].content;
+            }
+            GeneratedChat prompt = templateGenerator->generate(items.size(), items.data(), true);
+            if (prompt.length > 32u * 1024u * 1024u) throw std::invalid_argument("Prompt is too large");
+            tokens.resize(prompt.length + 3u);
+            int count = 0; tokenizer->encode(const_cast<char *>(prompt.content), tokens.data(), &count, true, true);
+            if (count <= 0 || (NnUint)count > header->seqLen)
+                throw std::invalid_argument("Prompt exceeds max-seq-len or has no tokens");
+            tokens.resize(count);
+            const NnUint available = header->seqLen - (NnUint)count + 1u;
+            if (params.max_tokens > 0 && (NnUint)params.max_tokens > available)
+                throw std::invalid_argument("max_tokens exceeds remaining context capacity: " + std::to_string(available));
+            if (prompt.publicPrompt != nullptr) publicPrompt = prompt.publicPrompt;
+        } catch (const json::exception &error) {
+            request.writeJson(json({{"error", {{"message", error.what()}, {"type", "invalid_request_error"}}}}).dump(), 400); return;
+        } catch (const std::invalid_argument &error) {
+            request.writeJson(json({{"error", {{"message", error.what()}, {"type", "invalid_request_error"}}}}).dump(), 400); return;
+        }
+        completePrepared(request, params, session, tokens, publicPrompt);
     }
 };
 

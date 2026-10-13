@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Correctness gate for the four-node, 28-layer CUDA lab; not a performance study."""
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import shlex
@@ -9,7 +8,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts.experiments.recording import RunRecorder, measurement, verify_artifacts
+from scripts.experiments.recording import RunRecorder, measurement
+from scripts.experiments.build_identity import validate_build_identity
 from scripts.experiments.timeline import validate_trace
 from scripts.lab import docker_gpu_check as lab
 
@@ -70,17 +70,10 @@ def main():
             'gpu_clock_control': measurement(status='unsupported', unit='MHz')}) as run:
         lab.configure(args.config, run.directory / 'evidence', ROOT)
         lab.validate()
-        build = verify_artifacts(args.build_evidence)
-        if build['status'] != 'passed':
-            raise ValueError('Cannot test a failed or incomplete build')
-        source = json.loads((lab.OUT / 'source_manifest.json').read_text())
-        source_hash = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
-        if source_hash != build['metadata']['source']['source_manifest_sha256']:
-            raise ValueError('Deployed code differs from accepted build')
-        binary = (lab.OUT / 'binary.sha256').read_text().split()[0]
-        built_binary = (Path(args.build_evidence) / 'deployment/binary.sha256').read_text().split()[0]
-        if binary != built_binary:
-            raise ValueError('Deployed binary differs from accepted build')
+        source = json.loads((lab.OUT/'source_manifest.json').read_text())
+        binary = (lab.OUT/'binary.sha256').read_text().split()[0]
+        _, api_hash = lab.node(0, 'sha256sum /source/EdgeVisor/dllama-api')
+        build = validate_build_identity(args.build_evidence, source, binary, api_hash.split()[0])
         run.manifest['metadata'].update(build=build['metadata'], binary_sha256=binary)
         _, model_hashes = lab.node(0, shlex.join(['sha256sum', lab.MODEL, lab.TOKENIZER]), timeout=90)
         (run.directory / 'model_tokenizer.sha256').write_text(model_hashes)

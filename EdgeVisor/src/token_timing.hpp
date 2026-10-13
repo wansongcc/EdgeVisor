@@ -24,6 +24,7 @@ bool experimentTraceEnabled();
 void experimentTracePoint(const char *phase, const nlohmann::json &attributes = nlohmann::json::object());
 bool experimentTraceHealthy();
 void experimentTraceNewContext();
+std::string experimentRuntimeContextKey();
 void requireExperimentTraceHealthy();
 class ExperimentTraceSpan {
 public:

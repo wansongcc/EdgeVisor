@@ -90,7 +90,7 @@ struct RootExperimentTrace {
         std::lock_guard<std::mutex> lock(mutex);
         nlohmann::json event = {{"schema_version", 1}, {"run_id", runId},
             {"clock_id", clockId}, {"clock", "steady"}, {"role", "root"},
-            {"runtime_context_id", traceContext.load()}, {"actor_id", traceActor()},
+            {"runtime_context_id", traceContext.load()}, {"runtime_context_key", experimentRuntimeContextKey()}, {"actor_id", traceActor()},
             {"seq", sequence++}, {"ts_ns", timestamp}, {"type", type},
             {"phase", phase}, {"span_id", id}, {"parent_id", parent},
             {"attributes", attributes}};
@@ -109,9 +109,13 @@ bool experimentTraceEnabled() {
     return path != nullptr && path[0] != '\0';
 }
 bool experimentTraceHealthy() { return traceHealthy.load(); }
+std::string experimentRuntimeContextKey() {
+    static const std::string process = "root-" + std::to_string(traceNowNs());
+    return process + ":" + std::to_string(traceContext.load());
+}
 void experimentTraceNewContext() {
-    if (!experimentTraceEnabled()) return;
     ++traceContext;
+    if (!experimentTraceEnabled()) return;
     experimentTracePoint("runtime_context_start");
 }
 void requireExperimentTraceHealthy() {

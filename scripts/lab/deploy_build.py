@@ -33,15 +33,21 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--image', required=True, help='Existing development image; never pulled')
     parser.add_argument('--architecture', default='75')
+    parser.add_argument('--backend', choices=['cuda', 'cpu'], default='cuda')
+    parser.add_argument('--check-only', action='store_true', help='Build/check an isolated snapshot without deploying')
     args = parser.parse_args()
     if not args.architecture.isdigit():
         parser.error('Architecture must be numeric')
+    if args.backend == 'cpu' and not args.check_only:
+        parser.error('CPU checks require --check-only; GPU lab deployment stays CUDA')
     config = json.loads(Path(args.config).read_text())
     run = RunRecorder(args.output, {'purpose': 'build-deploy', 'host': config['host'],
-                                   'image': args.image, 'architecture': args.architecture})
+                                   'image': args.image, 'architecture': args.architecture,
+                                   'backend': args.backend, 'check_only': args.check_only})
     try:
         lab.configure(args.config, run.directory / 'deployment', ROOT)
-        check_owned_idle()
+        if not args.check_only:
+            check_owned_idle()
         inputs = run.directory / 'inputs'
         subprocess.run([sys.executable, str(ROOT / 'scripts/lab/package_sources.py'), str(inputs)], check=True)
         info = json.loads((inputs / 'build_source.json').read_text())
@@ -59,7 +65,7 @@ def main():
                    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
                    '--user', lab.USER, '--cpus', '4', '--memory', '6g', '--pids-limit', '256',
                    '-v', remote_build + ':/source', '-w', '/source', args.image, '/bin/bash', '-lc',
-                   'make -C EdgeVisor -j4 DLLAMA_CUDA=1 DLLAMA_VULKAN=0 CUDA_ARCHS=' + args.architecture + ' dllama dllama-api check']
+                   'make -C EdgeVisor -j4 DLLAMA_CUDA=' + ('1' if args.backend == 'cuda' else '0') + ' DLLAMA_VULKAN=0 CUDA_ARCHS=' + args.architecture + ' dllama dllama-api check']
         run.event('build_start', {'remote_build': remote_build, 'command': command})
         print('Building fresh source snapshot ' + info['source_manifest_sha256'], flush=True)
         code, output = lab.remote(shlex.join(command) + ' > ' + shlex.quote(remote_build + '/build.log') + ' 2>&1',
@@ -69,11 +75,25 @@ def main():
         run.event('build_end', {'exit_code': code})
         if code:
             raise RuntimeError('Build/check failed; see preserved build.log')
+        _, built_hashes = lab.remote('cd ' + shlex.quote(remote_build) + ' && sha256sum EdgeVisor/dllama EdgeVisor/dllama-api')
+        (run.directory / 'built_binaries.sha256').write_text(built_hashes)
+        run.manifest['metadata']['remote_build'] = remote_build
+        if args.check_only:
+            run.event('isolated_build_checked', {'remote_build': remote_build})
+            run.seal('passed')
+            print('Isolated build/check passed; lab binaries were not changed.', flush=True)
+            return
         check_owned_idle()
         lab.remote('cp -a ' + shlex.quote(remote_build + '/EdgeVisor/.') + ' ' + shlex.quote(lab.BASE + '/source/EdgeVisor/') +
                    ' && cp ' + shlex.quote(remote_build + '/Makefile') + ' ' + shlex.quote(lab.BASE + '/source/Makefile') +
                    ' && cp ' + shlex.quote(remote_build + '/source_manifest.json') + ' ' + shlex.quote(lab.BASE + '/source_manifest.json'))
         lab.validate()
+        _, deployed_api = lab.node(0, 'sha256sum /source/EdgeVisor/dllama-api')
+        (run.directory / 'deployment/api_binary.sha256').write_text(deployed_api)
+        built = [line.split()[0] for line in built_hashes.splitlines()]
+        observed = [(run.directory / 'deployment/binary.sha256').read_text().split()[0], deployed_api.split()[0]]
+        if built != observed:
+            raise RuntimeError('Deployed CLI/API binary differs from the fresh accepted build')
         run.event('deployment_validated', {'remote_build': remote_build})
         run.manifest['metadata']['remote_build'] = remote_build
         run.seal('passed')

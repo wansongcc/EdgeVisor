@@ -283,9 +283,9 @@ def inference_suite():
 
 def cleanup_check():
     for i in range(4):
-        _, s = node(i, "ss -lnt | awk '$4 ~ /:(" + str(PORT) + "|19400)$/ {print}'")
+        _, s = node(i, "ss -lnt | awk '$4 ~ /:(" + str(PORT) + "|19400|19401)$/ {print}'")
         assert not s.strip(), s
-        _, s = node(i, 'pgrep -af "^./dllama |^/labtools/net_probe " || true')
+        _, s = node(i, 'pgrep -af "^./dllama(-api)? |^/labtools/net_probe " || true')
         assert not s.strip(), s
         _, s = node(i, 'tc qdisc show dev eth0')
         assert 'tbf' not in s and 'netem' not in s, s

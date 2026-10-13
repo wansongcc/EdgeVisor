@@ -329,6 +329,73 @@ static void testShadowOnce(const char *async) {
     releaseNetConfig(&config); releaseNodeConfig(&node);
     unsetenv("DLLAMA_BUBBLE_SHADOW_KV"); unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
 }
+class KvExportSegment : public NnDeviceSegment {
+    NnUint index;
+    std::vector<unsigned> &calls;
+public:
+    KvExportSegment(NnUint index, std::vector<unsigned> &calls) : index(index), calls(calls) {}
+    void loadWeight(NnUint, NnSize, NnSize, NnByte *) override {}
+    void forward(NnUint, NnUint, NnUint, NnUint) override {}
+    bool exportLayerKvRow(NnUint, NnUint, NnUint dim, std::vector<float> &k,
+                         std::vector<float> &v, NnUint start, NnUint len) override {
+        ++calls[index];
+        k.assign(len == 0u ? dim : len, 0.0f);
+        v.assign(k.size(), 0.0f);
+        if (index == 1u) return false; // An unrelated GPU op clears its arguments.
+        if (index == 2u) return true;  // An inactive shadow has stale all-zero KV.
+        for (NnUint i = 0u; i < k.size(); ++i) {
+            k[i] = 10.0f + (len == 0u ? i : start + i);
+            v[i] = 20.0f + (len == 0u ? i : start + i);
+        }
+        return true;
+    }
+};
+class KvExportDevice : public NnDevice {
+    std::vector<unsigned> &calls;
+public:
+    explicit KvExportDevice(std::vector<unsigned> &calls) : calls(calls) {}
+    NnUint maxNThreads() override { return 1u; }
+    NnDeviceSegment *createSegment(NnUint index) override { return new KvExportSegment(index, calls); }
+};
+static void testAuthoritativeKvExport() {
+    NnNetConfigBuilder netBuilder(1u, 1u);
+    const NnUint pipe = netBuilder.addPipe("X", size2D(F_32, 1u, 6u));
+    NnNodeConfigBuilder nodeBuilder(0u);
+    for (NnUint s = 0u; s < 3u; ++s) {
+        NnSegmentConfigBuilder segment;
+        NnMultiHeadAttOpConfig cfg{}; cfg.kvStart = 1u; cfg.kvDim0 = 3u;
+        const char *name = s == 0u ? "block_multihead_att" : "runtime_shadow_kv_att";
+        if (s == 1u) {
+            segment.addOp(OP_CAST, "unrelated_tail", 9u, pointerBatchConfig(SRC_PIPE, pipe),
+                pointerBatchConfig(SRC_PIPE, pipe), size0(), NnCastOpCodeConfig{});
+        } else {
+            segment.addOp(OP_MULTIHEAD_ATT, name, 3u, pointerBatchConfig(SRC_PIPE, pipe),
+                pointerBatchConfig(SRC_PIPE, pipe), size0(), cfg);
+        }
+        nodeBuilder.addSegment(segment.build());
+    }
+    NnNetConfig config = netBuilder.build();
+    NnNodeConfig node = nodeBuilder.build();
+    std::vector<unsigned> calls(3u, 0u);
+    {
+        NnNetExecution execution(1u, &config);
+        std::vector<NnExecutorDevice> devices;
+        devices.emplace_back(new KvExportDevice(calls), -1, -1);
+        NnFakeNodeSynchronizer sync;
+        NnExecutor executor(&config, &node, &devices, &execution, &sync, false);
+        std::vector<float> k, v;
+        assert(executor.exportLayerKvRow(3u, 0u, 6u, k, v));
+        assert(k == std::vector<float>({0, 11, 12, 13, 0, 0}));
+        assert(v == std::vector<float>({0, 21, 22, 23, 0, 0}));
+        assert(calls == std::vector<unsigned>({1, 0, 0}));
+        assert(executor.exportLayerKvRow(3u, 0u, 6u, k, v, 2u, 2u));
+        assert(k == std::vector<float>({12, 13}) && v == std::vector<float>({22, 23}));
+        executor.setPrimaryLayerEnabled(3u, false);
+        assert(!executor.exportLayerKvRow(3u, 0u, 6u, k, v));
+        assert(calls == std::vector<unsigned>({2, 0, 0}));
+    }
+    releaseNetConfig(&config); releaseNodeConfig(&node);
+}
 int main() {
     setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
     setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
@@ -348,5 +415,6 @@ int main() {
     testBeforePpSend(false, false); testBeforePpSend(false, true);
     testBeforePpSend(true, false, true); testBeforePpSend(false, true, true);
     testShadowOnce("0"); testShadowOnce("1");
+    testAuthoritativeKvExport();
     std::puts("PP recovery, buffered tail frames, bounded timeouts, protocol rejection and shadow KV passed");
 }

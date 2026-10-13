@@ -136,7 +136,9 @@ def save(name, result, txt):
     (OUT / (name + '.json')).write_text(json.dumps(result, indent=2))
     print(json.dumps(result), flush=True)
 
-def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64, prompt='List 20 detailed facts about Paris. Number each fact.'):
+def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64,
+          prompt='List 20 detailed facts about Paris. Number each fact.',
+          env=None, extra_args=(), plan_schedule=()):
     for i in range(4):
         reset(i)
     if kind:
@@ -156,10 +158,27 @@ def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64, p
             args += ['--ratios', '1@7*1@7*1@7*1@7', '--workers', *[ip + ':' + str(PORT) for ip in IPS[1:]]]
         if auto:
             args += ['--auto']
-        command = 'echo $$ > /out/' + name + '.root.pid; exec env DLLAMA_TOKEN_TIMING_PRINT=1 DLLAMA_PLAN_CTRL_SOCKET=/tmp/' + name + '.sock timeout -k 5 150 stdbuf -oL -eL ' + shlex.join(args) + ' > /out/' + name + '.log 2>&1'
+        args += list(extra_args)
+        env = env or {}
+        assert all(re.fullmatch('[A-Z][A-Z0-9_]*', key) for key in env)
+        environment = ['DLLAMA_TOKEN_TIMING_PRINT=1', 'DLLAMA_PLAN_CTRL_SOCKET=/tmp/' + name + '.sock']
+        environment += [key + '=' + str(value) for key, value in env.items()]
+        command = 'echo $$ > /out/' + name + '.root.pid; exec env ' + shlex.join(environment) + ' timeout -k 5 150 stdbuf -oL -eL ' + shlex.join(args) + ' > /out/' + name + '.log 2>&1'
         remote_cmd = shlex.join(['docker', 'exec', '--user', USER, '--env', 'CUDA_CACHE_PATH=/tmp/edgevisor-cache', NAMES[0], '/bin/bash', '-lc', command])
         proc = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', HOST, remote_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        next_plan = 0
         while proc.poll() is None:
+            if next_plan < len(plan_schedule):
+                _, txt = node(0, 'cat /out/' + name + '.log 2>/dev/null || true')
+                ts = tokens(txt)
+                entry = plan_schedule[next_plan]
+                if ts and int(ts[-1][0]) >= entry['after_position']:
+                    _, response = node(0, shlex.join(['/labtools/plan_client', '/tmp/' + name + '.sock', json.dumps(entry['request'])]))
+                    response = json.loads(response)
+                    events.append({'plan_request': entry['request'], 'response': response,
+                                   'observed_position': int(ts[-1][0])})
+                    assert response.get('ok'), response
+                    next_plan += 1
             if fault is not None and (not events):
                 _, txt = node(0, 'cat /out/' + name + '.log 2>/dev/null || true')
                 ts = tokens(txt)
@@ -168,7 +187,7 @@ def infer(name, distributed=True, kind=None, auto=False, fault=None, steps=64, p
                     events.append({'stop_worker': fault, 'observed_position': int(ts[-1][0])})
             if time.monotonic() - start > 165:
                 raise TimeoutError(name)
-            time.sleep(0.3 if fault is not None else 1)
+            time.sleep(0.1 if plan_schedule else (0.3 if fault is not None else 1))
         stdout, stderr = proc.communicate(timeout=5)
         _, txt = node(0, 'cat /out/' + name + '.log 2>/dev/null || true')
         ts = tokens(txt)

@@ -5376,15 +5376,15 @@ void RootLlmInference::forward(bool collectProfile) {
         double statePrepareMs = 0.0;
         double recoverMs = 0.0;
         std::string fallbackReason;
-        const NnStageConfig *fromStage = findStageForNodeLocal(plan, migrationFromNodeIndex);
-        const NnStageConfig *toStage = findStageForNodeLocal(plan, nextStageRootNode);
-        const bool migrateToLaterStage =
-            fromStage != nullptr && toStage != nullptr &&
-            getPpNextStageIndex(plan, fromStage->stageIndex) == toStage->stageIndex;
+        // A residency/ablation setting is not evidence that KV is ready.
+        // Only a local target with checked full history can skip transfer;
+        // remote readiness needs an explicit handshake before such a fast path.
+        const bool targetHistoryReady = nextStageRootNode == 0u &&
+            executor->shadowCovers(migrationLayers.front(), migrationLayers.back() + 1u, endPos + 1u);
 
         if (ablationCfg.shadowKvMode == ShadowKvMode::ENABLED) {
             auto t0 = std::chrono::steady_clock::now();
-            if (migrateToLaterStage) {
+            if (!targetHistoryReady) {
                 NnUint exported = 0u;
                 NnUint queued = 0u;
                 uint64_t sourceBytes = 0u;
@@ -5408,8 +5408,8 @@ void RootLlmInference::forward(bool collectProfile) {
                 lastMigrationStateTransferBytes = stateBytes;
                 lastMigrationExportedRows = exported;
                 applyOk = switched;
-                fallbackReason = "shadow_kv_forward_real_transfer";
-                std::printf("🧩 [kv-migrate] shadow forward transfer exported=%u queued=%u layers=%u posRange=[0,%u] sourceBytes=%llu targetBytes=%llu targetRoot=%u status=%s\n",
+                fallbackReason = "shadow_kv_unprepared_real_transfer";
+                std::printf("🧩 [kv-migrate] shadow state transfer exported=%u queued=%u layers=%u posRange=[0,%u] sourceBytes=%llu targetBytes=%llu targetRoot=%u status=%s\n",
                     (unsigned)exported,
                     (unsigned)queued,
                     (unsigned)migrationLayers.size(),

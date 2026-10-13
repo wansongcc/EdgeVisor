@@ -1366,9 +1366,39 @@ bool NnExecutor::exportLayerKvRow(
         if (s >= segments.size()) continue;
         NnDeviceSegment *baseSeg = segments[s].get();
         if (baseSeg == nullptr) continue;
+        // Only the current execution graph owns authoritative source KV.
+        // Disabled replicas can contain stale history, and non-attention GPU
+        // segments may clear their output arguments even when returning false.
+        if (!isSegmentEnabled(s)) continue;
+        const NnSegmentConfig &sourceSegment = nodeConfig->segments[s];
+        bool hasSource = false;
+        for (NnUint i = 0u; i < sourceSegment.nOps; ++i) {
+            const NnOpConfig &op = sourceSegment.ops[i];
+            if (op.code == OP_MULTIHEAD_ATT && op.index == layerIndex && op.config != nullptr) {
+                hasSource = true;
+                break;
+            }
+        }
+        if (!hasSource) continue;
         auto *cpuSeg = dynamic_cast<NnCpuDeviceSegment *>(baseSeg);
         if (cpuSeg == nullptr || cpuSeg->device == nullptr) {
-            if (baseSeg->exportLayerKvRow(layerIndex, position, kvDim, kRow, vRow, rangeStart, rangeLen)) {
+            std::vector<float> candidateK, candidateV;
+            if (baseSeg->exportLayerKvRow(layerIndex, position, kvDim, candidateK, candidateV, rangeStart, rangeLen) &&
+                    candidateK.size() == outDim && candidateV.size() == outDim) {
+                if (partial) {
+                    kRow = candidateK;
+                    vRow = candidateV;
+                } else {
+                    for (NnUint i = 0u; i < sourceSegment.nOps; ++i) {
+                        const NnOpConfig &op = sourceSegment.ops[i];
+                        if (op.code != OP_MULTIHEAD_ATT || op.index != layerIndex || op.config == nullptr) continue;
+                        const auto *cfg = reinterpret_cast<const NnMultiHeadAttOpConfig *>(op.config);
+                        if (cfg->kvStart >= kvDim) continue;
+                        const NnUint end = cfg->kvStart + std::min(cfg->kvDim0, kvDim - cfg->kvStart);
+                        std::copy(candidateK.begin() + cfg->kvStart, candidateK.begin() + end, kRow.begin() + cfg->kvStart);
+                        std::copy(candidateV.begin() + cfg->kvStart, candidateV.begin() + end, vRow.begin() + cfg->kvStart);
+                    }
+                }
                 readAny = true;
             }
             continue;

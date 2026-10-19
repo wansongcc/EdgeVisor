@@ -669,6 +669,10 @@ int main(int argc, char *argv[]) {
             runInferenceApp(&args, server);
         } catch (const ApiRuntimeRestartException &e) {
             printf("🚨 API runtime restart: %s\n", e.what());
+        } catch (const NnPeerTimeoutException &e) {
+            printf("🚨 Peer timeout during startup/restart: %s\n", e.what());
+        } catch (const NnTransferSocketException &e) {
+            printf("🚨 Transfer socket error during startup/restart: %d %s\n", e.code, e.what());
         } catch (const NnConnectionSocketException &e) {
             printf("🚨 Connection error: %s\n", e.what());
         } catch (const NnExecutorException &e) {

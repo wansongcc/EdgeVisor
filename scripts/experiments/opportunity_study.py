@@ -869,6 +869,7 @@ def main() -> int:
     parser.add_argument("--workloads", default="coding,search,sql")
     parser.add_argument("--limit", type=int, default=6, help="tasks per workload")
     parser.add_argument("--suite", choices=["base", "multi", "heavy"], default="base")
+    parser.add_argument("--only", default="", help="substring filter on task ids")
     parser.add_argument("--max-turns", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=float, default=180.0)
@@ -883,7 +884,9 @@ def main() -> int:
     if not (args.fixtures / "manifest.json").exists():
         raise SystemExit("fixtures missing; run with --prepare-fixtures")
     workloads = [item.strip() for item in args.workloads.split(",") if item.strip()]
-    tasks = task_specs(args.fixtures, workloads, args.limit, args.suite)
+    tasks = task_specs(args.fixtures, workloads, 1000 if args.only else args.limit, args.suite)
+    if args.only:
+        tasks = [task for task in tasks if args.only in task["id"]][:args.limit]
     args.out.mkdir(parents=True, exist_ok=True)
     client = ApiClient(args.api_url, args.timeout)
     episodes = []

@@ -74,6 +74,18 @@ CODING_SPECS = {
         "signature": "def binsearch(arr: list[int], target: int) -> int",
         "description": "Return the index of target in a sorted list, or -1.",
     },
+    "coding_fix_slug": {
+        "signature": "def slugify(text: str) -> str",
+        "description": "Lowercase, replace runs of non-alphanumerics with '-', strip leading/trailing '-'.",
+    },
+    "coding_fix_rle": {
+        "signature": "def rle(text: str) -> str",
+        "description": "Run-length encode: 'aaabb' -> 'a3b2'.",
+    },
+    "coding_fix_median": {
+        "signature": "def median(nums: list[float]) -> float",
+        "description": "Return the median; even-length input uses the mean of the two middle values.",
+    },
 }
 
 SEARCH_SPECS = [
@@ -92,6 +104,61 @@ SQL_SPECS = [
     {"id": "sql_004", "question": "Which region has the highest average sale amount (at least 100 rows)? Answer with the region only."},
     {"id": "sql_005", "question": "How many distinct regions are in the table? Answer with the integer."},
     {"id": "sql_006", "question": "What is the total sales amount for region R03? Answer with the number rounded to two decimals."},
+]
+
+
+MULTI_TASKS = [
+    {
+        "id": "coding_fix_slug", "workload": "coding", "allowed": {"run_tests"}, "min_tool_calls": 1,
+        "prompt": ("The starter code below has a bug. Fix it, then call run_tests with "
+                   "task='coding_fix_slug' and your corrected code. Iterate until both hidden tests pass, "
+                   "then final_answer with 'done'.\n```python\n"
+                   "import re\ndef slugify(text):\n    return re.sub(r'[^a-z0-9]+', '-', text.lower())\n```"),
+    },
+    {
+        "id": "coding_fix_rle", "workload": "coding", "allowed": {"run_tests"}, "min_tool_calls": 1,
+        "prompt": ("The starter code below has a bug. Fix it, then call run_tests with "
+                   "task='coding_fix_rle' and your corrected code. Iterate until both hidden tests pass, "
+                   "then final_answer with 'done'.\n```python\n"
+                   "def rle(text):\n    if not text:\n        return ''\n    out=[]; count=1\n"
+                   "    for i in range(1, len(text)):\n        if text[i] == text[i-1]:\n"
+                   "            count += 1\n        else:\n            out.append(text[i-1]); out.append(str(count)); count=0\n"
+                   "    out.append(text[-1]); out.append(str(count))\n    return ''.join(out)\n```"),
+    },
+    {
+        "id": "coding_fix_median", "workload": "coding", "allowed": {"run_tests"}, "min_tool_calls": 1,
+        "prompt": ("The starter code below has a bug. Fix it, then call run_tests with "
+                   "task='coding_fix_median' and your corrected code. Iterate until both hidden tests pass, "
+                   "then final_answer with 'done'.\n```python\n"
+                   "def median(nums):\n    return nums[len(nums)//2]\n```"),
+    },
+    {
+        "id": "sql_chain_region_day_count", "workload": "sql", "allowed": {"sql_query"}, "min_tool_calls": 3,
+        "prompt": ("Use exactly three separate sql_query calls, in order. (1) Find the region with the highest "
+                   "total sales amount and remember its region string. (2) For that region, find the day with the "
+                   "highest total sales amount. (3) For that region and day, count the number of rows. Then "
+                   "final_answer with 'region|day|count'."),
+    },
+    {
+        "id": "sql_chain_avg_region_total", "workload": "sql", "allowed": {"sql_query"}, "min_tool_calls": 3,
+        "prompt": ("Use exactly three sql_query calls. (1) Find the region with the highest average sale amount "
+                   "among regions with at least 100 rows. (2) For that region, find the day with the highest total "
+                   "sales amount. (3) Find the total sales amount for that region and day. Then final_answer with "
+                   "'region|day|total'."),
+    },
+    {
+        "id": "search_chain_top_region", "workload": "search", "allowed": {"sql_query", "search_docs"},
+        "min_tool_calls": 2,
+        "prompt": ("First use sql_query to find the region with the highest total sales amount. Then use "
+                   "search_docs to find that region's capital. final_answer with the city name only."),
+    },
+    {
+        "id": "search_chain_avg_region", "workload": "search", "allowed": {"sql_query", "search_docs"},
+        "min_tool_calls": 2,
+        "prompt": ("First use sql_query to find the region with the highest average sale amount among regions "
+                   "with at least 100 rows. Then use search_docs to find that region's capital. final_answer "
+                   "with the city name only."),
+    },
 ]
 
 
@@ -230,6 +297,34 @@ def test_large(solution):
         assert index == target // 2, (target, index)
     assert solution.binsearch(arr, 1) == -1
 '''
+    if task == "coding_fix_slug":
+        return r'''
+def test_basic(solution):
+    assert solution.slugify(" Hello, World! ") == "hello-world"
+
+def test_runs(solution):
+    assert solution.slugify("A--B__C") == "a-b-c"
+    assert solution.slugify("---") == ""
+'''
+    if task == "coding_fix_rle":
+        return r'''
+def test_basic(solution):
+    assert solution.rle("aaabb") == "a3b2"
+    assert solution.rle("abc") == "a1b1c1"
+    assert solution.rle("") == ""
+
+def test_runs(solution):
+    assert solution.rle("zzzzzzzzzzzz") == "z12"
+'''
+    if task == "coding_fix_median":
+        return r'''
+def test_odd(solution):
+    assert solution.median([3, 1, 2]) == 2
+
+def test_even(solution):
+    assert solution.median([4, 1, 3, 2]) == 2.5
+    assert solution.median([5]) == 5
+'''
     raise KeyError(task)
 
 
@@ -294,7 +389,7 @@ def prepare_sql(root: Path, rows: int = 1000000) -> dict:
     connection.execute("PRAGMA journal_mode=OFF")
     connection.execute("PRAGMA synchronous=OFF")
     connection.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount REAL, day TEXT)")
-    regions = [f"R{i:02d}" for i in range(20)]
+    regions = [f"R{i:06d}" for i in range(20)]
     batch = []
     for i in range(rows):
         day = f"2025-{(i * 7) % 12 + 1:02d}-{(i * 13) % 28 + 1:02d}"
@@ -523,7 +618,10 @@ def system_prompt(allowed: set[str]) -> str:
             "Available tools: " + json.dumps(tools, ensure_ascii=False) + " /no_think")
 
 
-def task_specs(fixtures: Path, workloads: list[str], limit: int) -> list[dict]:
+def task_specs(fixtures: Path, workloads: list[str], limit: int, suite: str = "base") -> list[dict]:
+    if suite == "multi":
+        tasks = [task for task in MULTI_TASKS if task["workload"] in workloads]
+        return tasks[:limit]
     tasks = []
     if "coding" in workloads:
         for task_id, spec in CODING_SPECS.items():
@@ -584,10 +682,13 @@ def run_episode(task: dict, client: ApiClient, out_dir: Path, max_turns: int, ma
             messages.append({"role": "user", "content": "Invalid action JSON. Return one complete action object."})
             continue
         if action["tool"] == "final_answer":
-            if task["allowed"] and tool_calls == 0:
-                events.append({"type": "premature_final", "turn": turn})
+            required_calls = int(task.get("min_tool_calls", 1))
+            if task["allowed"] and tool_calls < required_calls:
+                events.append({"type": "premature_final", "turn": turn,
+                               "tool_calls": tool_calls, "required": required_calls})
                 messages.append({"role": "user", "content":
-                    "You must call the available tool at least once and use its observation before final_answer."})
+                    f"You have used {tool_calls} of {required_calls} required tool calls. "
+                    "Continue with the next required step before final_answer."})
                 continue
             final_answer = str(action["arguments"].get("answer", ""))
             events.append({"type": "final_answer", "turn": turn, "answer": final_answer})
@@ -699,6 +800,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT / "pilot")
     parser.add_argument("--workloads", default="coding,search,sql")
     parser.add_argument("--limit", type=int, default=6, help="tasks per workload")
+    parser.add_argument("--suite", choices=["base", "multi"], default="base")
     parser.add_argument("--max-turns", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=float, default=180.0)
@@ -713,7 +815,7 @@ def main() -> int:
     if not (args.fixtures / "manifest.json").exists():
         raise SystemExit("fixtures missing; run with --prepare-fixtures")
     workloads = [item.strip() for item in args.workloads.split(",") if item.strip()]
-    tasks = task_specs(args.fixtures, workloads, args.limit)
+    tasks = task_specs(args.fixtures, workloads, args.limit, args.suite)
     args.out.mkdir(parents=True, exist_ok=True)
     client = ApiClient(args.api_url, args.timeout)
     episodes = []

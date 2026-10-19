@@ -23,10 +23,10 @@
 
 用户本轮要求：先把未来实验规划写入本文件，然后开始「实验 A：机会是否真实」。规划已提交 `ec5d4cf`；实验 A 试点 harness/结果已提交 `644210b`。此前已完成 API 生成失败恢复、等待预算修复和启动重连加固；没有合并 `main`，没有改 ROG 安全配置。
 
-- 当前开发分支 `refactor/experiment-foundation`；API 修复 `4032df5`、测试记录+交接 `20530db`、实验规划 `ec5d4cf`、实验 A 试点 `644210b` 均已推送。`main` 仍为 `bb97cab`。
-- **实验 A 试点结果**：单机 8B Qwen3 Q40，真实工具（沙箱 coding 测试、120k 文档 BM25、1M 行只读 SQLite），9 次真实工具调用窗口 **9.6 ms–691 ms，中位 473 ms**；coding 中位 430 ms、search 636 ms、SQL 353 ms。论文 Fig.5 的 1.096/1.20 s 中位未复现，实测约为其 35–60%。同一 workload 内查询选择性可差近两个数量级（SQL COUNT 9.6 ms vs GROUP BY day 618 ms；search 唯一 token 0.57 ms vs 宽查询 819 ms）。
-- 试点中 8B 每 episode 只调用 1 次工具（coding 3/3 测试通过、SQL 3/3 正确、search 2/3 一次连接 reset），所以累计机会未测；论文 W1 是 5 轮 ×1.096 s。工具时间占 episode wall 仅 0.43–0.65%，生成占主导。
-- 详细记录：`docs/test_records/18_实验A_机会真实性_pilot_2026-10-19.md`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_tool_windows_20261019.png`。
+- 当前开发分支 `refactor/experiment-foundation`；API 修复 `4032df5`、测试记录+交接 `20530db`、实验规划 `ec5d4cf`、实验 A 试点 `644210b`、实验 A 多轮 `98335ad` 均已推送。`main` 仍为 `bb97cab`。
+- **实验 A 单轮结果**：单机 8B Qwen3 Q40，真实工具（沙箱 coding 测试、120k 文档 BM25、1M 行只读 SQLite），9 次真实工具调用窗口 **9.6 ms–691 ms，中位 473 ms**；coding 中位 430 ms、search 636 ms、SQL 353 ms。论文 Fig.5 的 1.096/1.20 s 中位未复现，实测约为其 35–60%。同一 workload 内查询选择性可差近两个数量级（SQL COUNT 9.6 ms vs GROUP BY day 618 ms；search 唯一 token 0.57 ms vs 宽查询 819 ms）。
+- **实验 A 多轮结果**：7 个 episode、19 次调用、每 episode 2–4 次；累计窗口 **0.13–1.06 s**（coding fix 0.13–0.28 s；SQL 链 0.57–0.64 s；跨工具 search 链 0.98–1.06 s），仍远低于论文 W1 的 5×1.096 s≈5.5 s。6/7 完成；coding_fix_rle 在 180 s 客户端超时。第一个复杂查询贡献大部分窗口，后续索引查询只有 87–101 ms。
+- 详细记录：`docs/test_records/18_实验A_机会真实性_pilot_2026-10-19.md` 与 `19_实验A_多轮累计窗口_2026-10-19.md`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_{tool_windows,cumulative_windows}_20261019.png`。
 - API 修复的改动：`dllama-api.cpp` 捕获生成期 timeout/offline/session-restart/worker-socket/executor 异常，返回 503（流式则 SSE error）并展开 runtime 重建；客户端写失败不再混入推理故障；HTTP 状态短语修正；固定拓扑 KV/control-ACK/尾采样默认预算 5000→30000 ms；session restart 后最多 10×500 ms 等待 worker relisten。
 - 已实机验证（0.6B Q40）：
   - 双机强制 `DLLAMA_KV_ACK_TIMEOUT_MS=1`：返回 503 `peer_timeout`，进程存活，`/v1/models` 恢复，改 30 s 后 completion 返回 200。
@@ -52,12 +52,12 @@
 4. MobiSys 补强路线仍是 S0/S1 基础，S2–S7 未完成，详见 `docs/research/HANDOFF_2026-10-14.md`。S2 的 migration transaction/epoch/frontier/closure 仍是下一阶段主线。
 5. ROG 失守密码和公网 SSH 入口仍未处理；用户此前明确暂不动安全配置。
 6. nano2 根盘约余 6.1 GiB、ROG 约余 5.5 GiB；长实验前复查容量，不擅自删除用户文件。
-7. 实验 A 只完成单机 8B 试点：9 次工具窗口、每 episode 1 次调用、无多轮累计、无 14B/5 机、无 decode bubble。14B 5 机在 2048 context 下 nano1/nano2 OOM，重分配后首请求仍超时；14B 3 机约 0.8 token/s，暂不适合。多轮任务和 14B/5 机复核是 A 的剩余项。
+7. 实验 A 已完成单机 8B 的单轮 + 多轮试点：多轮累计 0.13–1.06 s，仍远低于论文 W1 5.5 s；每 episode 2–4 次调用。仍未做 14B/5 机、大测试套件上界、远程工具、decode bubble。14B 5 机在 2048 context 下 nano1/nano2 OOM，重分配后首请求仍超时；14B 3 机约 0.8 token/s，暂不适合。
 
 ### 4. 第一项下一步（First next action）
 
-A 的单机 8B 试点已完成（见第 6 节），下一步按顺序：
-1. **多轮任务**：coding 加隐藏 bug/多函数、search 分 3 步、SQL 迭代 3 个查询；目标每 episode 3–5 次工具调用，测累计窗口。
+A 的单机 8B 单轮+多轮试点已完成（见第 6 节），下一步按顺序：
+1. **大测试套件上界**：给 coding fix 任务加 1–5 s 的真实计算测试，测 coding 窗口上界；当前 64–74 ms 只是微测试下界。
 2. **14B/5 机复核**：先解决 nano1/nano2 在 2048 context 下的 OOM（降 context 或调整层数比例），用 `/no_think` + think 解析；再测同一组任务与 decode bubble。
 3. 通过后再进入 B 的 5-rep pilot；B 的“窗口”输入使用逐窗口分布，不用固定 1.1 s。
 
@@ -68,7 +68,8 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 ### 5. 证据、清理与约束（Optional context）
 
 - Mac repo：`/Users/yhbian/Documents/Codex/2026-10-08/github-plugin-github-openai-curated-remote-2/work/EdgeVisor`。测试记录 17（API 恢复）与 18（实验 A 试点）；实验 A harness `scripts/experiments/opportunity_study.py`、图 `docs/test_records/assets/experiment_a_tool_windows_20261019.png`。
-- 实验 A 原始数据：`work/opportunity_20261019/fixtures/`（120k 文档、1M 行 SQLite、coding 测试）、`work/opportunity_20261019/runs/pilot_8b_{coding4,search3,sql3}/`（episode/summary JSON）；不在 Git。
+- 实验 A 原始数据：`work/opportunity_20261019/fixtures/`（120k 文档、1M 行 SQLite、coding 测试）、`work/opportunity_20261019/runs/pilot_8b_{coding4,search3,sql3}/` 与 `runs/multi_8b/`（episode/summary JSON）；不在 Git。
+- 实验 A 记录 18/19，图 `experiment_a_tool_windows_20261019.png` 与 `experiment_a_cumulative_windows_20261019.png`。
 - 设备日志：`nx1:/home/jetson/edgevisor_runs/smoke_20261018_e431cbd/api_five_default_20261019_r2b.api.log`（5 s 失败）、同目录 `r2c`（30 s 通过）、`nx1:/home/jetson/edgevisor_runs/api_recovery_20261019/`、`failover_retry_20261019.log`、`auto_rerun_20261019.trace.jsonl`。
 - 本轮结束已清理测试 root/worker/API 进程和 19581/19584/19590 监听；未停无关服务，未改驱动、频率、网络、SSH 或安全设置。ROG 旧未提交目录和用户文件保持不动。
 - 沿用用户授权的 git 管理：只提交本轮代码/文档，推当前开发分支；远端变化则接到远端之上，不强推，不夹带 `._*`，未经新请求不合 main。新会话读取交接后仍须复查实际状态，不能把历史空闲状态当当前事实。
@@ -77,11 +78,12 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 
 目标：把论文从“机制正确性”补到“系统收益性”。主张写成条件式：**在同等内存/准备算力/带宽预算下，对真实 agent 任务和真实扰动，EdgeVisor 相对最强 proactive baseline 降低任务 p95 完成时间/提高截止期内成功率，且正常路径不劣化；收益来自 admission+JIT，而不是多准备 KV。**
 
-**实验 A（试点完成，1–2 周，待扩展）：机会是否真实。**
-- 已完成：单机 8B Qwen3 试点，3 类真实任务 × 3 任务，9 次工具调用；窗口 9.6 ms–691 ms，中位 473 ms（coding 430、search 636、SQL 353）；论文 1.096/1.20 s 中位未复现；查询选择性导致近两个数量级差异。
-- 未完成：每 episode 仅 1 次工具调用（累计机会未测）、14B/5 机复核、decode bubble、远程工具延迟。
-- 下一步：多轮任务（3–5 次调用/episode）+ 14B/5 机（`/no_think`、think 解析、解决 nano OOM）；产出累计窗口分布后作为 B 的输入。
-- 失败判据：多轮任务的累计窗口仍 < 准备一个候选的成本，或 14B 下窗口显著更短 → 机会不足，需改 workload/claim。
+**实验 A（单轮+多轮试点完成，待扩展）：机会是否真实。**
+- 单轮：3 类真实任务 × 3 任务，9 次工具调用；窗口 9.6 ms–691 ms，中位 473 ms（coding 430、search 636、SQL 353）；论文 1.096/1.20 s 中位未复现；查询选择性导致近两个数量级差异。
+- 多轮：7 个 episode、19 次调用、2–4 次/episode；累计窗口 0.13–1.06 s（coding fix 0.13–0.28、SQL 链 0.57–0.64、跨工具 search 链 0.98–1.06），仍远低于 W1 5×1.096 s≈5.5 s；6/7 完成。
+- 未完成：14B/5 机复核、大测试套件上界（当前 coding 64–74 ms 是微测试下界）、远程工具延迟、decode bubble。
+- 下一步：大测试套件（1–5 s）+ 14B/5 机（`/no_think`、think 解析、解决 nano OOM）；用累计窗口分布作为 B 的输入。
+- 失败判据：大测试/14B 下累计窗口仍 < 准备一个候选的成本 → 机会不足，需改 workload/claim。
 
 **实验 B（A 之后，主实验）：收益 + 归因。**
 - Arms：Boundary-Defer、KV-Transfer、Replay、**Pre-copy-all**、**Warm-spare**、EdgeVisor full、w/o admission、w/o JIT；所有臂同一内存/准备算力/带宽预算。

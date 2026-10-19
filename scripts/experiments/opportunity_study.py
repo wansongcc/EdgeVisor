@@ -86,6 +86,18 @@ CODING_SPECS = {
         "signature": "def median(nums: list[float]) -> float",
         "description": "Return the median; even-length input uses the mean of the two middle values.",
     },
+    "coding_heavy_matrix": {
+        "signature": "def matmul(a: list[list[int]], b: list[list[int]]) -> list[list[int]]",
+        "description": "Multiply two square integer matrices; tests use a 360x360 pair.",
+    },
+    "coding_heavy_topk": {
+        "signature": "def top_k(nums: list[int], k: int) -> list[int]",
+        "description": "Return the k largest integers in descending order; tests use 8M integers.",
+    },
+    "coding_heavy_logparse": {
+        "signature": "def parse_log(lines: list[str]) -> dict[str, int]",
+        "description": "Lines look like 'LEVEL message'; tests parse 6M lines three times.",
+    },
 }
 
 SEARCH_SPECS = [
@@ -131,6 +143,31 @@ MULTI_TASKS = [
                    "task='coding_fix_median' and your corrected code. Iterate until both hidden tests pass, "
                    "then final_answer with 'done'.\n```python\n"
                    "def median(nums):\n    return nums[len(nums)//2]\n```"),
+    },
+    {
+        "id": "coding_heavy_matrix", "workload": "coding", "allowed": {"run_tests"}, "min_tool_calls": 1,
+        "prompt": ("The starter code below has a bug. Fix it, then call run_tests with "
+                   "task='coding_heavy_matrix' and your corrected code. The hidden test multiplies a 360x360 pair. "
+                   "Iterate until it passes, then final_answer with 'done'.\n```python\n"
+                   "def matmul(a, b):\n    n = len(a)\n    result = [[0]*n for _ in range(n)]\n"
+                   "    for i in range(n):\n        for j in range(n):\n            for k in range(n):\n"
+                   "                result[i][j] += a[i][k] * b[j][k]\n    return result\n```"),
+    },
+    {
+        "id": "coding_heavy_topk", "workload": "coding", "allowed": {"run_tests"}, "min_tool_calls": 1,
+        "prompt": ("The starter code below has a bug. Fix it, then call run_tests with "
+                   "task='coding_heavy_topk' and your corrected code. The hidden test uses 8M integers. "
+                   "Iterate until it passes, then final_answer with 'done'.\n```python\n"
+                   "def top_k(nums, k):\n    return sorted(nums)[:k]\n```"),
+    },
+    {
+        "id": "coding_heavy_logparse", "workload": "coding", "allowed": {"run_tests"}, "min_tool_calls": 1,
+        "prompt": ("The starter code below has a bug. Fix it, then call run_tests with "
+                   "task='coding_heavy_logparse' and your corrected code. The hidden test parses 6M lines three times. "
+                   "Iterate until it passes, then final_answer with 'done'.\n```python\n"
+                   "def parse_log(lines):\n    counts = {}\n    for line in lines:\n"
+                   "        level = line.split()[1]\n        counts[level] = counts.get(level, 0) + 1\n"
+                   "    return counts\n```"),
     },
     {
         "id": "sql_chain_region_day_count", "workload": "sql", "allowed": {"sql_query"}, "min_tool_calls": 3,
@@ -255,7 +292,7 @@ def test_small(solution):
 
 def test_large(solution):
     rng = random.Random(11)
-    n = 180
+    n = 360
     a = [[rng.randrange(10) for _ in range(n)] for _ in range(n)]
     b = [[rng.randrange(10) for _ in range(n)] for _ in range(n)]
     expected = [[sum(a[i][k] * b[k][j] for k in range(n)) for j in range(n)] for i in range(n)]
@@ -324,6 +361,34 @@ def test_odd(solution):
 def test_even(solution):
     assert solution.median([4, 1, 3, 2]) == 2.5
     assert solution.median([5]) == 5
+'''
+    if task == "coding_heavy_matrix":
+        return r'''
+def test_heavy(solution):
+    import random
+    rng = random.Random(101)
+    n = 360
+    a = [[rng.randrange(10) for _ in range(n)] for _ in range(n)]
+    b = [[rng.randrange(10) for _ in range(n)] for _ in range(n)]
+    expected = [[sum(a[i][k] * b[k][j] for k in range(n)) for j in range(n)] for i in range(n)]
+    assert solution.matmul(a, b) == expected
+'''
+    if task == "coding_heavy_topk":
+        return r'''
+def test_heavy(solution):
+    import random
+    rng = random.Random(202)
+    nums = [rng.randrange(-10000000, 10000000) for _ in range(8000000)]
+    expected = sorted(nums, reverse=True)[:200]
+    assert solution.top_k(nums, 200) == expected
+'''
+    if task == "coding_heavy_logparse":
+        return r'''
+def test_heavy(solution):
+    lines = ["INFO message"] * 3000000 + ["WARN message"] * 2000000 + ["ERROR message"] * 1000000
+    expected = {"INFO": 3000000, "WARN": 2000000, "ERROR": 1000000}
+    for _ in range(3):
+        assert solution.parse_log(lines) == expected
 '''
     raise KeyError(task)
 
@@ -430,7 +495,7 @@ def _sandbox_profile(temp: Path) -> str:
             f'(allow file-write* (subpath "{temp}"))')
 
 
-def run_tests(task: str, code: str, timeout_s: float = 12.0) -> str:
+def run_tests(task: str, code: str, timeout_s: float = 30.0) -> str:
     if task not in CODING_SPECS:
         raise ValueError("unknown coding task: " + str(task))
     if not isinstance(code, str) or len(code) > 40000:
@@ -622,6 +687,9 @@ def task_specs(fixtures: Path, workloads: list[str], limit: int, suite: str = "b
     if suite == "multi":
         tasks = [task for task in MULTI_TASKS if task["workload"] in workloads]
         return tasks[:limit]
+    if suite == "heavy":
+        tasks = [task for task in MULTI_TASKS if task["id"].startswith("coding_heavy")]
+        return tasks[:limit]
     tasks = []
     if "coding" in workloads:
         for task_id, spec in CODING_SPECS.items():
@@ -800,7 +868,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT / "pilot")
     parser.add_argument("--workloads", default="coding,search,sql")
     parser.add_argument("--limit", type=int, default=6, help="tasks per workload")
-    parser.add_argument("--suite", choices=["base", "multi"], default="base")
+    parser.add_argument("--suite", choices=["base", "multi", "heavy"], default="base")
     parser.add_argument("--max-turns", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=float, default=180.0)

@@ -328,7 +328,12 @@ static int kvAckWaitTimeoutMs() {
     int timeoutMs = 0;
     if (parseEnvInt("DLLAMA_KV_ACK_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
     if (parseEnvInt("DLLAMA_IO_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
-    return 5000;
+    // A cold API replay starts decoding while the pipeline still has the
+    // prefill backlog queued; five devices exceeded the old 5 s budget on the
+    // third (cold) request of the session gate. 30 s is the budget validated
+    // by the five-device smoke matrix. It is a local deadline, not proof that
+    // the peer is offline, and the API turns it into a 503 + runtime rebuild.
+    return 30000;
 }
 
 static bool tryReadKvAckWithDeadline(NnNetwork *network, NnUint socketIndex, void *data, NnSize size, int timeoutMs) {
@@ -7274,6 +7279,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::string relaxedRatios;
     int sessionAttempts = 0;
     int memoryAttempts = 0;
+    int startupReconnects = 0;
     while (sessionAttempts < 3) {
         try {
             runInferenceAppBody(args, handler);
@@ -7283,9 +7289,27 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
                 throw std::runtime_error("Session restart limit reached after 2 retries");
             if (!g_failoverRestart.armed) throw;
             sessionAttempts += 1;
+            startupReconnects = 0;
             layerCeilings.clear();
             applyFailoverRestart(args);
+        } catch (const ApiRuntimeRestartException &) {
+            // The API server already turned this into a request error. Do not
+            // reinterpret it as a startup allocation failure or relax topology.
+            throw;
         } catch (const std::exception &error) {
+            // Workers that participated in the failed session relisten after
+            // the root socket closes. Retrying the same session must not race
+            // that relisten, and a transient reconnect must not be treated as
+            // an allocation failure that rewrites the topology.
+            if (sessionAttempts > 0 && startupReconnects < 10 &&
+                    std::strstr(error.what(), "Socket offline peer=") != nullptr) {
+                startupReconnects += 1;
+                std::printf("🔁 [failover] wait for worker relisten (%d/10): %s\n",
+                    startupReconnects, error.what());
+                std::fflush(stdout);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
             if (savedRatios != nullptr || memoryAttempts >= 12 || !startupAllocFailure(error.what())) throw;
             const char *current = args->ratiosStr;
             std::vector<unsigned> counts;

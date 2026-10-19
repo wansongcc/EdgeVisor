@@ -5,6 +5,7 @@
 #include <deque>
 #include <mutex>
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include "nn/nn-core.hpp"
@@ -769,6 +770,15 @@ typedef struct {
     NnNodeConfig *nodeConfig;
     std::function<void()> startDynamicControllers;
 } AppInferenceContext;
+
+// A request-time failure may leave a distributed runtime half-way through a
+// forward, a KV transfer, or a migration. The API server reports the error to
+// the client and unwinds the whole runtime; the process (or main loop) then
+// rebuilds it instead of serving from the damaged state.
+class ApiRuntimeRestartException : public std::runtime_error {
+public:
+    explicit ApiRuntimeRestartException(const std::string &message) : std::runtime_error(message) {}
+};
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
 // Between tokens, connect a reserved pool member and move a slice of the slowest donor onto it.

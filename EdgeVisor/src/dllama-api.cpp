@@ -99,12 +99,27 @@ public:
 
 private:
     int serverSocket;
+    void writeRaw(const std::string &data) {
+        if (writeFailed) return;
+        try {
+            writeSocket(serverSocket, data.data(), data.size());
+            responseStarted = true;
+        } catch (const std::exception &error) {
+            // The client may disconnect at any point. A broken HTTP peer must
+            // not be confused with a broken inference worker.
+            writeFailed = true;
+            std::fprintf(stderr, "API client write failed: %s\n", error.what());
+        }
+    }
 public:
     std::string path;
     std::unordered_map<std::string, std::string> headers;
     std::string body;
     json parsedJson;
     HttpMethod method;
+    bool responseStarted = false;
+    bool streaming = false;
+    bool writeFailed = false;
 
     HttpRequest(int serverSocket) {
         this->serverSocket = serverSocket;
@@ -204,8 +219,7 @@ public:
             << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
             << "Connection: close\r\n"
             << "\r\n";
-        std::string data = buffer.str();
-        writeSocket(serverSocket, data.c_str(), data.size());
+        writeRaw(buffer.str());
     }
 
     void writeNotFound() {
@@ -215,19 +229,29 @@ public:
             << "Content-Length: 9\r\n"
             << "\r\n"
             << "Not Found";
-        std::string data = buffer.str();
-        writeSocket(serverSocket, data.c_str(), data.size());
+        writeRaw(buffer.str());
+    }
+
+    static const char *reasonPhrase(int status) {
+        switch (status) {
+            case 200: return "OK";
+            case 204: return "No Content";
+            case 400: return "Bad Request";
+            case 404: return "Not Found";
+            case 500: return "Internal Server Error";
+            case 503: return "Service Unavailable";
+            default: return "Response";
+        }
     }
 
     void writeJson(std::string json, int status = 200) {
         std::ostringstream buffer;
-        buffer << "HTTP/1.1 " << status << (status == 200 ? " OK" : " Bad Request") << "\r\n"
+        buffer << "HTTP/1.1 " << status << " " << reasonPhrase(status) << "\r\n"
             << "Access-Control-Allow-Origin: *\r\n"
             << "Content-Type: application/json; charset=utf-8\r\n"
             << "Connection: close\r\n"
             << "Content-Length: " << json.length() << "\r\n\r\n" << json;
-        std::string data = buffer.str();
-        writeSocket(serverSocket, data.c_str(), data.size());
+        writeRaw(buffer.str());
     }
 
     void writeStreamStartChunk() {
@@ -237,20 +261,40 @@ public:
             << "Content-Type: text/event-stream; charset=utf-8\r\n"
             << "Connection: close\r\n"
             << "Transfer-Encoding: chunked\r\n\r\n";
-        std::string data = buffer.str();
-        writeSocket(serverSocket, data.c_str(), data.size());
+        writeRaw(buffer.str());
+        streaming = !writeFailed;
     }
 
     void writeStreamChunk(const std::string data) {
+        if (writeFailed || !streaming) return;
         std::ostringstream buffer;
         buffer << std::hex << data.size() << "\r\n" << data << "\r\n";
-        std::string d = buffer.str();
-        writeSocket(serverSocket, d.c_str(), d.size());
+        writeRaw(buffer.str());
     }
 
     void writeStreamEndChunk() {
+        if (writeFailed || !streaming) return;
         const char *endChunk = "0000\r\n\r\n";
-        writeSocket(serverSocket, endChunk, strlen(endChunk));
+        writeRaw(endChunk);
+        streaming = false;
+    }
+
+    // Report a runtime failure without assuming that no bytes were sent yet.
+    // A non-stream request can still use a proper HTTP status; once SSE
+    // headers are on the wire the only safe option is an error event followed
+    // by a terminated chunked body.
+    void writeFailure(int status, const std::string &type, const std::string &code, const std::string &message) {
+        if (writeFailed) return;
+        json body = {{"error", {{"message", message}, {"type", type}, {"code", code}}}};
+        if (!responseStarted) {
+            writeJson(body.dump(), status);
+            return;
+        }
+        if (streaming) {
+            writeStreamChunk("data: " + body.dump() + "\r\n\r\n");
+            writeStreamChunk("data: [DONE]");
+            writeStreamEndChunk();
+        }
     }
 };
 
@@ -540,16 +584,43 @@ static void server(AppInferenceContext *context) {
     };
 
     while (true) {
+        bool restart = false;
+        std::string restartReason;
         try {
             NnSocket clientSocket(acceptSocket(serverSocket.fd));
             HttpRequest request = HttpRequest::read(clientSocket.fd);
             printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
-            Router::resolve(request, routes);
-        } catch (const NnTransferSocketException& e) {
-            printf("Socket error: %d %s\n", e.code, e.what());
-        } catch (const NnExecutorException &e) {
-            throw;
+            try {
+                Router::resolve(request, routes);
+            } catch (const NnPeerTimeoutException &e) {
+                try { request.writeFailure(503, "runtime_unavailable", "peer_timeout", e.what()); } catch (...) {}
+                restart = true; restartReason = std::string("peer timeout: ") + e.what();
+            } catch (const NnPeerOfflineException &e) {
+                try { request.writeFailure(503, "runtime_unavailable", "peer_offline", e.what()); } catch (...) {}
+                restart = true; restartReason = std::string("peer offline: ") + e.what();
+            } catch (const NnSessionRestartException &e) {
+                try { request.writeFailure(503, "runtime_unavailable", "session_restart", e.what()); } catch (...) {}
+                restart = true; restartReason = std::string("session restart: ") + e.what();
+            } catch (const NnTransferSocketException &e) {
+                try { request.writeFailure(503, "runtime_unavailable", "worker_socket", e.what()); } catch (...) {}
+                restart = true; restartReason = std::string("worker socket error: ") + e.what();
+            } catch (const NnExecutorException &e) {
+                try { request.writeFailure(500, "server_error", "executor_error", e.what()); } catch (...) {}
+                restart = true; restartReason = std::string("executor error: ") + e.what();
+            } catch (const std::exception &e) {
+                try { request.writeFailure(500, "server_error", "internal_error", e.what()); } catch (...) {}
+                restart = true; restartReason = std::string("internal error: ") + e.what();
+            } catch (...) {
+                try { request.writeFailure(500, "server_error", "internal_error", "unknown generation failure"); } catch (...) {}
+                restart = true; restartReason = "unknown generation failure";
+            }
+        } catch (const std::exception &e) {
+            // Accept/read failures and client disconnects only invalidate this
+            // HTTP connection; they must not restart the inference runtime.
+            printf("API request I/O error: %s\n", e.what());
+            std::fflush(stdout);
         }
+        if (restart) throw ApiRuntimeRestartException(restartReason);
     }
 }
 
@@ -596,11 +667,14 @@ int main(int argc, char *argv[]) {
     while (true) {
         try {
             runInferenceApp(&args, server);
+        } catch (const ApiRuntimeRestartException &e) {
+            printf("🚨 API runtime restart: %s\n", e.what());
         } catch (const NnConnectionSocketException &e) {
             printf("🚨 Connection error: %s\n", e.what());
         } catch (const NnExecutorException &e) {
             printf("🚨 Inference error: %s\n", e.what());
         }
+        std::fflush(stdout);
 
         printf("🔄 Retrying in 3 seconds...\n");
         std::this_thread::sleep_for(std::chrono::seconds(3));

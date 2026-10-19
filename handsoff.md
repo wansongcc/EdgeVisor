@@ -21,9 +21,9 @@
 
 ### 1. 当前状态（Current state）
 
-用户本轮要求：先修复已有问题和 bug，过程中做好 git 管理。已完成 API 生成失败恢复、等待预算修复和启动重连加固；没有合并 `main`，没有改 ROG 安全配置。
+用户本轮要求：先把未来实验规划写入本文件，然后开始「实验 A：机会是否真实」。此前已完成 API 生成失败恢复、等待预算修复和启动重连加固；没有合并 `main`，没有改 ROG 安全配置。
 
-- 当前开发分支 `refactor/experiment-foundation`，代码提交 `4032df5`（已推送）。本交接随后作为单独文档提交推进分支。`main` 仍为 `bb97cab`。
+- 当前开发分支 `refactor/experiment-foundation`；代码修复 `4032df5`、测试记录+本交接 `20530db` 已推送。本轮实验规划/实验 A 的文档与 harness 改动随后单独提交。`main` 仍为 `bb97cab`。
 - 改动：`dllama-api.cpp` 捕获生成期 timeout/offline/session-restart/worker-socket/executor 异常，返回 503（流式则 SSE error）并展开 runtime 重建；客户端写失败不再混入推理故障；HTTP 状态短语修正；固定拓扑 KV/control-ACK/尾采样默认预算 5000→30000 ms；session restart 后最多 10×500 ms 等待 worker relisten。
 - 已实机验证（0.6B Q40）：
   - 双机强制 `DLLAMA_KV_ACK_TIMEOUT_MS=1`：返回 503 `peer_timeout`，进程存活，`/v1/models` 恢复，改 30 s 后 completion 返回 200。
@@ -52,7 +52,7 @@
 
 ### 4. 第一项下一步（First next action）
 
-先核对 `git status`、`git ls-remote` 和五台实际 HEAD/二进制哈希；本轮只有 nx1 是 `4032df5`。若继续修 bug，优先复现默认五机 auto 并保留 worker 退出码与 `dmesg`，确认 529 行导出后 node2 是真实断链还是误判；若是启动竞态，验证 relisten 重试是否覆盖。若转向论文主线，按 `docs/research/HANDOFF_2026-10-14.md` 做 S2 最小迁移事务。每个引擎改动都要 fresh build + 实机模型回归后 commit/push，不直接开始性能实验。
+先按第 6 节执行「实验 A」。核对五台 HEAD/二进制哈希与设备空闲；A 用真实工具与真实任务，产出 tool window / decode idle / 剩余工作分布，再决定 B 的 pilot。A 的 harness、任务集和原始数据要保留，代码改动 fresh build + 实机回归后 commit/push。未经新请求不合 main，不直接开始论文性能主实验。
 
 重跑入口：Mac 项目父目录 `work/device_smoke_20261018/` 下新增 `api_recovery_20261019.py`、`api_five_default_20261019.py`、`failover_retry_20261019.py`；原有 `final_checks.py`、`smoke_14b.py`、`lab.py`、`smoke.py`、`api_smoke.py` 仍在。精确逐场景命令见 `cases/*.command.txt`。这些是证据/控制脚本，不在 Git 中，运行中不要编辑源码或脚本。
 
@@ -62,3 +62,33 @@
 - 设备日志：`nx1:/home/jetson/edgevisor_runs/smoke_20261018_e431cbd/api_five_default_20261019_r2b.api.log`（5 s 失败）、同目录 `r2c`（30 s 通过）、`nx1:/home/jetson/edgevisor_runs/api_recovery_20261019/`、`failover_retry_20261019.log`、`auto_rerun_20261019.trace.jsonl`。
 - 本轮结束已清理测试 root/worker 进程和 19581/19584 监听；未停无关服务，未改驱动、频率、网络、SSH 或安全设置。ROG 旧未提交目录和用户文件保持不动。
 - 沿用用户授权的 git 管理：只提交本轮代码/文档，推当前开发分支；远端变化则接到远端之上，不强推，不夹带 `._*`，未经新请求不合 main。新会话读取交接后仍须复查实际状态，不能把历史空闲状态当当前事实。
+
+### 6. 后续实验规划（2026-10-19）
+
+目标：把论文从“机制正确性”补到“系统收益性”。主张写成条件式：**在同等内存/准备算力/带宽预算下，对真实 agent 任务和真实扰动，EdgeVisor 相对最强 proactive baseline 降低任务 p95 完成时间/提高截止期内成功率，且正常路径不劣化；收益来自 admission+JIT，而不是多准备 KV。**
+
+**实验 A（进行中，1–2 周，便宜，先做）：机会是否真实。**
+- 3 类真实任务：coding（真实执行测试）、search/retrieval（本地语料/检索）、multi-tool（SQLite/计算等真实工具）；每类 10–20 个任务，真实工具执行，不用固定 sleep。
+- 记录：tool window（工具调用→结果回填）、decode 侧 idle/bubble、episode token 数、每个 tool window 后的剩余工作、tool 时间占 episode 比例。
+- 指标：tool window p50/p95/max、idle 分布、剩余工作分布；与论文 Fig.5 的 1.096 s / 15 ms / 1.9 ms 对照。
+- 失败判据：中位 tool window < 100 ms 或故障/机会太稀疏 → 机会不成立，换 workload 或改 claim。
+- 产出：机会分布图 + 真实 workload 描述，作为 B 的输入；harness/原始 JSON 保留。
+
+**实验 B（A 之后，主实验）：收益 + 归因。**
+- Arms：Boundary-Defer、KV-Transfer、Replay、**Pre-copy-all**、**Warm-spare**、EdgeVisor full、w/o admission、w/o JIT；所有臂同一内存/准备算力/带宽预算。
+- 3 workloads × 3 扰动（compute clamp、link loss、worker removal）× 3 强度/持续时间 × ≥10 个配对 episode；先 5 reps pilot 估 effect size，再决定是否扩到 20。
+- 主指标预注册：受扰任务 p95 完成时间，或截止期内成功率；副指标：p99 inter-token stall、F2FT、任务质量/成功率、能耗/task、峰值内存、prepared-but-unused。
+- 分析：同任务/同扰动 trace 配对，随机化臂顺序，paired difference + 95% CI，保留全部失败/OOM/abort。
+- 失败判据：Pre-copy-all 在多数 cell 不劣于 full → novelty 不成立；要么找 selection 的 crossover，要么把论文收缩为“pre-copy 足够，VDC 提供正确性/安全切换”。
+
+**实验 C（B 之后）：边界与代价。**
+- 另一模型家族/尺寸（至少 0.6B/3B/8B 之一）、2/3/5 节点、真实 Wi-Fi/蜂窝、30–60 min 热/功耗。
+- 输出：收益 vs 额外内存/焦耳/task 的 Pareto 曲线；(故障持续时间, 剩余工作, 内存预算) 的 phase diagram，标出值得/不值得准备的区域。
+
+**横贯要求：**
+- F2FT 归因：拆开 84% residual；否则主结果仍是 0.006% 的组件优化。
+- 统计：3 reps → 10+；0/5 故障 → 0/30；JIT 16 cells → 100+，calibration/test 分开。
+- 先修 E2 +18 s、M1 90.3 vs 95.0、E8B patch 等证据链；所有臂冻结同一代码版本。
+- 章节重排，不往当前 12 页稿硬塞。
+
+当前状态：A 进行中；B/C 未开始；不改 `main`。

@@ -454,8 +454,10 @@ class ApiServer {
             ExperimentTraceSpan decodeTrace("decode", {{"generation_id", generation}});
             for (; pos < maxPred; ++pos) {
                 ExperimentTraceSpan tokenTrace("token", {{"generation_id", generation}, {"position", pos}});
+                const auto tokenWallStart = std::chrono::steady_clock::now();
                 inference->setPosition(pos); inference->setToken(0, token);
                 inference->forward();
+                const std::vector<LlmPerfPacket> &tokenPerf = inference->getLastPerf();
                 consumed.push_back(token);
                 NnUint tailToken = 0u;
                 token = args->lastStageSampling && network != nullptr &&
@@ -471,6 +473,22 @@ class ApiServer {
                     detector.reset();
                 }
                 experimentTracePoint("token_emitted", {{"generation_id", generation}, {"position", pos}, {"token", token}});
+                if (dllamaTokenTimingPrintEnabled()) {
+                    const auto tokenWallEnd = std::chrono::steady_clock::now();
+                    const double wallMs = std::chrono::duration<double, std::milli>(tokenWallEnd - tokenWallStart).count();
+                    printf("%s\n", formatTokenE2eTimingLine((unsigned int)pos, token, wallMs).c_str());
+                    for (const LlmPerfPacket &packet : tokenPerf) {
+                        DllamaTokenNodeTiming timing;
+                        timing.nodeIndex = packet.nodeIndex;
+                        timing.stageIndex = packet.stageIndex;
+                        timing.hasStage = true;
+                        timing.execUs = packet.execUs;
+                        timing.syncUs = packet.syncUs;
+                        timing.bubbleUs = packet.bubbleUs;
+                        printf("%s\n", formatTokenNodeTimingLine((unsigned int)pos, timing).c_str());
+                    }
+                    std::fflush(stdout);
+                }
                 if (eosType == EOS) { stopped = true; ++pos; break; }
             }
             if (!stopped && eosType == MAYBE_EOS) {

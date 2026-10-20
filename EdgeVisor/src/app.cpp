@@ -477,7 +477,9 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.magic = LLM_BOOTSTRAP_MAGIC;
     p.version = LLM_BOOTSTRAP_VERSION;
     p.flags = 0u;
-    p.benchmarkEnabled = (args->benchmark || envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false)) ? 1u : 0u;
+    p.benchmarkEnabled = (args->benchmark ||
+        envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false) ||
+        envFlagEnabledDefault("DLLAMA_PROFILE", false)) ? 1u : 0u;
     p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
     p.enableStageFullWeights = args->enableStageFullWeights ? 1u : 0u;
     p.enableKvRedundancyDuringMigration = args->enableKvRedundancyDuringMigration ? 1u : 0u;
@@ -6918,7 +6920,8 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     NnNetwork *network = nullptr;
 
     const bool dynamicTpotEnabled = args->enableDynamicTpot;
-    const bool profileEnabled = args->benchmark || dynamicTpotEnabled;
+    const bool profileEnabled = args->benchmark || dynamicTpotEnabled ||
+        envFlagEnabledDefault("DLLAMA_PROFILE", false);
     const bool layerProfileEnabled = profileEnabled && envFlagEnabledDefault("DLLAMA_LAYER_PROF_ENABLE", false);
 
     if (nNodes == 1) {

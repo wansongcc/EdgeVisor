@@ -30,8 +30,9 @@
 - **14B/5 机复核**：18/18/2/1/1 + context 1024 + 180 s 预算解决 nano OOM；search 1 call 622 ms、SQL 链 3 calls 530 ms、heavy topk 3 calls **11.80 s**（2.1× W1），三者均正确完成。工具窗口与 8B 一致；生成约 1.2 token/s，不是性能配置。期间发现并修复 runtime 重建时裸 `NnTransferSocketException` 逃出 main 导致 terminate（`94ec488`）。
 - **API per-stage 计时**：`DLLAMA_PROFILE=1` + `DLLAMA_TOKEN_TIMING_PRINT=1` 现在让 API 输出 `[token-e2e]` 与 `[token-prof]`（worker perf packet 经 boot packet 启用）。14B 12/12/12/2/2 @1024 的 e2e p50 **487 ms（2.05 token/s）**，与 18/18/2/1/1 相同；2 threads 507 ms 更慢。同步 PP 把各 stage exec 串行相加，单靠层数分配到不了 3 token/s；要 >3 需要 pipeline overlap 或更小模型（8B 单机 5–6 token/s）。
 - **bubble 口径**：`[token-prof]` 的 `bubble` 是 shadow/tool-window 准备时间，不是 pipeline idle；普通 token 恒为 0。论文 Fig.5 的 15 ms/1.9 ms 不能用该字段验证，需要单独的 stage idle 埋点。
-- **B smoke 吞吐/故障**：2 机 8B 18/18 @1024 达 **4.8 token/s**（e2e 205–221 ms），是唯一 >3 的多机配置；shadow 臂 250 ms/token（bubble 75–80 ms/token，约 22% 开销）。3B 3 机 shadow 12/12/4 约 207–211 ms/token；3B/8B 多机 1.3–2.3，14B 2.05。末级故障 failover 报 `reason=last-stage` 并重启（设计边界）；中间故障固定/shadow 臂在外部 kill 下都 503/restart——杀点落在请求边界，API 在请求开始前已知 peer 离线时直接 503，没走 forward 内 shadow 接管。B 还不能给出有效收益对比。
-- 详细记录：`docs/test_records/18`–`23`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_*_2026101{9,20}.png`。
+- **B smoke 吞吐/故障**：2 机 8B 18/18 @1024 达 **4.8 token/s**（e2e 205–221 ms），是唯一 >3 的多机配置；shadow 臂 250 ms/token（bubble 75–80 ms/token，约 22% 开销）。3B 3 机 shadow 12/12/4 约 207–211 ms/token；3B/8B 多机 1.3–2.3，14B 2.05。末级故障 failover 报 `reason=last-stage` 并重启（设计边界）；外部 kill 的中间故障会落在请求边界，API 直接 503。
+- **B 确定性故障**：新增 `EDGEVISOR_TEST_WORKER_EXIT_POS/NODE`，worker 在 decode pos=160 退出。固定臂 `partial-cover` → 503、0 generation；shadow 臂 `ejectedStage=1 targetStage=0 layers=[12,24) replay=1` → 2 generations、无 restart，**2/2 次可重复**。任务未 final（3B 重复 tool），机制接管成立、端到端成功尚未证明。
+- 详细记录：`docs/test_records/18`–`24`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_*_2026101{9,20}.png`。
 - API 修复的改动：`dllama-api.cpp` 捕获生成期 timeout/offline/session-restart/worker-socket/executor 异常，返回 503（流式则 SSE error）并展开 runtime 重建；客户端写失败不再混入推理故障；HTTP 状态短语修正；固定拓扑 KV/control-ACK/尾采样默认预算 5000→30000 ms；session restart 后最多 10×500 ms 等待 worker relisten。
 - 已实机验证（0.6B Q40）：
   - 双机强制 `DLLAMA_KV_ACK_TIMEOUT_MS=1`：返回 503 `peer_timeout`，进程存活，`/v1/models` 恢复，改 30 s 后 completion 返回 200。
@@ -58,15 +59,15 @@
 5. ROG 失守密码和公网 SSH 入口仍未处理；用户此前明确暂不动安全配置。
 6. nano2 根盘约余 6.1 GiB、ROG 约余 5.5 GiB；长实验前复查容量，不擅自删除用户文件。
 7. 实验 A 已完成单机 8B 的单轮 + 多轮 + 大测试、14B/5 机 OOM 修复与复核、API per-stage 计时：机会范围 0.13–11.8 s；14B 2.05 token/s、2 机 8B 4.8 token/s。仍未做远程工具、真正 pipeline bubble、大样本 p95。
-8. B smoke 只完成吞吐与故障路径摸底，未得到有效收益对比：末级故障按设计重启；中间故障在外部 kill 下固定/shadow 都 503/restart，杀点落在请求边界，API 未走 forward 内 shadow 接管。需要确定性故障 hook + readiness 检查 + 明确 pre-existing offline peer 的接管语义。
+8. B 的确定性故障已打通：`EDGEVISOR_TEST_WORKER_EXIT_POS/NODE` 让 node1 在 pos=160 退出；固定臂 `partial-cover`→503/0 generation，shadow 臂 `ejectedStage=1 targetStage=0 replay=1`→2 generations、无 restart，2/2 可重复。但 3B 任务未 final，端到端成功率/F2FT 还没有；外部 kill 的请求边界问题仍在（确定 hook 已绕开）。
 
 ### 4. 第一项下一步（First next action）
 
-B pilot 继续，先解决可重复故障，再跑对比：
-1. **确定性故障 hook**：worker 在指定 token/position 的 forward 中退出（测试专用 env），替代外部 kill 竞态；同时输出 committed frontier 与 shadow coverage。
-2. **API 接管语义**：明确“请求开始前已知 peer 离线”时是否尝试 shadow 接管；当前直接 503/restart。若不支持，B 的 takeover 用 CLI episode 路径或先修 API。
-3. **B smoke 重跑**：2 机 8B fixed vs shadow（吞吐/任务质量/shadow 开销）；3 机 3B 12/12/4 middle-failure（确定性命中）各 3 reps。
-4. **模型/拓扑**：主吞吐用 2 机 8B（4.8 token/s）；takeover 用 3 机 3B（nano 4 层、shadow 12 层）；14B 只做少量核对。
+B pilot 继续：
+1. **让任务 finalize**：把 max_turns 提到 4，或换 coding_fix_slug / 更明确的 search 提示；先在无故障下确认 3B 能完成。
+2. **同任务 fixed vs shadow**：各 3 reps，记录成功率、wall、F2FT、replay token 数、shadow bubble 开销；无故障基线各 1 次。
+3. **故障位置扫描**：pos=160/200/240，确认 shadow readiness 与接管率；哪些位置 `partial-cover`。
+4. **模型/拓扑**：吞吐用 2 机 8B（4.8 token/s）；takeover 用 3 机 3B 12/12/4；14B 只做少量核对。
 5. **主指标**：受扰任务 p95 完成时间/成功率；副指标 F2FT、p99 stall、shadow bubble 开销、能耗/内存。
 6. B 的窗口输入用 0.1–12 s 的逐窗口分布（A 的结果），不用固定 1.1 s。
 
@@ -76,11 +77,11 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 
 ### 5. 证据、清理与约束（Optional context）
 
-- Mac repo：`/Users/yhbian/Documents/Codex/2026-10-08/github-plugin-github-openai-curated-remote-2/work/EdgeVisor`。测试记录 17–23；实验 A harness `scripts/experiments/opportunity_study.py`。
+- Mac repo：`/Users/yhbian/Documents/Codex/2026-10-08/github-plugin-github-openai-curated-remote-2/work/EdgeVisor`。测试记录 17–24；实验 A harness `scripts/experiments/opportunity_study.py`。
 - 实验 A 原始数据：`work/opportunity_20261019/fixtures/`（120k 文档、1M 行 SQLite、coding 测试）、`runs/pilot_8b_*`、`runs/multi_8b`、`runs/heavy_8b`、`runs/opp14b5_*`、`runs/b_*`（episode/summary JSON）；不在 Git。
 - 图：`docs/test_records/assets/experiment_a_tool_windows_20261019.png`、`..._cumulative_windows_20261019.png`、`..._opportunity_range_20261020.png`、`..._14b_topk_20261020.png`。
 - 14B 日志：`nx1:/home/jetson/edgevisor_runs/opp14b5_20261020.log` / `.trace.jsonl`；worker 日志在 `~/edgevisor_runs/smoke_20261018_e431cbd/opp14b5_20261020.log`。
-- B smoke 日志：`nx1:/home/jetson/edgevisor_runs/b_2dev_8b.log`（4.8 token/s）、`b_2dev_8b_shadow.log`、`b_mid_fixed.log`、`b_mid_shadow3.log`；episodes 在 `work/opportunity_20261019/runs/b_*`。
+- B smoke 日志：`nx1:/home/jetson/edgevisor_runs/b_2dev_8b.log`（4.8 token/s）、`b_2dev_8b_shadow.log`、`b_mid_fixed.log`、`b_mid_shadow3.log`；确定性故障：`b_det_fixed4.log`、`b_det_shadow.log`、`b_det_shadow2.log`；episodes 在 `work/opportunity_20261019/runs/b_*`。
 - 设备日志：`nx1:/home/jetson/edgevisor_runs/smoke_20261018_e431cbd/api_five_default_20261019_r2b.api.log`（5 s 失败）、同目录 `r2c`（30 s 通过）、`nx1:/home/jetson/edgevisor_runs/api_recovery_20261019/`、`failover_retry_20261019.log`、`auto_rerun_20261019.trace.jsonl`。
 - 本轮结束已清理测试 root/worker/API 进程和 19581/19584/19590 监听；未停无关服务，未改驱动、频率、网络、SSH 或安全设置。ROG 旧未提交目录和用户文件保持不动。
 - 沿用用户授权的 git 管理：只提交本轮代码/文档，推当前开发分支；远端变化则接到远端之上，不强推，不夹带 `._*`，未经新请求不合 main。新会话读取交接后仍须复查实际状态，不能把历史空闲状态当当前事实。
@@ -100,11 +101,12 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 - 下一步：B pilot 用 2 机 8B 主跑（4.8 token/s）、3 机 3B 做 takeover；窗口输入用 0.1–12 s 分布。
 - 失败判据：B 的 8B pilot 中 EdgeVisor 相对最强 proactive baseline 的配对收益 CI 跨 0 → 需重设 workload/预算。
 
-**实验 B（B smoke 完成，pilot 待可重复故障）：收益 + 归因。**
+**实验 B（确定性故障已验证，pilot 待任务 finalize）：收益 + 归因。**
 - 吞吐：2 机 8B 4.8 token/s（唯一 >3）；shadow 250 ms/token（bubble 75–80 ms，约 22% 开销）；3B 3 机 shadow 12/12/4 ~207–211 ms/token；3B/8B 多机 1.3–2.3；14B 2.05。
-- 故障：末级 failover 报 `last-stage` 并重启（设计）；中间故障外部 kill 下固定/shadow 都 503/restart，杀点落在请求边界；API 在请求开始前已知 peer 离线时直接 503，未走 shadow 接管。B 尚无有效收益对比。
-- 先做：确定性 mid-forward 故障 hook + shadow readiness/frontier 查询 + 明确 pre-existing offline peer 的接管语义；然后 2 机 8B fixed vs shadow、3 机 3B middle-failure 各 3 reps。
-- 之后：全 arms（Boundary-Defer、KV-Transfer、Replay、Pre-copy-all、Warm-spare、full、ablation）、3 workloads × 3 扰动、主指标 p95/成功率。
+- 故障：末级 failover 报 `last-stage` 并重启（设计）。确定性 hook pos=160：固定臂 `partial-cover`→503/0 generation；shadow 臂 `ejectedStage=1 targetStage=0 replay=1`→2 generations、无 restart，2/2 可重复。
+- 未完成：任务未 final（3B 重复 tool）；无故障基线、3 reps、F2FT/replay token 细拆、pos=160/200/240 扫描、全 arms 未做。
+- 先做：让 3B 任务 finalize（max_turns 4 / coding_fix_slug），再 fixed vs shadow 各 3 reps；之后扩 arms/扰动。
+- 失败判据：shadow 相对 fixed 的成功率/完成时间配对收益 CI 跨 0，或 shadow 只在大故障时有效但正常路径显著变慢 → 需重设 workload/预算。
 
 **实验 C（B 之后）：边界与代价。**
 - 另一模型家族/尺寸（至少 0.6B/3B/8B 之一）、2/3/5 节点、真实 Wi-Fi/蜂窝、30–60 min 热/功耗。

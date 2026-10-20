@@ -7831,6 +7831,24 @@ void runWorkerApp(AppCliArgs *args) {
                     }
                 }
 
+                {
+                    // Deterministic fault injection for B experiments: a worker
+                    // exits during the forward for a chosen decode position.
+                    const char *exitPos = std::getenv("EDGEVISOR_TEST_WORKER_EXIT_POS");
+                    const char *exitNode = std::getenv("EDGEVISOR_TEST_WORKER_EXIT_NODE");
+                    if (exitPos != nullptr && exitPos[0] != '\0' && inference.batchSize() == 1u) {
+                        const long wantedPos = std::strtol(exitPos, nullptr, 10);
+                        const long wantedNode = (exitNode != nullptr && exitNode[0] != '\0')
+                            ? std::strtol(exitNode, nullptr, 10) : -1;
+                        if ((long)inference.position() == wantedPos &&
+                                (wantedNode < 0 || (NnUint)wantedNode == nodeConfig.nodeIndex)) {
+                            std::printf("\xF0\x9F\xA7\xAA [test] worker node=%u exit at pos=%u\n",
+                                (unsigned)nodeConfig.nodeIndex, (unsigned)inference.position());
+                            std::fflush(stdout);
+                            std::_Exit(86);
+                        }
+                    }
+                }
                 executor.forward();
                 NnBubbleShadowStats bubbleStats = maybeRunBubbleShadowKv(&executor, "worker", nodeConfig.nodeIndex, inference.position(), inference.batchSize());
                 inference.flushPendingKvAck();

@@ -60,12 +60,13 @@
 6. nano2 根盘约余 6.1 GiB、ROG 约余 5.5 GiB；长实验前复查容量，不擅自删除用户文件。
 7. 实验 A 已完成单机 8B 的单轮 + 多轮 + 大测试、14B/5 机 OOM 修复与复核、API per-stage 计时：机会范围 0.13–11.8 s；14B 2.05 token/s、2 机 8B 4.8 token/s。仍未做远程工具、真正 pipeline bubble、大样本 p95。
 8. B 的确定性故障已打通：`EDGEVISOR_TEST_WORKER_EXIT_POS/NODE` 让 node1 在 pos=160 退出；固定臂 `partial-cover`→503/0 generation，shadow 臂 `ejectedStage=1 targetStage=0 replay=1`→2 generations、无 restart，2/2 可重复。但 3B 任务未 final，端到端成功率/F2FT 还没有；外部 kill 的请求边界问题仍在（确定 hook 已绕开）。
+9. B 任务级 smoke 卡在两条约束：3B 在 search 任务上 max_turns=4 仍重复 tool、不 final（348 s）；8B 3 机 shadow 在 nano 4 层和 2 层都 OOM，4 机无 shadow 才能跑。8B 2 机 shadow 可跑但末级故障只能重启。
 
 ### 4. 第一项下一步（First next action）
 
 B pilot 继续：
-1. **让任务 finalize**：把 max_turns 提到 4，或换 coding_fix_slug / 更明确的 search 提示；先在无故障下确认 3B 能完成。
-2. **同任务 fixed vs shadow**：各 3 reps，记录成功率、wall、F2FT、replay token 数、shadow bubble 开销；无故障基线各 1 次。
+1. **3B 可 finalize 任务**：用 calculator 或 coding_fix_slug，先无故障确认 final，再加 pos=160 故障；fixed vs shadow 各 3 reps。
+2. **8B shadow 内存**：nano 只放 1 层 + context 512 再试；或增加第三个能放 8B 的设备（ROG 磁盘不足）；否则 8B 只做无 shadow 的吞吐/质量基线。
 3. **故障位置扫描**：pos=160/200/240，确认 shadow readiness 与接管率；哪些位置 `partial-cover`。
 4. **模型/拓扑**：吞吐用 2 机 8B（4.8 token/s）；takeover 用 3 机 3B 12/12/4；14B 只做少量核对。
 5. **主指标**：受扰任务 p95 完成时间/成功率；副指标 F2FT、p99 stall、shadow bubble 开销、能耗/内存。
@@ -77,11 +78,11 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 
 ### 5. 证据、清理与约束（Optional context）
 
-- Mac repo：`/Users/yhbian/Documents/Codex/2026-10-08/github-plugin-github-openai-curated-remote-2/work/EdgeVisor`。测试记录 17–24；实验 A harness `scripts/experiments/opportunity_study.py`。
+- Mac repo：`/Users/yhbian/Documents/Codex/2026-10-08/github-plugin-github-openai-curated-remote-2/work/EdgeVisor`。测试记录 17–25；实验 A harness `scripts/experiments/opportunity_study.py`。
 - 实验 A 原始数据：`work/opportunity_20261019/fixtures/`（120k 文档、1M 行 SQLite、coding 测试）、`runs/pilot_8b_*`、`runs/multi_8b`、`runs/heavy_8b`、`runs/opp14b5_*`、`runs/b_*`（episode/summary JSON）；不在 Git。
 - 图：`docs/test_records/assets/experiment_a_tool_windows_20261019.png`、`..._cumulative_windows_20261019.png`、`..._opportunity_range_20261020.png`、`..._14b_topk_20261020.png`。
 - 14B 日志：`nx1:/home/jetson/edgevisor_runs/opp14b5_20261020.log` / `.trace.jsonl`；worker 日志在 `~/edgevisor_runs/smoke_20261018_e431cbd/opp14b5_20261020.log`。
-- B smoke 日志：`nx1:/home/jetson/edgevisor_runs/b_2dev_8b.log`（4.8 token/s）、`b_2dev_8b_shadow.log`、`b_mid_fixed.log`、`b_mid_shadow3.log`；确定性故障：`b_det_fixed4.log`、`b_det_shadow.log`、`b_det_shadow2.log`；episodes 在 `work/opportunity_20261019/runs/b_*`。
+- B smoke 日志：`nx1:/home/jetson/edgevisor_runs/b_2dev_8b.log`（4.8 token/s）、`b_2dev_8b_shadow.log`、`b_mid_fixed.log`、`b_mid_shadow3.log`；确定性故障：`b_det_fixed4.log`、`b_det_shadow.log`、`b_det_shadow2.log`、`b_det_shadow4.log`（3B max_turns 4）、`b_det_8b_shadow{,2}.log`（nano OOM）；episodes 在 `work/opportunity_20261019/runs/b_*`。
 - 设备日志：`nx1:/home/jetson/edgevisor_runs/smoke_20261018_e431cbd/api_five_default_20261019_r2b.api.log`（5 s 失败）、同目录 `r2c`（30 s 通过）、`nx1:/home/jetson/edgevisor_runs/api_recovery_20261019/`、`failover_retry_20261019.log`、`auto_rerun_20261019.trace.jsonl`。
 - 本轮结束已清理测试 root/worker/API 进程和 19581/19584/19590 监听；未停无关服务，未改驱动、频率、网络、SSH 或安全设置。ROG 旧未提交目录和用户文件保持不动。
 - 沿用用户授权的 git 管理：只提交本轮代码/文档，推当前开发分支；远端变化则接到远端之上，不强推，不夹带 `._*`，未经新请求不合 main。新会话读取交接后仍须复查实际状态，不能把历史空闲状态当当前事实。
@@ -101,11 +102,11 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 - 下一步：B pilot 用 2 机 8B 主跑（4.8 token/s）、3 机 3B 做 takeover；窗口输入用 0.1–12 s 分布。
 - 失败判据：B 的 8B pilot 中 EdgeVisor 相对最强 proactive baseline 的配对收益 CI 跨 0 → 需重设 workload/预算。
 
-**实验 B（确定性故障已验证，pilot 待任务 finalize）：收益 + 归因。**
+**实验 B（确定性故障已验证，任务级 pilot 待 finalize）：收益 + 归因。**
 - 吞吐：2 机 8B 4.8 token/s（唯一 >3）；shadow 250 ms/token（bubble 75–80 ms，约 22% 开销）；3B 3 机 shadow 12/12/4 ~207–211 ms/token；3B/8B 多机 1.3–2.3；14B 2.05。
 - 故障：末级 failover 报 `last-stage` 并重启（设计）。确定性 hook pos=160：固定臂 `partial-cover`→503/0 generation；shadow 臂 `ejectedStage=1 targetStage=0 replay=1`→2 generations、无 restart，2/2 可重复。
-- 未完成：任务未 final（3B 重复 tool）；无故障基线、3 reps、F2FT/replay token 细拆、pos=160/200/240 扫描、全 arms 未做。
-- 先做：让 3B 任务 finalize（max_turns 4 / coding_fix_slug），再 fixed vs shadow 各 3 reps；之后扩 arms/扰动。
+- 未完成：3B max_turns=4 仍不 final（348 s）；8B 3 机 shadow 在 nano 4/2 层均 OOM；无故障基线、3 reps、F2FT/replay token 细拆、pos 扫描、全 arms 未做。
+- 先做：3B calculator/coding_fix 先无故障 final，再加 pos=160；fixed vs shadow 各 3 reps。8B 只做无 shadow 吞吐/质量基线，除非 nano 1 层 + 512 能跑 shadow。
 - 失败判据：shadow 相对 fixed 的成功率/完成时间配对收益 CI 跨 0，或 shadow 只在大故障时有效但正常路径显著变慢 → 需重设 workload/预算。
 
 **实验 C（B 之后）：边界与代价。**

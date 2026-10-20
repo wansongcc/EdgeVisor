@@ -40,7 +40,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 DEFAULT_FIXTURES = ROOT.parent / "opportunity_20261019" / "fixtures"
 DEFAULT_OUT = ROOT.parent / "opportunity_20261019" / "runs"
 
@@ -661,6 +663,9 @@ def _call_tool(tool: str, arguments: dict) -> str:
         return search_docs(str(arguments.get("query", "")))
     if tool == "sql_query":
         return sql_query(str(arguments.get("query", "")))
+    if tool == "calculator":
+        from agent_bench.tools import calculator
+        return calculator(str(arguments.get("expression", "")))
     raise ValueError("unknown tool: " + tool)
 
 
@@ -671,6 +676,8 @@ TOOL_DESCRIPTIONS = [
      "description": "Search the local document corpus. Returns the top three documents."},
     {"name": "sql_query", "arguments": {"query": "read-only SQLite SELECT query"},
      "description": "Run a read-only SQL query against table sales(id, region, amount, day)."},
+    {"name": "calculator", "arguments": {"expression": "arithmetic expression"},
+     "description": "Evaluate a simple arithmetic expression."},
 ]
 
 
@@ -703,6 +710,10 @@ def task_specs(fixtures: Path, workloads: list[str], limit: int, suite: str = "b
             tasks.append({"id": spec["id"], "workload": "search", "allowed": {"search_docs"},
                           "prompt": (f"Use search_docs to find the capital of region {spec['region']}. "
                                      "Return final_answer with only the city name.")})
+    if "calc" in workloads:
+        tasks.append({"id": "calc_001", "workload": "calc", "allowed": {"calculator"},
+                      "prompt": ("Use calculator to evaluate (17+25)*3. "
+                                 "Then return final_answer with only the integer.")})
     if "sql" in workloads:
         for spec in SQL_SPECS:
             tasks.append({"id": spec["id"], "workload": "sql", "allowed": {"sql_query"},

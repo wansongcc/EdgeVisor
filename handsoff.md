@@ -28,7 +28,9 @@
 - **实验 A 多轮结果**：7 个 episode、19 次调用、每 episode 2–4 次；累计窗口 **0.13–1.06 s**（coding fix 0.13–0.28 s；SQL 链 0.57–0.64 s；跨工具 search 链 0.98–1.06 s），仍远低于论文 W1 的 5×1.096 s≈5.5 s。6/7 完成；coding_fix_rle 在 180 s 客户端超时。第一个复杂查询贡献大部分窗口，后续索引查询只有 87–101 ms。
 - **实验 A 大测试上界**：heavy matrix 3.08 s、topk 3.93+4.01=7.94 s、logparse 1.78 s；参考测试本身 1.5–4.6 s。与微测试合并后，累计机会范围 **0.13–7.94 s**；W1 的 5.5 s 落在范围内但非普适。
 - **14B/5 机复核**：18/18/2/1/1 + context 1024 + 180 s 预算解决 nano OOM；search 1 call 622 ms、SQL 链 3 calls 530 ms、heavy topk 3 calls **11.80 s**（2.1× W1），三者均正确完成。工具窗口与 8B 一致；生成约 1.2 token/s，不是性能配置。期间发现并修复 runtime 重建时裸 `NnTransferSocketException` 逃出 main 导致 terminate（`94ec488`）。
-- 详细记录：`docs/test_records/18`–`21`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_*_2026101{9,20}.png`。
+- **API per-stage 计时**：`DLLAMA_PROFILE=1` + `DLLAMA_TOKEN_TIMING_PRINT=1` 现在让 API 输出 `[token-e2e]` 与 `[token-prof]`（worker perf packet 经 boot packet 启用）。14B 12/12/12/2/2 @1024 的 e2e p50 **487 ms（2.05 token/s）**，与 18/18/2/1/1 相同；2 threads 507 ms 更慢。同步 PP 把各 stage exec 串行相加，单靠层数分配到不了 3 token/s；要 >3 需要 pipeline overlap 或更小模型（8B 单机 5–6 token/s）。
+- **bubble 口径**：`[token-prof]` 的 `bubble` 是 shadow/tool-window 准备时间，不是 pipeline idle；普通 token 恒为 0。论文 Fig.5 的 15 ms/1.9 ms 不能用该字段验证，需要单独的 stage idle 埋点。
+- 详细记录：`docs/test_records/18`–`22`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_*_2026101{9,20}.png`。
 - API 修复的改动：`dllama-api.cpp` 捕获生成期 timeout/offline/session-restart/worker-socket/executor 异常，返回 503（流式则 SSE error）并展开 runtime 重建；客户端写失败不再混入推理故障；HTTP 状态短语修正；固定拓扑 KV/control-ACK/尾采样默认预算 5000→30000 ms；session restart 后最多 10×500 ms 等待 worker relisten。
 - 已实机验证（0.6B Q40）：
   - 双机强制 `DLLAMA_KV_ACK_TIMEOUT_MS=1`：返回 503 `peer_timeout`，进程存活，`/v1/models` 恢复，改 30 s 后 completion 返回 200。
@@ -58,11 +60,13 @@
 
 ### 4. 第一项下一步（First next action）
 
-A 的主体已完成（见第 6 节），下一步按顺序：
-1. **14B per-stage token 埋点 + bubble**：API 模式目前没有 worker `[token-prof]`，无法拆 stage exec/sync；先补埋点，再测 14B/5 机的 bubble 和 stage idle。
-2. **均衡 14B 配置**：当前 18/18/2/1/1 生成约 1.2 token/s；尝试 context 512/768 或 16/16/4/2/2 等更均衡的分配，目标 >3 token/s。
-3. **大样本**：heavy coding 每类 3–5 个任务、14B 至少 2–3 个任务，统计完成率与窗口分布；再进 B 的 5-rep pilot。
-4. B 的窗口输入用 0.1–12 s 的逐窗口分布，不用固定 1.1 s。
+A 的主体已完成（见第 6 节），下一步进入 **B pilot**：
+1. **模型选择**：8B 做主 pilot（单机 5–6 token/s；5 机应更快），14B 只做少量核对（12/12/12/2/2 @1024，2.05 token/s）。不要用 14B 跑大矩阵。
+2. **Arms**：先做可运行的 4 臂——Boundary-Defer、KV-Transfer、Replay、EdgeVisor；pre-copy/warm-spare 与 admission/JIT ablation 第二批。
+3. **扰动**：先 compute clamp 与 worker removal 两类，每类 5 reps；同任务/同 trace 配对，随机化臂顺序。
+4. **主指标**：受扰任务 p95 完成时间/成功率；副指标 F2FT、p99 stall、工具窗口利用、能耗/内存。
+5. **首跑**：1 workload × 1 扰动 × 4 arms × 3 reps 的 smoke，确认 harness、失败语义和公平预算，再扩矩阵。
+6. B 的窗口输入用 0.1–12 s 的逐窗口分布（A 的结果），不用固定 1.1 s。
 
 A 的 harness、任务集和原始数据要保留；代码改动 fresh build + 实机回归后 commit/push。未经新请求不合 main，不直接开始论文性能主实验。
 
@@ -82,14 +86,16 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 
 目标：把论文从“机制正确性”补到“系统收益性”。主张写成条件式：**在同等内存/准备算力/带宽预算下，对真实 agent 任务和真实扰动，EdgeVisor 相对最强 proactive baseline 降低任务 p95 完成时间/提高截止期内成功率，且正常路径不劣化；收益来自 admission+JIT，而不是多准备 KV。**
 
-**实验 A（主体完成，待大样本/均衡/bubble）：机会是否真实。**
+**实验 A（主体完成，B pilot 待启动）：机会是否真实。**
 - 单轮：3 类真实任务 × 3 任务，9 次工具调用；窗口 9.6 ms–691 ms，中位 473 ms（coding 430、search 636、SQL 353）；论文 1.096/1.20 s 中位未复现；查询选择性导致近两个数量级差异。
 - 多轮：7 个 episode、19 次调用、2–4 次/episode；累计窗口 0.13–1.06 s；6/7 完成。
 - 大测试：heavy matrix 3.08 s、topk 7.94 s、logparse 1.78 s；参考测试 1.5–4.6 s；合并微测试后范围 **0.13–7.94 s**。
 - 14B/5 机：18/18/2/1/1 + context 1024 + 180 s 跑通；search 622 ms、SQL 链 530 ms、heavy topk **11.80 s**（2.1× W1），均完成；生成约 1.2 token/s。
-- 未完成：远程工具延迟、14B 均衡性能配置、worker per-stage bubble、heavy matrix 的 14B 重跑、大样本 p95。
-- 下一步：先补 bubble 埋点与均衡 14B，再扩样本；B 的窗口输入用 0.1–12 s 分布。
-- 失败判据：14B/均衡配置下累计窗口仍 < 准备一个候选的成本 → 机会不足，需改 workload/claim。
+- API 计时：`DLLAMA_PROFILE=1` + `DLLAMA_TOKEN_TIMING_PRINT=1` 输出 `[token-e2e]`/`[token-prof]`；12/12/12/2/2 @1024 e2e p50 487 ms（2.05 token/s），与 18/18 相同；2 threads 更慢。同步 PP 串行相加，单靠层数到不了 3 token/s。
+- bubble 口径：`[token-prof] bubble` 是 shadow 准备时间，不是 pipeline idle；论文 15 ms/1.9 ms 需新埋点。
+- 未完成：远程工具延迟、真正 pipeline bubble、大样本 p95。
+- 下一步：B pilot 用 8B 主跑、14B 少量核对；窗口输入用 0.1–12 s 分布。
+- 失败判据：B 的 8B pilot 中 EdgeVisor 相对最强 proactive baseline 的配对收益 CI 跨 0 → 需重设 workload/预算。
 
 **实验 B（A 之后，主实验）：收益 + 归因。**
 - Arms：Boundary-Defer、KV-Transfer、Replay、**Pre-copy-all**、**Warm-spare**、EdgeVisor full、w/o admission、w/o JIT；所有臂同一内存/准备算力/带宽预算。

@@ -33,7 +33,8 @@
 - **B smoke 吞吐/故障**：2 机 8B 18/18 @1024 达 **4.8 token/s**（e2e 205–221 ms），是唯一 >3 的多机配置；shadow 臂 250 ms/token（bubble 75–80 ms/token，约 22% 开销）。3B 3 机 shadow 12/12/4 约 207–211 ms/token；3B/8B 多机 1.3–2.3，14B 2.05。末级故障 failover 报 `reason=last-stage` 并重启（设计边界）；外部 kill 的中间故障会落在请求边界，API 直接 503。
 - **B 确定性故障**：新增 `EDGEVISOR_TEST_WORKER_EXIT_POS/NODE`，worker 在 decode pos=160 退出。固定臂 `partial-cover` → 503、0 generation；shadow 臂 `ejectedStage=1 targetStage=0 layers=[12,24) replay=1` → 2 generations、无 restart，**2/2 次可重复**。任务未 final（3B 重复 tool），机制接管成立、端到端成功尚未证明。
 - **B 任务级 fixed vs shadow**：calculator `(17+25)*3`，3B 3 机 12/12/4，node1 pos=150 确定性退出。无故障 fixed 126/75.2 s；故障 fixed **0/3 成功**（503，30.1–30.9 s，`partial-cover`）；故障 shadow **3/3 成功**（126，72.0–72.3 s，`ejectedStage=1 targetStage=0 replay=1`，无 restart）。shadow 完成时间接近无故障 fixed；固定臂只是快速失败。
-- 详细记录：`docs/test_records/18`–`26`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_*_2026101{9,20}.png`。
+- **nx1 掉线/回退**：2026-10-21 13:10 左右 nx1 ping/SSH 均不可达，其余设备在线。root 迁 nx2（20/4/4，3B，shadow 4 层），pos=150 故障：shadow final 126/57.8 s，fixed 无 final/28.0 s（`partial-cover`），与 nx1 主结果方向一致。
+- 详细记录：`docs/test_records/18`–`27`；harness `scripts/experiments/opportunity_study.py`；图 `docs/test_records/assets/experiment_a_*_2026101{9,20}.png`。
 - API 修复的改动：`dllama-api.cpp` 捕获生成期 timeout/offline/session-restart/worker-socket/executor 异常，返回 503（流式则 SSE error）并展开 runtime 重建；客户端写失败不再混入推理故障；HTTP 状态短语修正；固定拓扑 KV/control-ACK/尾采样默认预算 5000→30000 ms；session restart 后最多 10×500 ms 等待 worker relisten。
 - 已实机验证（0.6B Q40）：
   - 双机强制 `DLLAMA_KV_ACK_TIMEOUT_MS=1`：返回 503 `peer_timeout`，进程存活，`/v1/models` 恢复，改 30 s 后 completion 返回 200。
@@ -62,15 +63,16 @@
 7. 实验 A 已完成单机 8B 的单轮 + 多轮 + 大测试、14B/5 机 OOM 修复与复核、API per-stage 计时：机会范围 0.13–11.8 s；14B 2.05 token/s、2 机 8B 4.8 token/s。仍未做远程工具、真正 pipeline bubble、大样本 p95。
 8. B 的确定性故障已打通：`EDGEVISOR_TEST_WORKER_EXIT_POS/NODE` 让 node1 在 pos=160 退出；固定臂 `partial-cover`→503/0 generation，shadow 臂 `ejectedStage=1 targetStage=0 replay=1`→2 generations、无 restart，2/2 可重复。但 3B 任务未 final，端到端成功率/F2FT 还没有；外部 kill 的请求边界问题仍在（确定 hook 已绕开）。
 9. B 任务级 smoke 已有首个正结果：calculator 任务、node1 pos=150、3B 3 机 12/12/4；fixed 0/3（503，30.1–30.9 s），shadow 3/3（126，72.0–72.3 s，无 restart）。仍未做长工具窗口任务、无故障 shadow 基线、pos 扫描、全 arms；8B 3 机 shadow 在 nano 4/2 层仍 OOM。
+10. nx1 于 2026-10-21 13:10 左右失联（ping/SSH 不通），其余设备在线。nx2 回退拓扑（20/4/4，3B，shadow 4）已复现 shadow 成功/fixed `partial-cover`；nx1 恢复前不要把它当主统计。
 
 ### 4. 第一项下一步（First next action）
 
 B pilot 继续：
-1. **长工具窗口任务**：把 calculator 换成 coding_fix_slug 或 heavy topk（3B 先确认 finalize），同一 pos=150 故障，fixed vs shadow 各 3 reps；同时补无故障 shadow 基线。
-2. **故障位置扫描**：pos=150/160/200/240，确认 shadow readiness 与接管率；哪些位置 `partial-cover`。
-3. **8B shadow 内存**：nano 只放 1 层 + context 512 再试；或增加第三个能放 8B 的设备（ROG 磁盘不足）；否则 8B 只做无 shadow 的吞吐/质量基线。
-4. **Arms**：在 3B 3 机上补 Boundary-Defer/KV-Transfer/Replay/pre-copy，先各 3 reps；再扩 workload/扰动。
-5. **主指标**：受扰任务 p95 完成时间/成功率；副指标 F2FT、p99 stall、shadow bubble 开销、能耗/内存。
+1. **nx1 恢复**：优先回到 nx1 3B 3 机 12/12/4 主拓扑；nx1 不可用时用 nx2 20/4/4 回退，但标注非均衡拓扑。
+2. **无故障 shadow + 3 reps**：在 nx1 主拓扑补 shadow 无故障基线和 pos=140/150/160 扫描；每格 3 reps。
+3. **长工具窗口**：3B coding 4 轮测试均失败，calculator 太短；需要 8B 或更简单的可 final 任务，不能只用短任务下结论。
+4. **8B shadow 内存**：nano 只放 1 层 + context 512 再试；或增加第三个能放 8B 的设备（ROG 磁盘不足）；否则 8B 只做无 shadow 吞吐/质量基线。
+5. **Arms**：补 Boundary-Defer/KV-Transfer/Replay/pre-copy，先各 3 reps；主指标 p95/成功率，副指标 F2FT/p99 stall/bubble 开销。
 6. B 的窗口输入用 0.1–12 s 的逐窗口分布（A 的结果），不用固定 1.1 s。
 
 A 的 harness、任务集和原始数据要保留；代码改动 fresh build + 实机回归后 commit/push。未经新请求不合 main，不直接开始论文性能主实验。
@@ -79,11 +81,11 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 
 ### 5. 证据、清理与约束（Optional context）
 
-- Mac repo：`/Users/yhbian/Documents/Codex/2026-10-08/github-plugin-github-openai-curated-remote-2/work/EdgeVisor`。测试记录 17–26；实验 A harness `scripts/experiments/opportunity_study.py`。
+- Mac repo：`/Users/yhbian/Documents/Codex/2026-10-08/github-plugin-github-openai-curated-remote-2/work/EdgeVisor`。测试记录 17–27；实验 A harness `scripts/experiments/opportunity_study.py`。
 - 实验 A 原始数据：`work/opportunity_20261019/fixtures/`（120k 文档、1M 行 SQLite、coding 测试）、`runs/pilot_8b_*`、`runs/multi_8b`、`runs/heavy_8b`、`runs/opp14b5_*`、`runs/b_*`（episode/summary JSON）；不在 Git。
 - 图：`docs/test_records/assets/experiment_a_tool_windows_20261019.png`、`..._cumulative_windows_20261019.png`、`..._opportunity_range_20261020.png`、`..._14b_topk_20261020.png`。
 - 14B 日志：`nx1:/home/jetson/edgevisor_runs/opp14b5_20261020.log` / `.trace.jsonl`；worker 日志在 `~/edgevisor_runs/smoke_20261018_e431cbd/opp14b5_20261020.log`。
-- B smoke 日志：`nx1:/home/jetson/edgevisor_runs/b_2dev_8b.log`（4.8 token/s）、`b_2dev_8b_shadow.log`、`b_mid_fixed.log`、`b_mid_shadow3.log`；确定性故障：`b_det_fixed4.log`、`b_det_shadow.log`、`b_det_shadow2.log`、`b_det_shadow4.log`（3B max_turns 4）、`b_det_8b_shadow{,2}.log`（nano OOM）；episodes 在 `work/opportunity_20261019/runs/b_*`。
+- B smoke 日志：`nx2:/home/jetson/edgevisor_runs/b_nx2_shadow_{nofault,fault}.log`、`b_nx2_fixed_fault.log`；`nx1:/home/jetson/edgevisor_runs/b_2dev_8b.log`（4.8 token/s）、`b_2dev_8b_shadow.log`、`b_mid_fixed.log`、`b_mid_shadow3.log`；确定性故障：`b_det_fixed4.log`、`b_det_shadow.log`、`b_det_shadow2.log`、`b_det_shadow4.log`（3B max_turns 4）、`b_det_8b_shadow{,2}.log`（nano OOM）；episodes 在 `work/opportunity_20261019/runs/b_*`。
 - 设备日志：`nx1:/home/jetson/edgevisor_runs/smoke_20261018_e431cbd/api_five_default_20261019_r2b.api.log`（5 s 失败）、同目录 `r2c`（30 s 通过）、`nx1:/home/jetson/edgevisor_runs/api_recovery_20261019/`、`failover_retry_20261019.log`、`auto_rerun_20261019.trace.jsonl`。
 - 本轮结束已清理测试 root/worker/API 进程和 19581/19584/19590 监听；未停无关服务，未改驱动、频率、网络、SSH 或安全设置。ROG 旧未提交目录和用户文件保持不动。
 - 沿用用户授权的 git 管理：只提交本轮代码/文档，推当前开发分支；远端变化则接到远端之上，不强推，不夹带 `._*`，未经新请求不合 main。新会话读取交接后仍须复查实际状态，不能把历史空闲状态当当前事实。
@@ -107,6 +109,7 @@ A 的 harness、任务集和原始数据要保留；代码改动 fresh build + �
 - 吞吐：2 机 8B 4.8 token/s（唯一 >3）；shadow 250 ms/token（bubble 75–80 ms，约 22% 开销）；3B 3 机 shadow 12/12/4 ~207–211 ms/token；3B/8B 多机 1.3–2.3；14B 2.05。
 - 故障：末级 failover 报 `last-stage` 并重启（设计）。确定性 hook pos=160：固定臂 `partial-cover`→503/0 generation；shadow 臂 `ejectedStage=1 targetStage=0 replay=1`→2 generations、无 restart，2/2 可重复。
 - 任务级：calculator、node1 pos=150、3B 3 机 12/12/4；fixed 0/3（503，30.1–30.9 s），shadow 3/3（126，72.0–72.3 s，无 restart）；无故障 fixed 75.2 s。
+- nx2 回退（nx1 失联）：20/4/4，shadow 无故障 69.5 s；故障 shadow 126/57.8 s；fixed 无 final/28.0 s（`partial-cover`）。
 - 未完成：长工具窗口任务、无故障 shadow 基线、pos 扫描、全 arms；8B 3 机 shadow 在 nano 4/2 层仍 OOM。
 - 先做：长工具窗口任务（coding_fix/heavy topk）先无故障 final，再加 pos=150；fixed vs shadow 各 3 reps，并补无故障 shadow 基线。8B 只做无 shadow 吞吐/质量基线，除非 nano 1 层 + 512 能跑 shadow。
 - 失败判据：shadow 相对 fixed 的成功率/完成时间配对收益 CI 跨 0，或 shadow 只在大故障时有效但正常路径显著变慢 → 需重设 workload/预算。

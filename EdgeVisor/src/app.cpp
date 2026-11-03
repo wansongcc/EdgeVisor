@@ -2971,6 +2971,14 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
                 throw std::runtime_error("Unexpected sampled token identity or position");
             token = packet.token;
             if (logit != nullptr) *logit = packet.logit;
+            // Accumulate tail sampling cost so the scheduler can amortise it
+            // into the tail stage's per-layer cost. Only the tail emits this
+            // packet, so no other stage is affected.
+            {
+                std::lock_guard<std::mutex> lk(tailSampleMutex);
+                tailSampleUsTotal += (double)packet.sampleUs;
+                tailSampleCount += 1u;
+            }
             return true;
         }
         if (!network->isSocketActive((NnUint)socketIndex))
@@ -2987,6 +2995,14 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
 void RootLlmInference::setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments) {
     if (executor == nullptr) return;
     executor->setRuntimeLayerGate(enablePrimarySegments, enableRedundantSegments);
+}
+
+void RootLlmInference::drainTailSampleCost(double *totalUs, uint32_t *samples) {
+    std::lock_guard<std::mutex> lk(tailSampleMutex);
+    if (totalUs != nullptr) *totalUs = tailSampleUsTotal;
+    if (samples != nullptr) *samples = tailSampleCount;
+    tailSampleUsTotal = 0.0;
+    tailSampleCount = 0u;
 }
 
 void RootLlmInference::setPrimaryLayerEnabled(NnUint layerIndex, bool enabled) {
@@ -5606,8 +5622,12 @@ void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionP
     }
     if (vocabSize == 0u) return;
 
+    const auto sampleStart = std::chrono::steady_clock::now();
     const int localToken = lastStageSampler->sample(logitsPipe);
     if (localToken < 0) return;
+    const auto sampleEnd = std::chrono::steady_clock::now();
+    const NnUint sampleUs = (NnUint)std::chrono::duration_cast<std::chrono::microseconds>(
+        sampleEnd - sampleStart).count();
     const NnUint token = (NnUint)localToken;
     const float sampledLogit = ((NnUint)localToken < vocabSize) ? logitsPipe[localToken] : 0.0f;
 
@@ -5618,6 +5638,7 @@ void WorkerLlmInference::maybeSendLastStageSampledToken(const NnUnevenPartitionP
     packet.position = controlPacket.position;
     packet.token = token;
     packet.logit = sampledLogit;
+    packet.sampleUs = sampleUs;
     writeWorkerFrame(network, LLM_WORKER_FRAME_SAMPLED_TOKEN, &packet, sizeof(packet));
 }
 

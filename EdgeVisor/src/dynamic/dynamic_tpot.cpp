@@ -130,6 +130,9 @@ struct ControllerRuntime {
     PendingAction pending;
     tpot::PpLayoutGuard ppLayoutGuard;
     SchedulerMetrics metrics;
+    // Tail sampling cost observed in the most recent snapshot build.
+    double lastTailSampleMs = 0.0;
+    uint32_t lastTailSampleCount = 0u;
 };
 
 static bool parseEnvBool(const char *name, bool fallback) {
@@ -206,6 +209,7 @@ static tpot::SchedulerConfig loadSchedulerConfigFromEnvironmentImpl() {
     cfg.maxPpLayerMove = parseEnvBoundedUint("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", cfg.maxPpLayerMove, 1, 64);
     cfg.maxHeadMove = (uint32_t)std::max(1, parseEnvInt("DLLAMA_TPOT_MAX_HEAD_MOVE", (int)cfg.maxHeadMove));
     cfg.maxFfnMove = (uint32_t)std::max(1, parseEnvInt("DLLAMA_TPOT_MAX_FFN_MOVE", (int)cfg.maxFfnMove));
+    cfg.logRejectedCandidates = parseEnvBool("DLLAMA_TPOT_LOG_REJECTED", cfg.logRejectedCandidates);
     return cfg;
 }
 
@@ -504,7 +508,8 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
     const NnUnevenPartitionPlan *plan,
     const WindowSummary &window,
     const json &status,
-    const RuntimePrimaryOwnership &ownership) {
+    const RuntimePrimaryOwnership &ownership,
+    RootLlmInference *inference) {
     std::vector<tpot::StageSnapshot> out;
     if (plan == nullptr || plan->stages == nullptr) return out;
 
@@ -561,6 +566,25 @@ static std::vector<tpot::StageSnapshot> buildStageSnapshots(
         stage.avgLayerMs = stage.stageTimeMs > 0.0 ? stage.stageTimeMs / layerDiv : 0.0;
         stage.recentAvgMs = ewma.recentStageMs / layerDiv;
         stage.previousAvgMs = ewma.previousStageMs / layerDiv;
+        // DynaPipe: the pipeline tail pays sampling on top of its layers, and
+        // no layer cost includes it. Attach it to the tail only, so the search
+        // sees a genuinely heavier tail instead of a balanced pipeline of
+        // identical per-layer costs.
+        {
+            const NnStageConfig *tailStage = pipelineTailStage(plan);
+            if (inference != nullptr && tailStage != nullptr &&
+                tailStage->stageIndex == stageCfg.stageIndex) {
+                double sampleUsTotal = 0.0;
+                uint32_t sampleCount = 0u;
+                inference->drainTailSampleCost(&sampleUsTotal, &sampleCount);
+                if (sampleCount > 0u) {
+                    stage.tailSampleMs = (sampleUsTotal / (double)sampleCount) / 1000.0;
+                    stage.tailSampleSamples = sampleCount;
+                    rt.lastTailSampleMs = stage.tailSampleMs;
+                    rt.lastTailSampleCount = sampleCount;
+                }
+            }
+        }
 
         for (NnUint ni = 0u; ni < stageCfg.nNodes; ++ni) {
             const uint32_t nodeIndex = stageCfg.nodeIndices[ni];
@@ -845,6 +869,7 @@ static void logDecision(
         << " pos_begin=" << window.posBegin
         << " pos_end=" << window.posEnd;
     oss << " " << tpot::formatPpCandidateLogFields(bestPp);
+    oss << tpot::formatTailSampleLogFields(rt.lastTailSampleMs, rt.lastTailSampleCount);
     if (extra != nullptr && extra[0] != '\0') oss << " note=" << extra;
     oss << " " << metricsString(rt.metrics, window.posEnd);
     appendLog(rt.logPath, oss.str());
@@ -1005,7 +1030,7 @@ void DynamicTpotController::run() {
                     }
                 }
             }
-            std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status, inference_->getRuntimePrimaryOwnershipSnapshot());
+            std::vector<tpot::StageSnapshot> stages = buildStageSnapshots(rt, plan, window, status, inference_->getRuntimePrimaryOwnershipSnapshot(), inference_);
             if (!rt.hasCommittedPpLayout) {
                 rt.committedPpLayout = stages;
                 rt.authoritativePpLayout = stages;
@@ -1063,7 +1088,19 @@ void DynamicTpotController::run() {
                         command.toNodeIndex = candidate.toNodeIndex;
                         command.triggerLayer = candidate.layerIndex;
                         command.reserved0 = candidate.layerCount;
-                        if (!inference_->validatePpMigrationCommand(command)) continue;
+                        std::string rejectReason;
+                        if (!inference_->validatePpMigrationCommand(command, &rejectReason)) {
+                            if (rt.cfg.logRejectedCandidates) {
+                                appendLog(rt.logPath,
+                                    std::string("tpot_pp_reject from=") + std::to_string(candidate.fromStageIndex) +
+                                    " to=" + std::to_string(candidate.toStageIndex) +
+                                    " firstLayer=" + std::to_string(candidate.layerIndex) +
+                                    " count=" + std::to_string(candidate.layerCount) +
+                                    " gain_ms=" + std::to_string(candidate.gainMs) +
+                                    " reason=" + (rejectReason.empty() ? std::string("unspecified") : rejectReason));
+                            }
+                            continue;
+                        }
                         bestPp = tpot::betterCandidate(bestPp, candidate);
                     }
                 }

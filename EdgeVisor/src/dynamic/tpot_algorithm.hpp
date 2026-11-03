@@ -33,6 +33,10 @@ struct SchedulerConfig {
     uint32_t maxPpLayerMove = 1u;
     uint32_t maxHeadMove = 1u;
     uint32_t maxFfnMove = 256u;
+    // Emit one line per rejected PP candidate. Off by default because a wide
+    // search produces many; useful when a mechanism experiment needs to know
+    // why the scheduler declined to move anything.
+    bool logRejectedCandidates = false;
 };
 
 struct NodeSnapshot {
@@ -62,6 +66,12 @@ struct StageSnapshot {
     double leftBoundaryLayerMs = 0.0;
     double rightBoundaryLayerMs = 0.0;
     double riskPenalty = 0.0;
+    // Sampling runs only on the pipeline tail, and it is not part of the
+    // per-layer forward time. DynaPipe's premise is that this asymmetry makes
+    // an evenly split pipeline unbalanced: the tail stage pays extra work
+    // that no layer cost accounts for. Zero on every non-tail stage.
+    double tailSampleMs = 0.0;
+    uint32_t tailSampleSamples = 0u;
     std::vector<NodeSnapshot> nodes;
 };
 

@@ -32,6 +32,17 @@ inline std::string formatPpCandidateLogFields(const Candidate &candidate) {
     return oss.str();
 }
 
+// Tail sampling cost seen by the scheduler this window. Reported separately
+// from the candidate fields because it explains why a balanced-looking layer
+// split can still produce a PP candidate: the tail is heavier than its layer
+// count implies.
+inline std::string formatTailSampleLogFields(double tailSampleMs, uint32_t tailSamples) {
+    std::ostringstream oss;
+    oss << " tail_sample_ms=" << tailSampleMs
+        << " tail_sample_n=" << tailSamples;
+    return oss.str();
+}
+
 inline std::string formatSelectedCandidateLogFields(const Candidate &candidate) {
     std::ostringstream oss;
     oss << "best=" << candidateKindName(candidate.kind)

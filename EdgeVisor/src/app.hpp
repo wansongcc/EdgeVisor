@@ -446,7 +446,11 @@ static constexpr NnUint LLM_BOOTSTRAP_MAGIC = 0x4d424c44u; // 'DLBM' little-endi
 static constexpr NnUint LLM_BOOTSTRAP_VERSION = 15u;
 
 static constexpr NnUint LLM_SAMPLED_TOKEN_MAGIC = 0x4b545344u; // 'DSTK' little-endian
-static constexpr NnUint LLM_SAMPLED_TOKEN_VERSION = 1u;
+// v2 adds sampleUs so the root can attribute tail sampling cost separately from
+// per-layer forward time. The tail is the only stage that samples, and leaving
+// this out is exactly what makes an evenly split pipeline look balanced when it
+// is not.
+static constexpr NnUint LLM_SAMPLED_TOKEN_VERSION = 2u;
 
 typedef struct {
     NnUint magic;
@@ -455,6 +459,7 @@ typedef struct {
     NnUint position;
     NnUint token;
     float logit;
+    NnUint sampleUs;
 } LlmSampledTokenPacket;
 
 typedef struct {
@@ -503,6 +508,10 @@ public:
     bool hasMigrationAck() const { return migrationAckSeen; }
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
+    // Tail sampling cost accumulated since the last drain. The scheduler reads
+    // and resets this to amortise sampling into the tail stage's per-layer
+    // cost, so an evenly split pipeline stops looking balanced.
+    void drainTailSampleCost(double *totalUs, uint32_t *samples);
     unsigned long long getPpMigrationAppliedGeneration() const { return ppMigrationAppliedGeneration; }
     NnUint getPpMigrationAppliedFromNodeIndex() const { return ppMigrationAppliedFromNodeIndex; }
     NnUint getPpMigrationAppliedToNodeIndex() const { return ppMigrationAppliedToNodeIndex; }
@@ -596,6 +605,10 @@ private:
     std::vector<NnUint> waitingKvAckNodeExpected;
     std::vector<NnUint> waitingKvAckNodeReceived;
     std::vector<NnUint> pendingLayerSwitchLayers;
+    // Tail sampling cost, microsecond sum plus count, drained by the scheduler.
+    double tailSampleUsTotal = 0.0;
+    uint32_t tailSampleCount = 0u;
+    std::mutex tailSampleMutex;
     std::vector<NnUint> migrationLayers;
     std::vector<int> tokenHistory;
     int migrationStageStartLayer = -1;

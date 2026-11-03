@@ -24,13 +24,33 @@ double clampTrendPenalty(double recentAvgMs, double previousAvgMs) {
     return r;
 }
 
+// Per-layer cost used for stage arithmetic.
+//
+// A tail stage pays sampling on top of its layers, and no layer accounts for
+// it. Amortising that cost across the stage's own layers is what makes the
+// tail look heavier per layer than an identical-count upstream stage, which is
+// the asymmetry DynaPipe targets. Adding sampling as a constant to the stage
+// total would not work: it cancels out of every difference the candidate search
+// takes, so shedding layers off the tail would look no better than shedding
+// them off any other stage.
+static double effectiveAvgLayerMs(const StageSnapshot &stage) {
+    if (stage.avgLayerMs <= 0.0) return 0.0;
+    const double total = stage.stageTimeMs + stage.tailSampleMs;
+    const double base = stage.stageTimeMs;
+    if (base <= 0.0) return stage.avgLayerMs;
+    // Keep the measured per-layer slope and only stretch it by the sampling
+    // share of the stage total.
+    return stage.avgLayerMs * (total / base);
+}
+
 double stageCostMs(const StageSnapshot &stage, uint32_t nLayers, const SchedulerConfig &cfg) {
-    if (nLayers == 0u || stage.avgLayerMs <= 0.0) return 0.0;
+    const double perLayerMs = effectiveAvgLayerMs(stage);
+    if (nLayers == 0u || perLayerMs <= 0.0) return 0.0;
     const uint32_t soft = stage.softCapacity != 0u ? stage.softCapacity : nLayers;
     const double over = nLayers > soft ? (double)(nLayers - soft) : 0.0;
     const double loadPenalty = 1.0 + cfg.loadPenaltyBeta * over;
     const double trendPenalty = clampTrendPenalty(stage.recentAvgMs, stage.previousAvgMs);
-    return stage.avgLayerMs * (double)nLayers * loadPenalty * trendPenalty;
+    return perLayerMs * (double)nLayers * loadPenalty * trendPenalty;
 }
 
 double ppDeltaInMs(const StageSnapshot &stage, const SchedulerConfig &cfg) {

@@ -1493,6 +1493,9 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
 #endif
         token = haveLastStageToken ? (int)lastStageToken : context->sampler->sample(context->inference->logitsPipe);
+        // KV for this position is already written. Copy a chunk now and leave
+        // the residual for the migration trigger.
+        context->inference->runPipeLivePatch(pos);
 
         char *piece = context->tokenizer->decode(token);
         EosDetectorType eosType = eosDetector.append(token, piece);
@@ -1927,7 +1930,9 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
             appendEpisodeEvent("tool_shadow_run", roundNumber, pos, 0u, toolShadowUs);
         }
         if (std::getenv("DLLAMA_BACKGROUND_PRECOPY") != nullptr) {
-            const unsigned long long bgUs = context->inference->runBackgroundPreCopy(pos);
+            // Hold ownership until the migration trigger. The copy is the
+            // prefix; the trigger sends the delta and switches.
+            const unsigned long long bgUs = context->inference->runBackgroundPreCopy(pos, true);
             if (bgUs > 0u) {
                 appendEpisodeEvent("bg_precopy_run", roundNumber, pos, 0u, bgUs);
             }

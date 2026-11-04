@@ -2822,6 +2822,21 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
         bgPrecopyEnabled = (bgEnv != nullptr && bgEnv[0] == '1');
         const char *bgMax = std::getenv("DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES");
         if (bgMax != nullptr && bgMax[0] != '\0') bgPrecopyMaxPasses = (NnUint)std::strtoul(bgMax, nullptr, 10);
+        const char *pipeLive = std::getenv("DLLAMA_PIPELIVE_PATCH");
+        pipeLivePatchEnabled = (pipeLive != nullptr && pipeLive[0] == '1');
+        if (pipeLivePatchEnabled) bgPrecopyEnabled = true;
+        const char *chunkEnv = std::getenv("DLLAMA_PIPELIVE_CHUNK");
+        if (chunkEnv != nullptr && chunkEnv[0] != '\0') {
+            const unsigned long parsed = std::strtoul(chunkEnv, nullptr, 10);
+            if (parsed > 0ul) pipeLiveChunk = (NnUint)parsed;
+        }
+        const char *tauEnv = std::getenv("DLLAMA_PIPELIVE_TAU");
+        if (tauEnv != nullptr && tauEnv[0] != '\0') pipeLiveTau = (NnUint)std::strtoul(tauEnv, nullptr, 10);
+    }
+    if (pipeLivePatchEnabled) {
+        std::printf("🧩 [pipelive] online kv patch chunk=%u tau=%u\n",
+            (unsigned)pipeLiveChunk, (unsigned)pipeLiveTau);
+        std::fflush(stdout);
     }
 
     if (!migrationLayers.empty() && this->ppMigrationEnabled) {
@@ -3972,15 +3987,23 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
             waitingKvAckNodes.clear();
             waitingKvAckNodeExpected.clear();
             waitingKvAckNodeReceived.clear();
-            pendingLayerSwitchLayers = waitingKvAckReceivedLayers;
+            const std::vector<NnUint> ackedLayers = waitingKvAckReceivedLayers;
             waitingKvAckLayers.clear();
             waitingKvAckReceivedLayers.clear();
-            migrationAckSeen = true;
-            migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
-            migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
-            std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
-                (unsigned)pendingLayerSwitchLayers.size());
-            std::fflush(stdout);
+            if (kvAckDeferSwitch) {
+                kvAckDeferSwitch = false;
+                std::printf("🧩 [pipelive] chunk acked layers=%u, switch deferred\n",
+                    (unsigned)ackedLayers.size());
+                std::fflush(stdout);
+            } else {
+                pendingLayerSwitchLayers = ackedLayers;
+                migrationAckSeen = true;
+                migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
+                migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
+                std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
+                    (unsigned)pendingLayerSwitchLayers.size());
+                std::fflush(stdout);
+            }
         }
     }
 
@@ -4461,21 +4484,27 @@ unsigned long long RootLlmInference::runToolWindowShadow() {
 // P2 BackgroundPreCopy baseline: copy the candidate migration layers' KV to
 // the destination in idle windows; the trigger later transfers only the
 // delta [bgCopiedPos+1, endPos]. Returns elapsed microseconds.
-unsigned long long RootLlmInference::runBackgroundPreCopy(NnUint endPos) {
+unsigned long long RootLlmInference::runBackgroundPreCopy(NnUint endPos, bool deferSwitch) {
     if (!bgPrecopyEnabled) return 0u;
     if (bgPrecopyMaxPasses != 0u && bgPrecopyPasses >= bgPrecopyMaxPasses) return 0u;
     if (network == nullptr || executor == nullptr || header == nullptr) return 0u;
     if (!ppMigrationEnabled || migrationLayers.empty()) return 0u;
     if (waitingKvAck) return 0u;
-    if (endPos == 0u || bgCopiedPos >= endPos) return 0u;
+    // passes==0 means nothing has been copied yet, even though bgCopiedPos is 0.
+    // endPos is inclusive, so 0 is a real copy of position 0.
+    if (bgPrecopyPasses > 0u && bgCopiedPos >= endPos) return 0u;
     const auto started = std::chrono::steady_clock::now();
     NnUint exported = 0u;
     NnUint queued = 0u;
     uint64_t sourceBytes = 0u;
     const NnUint startPos = (bgPrecopyPasses == 0u) ? 0u : bgCopiedPos + 1u;
+    if (deferSwitch) kvAckDeferSwitch = true;
     const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes, startPos);
     uint64_t targetBytes = 0u;
     const bool flushed = collected && flushPendingKvTransfersControlOnly(&targetBytes);
+    // An incomplete ack is finished by a later forward. Keep the deferral so
+    // that late ack does not switch ownership. A failed send has no ack.
+    if (!flushed && !waitingKvAck) kvAckDeferSwitch = false;
     const auto finished = std::chrono::steady_clock::now();
     const auto elapsedUs = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(finished - started).count();
     if (flushed) {
@@ -4490,6 +4519,36 @@ unsigned long long RootLlmInference::runBackgroundPreCopy(NnUint endPos) {
             elapsedUs);
         std::fflush(stdout);
     }
+    return elapsedUs;
+}
+
+// Copy a bounded slice of already-written KV during decode, leaving `tau`
+// positions for the migration trigger. Returns elapsed microseconds.
+unsigned long long RootLlmInference::runPipeLivePatch(NnUint pos) {
+    if (!pipeLivePatchEnabled || migrationBatchSubmitted) return 0u;
+    if (!bgPrecopyEnabled || waitingKvAck) return 0u;
+    const NnUint firstMissing = (bgPrecopyPasses == 0u) ? 0u : (bgCopiedPos + 1u);
+    if (firstMissing > pos) return 0u;
+    const NnUint residual = pos - firstMissing + 1u;
+    if (residual <= pipeLiveTau) return 0u;
+    NnUint copyCount = residual - pipeLiveTau;
+    // After the first catch-up, wait until a full chunk has accumulated.
+    // Copying one new token per step spends a control round trip on a single
+    // KV row, which costs more than the row itself on this machine.
+    if (pipeLiveChunk > 0u && bgPrecopyPasses > 0u && copyCount < pipeLiveChunk) return 0u;
+    if (pipeLiveChunk > 0u && copyCount > pipeLiveChunk) copyCount = pipeLiveChunk;
+    const NnUint endInclusive = firstMissing + copyCount - 1u;
+    const unsigned long long elapsedUs = runBackgroundPreCopy(endInclusive, true);
+    if (elapsedUs == 0u || bgPrecopyPasses == 0u || bgCopiedPos != endInclusive) return elapsedUs;
+    const NnUint copiedThrough = bgCopiedPos;
+    const NnUint residualAfter = (bgPrecopyPasses == 0u || copiedThrough >= pos) ? 0u : (pos - copiedThrough);
+    std::printf("🧩 [pipelive] pos=%u copied_through=%u residual_before=%u residual_after=%u elapsed_us=%llu\n",
+        (unsigned)pos,
+        (unsigned)copiedThrough,
+        (unsigned)residual,
+        (unsigned)residualAfter,
+        elapsedUs);
+    std::fflush(stdout);
     return elapsedUs;
 }
 
@@ -5058,15 +5117,23 @@ void RootLlmInference::forward(bool collectProfile) {
                 waitingKvAckNodes.clear();
                 waitingKvAckNodeExpected.clear();
                 waitingKvAckNodeReceived.clear();
-                pendingLayerSwitchLayers = waitingKvAckReceivedLayers;
+                const std::vector<NnUint> ackedLayers = waitingKvAckReceivedLayers;
                 waitingKvAckLayers.clear();
                 waitingKvAckReceivedLayers.clear();
-                migrationAckSeen = true;
-                migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
-                migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
-                std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
-                    (unsigned)pendingLayerSwitchLayers.size());
-                std::fflush(stdout);
+                if (kvAckDeferSwitch) {
+                    kvAckDeferSwitch = false;
+                    std::printf("🧩 [pipelive] chunk acked layers=%u, switch deferred\n",
+                        (unsigned)ackedLayers.size());
+                    std::fflush(stdout);
+                } else {
+                    pendingLayerSwitchLayers = ackedLayers;
+                    migrationAckSeen = true;
+                    migrationAckPos = ackPosSet ? (int)ackPos : migrationAckPos;
+                    migrationAckLayer = !pendingLayerSwitchLayers.empty() ? (int)pendingLayerSwitchLayers.back() : migrationAckLayer;
+                    std::printf("🔁 [kv-migrate] ack batch complete layers=%u -> switch ownership\n",
+                        (unsigned)pendingLayerSwitchLayers.size());
+                    std::fflush(stdout);
+                }
             } else if (layersMatched && !rowsMatched) {
                 std::printf("⚠️  [kv-migrate] ack rows incomplete got=%u expected=%u (waiting)\n",
                     (unsigned)waitingKvAckReceivedCount,
@@ -5192,11 +5259,23 @@ void RootLlmInference::forward(bool collectProfile) {
                 (fromStage->endLayer > fromStage->startLayer);
 
             std::string rangeReason;
+            std::vector<NnUint> previousLayers = migrationLayers;
+            std::sort(previousLayers.begin(), previousLayers.end());
             migrationLayers.clear();
             const bool canApplyRoute = validRoute &&
                 resolvePpMigrationLayers(pc, plan, runtimePlan, migrationLayers, &rangeReason);
 
             if (canApplyRoute) {
+                std::vector<NnUint> appliedLayers = migrationLayers;
+                std::sort(appliedLayers.begin(), appliedLayers.end());
+                if (appliedLayers != previousLayers) {
+                    bgCopiedPos = 0u;
+                    bgPrecopyPasses = 0u;
+                    if (pipeLivePatchEnabled || bgPrecopyEnabled) {
+                        std::printf("🧩 [pipelive] layer set changed, delta cursor reset\n");
+                        std::fflush(stdout);
+                    }
+                }
                 migrationFromNodeIndex = routeFromNode;
                 nextStageRootNode = routeToNode;
                 kvAckSocketIndex = (network != nullptr) ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;

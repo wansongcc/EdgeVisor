@@ -588,6 +588,13 @@ private:
     NnUint bgCopiedPos = 0u;
     unsigned long long bgPrecopyBytesTotal = 0u;
     unsigned long long bgPrecopyPasses = 0u;
+    // PipeLive online patch (DLLAMA_PIPELIVE_PATCH=1): each decode step copies
+    // a bounded chunk of already-written KV and leaves `pipeLiveTau` positions
+    // for the trigger. Chunk acks must not switch ownership.
+    bool pipeLivePatchEnabled = false;
+    NnUint pipeLiveChunk = 8u;
+    NnUint pipeLiveTau = 8u;
+    bool kvAckDeferSwitch = false;
     NnUint waitingKvAckExpectedCount = 0u;
     std::vector<NnUint> waitingKvAckLayers;
     NnUint waitingKvAckReceivedCount = 0u;
@@ -691,7 +698,10 @@ public:
     void forward(bool collectProfile = true);
     // Returns elapsed microseconds; zero means the operation was not run.
     unsigned long long runToolWindowShadow();
-    unsigned long long runBackgroundPreCopy(NnUint endPos);
+    // deferSwitch: ack completes the copy but does not move layer ownership.
+    // PipeLive uses this so the trigger still performs the residual switch.
+    unsigned long long runBackgroundPreCopy(NnUint endPos, bool deferSwitch = false);
+    unsigned long long runPipeLivePatch(NnUint pos);
     void collectDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out);
     LlmPerfPacket makeRootPerfPacket() const;
     void finish();

@@ -1545,8 +1545,11 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
         predTotalTime += predTime + syncTime + predBubbleTime;
         if (eosType == EOS) {
-            pos++;
-            break;
+            const char *ignoreEos = std::getenv("DLLAMA_IGNORE_EOS");
+            if (ignoreEos == nullptr || ignoreEos[0] != '1') {
+                pos++;
+                break;
+            }
         }
     }
     const auto predWallEnd = std::chrono::steady_clock::now();

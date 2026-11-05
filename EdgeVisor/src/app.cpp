@@ -2832,10 +2832,14 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
         }
         const char *tauEnv = std::getenv("DLLAMA_PIPELIVE_TAU");
         if (tauEnv != nullptr && tauEnv[0] != '\0') pipeLiveTau = (NnUint)std::strtoul(tauEnv, nullptr, 10);
+        const char *armEnv = std::getenv("DLLAMA_PIPELIVE_ARM_POS");
+        if (armEnv != nullptr && armEnv[0] != '\0') pipeLiveArmPos = (NnUint)std::strtoul(armEnv, nullptr, 10);
     }
     if (pipeLivePatchEnabled) {
-        std::printf("🧩 [pipelive] online kv patch chunk=%u tau=%u\n",
-            (unsigned)pipeLiveChunk, (unsigned)pipeLiveTau);
+        std::printf("🧩 [pipelive] online kv patch chunk=%u tau=%u arm_pos=%u\n",
+            (unsigned)pipeLiveChunk,
+            (unsigned)pipeLiveTau,
+            pipeLiveArmPos == 0xFFFFFFFFu ? 0xFFFFFFFFu : (unsigned)pipeLiveArmPos);
         std::fflush(stdout);
     }
 
@@ -3349,6 +3353,7 @@ bool RootLlmInference::collectSourceStageKvTransfers(
     req.kvDim = kvDim;
     req.rangeStart = 0u;
     req.rangeLen = 0u;
+    req.startPosition = startPos;
 
     for (NnUint node : sourceNodes) {
         if (node == 0u) continue;
@@ -3369,10 +3374,11 @@ bool RootLlmInference::collectSourceStageKvTransfers(
             network->write((NnUint)socketIndex, &layer, sizeof(layer));
         }
         requestedRemote = true;
-        std::printf("🧩 [kv-export-request] requestId=%u sourceNode=%u layers=%u posRange=[0,%u]\n",
+        std::printf("🧩 [kv-export-request] requestId=%u sourceNode=%u layers=%u posRange=[%u,%u]\n",
             (unsigned)requestId,
             (unsigned)node,
             (unsigned)migrationLayers.size(),
+            (unsigned)startPos,
             (unsigned)endPos);
         std::fflush(stdout);
     }
@@ -4526,6 +4532,7 @@ unsigned long long RootLlmInference::runBackgroundPreCopy(NnUint endPos, bool de
 // positions for the migration trigger. Returns elapsed microseconds.
 unsigned long long RootLlmInference::runPipeLivePatch(NnUint pos) {
     if (!pipeLivePatchEnabled || migrationBatchSubmitted) return 0u;
+    if (pipeLiveArmPos != 0xFFFFFFFFu && pos < pipeLiveArmPos) return 0u;
     if (!bgPrecopyEnabled || waitingKvAck) return 0u;
     const NnUint firstMissing = (bgPrecopyPasses == 0u) ? 0u : (bgCopiedPos + 1u);
     if (firstMissing > pos) return 0u;
@@ -4548,6 +4555,14 @@ unsigned long long RootLlmInference::runPipeLivePatch(NnUint pos) {
         (unsigned)residual,
         (unsigned)residualAfter,
         elapsedUs);
+    // The fault is pipeLiveArmPos. Once the leftover is within tau, the next
+    // token is the switch: ownership moves and only that leftover is sent.
+    if (pipeLiveArmPos != 0xFFFFFFFFu && residualAfter <= pipeLiveTau &&
+        (asyncKvCollectPos < 0 || (NnUint)asyncKvCollectPos > pos + 1u)) {
+        asyncKvCollectPos = (int)pos + 1u;
+        std::printf("🧩 [pipelive] residual within tau, switch armed at pos=%u\n",
+            (unsigned)(pos + 1u));
+    }
     std::fflush(stdout);
     return elapsedUs;
 }
@@ -4607,6 +4622,18 @@ bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double 
     }
     if (!savedLogits.empty() && logitsPipe != nullptr) {
         std::memcpy(logitsPipe, savedLogits.data(), savedLogits.size() * sizeof(float));
+    }
+    // Replay forwards make the last stage sample every replayed position.
+    // Keep only the sample for the token that was in progress.
+    for (auto &entry : workerSampleFrameCache) {
+        std::deque<LlmSampledTokenPacket> kept;
+        for (const LlmSampledTokenPacket &packet : entry.second) {
+            if (packet.position == savedPosition) {
+                kept.push_back(packet);
+                break;
+            }
+        }
+        entry.second.swap(kept);
     }
 
     if (recomputeMs != nullptr) {
@@ -5921,8 +5948,9 @@ void WorkerLlmInference::flushKvExportResponse(
     };
     std::vector<ExportedRow> rows;
     const NnUint endPos = req.endPosition;
+    const NnUint beginPos = req.startPosition <= endPos ? req.startPosition : endPos + 1u;
     for (NnUint layer : layers) {
-        for (NnUint pos = 0u; pos <= endPos; ++pos) {
+        for (NnUint pos = beginPos; pos <= endPos; ++pos) {
             std::vector<float> kRow;
             std::vector<float> vRow;
             if (!executor->exportLayerKvRow(layer, pos, kvDim, kRow, vRow, payloadStart, req.rangeLen != 0u ? payloadLen : 0u)) {

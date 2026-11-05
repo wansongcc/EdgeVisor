@@ -1131,6 +1131,18 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     const auto predWallStart = std::chrono::steady_clock::now();
     for (; pos < maxPos; pos++) {
         const auto tokenWallStart = std::chrono::steady_clock::now();
+        if (const char *mark = std::getenv("DLLAMA_MARK_POS")) {
+            if (mark[0] != '\0' && pos == (NnUint)std::strtoul(mark, nullptr, 10)) {
+                static bool marked = false;
+                if (!marked) {
+                    marked = true;
+                    const unsigned long long monoNs = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    std::printf("[e1-mark] pos=%u t_mono_ns=%llu\n", (unsigned)pos, monoNs);
+                    std::fflush(stdout);
+                }
+            }
+        }
         maybeJoinReservedDevice(context, pos);
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
@@ -1553,6 +1565,12 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
     }
     const auto predWallEnd = std::chrono::steady_clock::now();
+    {
+        const unsigned long long monoNs = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            predWallEnd.time_since_epoch()).count();
+        std::printf("[e1-end] pos=%u t_mono_ns=%llu\n", (unsigned)pos, monoNs);
+        std::fflush(stdout);
+    }
 
     NnUint nEvalTokens = nInputTokens - 1;
     NnUint nPredTokens = pos - nEvalTokens;

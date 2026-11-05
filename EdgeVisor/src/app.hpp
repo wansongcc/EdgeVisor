@@ -313,6 +313,10 @@ typedef struct {
     NnUint kvDim;
     NnUint rangeStart;
     NnUint rangeLen;
+    // First token position to export. Older callers leave this 0 and still
+    // export [0, endPosition]. PipeLive sets it so a remote stage does not
+    // resend the prefix on every chunk.
+    NnUint startPosition;
 } LlmKvExportRequestHeader;
 
 typedef struct {
@@ -594,6 +598,10 @@ private:
     bool pipeLivePatchEnabled = false;
     NnUint pipeLiveChunk = 8u;
     NnUint pipeLiveTau = 8u;
+    // 0xFFFFFFFF: patch from the first decoded token (the earlier experiment).
+    // Any other value: ignore positions before this one, then pull the switch
+    // forward to the next token once the residual is down to tau.
+    NnUint pipeLiveArmPos = 0xFFFFFFFFu;
     bool kvAckDeferSwitch = false;
     NnUint waitingKvAckExpectedCount = 0u;
     std::vector<NnUint> waitingKvAckLayers;

@@ -2986,8 +2986,12 @@ bool RootLlmInference::tryReceiveLastStageSampledToken(NnUint &token, float *log
             const LlmSampledTokenPacket packet = samples.front();
             samples.pop_front();
             if (packet.magic != LLM_SAMPLED_TOKEN_MAGIC || packet.version != LLM_SAMPLED_TOKEN_VERSION ||
-                    packet.position != controlPacket.position || packet.nodeIndex != sourceNode)
+                    packet.nodeIndex != sourceNode)
                 throw std::runtime_error("Unexpected sampled token identity or position");
+            // A history replay samples every replayed position onto this socket.
+            // Drop those and keep waiting for the token that is actually in progress.
+            if (packet.position != controlPacket.position)
+                continue;
             token = packet.token;
             if (logit != nullptr) *logit = packet.logit;
             return true;

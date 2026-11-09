@@ -127,13 +127,6 @@ public:
 
 void printAvailableDevices();
 
-bool resolvePpMigrationLayers(
-    const PlanCommand &command,
-    const NnUnevenPartitionPlan *plan,
-    const RuntimeStageLayerPlan *runtimePlan,
-    std::vector<NnUint> &layers,
-    std::string *reason = nullptr);
-
 // Mutable primary ownership is intentionally distinct from the immutable
 // runtime provision map.  PP moves change ownership only after their switch
 // succeeds; bypass admission uses that ownership but validates the target
@@ -143,6 +136,26 @@ struct RuntimePrimaryOwnership {
     NnUint nStages = 0u;
     std::vector<NnUint> ownerByLayer;
 };
+
+bool resolvePpMigrationLayers(
+    const PlanCommand &command,
+    const NnUnevenPartitionPlan *plan,
+    const RuntimeStageLayerPlan *runtimePlan,
+    std::vector<NnUint> &layers,
+    std::string *reason = nullptr);
+
+// Same admission rules, but the candidate layers come from current primary
+// ownership rather than the static stage boundary. A repeated migration would
+// otherwise ask for the boundary layer again, which the source no longer owns
+// after the first move. Chooses the highest still-owned layer adjacent to the
+// target, so successive single-layer moves walk the boundary inward.
+bool resolvePpMigrationLayersByOwnership(
+    const PlanCommand &command,
+    const NnUnevenPartitionPlan *plan,
+    const RuntimeStageLayerPlan *runtimePlan,
+    const RuntimePrimaryOwnership &ownership,
+    std::vector<NnUint> &layers,
+    std::string *reason = nullptr);
 
 bool initializeRuntimePrimaryOwnership(
     const RuntimeStageLayerPlan *provisionMap,
@@ -188,7 +201,24 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_PRECOMMIT_PROBE = 1u << 8, // control-only liveness ACK before a PP binding hand-off
     LLM_CTRL_TOOL_WINDOW_SHADOW = 1u << 9, // execute actual redundant ShadowKV work during a control-only tool window
     LLM_CTRL_DEVICE_JOIN = 1u << 10,
+    LLM_CTRL_HAS_WEIGHT_LOAD = 1u << 11, // resident-weight upload for layers a migration is about to bring in
 };
+
+static constexpr NnUint LLM_WEIGHT_LOAD_MAGIC = 0x444c574cu; // 'LWLD'
+static constexpr NnUint LLM_WEIGHT_LOAD_VERSION = 1u;
+
+// Sent to the receiving stage right before the binding switch. The receiver
+// owns no weights for these layers yet (that residency is exactly what EV
+// pre-allocates and the reactive baselines do not), so this is the point where
+// a reactive baseline pays for them. The payload lists one layer per entry and
+// the worker streams that layer's tensors from the model file into VRAM,
+// charging the time to the migration stall.
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint layerCount;
+    NnUint reserved;
+} LlmWeightLoadHeader;
 
 static constexpr NnUint LLM_DEVICE_JOIN_MAGIC = 0x4e4f4a44u; // 'DJON'
 static constexpr NnUint LLM_DEVICE_JOIN_VERSION = 1u;
@@ -589,6 +619,12 @@ private:
     // background during idle windows; the trigger only transfers the delta.
     bool bgPrecopyEnabled = false;
     NnUint bgPrecopyMaxPasses = 0u;   // 0 = unlimited (DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES)
+    // EV reserves residency for the layers it may take over, before the fault.
+    // Every other arm learns the layer only at the trigger and therefore pays a
+    // weight upload inside the stall. Set by EDGEVISOR_WEIGHT_RESIDENCY=preallocated
+    // (EV hit) vs `on_demand` (everything else); the default is on_demand so a
+    // missing setting charges the cost rather than hiding it.
+    bool weightResidencyPreallocated = false;
     NnUint bgCopiedPos = 0u;
     unsigned long long bgPrecopyBytesTotal = 0u;
     unsigned long long bgPrecopyPasses = 0u;
@@ -674,6 +710,9 @@ private:
     void resetPendingKvMigrationState(const char *reason);
     bool verifyPendingLayerSwitchPrecommit();
     bool sendPendingLayerSwitchControlOnly();
+    // Asks the receiving stage to upload weights for these layers and waits for
+    // the upload to finish. No-op for arms that pre-reserved them at boot.
+    bool sendWeightLoadRequest(const std::vector<NnUint> &layers);
     void maybeApplyShiftedPpStartForStageMove(
         const std::vector<NnUint> &switchLayers,
         NnUint sourceNodeIndex,
@@ -752,6 +791,19 @@ public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex, NnUint logitsPipeIndex, Sampler *lastStageSampler);
     bool isSkipLogits() const { return (controlPacket.flags & LLM_CTRL_SKIP_LOGITS) != 0u; }
     bool tryReadControlPacket();
+
+    // Weight residency for migrated-in layers. `weightHostPath` is the local
+    // model file this worker booted from; a stage that did not pre-reserve a
+    // layer pulls its tensors from there when the migration reaches it.
+    void setWeightHostPath(const char *path) { weightHostPath_ = (path != nullptr) ? path : ""; }
+    bool hasPendingWeightLoads() const { return !pendingWeightLayers_.empty(); }
+    // Uploads every queued layer and returns the wall-clock cost in ms.
+    double applyPendingWeightLoads(NnExecutor *executor, const NnUnevenPartitionPlan *plan);
+    NnSize lastWeightLoadBytes() const { return lastWeightLoadBytes_; }
+private:
+    std::string weightHostPath_;
+    std::deque<NnUint> pendingWeightLayers_;
+    NnSize lastWeightLoadBytes_ = 0u;
 };
 
 typedef struct {

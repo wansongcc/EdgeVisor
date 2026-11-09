@@ -206,6 +206,35 @@ struct TestComputeDelayConfig {
     NnByte role = 255u;
 };
 
+// Fault schedule: a list of (posBegin, posEnd, slowdown) windows applied to the
+// stage that owns `node`. A slowdown of s makes one forward on that stage cost
+// s times its nominal time, which is what a clock/power cap looks like from the
+// rest of the pipeline. `window` fields are inclusive positions.
+//
+// Format (DLLAMA_FAULT_SCHEDULE):
+//     node:posBegin-posEnd:slowdown[,node:posBegin-posEnd:slowdown]...
+// e.g. "2:1000-1400:4,2:3000-3400:6"
+//
+// `DLLAMA_FAULT_SCHEDULE_CALIBRATE=1` measures this node's nominal forward time
+// during decode and uses it as the reference, so the injected slowdown is a
+// ratio rather than a wall-clock constant. Without calibration the schedule
+// falls back to DLLAMA_FAULT_STEP_COST_US (default 0 = disabled).
+struct FaultWindow {
+    long posBegin = 0;
+    long posEnd = 0;
+    double slowdown = 1.0;
+};
+
+struct FaultScheduleConfig {
+    bool enabled = false;
+    bool calibrate = false;
+    long node = -1;
+    long calibPosBegin = -1;
+    long calibPosEnd = -1;
+    long stepCostUs = 0;
+    std::vector<FaultWindow> windows;
+};
+
 static const TestComputeDelayConfig &testComputeDelayConfig() {
     static const TestComputeDelayConfig cfg = []() {
         TestComputeDelayConfig c;
@@ -260,6 +289,129 @@ static bool shouldInjectTestComputeDelay(const NnExecutorStep *step, const NnExe
     if (cfg.kind != 255u && context->segmentKinds[step->segmentIndex] != cfg.kind) return false;
     if (cfg.role != 255u && context->segmentRuntimeRoles[step->segmentIndex] != cfg.role) return false;
     return true;
+}
+
+// --- Fault schedule -------------------------------------------------------
+// Injects repeatable compute slowdowns on one stage. Unlike the one-shot
+// DLLAMA_TEST_COMPUTE_DELAY_* knob, this can fire several times inside a single
+// episode, each window a different severity, so recovery cost is measured
+// against a pipeline that degrades, recovers, and degrades again.
+static const FaultScheduleConfig &faultScheduleConfig() {
+    static const FaultScheduleConfig cfg = []() {
+        FaultScheduleConfig c;
+        const char *spec = std::getenv("DLLAMA_FAULT_SCHEDULE");
+        if (spec == nullptr || spec[0] == '\0') return c;
+        std::string text(spec);
+        std::stringstream ss(text);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (item.empty()) continue;
+            // node:posBegin-posEnd:slowdown
+            const size_t c1 = item.find(':');
+            if (c1 == std::string::npos) continue;
+            const size_t c2 = item.find(':', c1 + 1);
+            if (c2 == std::string::npos) continue;
+            try {
+                const long node = std::stol(item.substr(0, c1));
+                const std::string window = item.substr(c1 + 1, c2 - c1 - 1);
+                const double slowdown = std::stod(item.substr(c2 + 1));
+                const size_t dash = window.find('-');
+                if (dash == std::string::npos) continue;
+                FaultWindow w;
+                w.posBegin = std::stol(window.substr(0, dash));
+                w.posEnd = std::stol(window.substr(dash + 1));
+                w.slowdown = slowdown;
+                if (w.posEnd < w.posBegin || w.slowdown <= 1.0) continue;
+                if (c.node < 0) c.node = node;
+                if (c.node != node) continue;
+                c.windows.push_back(w);
+            } catch (...) {
+                continue;
+            }
+        }
+        c.enabled = !c.windows.empty();
+        c.calibrate = parseEnvBoolOr("DLLAMA_FAULT_SCHEDULE_CALIBRATE", true);
+        c.stepCostUs = parseEnvLongOr("DLLAMA_FAULT_STEP_COST_US", 0);
+        c.calibPosBegin = parseEnvLongOr("DLLAMA_FAULT_CALIB_POS_BEGIN", -1);
+        c.calibPosEnd = parseEnvLongOr("DLLAMA_FAULT_CALIB_POS_END", -1);
+        return c;
+    }();
+    return cfg;
+}
+
+// Nominal per-forward cost of this node, in microseconds. Calibrated from the
+// decode forwards that fall inside the calibration window; until enough
+// samples exist the schedule reports "not ready" so a half-learned baseline
+// never inflates a fault window.
+struct FaultCalibrationState {
+    double sumUs = 0.0;
+    long samples = 0;
+    std::atomic<long> publishedUs{0};
+    // Cost of one primary layer in this stage, in microseconds. This is the
+    // quantity the degradation scales; shadow work is excluded because it does
+    // not slow down with the clock.
+    std::atomic<long> publishedPerLayerUs{0};
+    // How many layers were executing when the baseline was taken.
+    NnUint layersAtCalibration = 0u;
+};
+
+static FaultCalibrationState &faultCalibrationState() {
+    static FaultCalibrationState state;
+    return state;
+}
+
+static bool faultCalibrationReady(const FaultScheduleConfig &cfg) {
+    return faultCalibrationState().publishedUs.load(std::memory_order_relaxed) > 0;
+}
+
+static void faultCalibrationObserve(const FaultScheduleConfig &cfg, const NnExecutorContext *context, double ms, NnUint primaryLayers) {
+    if (!cfg.calibrate || context == nullptr || ms <= 0.0) return;
+    if (cfg.calibPosBegin >= 0 && (long)context->position < cfg.calibPosBegin) return;
+    if (cfg.calibPosEnd >= 0 && (long)context->position > cfg.calibPosEnd) return;
+    if (primaryLayers == 0u) return;
+    FaultCalibrationState &state = faultCalibrationState();
+    state.sumUs += ms * 1000.0;
+    state.samples += 1;
+    state.layersAtCalibration = primaryLayers;
+    if (state.samples >= 8) {
+        const long avg = (long)(state.sumUs / (double)state.samples);
+        if (avg > 0) {
+            state.publishedUs.store(avg, std::memory_order_relaxed);
+            state.publishedPerLayerUs.store(avg / (long)primaryLayers, std::memory_order_relaxed);
+        }
+    }
+}
+
+// Layers this node executes on the current forward. The fault penalty is
+// per-layer, so it shrinks when a rebalance hands layers to a neighbour.
+//
+// Counts primary layers only. A redundant (shadow) segment is spare capacity
+// kept for a possible takeover, not work this stage must finish every token;
+// counting it would make EV's own preparation inflate the degradation penalty
+// and hide the benefit it is supposed to show.
+NnUint NnExecutor::countExecutedLayers() const {
+    if (nodeConfig == nullptr || segmentEnabled == nullptr || segmentRuntimeRoles.empty()) return 0u;
+    NnUint count = 0u;
+    for (NnUint s = 0u; s < nodeConfig->nSegments; ++s) {
+        if (s >= segmentRuntimeRoles.size()) break;
+        if (segmentEnabled[s].load(std::memory_order_relaxed) == 0u) continue;
+        if (segmentRuntimeRoles[s] != SEG_ROLE_PRIMARY) continue;
+        if (nodeConfig->segments[s].nOps == 0u) continue;
+        // One layer has an attention segment and an FFN segment; count the
+        // attention half so the total tracks layers, not segments.
+        if (segmentKinds.size() > s && segmentKinds[s] == SEG_KIND_ATTN) ++count;
+    }
+    return count;
+}
+
+static double faultSlowdownAt(const FaultScheduleConfig &cfg, const NnExecutorContext *context) {
+    if (!cfg.enabled || context == nullptr) return 1.0;
+    if (cfg.node >= 0 && (long)context->nodeIndex != cfg.node) return 1.0;
+    const long pos = (long)context->position;
+    for (const FaultWindow &w : cfg.windows) {
+        if (pos >= w.posBegin && pos <= w.posEnd) return w.slowdown;
+    }
+    return 1.0;
 }
 
 static std::unordered_set<NnUint> parseLayerSetEnv(const char *name) {
@@ -838,12 +990,50 @@ void NnExecutor::forward() {
     g_executorErrorClaim.clear(std::memory_order_release);
     assert(netExecution->batchSize > 0);
 
+    const auto forwardEntered = std::chrono::steady_clock::now();
     NnUint nThreads = netExecution->nThreads;
     context.isAlive.exchange(true);
     context.currentStepIndex.exchange(0);
     context.doneThreadCount.exchange(0);
     context.batchSize = netExecution->batchSize;
     context.position = netExecution->position;
+
+    // Fault schedule: charge this forward the extra time a degraded stage would
+    // need. Calibration yields a per-primary-layer cost, so the penalty is
+    // (slowdown-1) x (that cost) x (primary layers still here). A stage that
+    // handed layers away therefore pays less, which is what a rebalance buys.
+    //
+    // Deriving the cost per primary layer matters for EV: its forward also runs
+    // shadow segments, and those do not get slower when the clock drops. Taking
+    // the raw forward time as the baseline would double-count that preparation
+    // work into the degradation penalty.
+    const FaultScheduleConfig &faultCfg = faultScheduleConfig();
+    if (faultCfg.enabled) {
+        const double slowdown = faultSlowdownAt(faultCfg, &context);
+        if (slowdown > 1.0) {
+            const FaultCalibrationState &calib = faultCalibrationState();
+            const NnUint layersNow = countExecutedLayers();
+            const long perLayerUs = calib.publishedPerLayerUs.load(std::memory_order_relaxed);
+            const long baselineUs = faultCfg.stepCostUs > 0 ? faultCfg.stepCostUs : 0;
+            double extraUs = 0.0;
+            if (perLayerUs > 0 && layersNow > 0u) {
+                extraUs = (slowdown - 1.0) * (double)perLayerUs * (double)layersNow;
+            } else if (baselineUs > 0) {
+                extraUs = (slowdown - 1.0) * (double)baselineUs;
+            }
+            if (extraUs >= 1.0) {
+                static std::atomic<long> lastLoggedPos(-1);
+                if (lastLoggedPos.exchange((long)context.position) != (long)context.position) {
+                    std::printf("🧱 [fault] node=%d pos=%ld slowdown=%.2f layers=%u "
+                                "per_layer_us=%ld extra_us=%.0f\n",
+                        (int)context.nodeIndex, (long)context.position, slowdown,
+                        (unsigned)layersNow, perLayerUs, extraUs);
+                    std::fflush(stdout);
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds((long long)extraUs));
+            }
+        }
+    }
 
     resetBubbleShadowStateForForward();
 
@@ -866,6 +1056,28 @@ void NnExecutor::forward() {
     executorThreadHandler((void *)&threads[0]);
     for (threadIndex = 1; threadIndex < nThreads; threadIndex++)
         pthread_join(threads[threadIndex].handler, NULL);
+
+    // Calibrate the nominal forward cost used by the fault schedule. Only
+    // decode forwards before the first fault window are eligible, so the
+    // reference is never contaminated by the slowdown we are injecting.
+    if (faultCfg.enabled && faultCfg.calibrate && netExecution->batchSize == 1u) {
+        const long pos = (long)context.position;
+        bool beforeFirstFault = true;
+        for (const FaultWindow &w : faultCfg.windows) {
+            if (pos >= w.posBegin) { beforeFirstFault = false; break; }
+        }
+        if (beforeFirstFault) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - forwardEntered).count();
+            // Normalize to a per-primary-layer cost. The measured forward may
+            // also contain shadow (redundant) work, which a degradation does
+            // not scale; dividing by the primary layer count and multiplying
+            // back at fault time keeps the penalty proportional to the work
+            // that actually gets slower.
+            const NnUint primaries = countExecutedLayers();
+            faultCalibrationObserve(faultCfg, &context, ms, primaries);
+        }
+    }
 
     // Shadow work shares scratch buffers with primary compute. Run it only
     // after every primary executor thread has returned, never during sync.

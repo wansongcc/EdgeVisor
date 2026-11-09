@@ -208,6 +208,10 @@ private:
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
     NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool allowWhileRunning);
     bool isRedundantLayerActive(NnUint layerIndex) const;
+    // Layers this node currently executes, derived from the runtime gate. The
+    // fault penalty scales by this so a stage that gave layers away does not
+    // keep paying for work it no longer does.
+    NnUint countExecutedLayers() const;
     void noteShadowFilled(NnUint layerIndex);
     void replayRedundantLayer(NnUint layerIndex);
     void resetBubbleShadowStateForForward();

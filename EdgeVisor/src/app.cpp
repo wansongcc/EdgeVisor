@@ -2475,6 +2475,65 @@ bool resolvePpMigrationLayers(
     return true;
 }
 
+bool resolvePpMigrationLayersByOwnership(
+    const PlanCommand &command,
+    const NnUnevenPartitionPlan *plan,
+    const RuntimeStageLayerPlan *runtimePlan,
+    const RuntimePrimaryOwnership &ownership,
+    std::vector<NnUint> &layers,
+    std::string *reason) {
+    layers.clear();
+    auto reject = [&](const std::string &message) {
+        layers.clear();
+        if (reason != nullptr) *reason = message;
+        return false;
+    };
+    if (plan == nullptr || runtimePlan == nullptr || ownership.nLayers == 0u) {
+        return reject("missing ownership/partition plan");
+    }
+    NnUint fromNode = planCommandHasMoveList(command) ? command.moves[0].fromNodeIndex : command.fromNodeIndex;
+    NnUint toNode = planCommandHasMoveList(command) ? command.moves[0].toNodeIndex : command.toNodeIndex;
+    const NnStageConfig *fromStage = findStageForNodeLocal(plan, fromNode);
+    const NnStageConfig *toStage = findStageForNodeLocal(plan, toNode);
+    if (fromStage == nullptr || toStage == nullptr || fromStage->stageIndex == toStage->stageIndex) {
+        return reject("invalid PP stage route");
+    }
+    if (!areStagesAdjacentOnActivePpChain(plan, fromStage->stageIndex, toStage->stageIndex)) {
+        return reject("PP stages must be adjacent on the active chain");
+    }
+    const NnUint count = command.reserved0 > 0u ? command.reserved0 : 1u;
+
+    // Walk from the target boundary outward over layers the source still owns,
+    // taking the highest such layers. Repeated single-layer moves therefore
+    // consume the source's boundary layers in turn instead of retrying one.
+    std::vector<NnUint> candidates;
+    const bool movingForward = getPpNextStageIndex(plan, fromStage->stageIndex) == toStage->stageIndex;
+    const NnUint fromStart = fromStage->startLayer;
+    const NnUint fromEnd = fromStage->endLayer;   // exclusive
+    if (movingForward) {
+        for (NnUint layer = fromEnd; layer-- > fromStart;) {
+            candidates.push_back(layer);
+            if (layer == 0u) break;
+        }
+    } else {
+        for (NnUint layer = fromStart; layer < fromEnd; ++layer) candidates.push_back(layer);
+    }
+
+    for (NnUint layer : candidates) {
+        if (layers.size() >= count) break;
+        if (layer >= ownership.ownerByLayer.size()) continue;
+        if (ownership.ownerByLayer[layer] != fromStage->stageIndex) continue;
+        if (runtimePlan->getRole(toStage->stageIndex, layer) != RUNTIME_LAYER_REDUNDANT) continue;
+        layers.push_back(layer);
+    }
+    if (layers.empty()) {
+        return reject("source owns no transferable boundary layer");
+    }
+    std::sort(layers.begin(), layers.end());
+    if (reason != nullptr) reason->clear();
+    return true;
+}
+
 bool initializeRuntimePrimaryOwnership(
     const RuntimeStageLayerPlan *provisionMap,
     RuntimePrimaryOwnership &ownership,
@@ -2820,6 +2879,15 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     {
         const char *bgEnv = std::getenv("DLLAMA_BACKGROUND_PRECOPY");
         bgPrecopyEnabled = (bgEnv != nullptr && bgEnv[0] == '1');
+        // EV hit reserves layer weights before the fault; everything else pays
+        // at the trigger. Default is on_demand so an unset variable is charged.
+        const char *residencyEnv = std::getenv("EDGEVISOR_WEIGHT_RESIDENCY");
+        weightResidencyPreallocated = residencyEnv != nullptr &&
+            std::strcmp(residencyEnv, "preallocated") == 0;
+        if (!weightResidencyPreallocated && productLogLevel() >= 1) {
+            std::printf("🧱 [weight-load] residency=on_demand: uploading at trigger\n");
+            std::fflush(stdout);
+        }
         const char *bgMax = std::getenv("DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES");
         if (bgMax != nullptr && bgMax[0] != '\0') bgPrecopyMaxPasses = (NnUint)std::strtoul(bgMax, nullptr, 10);
         const char *pipeLive = std::getenv("DLLAMA_PIPELIVE_PATCH");
@@ -2939,25 +3007,45 @@ bool RootLlmInference::validatePpMigrationCommand(const PlanCommand &command, st
         return false;
     }
     std::vector<NnUint> layers;
-    if (!resolvePpMigrationLayers(command, plan, runtimePlan, layers, reason)) return false;
-    const NnUint sourceNode = planCommandHasMoveList(command) ? command.moves[0].fromNodeIndex : command.fromNodeIndex;
-    const NnStageConfig *source = findStageForNodeLocal(plan, sourceNode);
-    if (source == nullptr) return false;
-    std::lock_guard<std::mutex> lock(runtimeOwnershipMutex);
-    NnUint ownedCount = 0u;
-    for (NnUint owner : runtimePrimaryOwnership.ownerByLayer) if (owner == source->stageIndex) ++ownedCount;
-    for (NnUint layer : layers) {
-        if (layer >= runtimePrimaryOwnership.ownerByLayer.size() ||
-                runtimePrimaryOwnership.ownerByLayer[layer] != source->stageIndex) {
-            if (reason != nullptr) *reason = "source does not currently own the requested layer";
+    {
+        std::lock_guard<std::mutex> lock(runtimeOwnershipMutex);
+        // Prefer the ownership-aware resolution: after one move the static
+        // boundary layer belongs to the target, so asking for it again would be
+        // rejected even though the source still has transferable layers.
+        if (resolvePpMigrationLayersByOwnership(command, plan, runtimePlan, runtimePrimaryOwnership,
+                                                layers, reason)) {
+            NnUint ownedCount = 0u;
+            const NnUint sourceStageIndex =
+                findStageForNodeLocal(plan, planCommandHasMoveList(command) ? command.moves[0].fromNodeIndex
+                                                                           : command.fromNodeIndex)->stageIndex;
+            for (NnUint owner : runtimePrimaryOwnership.ownerByLayer) if (owner == sourceStageIndex) ++ownedCount;
+            if (layers.size() >= ownedCount) {
+                if (reason != nullptr) *reason = "PP migration would empty the current source stage";
+                return false;
+            }
+            return true;
+        }
+        const std::string ownershipReason = reason != nullptr ? *reason : std::string();
+        if (!resolvePpMigrationLayers(command, plan, runtimePlan, layers, reason)) return false;
+        if (reason != nullptr && !ownershipReason.empty()) reason->clear();
+        const NnUint sourceNode = planCommandHasMoveList(command) ? command.moves[0].fromNodeIndex : command.fromNodeIndex;
+        const NnStageConfig *source = findStageForNodeLocal(plan, sourceNode);
+        if (source == nullptr) return false;
+        NnUint ownedCount = 0u;
+        for (NnUint owner : runtimePrimaryOwnership.ownerByLayer) if (owner == source->stageIndex) ++ownedCount;
+        for (NnUint layer : layers) {
+            if (layer >= runtimePrimaryOwnership.ownerByLayer.size() ||
+                    runtimePrimaryOwnership.ownerByLayer[layer] != source->stageIndex) {
+                if (reason != nullptr) *reason = "source does not currently own the requested layer";
+                return false;
+            }
+        }
+        if (layers.size() >= ownedCount) {
+            if (reason != nullptr) *reason = "PP migration would empty the current source stage";
             return false;
         }
+        return true;
     }
-    if (layers.size() >= ownedCount) {
-        if (reason != nullptr) *reason = "PP migration would empty the current source stage";
-        return false;
-    }
-    return true;
 }
 
 void RootLlmInference::recordReservedJoin(NnUint donorStage, NnUint newStage, NnUint begin, NnUint end) {
@@ -4045,6 +4133,40 @@ bool RootLlmInference::verifyPendingLayerSwitchPrecommit() {
     return true;
 }
 
+// Tells the receiving stage to pull in weights for `layers` before the binding
+// switch. Only used when the arm did not pre-reserve them (EV reserves at boot),
+// so a reactive baseline charges the upload to the migration stall.
+bool RootLlmInference::sendWeightLoadRequest(const std::vector<NnUint> &layers) {
+    if (network == nullptr || layers.empty()) return false;
+    const NnUint targetNode = nextStageRootNode;
+    const int socketIndex = network->getSocketIndexForNode(targetNode, 0u);
+    if (socketIndex < 0) return false;
+
+    LlmControlPacket out = controlPacket;
+    out.flags = LLM_CTRL_HAS_WEIGHT_LOAD | LLM_CTRL_CONTROL_ONLY;
+    out.batchSize = 1u;
+    out.planCmdSeq = 0u;
+    logRootControlSend(out);
+    network->write((NnUint)socketIndex, &out, sizeof(out));
+
+    LlmWeightLoadHeader wh{};
+    wh.magic = LLM_WEIGHT_LOAD_MAGIC;
+    wh.version = LLM_WEIGHT_LOAD_VERSION;
+    wh.layerCount = (NnUint)layers.size();
+    wh.reserved = targetNode;
+    network->write((NnUint)socketIndex, &wh, sizeof(wh));
+    for (NnUint layer : layers) {
+        network->write((NnUint)socketIndex, &layer, sizeof(layer));
+    }
+    // The worker applies the upload while draining this control packet, before
+    // it can reach the switch packet, so the ACK below means "uploaded".
+    waitWorkerControlAck((NnUint)socketIndex, 30000);
+    std::printf("🧱 [weight-load] requested node=%u layers=%zu status=ok\n",
+        (unsigned)targetNode, layers.size());
+    std::fflush(stdout);
+    return true;
+}
+
 bool RootLlmInference::sendPendingLayerSwitchControlOnly() {
     if (network == nullptr) return false;
     std::vector<NnUint> switchLayers;
@@ -4891,6 +5013,9 @@ void RootLlmInference::forward(bool collectProfile) {
                     }
                     if (selfIsTarget) {
                         executor->setPrimaryLayerEnabled(layer, true);
+                        // Same as on the workers: the incoming layer exists here only
+                        // as a redundant segment, and that segment is what will run
+                        // it from now on. It is no longer a spare, so it must stay on.
                         executor->setRedundantLayerEnabled(layer, true);
                     }
                 }
@@ -5293,8 +5418,19 @@ void RootLlmInference::forward(bool collectProfile) {
             std::vector<NnUint> previousLayers = migrationLayers;
             std::sort(previousLayers.begin(), previousLayers.end());
             migrationLayers.clear();
-            const bool canApplyRoute = validRoute &&
-                resolvePpMigrationLayers(pc, plan, runtimePlan, migrationLayers, &rangeReason);
+            // Resolve against current ownership so a second migration in the
+            // same episode moves the next still-owned boundary layer instead of
+            // retrying the one the first move already gave away.
+            bool canApplyRoute = validRoute &&
+                resolvePpMigrationLayersByOwnership(pc, plan, runtimePlan, runtimePrimaryOwnership,
+                                                    migrationLayers, &rangeReason);
+            if (!canApplyRoute && validRoute) {
+                // Fall back to the static-boundary resolution for the first
+                // move of an episode, where ownership and the provision map
+                // still agree.
+                migrationLayers.clear();
+                canApplyRoute = resolvePpMigrationLayers(pc, plan, runtimePlan, migrationLayers, &rangeReason);
+            }
 
             if (canApplyRoute) {
                 std::vector<NnUint> appliedLayers = migrationLayers;
@@ -5501,6 +5637,9 @@ void RootLlmInference::forward(bool collectProfile) {
                 e5PhaseHook("freeze_quiesce", endPos, migrationFromNodeIndex, nextStageRootNode,
                     migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
                 e5MaybeFailMigrationPhaseOnce("DLLAMA_E5_FAIL_FREEZE_ONCE", "freeze_quiesce");
+                if (!weightResidencyPreallocated) {
+                    sendWeightLoadRequest(migrationLayers);
+                }
                 const bool collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes);
                 auto t1 = std::chrono::steady_clock::now();
                 uint64_t targetBytes = 0u;
@@ -5550,6 +5689,12 @@ void RootLlmInference::forward(bool collectProfile) {
             const bool bgActive = (bgPrecopyEnabled && bgPrecopyPasses > 0u);
             const NnUint deltaStart = bgActive ? (bgCopiedPos + 1u) : 0u;
             const bool fullyCopied = bgActive && (bgCopiedPos >= endPos);
+            // Weights first: a baseline that learns the route at the trigger
+            // owns no residency for these layers yet. Charging the upload here
+            // keeps it inside the measured stall, ahead of the KV move.
+            if (!weightResidencyPreallocated) {
+                sendWeightLoadRequest(migrationLayers);
+            }
             bool collected = true;
             if (!fullyCopied) {
                 collected = collectSourceStageKvTransfers(endPos, &exported, &queued, &sourceBytes, deltaStart);
@@ -5595,6 +5740,9 @@ void RootLlmInference::forward(bool collectProfile) {
             {
                 std::lock_guard<std::mutex> lk(kvTransferMutex);
                 pendingLayerSwitchLayers = migrationLayers;
+            }
+            if (!weightResidencyPreallocated) {
+                sendWeightLoadRequest(migrationLayers);
             }
             const bool switched = sendPendingLayerSwitchControlOnly();
             auto tSwitch = std::chrono::steady_clock::now();
@@ -5845,6 +5993,21 @@ bool WorkerLlmInference::tryReadControlPacket() {
         network->writeAck(ROOT_SOCKET_INDEX);
     }
 
+    if ((controlPacket.flags & LLM_CTRL_HAS_WEIGHT_LOAD) != 0u) {
+        LlmWeightLoadHeader wh{};
+        network->read(ROOT_SOCKET_INDEX, &wh, sizeof(wh));
+        if (wh.magic == LLM_WEIGHT_LOAD_MAGIC && wh.version == LLM_WEIGHT_LOAD_VERSION) {
+            for (NnUint i = 0u; i < wh.layerCount; ++i) {
+                NnUint layer = 0u;
+                network->read(ROOT_SOCKET_INDEX, &layer, sizeof(layer));
+                pendingWeightLayers_.push_back(layer);
+            }
+            std::printf("🧱 [weight-load] node=%u queued layers=%u\n",
+                (unsigned)localNodeIndex, (unsigned)pendingWeightLayers_.size());
+            std::fflush(stdout);
+        }
+    }
+
     if ((controlPacket.flags & LLM_CTRL_DEVICE_JOIN) != 0u) {
         LlmDeviceJoinPacket pkt{};
         network->read(ROOT_SOCKET_INDEX, &pkt, sizeof(pkt));
@@ -5914,6 +6077,35 @@ bool WorkerLlmInference::consumeLayerSwitch(LlmLayerSwitchPacket &packet) {
     packet = pendingLayerSwitches.front();
     pendingLayerSwitches.pop_front();
     return true;
+}
+
+// Streams each queued layer's tensors from the local model file into VRAM.
+// This is the cost a reactive baseline pays at the trigger for a layer it did
+// not keep residency for; EV has already paid it before the fault.
+double WorkerLlmInference::applyPendingWeightLoads(NnExecutor *executor, const NnUnevenPartitionPlan *plan) {
+    lastWeightLoadBytes_ = 0u;
+    if (executor == nullptr || pendingWeightLayers_.empty() || weightHostPath_.empty()) return 0.0;
+
+    std::unordered_set<NnUint> layers;
+    while (!pendingWeightLayers_.empty()) {
+        layers.insert(pendingWeightLayers_.front());
+        pendingWeightLayers_.pop_front();
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    LlmHeader header = loadLlmHeader(weightHostPath_.c_str(), 0u, F_32);
+    LlmNet tempNet = buildLlmNetUneven(&header, 1u, 1u, plan);
+    NnLocalWeightLoader loader(executor, localNodeIndex);
+    loadLlmNetWeightUnevenFiltered(weightHostPath_.c_str(), &tempNet, &loader, plan, localNodeIndex, &layers);
+    releaseLlmNet(&tempNet);
+    const auto finished = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(finished - started).count();
+    lastWeightLoadBytes_ = predictLlmLayerWeightBytes(weightHostPath_.c_str()) * (NnSize)layers.size();
+    std::printf("🧱 [weight-load] node=%u layers=%zu bytes=%llu elapsed_ms=%.3f\n",
+        (unsigned)localNodeIndex, layers.size(),
+        (unsigned long long)lastWeightLoadBytes_, ms);
+    std::fflush(stdout);
+    return ms;
 }
 
 bool WorkerLlmInference::consumePendingKvTransfer(LlmKvTransferHeader &hdr, std::vector<float> &kRow, std::vector<float> &vRow) {
@@ -7494,6 +7686,7 @@ void runWorkerApp(AppCliArgs *args) {
             lastStageSampler.reset(new Sampler((int)samplerVocabSize, boot.samplerTemperature, boot.samplerTopP, boot.samplerSeed));
         }
         WorkerLlmInference inference(&execution, network, nodeConfig.nodeIndex, logitsPipeIndex, lastStageSampler.get());
+        inference.setWeightHostPath(workerModelPath);
         const std::vector<NnUint> logitsSegmentIndices = findLogitsSegmentIndices(&nodeConfig);
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
@@ -7581,6 +7774,14 @@ void runWorkerApp(AppCliArgs *args) {
                     std::fflush(stdout);
                 }
 
+                // Weights for layers this stage is about to take over. Paid here,
+                // inside the migration's own path, so the root's stall timing
+                // includes them for any arm that did not pre-reserve the layer.
+                if (inference.hasPendingWeightLoads()) {
+                    inference.applyPendingWeightLoads(&executor, planPtr.get());
+                    network->writeAck(ROOT_SOCKET_INDEX);
+                }
+
                 LlmLayerSwitchPacket switchPkt{};
                 bool sawStageBypass = false;
                 NnUint bypassGeneration = 0u;
@@ -7631,8 +7832,13 @@ void runWorkerApp(AppCliArgs *args) {
                     }
                     if (localIsTargetStage) {
                         executor.setPrimaryLayerEnabled(switchPkt.boundaryLayer, true);
+                        // The target holds the incoming layer as a redundant segment
+                        // -- there is no primary segment for a layer this stage never
+                        // owned. So the redundant copy must stay enabled: it is the
+                        // execution path now, not a spare. Disabling it here would
+                        // silently drop the layer from the pipeline.
                         executor.setRedundantLayerEnabled(switchPkt.boundaryLayer, true);
-                        std::printf("🔁 [worker-switch] node=%u activate redundant layer=%u (target-stage)\n",
+                        std::printf("🔁 [worker-switch] node=%u promote shadow layer=%u to executing copy\n",
                             (unsigned)nodeConfig.nodeIndex,
                             (unsigned)switchPkt.boundaryLayer);
                         std::fflush(stdout);

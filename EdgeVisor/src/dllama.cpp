@@ -1129,19 +1129,28 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     // forward(), worker/profile waits, sampling/decoding, and token output/flush.
     if (context->args->showTerminalUi) edgeVisorUiOpen();
     const auto predWallStart = std::chrono::steady_clock::now();
+    // Anchor timestamps for every position a degradation can start at. The
+    // matrix injects several faults in one episode, so one mark is not enough.
+    std::vector<NnUint> markPositions;
+    if (const char *mark = std::getenv("DLLAMA_MARK_POS")) {
+        std::stringstream ss{std::string(mark)};
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (item.empty()) continue;
+            try { markPositions.push_back((NnUint)std::stoul(item)); } catch (...) {}
+        }
+    }
+    std::vector<NnUint> markedPositions;
     for (; pos < maxPos; pos++) {
         const auto tokenWallStart = std::chrono::steady_clock::now();
-        if (const char *mark = std::getenv("DLLAMA_MARK_POS")) {
-            if (mark[0] != '\0' && pos == (NnUint)std::strtoul(mark, nullptr, 10)) {
-                static bool marked = false;
-                if (!marked) {
-                    marked = true;
-                    const unsigned long long monoNs = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                    std::printf("[e1-mark] pos=%u t_mono_ns=%llu\n", (unsigned)pos, monoNs);
-                    std::fflush(stdout);
-                }
-            }
+        for (NnUint markPos : markPositions) {
+            if (pos != markPos) continue;
+            if (std::find(markedPositions.begin(), markedPositions.end(), pos) != markedPositions.end()) continue;
+            markedPositions.push_back(pos);
+            const unsigned long long monoNs = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::printf("[e1-mark] pos=%u t_mono_ns=%llu\n", (unsigned)pos, monoNs);
+            std::fflush(stdout);
         }
         maybeJoinReservedDevice(context, pos);
         context->inference->setPosition(pos);
@@ -1505,6 +1514,16 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
 #endif
         token = haveLastStageToken ? (int)lastStageToken : context->sampler->sample(context->inference->logitsPipe);
+        // Per-token completion timestamps. The matrix measures "trigger to the
+        // first token emitted on the new route", which needs the emission time
+        // of individual tokens, not just the episode total.
+        if (markPositions.size() > 0u) {
+            const unsigned long long tokenMonoNs =
+                (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::printf("[e1-token] pos=%u t_mono_ns=%llu\n", (unsigned)pos, tokenMonoNs);
+            std::fflush(stdout);
+        }
         // KV for this position is already written. Copy a chunk now and leave
         // the residual for the migration trigger.
         context->inference->runPipeLivePatch(pos);

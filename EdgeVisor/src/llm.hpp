@@ -6,6 +6,7 @@
 #include "nn/nn-network-local.hpp"
 #include "nn/nn-network.hpp"
 #include <vector>
+#include <unordered_set>
 
 
 enum LlmHeaderKey {
@@ -190,6 +191,17 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
 void loadLlmNetWeightUneven(const char* path, LlmNet *net, NnLocalWeightLoader *loader, const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+
+// Load only the listed transformer layers. Used by a receiving stage to pull in
+// weights for layers a migration is bringing over after the fact, instead of
+// holding them from boot. Returns the layer range it walked.
+void loadLlmNetWeightUnevenFiltered(const char *path, LlmNet *net, NnLocalWeightLoader *loader,
+                                    const NnUnevenPartitionPlan* plan, NnUint nodeIndex,
+                                    const std::unordered_set<NnUint> *onlyLayers);
+
+// Bytes one transformer layer of this model occupies in the weight file, so a
+// harness can predict the upload cost of an N-layer move.
+NnSize predictLlmLayerWeightBytes(const char* path);
 
 // Set enable plan barrier flag (called from app after reading bootstrap packet)
 void setEnablePlanBarrier(bool enable);

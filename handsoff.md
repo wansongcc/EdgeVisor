@@ -28,7 +28,7 @@
 
 ## 可变交接
 
-更新时间：2026-11-10 11:45 CST。分支 `exp/multifault-5dev-lab`（从 `exp/multifault-weights` @ `81cb8b7` 拉出，**未推送**）。
+更新时间：2026-11-10 13:50 CST。分支 `exp/multifault-5dev-lab`（从 `exp/multifault-weights` @ `81cb8b7` 拉出，已推送 GitHub `wansongcc/EdgeVisor`）。
 
 > **重要：上一段交接描述的 8B 矩阵不是这台机器上的。** `/tmp/ev_matrix_v2`、`/tmp/ev_st3b`、`/tmp/ev_e1_deprecated`、`/home/byh` 在本机都不存在，也没有 `run_8b.sh` / `e1_v2.py` 进程。那份矩阵在 `wansongcc/EdgeVisor` 的 `exp/multifault-weights` 分支上另一台机器里跑（`/home/byh/B01`）。本机是 `yahboom`（Orin NX 16GB），不是那台。
 

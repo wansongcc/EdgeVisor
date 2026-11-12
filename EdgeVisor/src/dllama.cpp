@@ -1898,6 +1898,29 @@ static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int
             std::printf("%s\n", nodeLine.c_str());
         }
     }
+    // Occupancy line: per node, how much of this token's wall time went to
+    // compute versus how long the device was free. Emitted for every episode
+    // token regardless of the general timing flag, because the bubble-coverage
+    // study needs the full series and nothing else.
+    //
+    // Two idle figures, because they answer different questions:
+    //   idle_avail = wall - exec
+    //       Everything the stage does not spend computing. A PP stage finishes
+    //       its slice and then waits for the rest of the ring to come round,
+    //       so most of this is real slack that a shadow pass could fill.
+    //   idle_strict = wall - exec - sync
+    //       The subset where the stage is not even waiting on a peer. Smaller,
+    //       and the conservative number when arguing that shadow work hides.
+    for (const LlmPerfPacket &packet : perf) {
+        const double execMs = (double)packet.execUs / 1000.0;
+        const double syncMs = (double)packet.syncUs / 1000.0;
+        const double idleAvail = wallMs > execMs ? wallMs - execMs : 0.0;
+        const double idleStrict = wallMs > execMs + syncMs ? wallMs - execMs - syncMs : 0.0;
+        std::printf("[occupancy] pos=%u node=%u stage=%u wall_ms=%.2f exec_ms=%.2f "
+                    "sync_ms=%.2f idle_avail_ms=%.2f idle_strict_ms=%.2f\n",
+            (unsigned)pos, (unsigned)packet.nodeIndex, (unsigned)packet.stageIndex,
+            wallMs, execMs, syncMs, idleAvail, idleStrict);
+    }
     std::fflush(stdout);
     appendEpisodeTokenCommit(phase, round, pos, inputToken, sampledToken);
     return sampledToken;
@@ -1947,8 +1970,11 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
     if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
         throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
     }
-    if (rounds.size() != 5u) {
-        throw std::runtime_error("Formal E1 episode requires exactly five ROUND records");
+    // The round count used to be pinned to five because every formal run had
+    // five. Different agent workloads have different tool-call cadences, so the
+    // count is now whatever the script declares.
+    if (rounds.empty()) {
+        throw std::runtime_error("Episode script declares no ROUND records");
     }
     NnUint pos = 0u;
     int currentToken = 0;
@@ -2280,8 +2306,8 @@ static void inferenceRunMultiSessionEpisode(AppInferenceContext *context, const 
     if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
         throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
     }
-    if (rounds.size() != 5u) {
-        throw std::runtime_error("Formal E3 episode requires exactly five ROUND records");
+    if (rounds.empty()) {
+        throw std::runtime_error("Episode script declares no ROUND records");
     }
     if (sessionCount < 1u || sessionCount > 64u) {
         throw std::runtime_error("DLLAMA_MULTI_SESSION_COUNT must be within 1..64");

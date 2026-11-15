@@ -1,0 +1,8 @@
+# stage priority reason
+# Read only when EDGEVISOR_SHADOW_ALLOCATION=priority or reversed.
+# Weights: low=2 mid=3 high=4. Missing stages stay mid.
+# reversed swaps low and high. equal ignores this file.
+0 low dedicated-and-plugged-in
+1 high mobile-unplugged
+2 mid shared-workstation
+3 low dedicated-and-plugged-in

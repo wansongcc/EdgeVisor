@@ -405,16 +405,172 @@ inline std::vector<unsigned> bubbleShadowLayerCap(
     return cap;
 }
 
+// Split one device's shadow budget between the two directions it can serve.
+//
+// budget is what this device can hold on top of its own primary layers.
+// leftCap and rightCap are the most the left and right neighbor can take
+// without being emptied, so nothing here can hand a neighbor more than
+// primary-1. A zero cap or a zero weight means that side does not take part:
+// the whole budget then goes to the other side, still under its cap. Two
+// inactive sides leave both directions at zero.
+//
+// Both sides take their proportional floor first, computed with the largest
+// remainder method so integer rounding is decided once instead of drifting
+// over calls. The leftover goes one layer at a time to a side that is still
+// under its cap and has the larger remainder; an exact tie goes left. A side
+// that just took a layer drops its remainder to zero, so the next tie does not
+// keep feeding the same side.
+//
+// The weights are a starting point for experiments, not a tuned result: they
+// exist so a run can be biased without touching the caps.
+inline void splitDeviceShadowBudget(
+    unsigned budget,
+    unsigned leftCap,
+    unsigned rightCap,
+    unsigned leftWeight,
+    unsigned rightWeight,
+    unsigned *xLeft,
+    unsigned *xRight) {
+    unsigned left = 0u;
+    unsigned right = 0u;
+    const bool leftActive = leftCap > 0u && leftWeight > 0u;
+    const bool rightActive = rightCap > 0u && rightWeight > 0u;
+    if (leftActive && rightActive) {
+        const unsigned long long weightSum =
+            (unsigned long long)leftWeight + (unsigned long long)rightWeight;
+        const unsigned long long wanted = std::min<unsigned long long>(
+            (unsigned long long)budget, (unsigned long long)leftCap + (unsigned long long)rightCap);
+        const unsigned long long leftScaled = wanted * (unsigned long long)leftWeight;
+        const unsigned long long rightScaled = wanted * (unsigned long long)rightWeight;
+        left = (unsigned)std::min<unsigned long long>(leftScaled / weightSum, (unsigned long long)leftCap);
+        right = (unsigned)std::min<unsigned long long>(rightScaled / weightSum, (unsigned long long)rightCap);
+        unsigned long long leftRemainder = leftScaled % weightSum;
+        unsigned long long rightRemainder = rightScaled % weightSum;
+        unsigned long long leftover =
+            wanted - (unsigned long long)left - (unsigned long long)right;
+        while (leftover > 0ull) {
+            const bool leftRoom = left < leftCap;
+            const bool rightRoom = right < rightCap;
+            if (!leftRoom && !rightRoom) break;
+            bool takeLeft = leftRoom;
+            if (leftRoom && rightRoom) takeLeft = leftRemainder >= rightRemainder;
+            if (takeLeft) {
+                left += 1u;
+                leftRemainder = 0ull;
+            } else {
+                right += 1u;
+                rightRemainder = 0ull;
+            }
+            leftover -= 1ull;
+        }
+    } else if (leftActive) {
+        left = std::min(budget, leftCap);
+    } else if (rightActive) {
+        right = std::min(budget, rightCap);
+    }
+    if (xLeft != nullptr) *xLeft = left;
+    if (xRight != nullptr) *xRight = right;
+}
+
+// Parses a shadow priority file: one stage per line, "<stage> <priority>
+// [reason]". Blank lines and lines whose first non-space character is '#'
+// are skipped, so config/shadow_priorities.example reads as written. The
+// priority token is case-insensitive: low=2, mid and medium=3, high=4. A later
+// line for the same stage wins, and a stage that never appears keeps mid, so
+// an empty file means the equal split. On a bad stage index or an unknown
+// token the reason lands in error and parsing stops; weights keep whatever was
+// already written.
+inline bool parseShadowPriorityText(
+    const std::string &text,
+    unsigned nStages,
+    std::vector<unsigned> *weights,
+    std::string *error) {
+    if (weights == nullptr) return false;
+    weights->assign(nStages, 3u);
+    std::size_t pos = 0u;
+    unsigned lineNumber = 0u;
+    while (pos < text.size()) {
+        const std::size_t newline = text.find('\n', pos);
+        const std::size_t lineEnd = newline == std::string::npos ? text.size() : newline;
+        std::string line = text.substr(pos, lineEnd - pos);
+        pos = newline == std::string::npos ? text.size() : newline + 1u;
+        ++lineNumber;
+        const std::size_t first = line.find_first_not_of(" \t\r\v\f");
+        if (first == std::string::npos) continue;
+        if (line[first] == '#') continue;
+        std::istringstream fields(line.substr(first));
+        std::string indexToken;
+        if (!(fields >> indexToken)) continue;
+        char *stop = nullptr;
+        const unsigned long index = std::strtoul(indexToken.c_str(), &stop, 10);
+        if (stop == indexToken.c_str() || *stop != '\0') {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": stage '" + indexToken + "' is not a number";
+            }
+            return false;
+        }
+        if (index >= (unsigned long)nStages) {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": stage " + indexToken
+                    + " is outside " + std::to_string(nStages) + " stages";
+            }
+            return false;
+        }
+        std::string priorityToken;
+        if (!(fields >> priorityToken)) {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": stage " + indexToken + " has no priority";
+            }
+            return false;
+        }
+        std::string token = priorityToken;
+        for (std::size_t i = 0u; i < token.size(); ++i) {
+            if (token[i] >= 'A' && token[i] <= 'Z') token[i] = (char)(token[i] - 'A' + 'a');
+        }
+        unsigned weight = 0u;
+        if (token == "low") weight = 2u;
+        else if (token == "mid" || token == "medium") weight = 3u;
+        else if (token == "high") weight = 4u;
+        else {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": unknown priority '" + priorityToken + "'";
+            }
+            return false;
+        }
+        // A later line for the same stage wins.
+        (*weights)[index] = weight;
+    }
+    return true;
+}
+
+// Low and high trade places. Reversed mode reads the same file as priority
+// mode but asks the opposite question: whether the experiment holds up when
+// the quiet neighbors get the shadow instead.
+inline void reverseShadowPriorityWeights(std::vector<unsigned> *weights) {
+    if (weights == nullptr) return;
+    for (std::size_t i = 0u; i < weights->size(); ++i) {
+        if ((*weights)[i] == 2u) (*weights)[i] = 4u;
+        else if ((*weights)[i] == 4u) (*weights)[i] = 2u;
+    }
+}
+
 // After the primary split, each stage may keep extra layers up to the tighter
 // of two caps: leftover memory (70% of free memory, one layer of headroom)
 // and the bubble depth from bubbleShadowLayerCap. A null bubble cap means
 // "memory only", which is what the older callers asked for. A stage with two
-// neighbors spends that spare on both boundaries. A stage is never emptied,
-// so a neighbor with N primary layers can donate at most N-1.
+// neighbors divides its spare between both boundaries with
+// splitDeviceShadowBudget. A stage is never emptied, so a neighbor with N
+// primary layers can take at most N-1 from this stage.
+//
+// priorityWeight scores the neighbor being protected, not the stage holding
+// the copy: a high-priority neighbor pulls more shadow onto both of its peers.
+// A null vector, or a vector shorter than the pipeline, means mid weights
+// everywhere, which reproduces the equal split the older callers relied on.
 inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
     const std::vector<unsigned> &primary,
     const std::vector<unsigned> &memoryCap,
-    const std::vector<unsigned> *bubbleCap = nullptr) {
+    const std::vector<unsigned> *bubbleCap = nullptr,
+    const std::vector<unsigned> *priorityWeight = nullptr) {
     const unsigned n = (unsigned)std::min(primary.size(), memoryCap.size());
     std::vector<unsigned> spare(n, 0u);
     for (unsigned i = 0; i < n; ++i) {
@@ -425,25 +581,18 @@ inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
         spare[i] = limit;
     }
     std::vector<BoundaryOverlap> overlaps(n < 2u ? 0u : n - 1u);
-    bool grew = true;
-    while (grew) {
-        grew = false;
-        for (unsigned boundary = 0u; boundary + 1u < n; ++boundary) {
-            const unsigned left = boundary;
-            const unsigned right = boundary + 1u;
-            const unsigned maxLeftHolds = primary[right] > 0u ? primary[right] - 1u : 0u;
-            const unsigned maxRightHolds = primary[left] > 0u ? primary[left] - 1u : 0u;
-            if (spare[left] > 0u && overlaps[boundary].leftHolds < maxLeftHolds) {
-                overlaps[boundary].leftHolds += 1u;
-                spare[left] -= 1u;
-                grew = true;
-            }
-            if (spare[right] > 0u && overlaps[boundary].rightHolds < maxRightHolds) {
-                overlaps[boundary].rightHolds += 1u;
-                spare[right] -= 1u;
-                grew = true;
-            }
-        }
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned leftCap = i > 0u && primary[i - 1u] > 0u ? primary[i - 1u] - 1u : 0u;
+        const unsigned rightCap = i + 1u < n && primary[i + 1u] > 0u ? primary[i + 1u] - 1u : 0u;
+        const unsigned leftWeight = i > 0u && priorityWeight != nullptr
+            && i - 1u < priorityWeight->size() ? (*priorityWeight)[i - 1u] : 3u;
+        const unsigned rightWeight = i + 1u < n && priorityWeight != nullptr
+            && i + 1u < priorityWeight->size() ? (*priorityWeight)[i + 1u] : 3u;
+        unsigned xLeft = 0u;
+        unsigned xRight = 0u;
+        splitDeviceShadowBudget(spare[i], leftCap, rightCap, leftWeight, rightWeight, &xLeft, &xRight);
+        if (i > 0u) overlaps[i - 1u].rightHolds = xLeft;
+        if (i + 1u < n) overlaps[i].leftHolds = xRight;
     }
     return overlaps;
 }

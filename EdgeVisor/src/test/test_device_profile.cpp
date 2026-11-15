@@ -202,6 +202,83 @@ int main() {
     expect(residentCap < syncCap && residentCap >= 1u,
         "full F32 KV admits fewer resident layers than the sync-byte cap");
 
+    // Four stages of 7 layers with a cap of 13: each device has 6 spare and a
+    // single side can take all 6. Equal weights must reproduce the old
+    // round-robin result exactly, otherwise every earlier run changed meaning.
+    std::vector<unsigned> fourPrimary(4u, 7u);
+    std::vector<unsigned> fourCaps(4u, 13u);
+    std::vector<unsigned> equalWeights(4u, 3u);
+    const std::vector<BoundaryOverlap> equalOverlaps =
+        assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &equalWeights);
+    expect(formatBoundaryOverlap(assignBoundaryOverlap(fourPrimary, fourCaps)) == "6,3;3,3;3,6",
+        "equal weights reproduce the default split");
+    expect(formatBoundaryOverlap(equalOverlaps) == "6,3;3,3;3,6",
+        "an explicit mid weight vector matches a null one");
+    if (equalOverlaps.size() == 3u) {
+        expect(equalOverlaps[1].rightHolds == 3u && equalOverlaps[2].leftHolds == 3u,
+            "stage 2 splits its spare evenly across both boundaries");
+    } else {
+        expect(false, "four stages produce three boundaries");
+    }
+
+    // The high neighbor pulls copies onto both of its peers; the low neighbor
+    // pulls fewer. Weighting the holder instead would swap these numbers.
+    std::vector<unsigned> highB(4u, 3u);
+    highB[1] = 4u;
+    highB[3] = 2u;
+    const std::vector<BoundaryOverlap> highBOverlaps =
+        assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &highB);
+    expect(highBOverlaps.size() == 3u
+        && highBOverlaps[1].rightHolds == 4u && highBOverlaps[2].leftHolds == 2u,
+        "a high-priority left neighbor takes more of the middle stage's spare");
+
+    std::vector<unsigned> highD(4u, 3u);
+    highD[1] = 2u;
+    highD[3] = 4u;
+    const std::vector<BoundaryOverlap> highDOverlaps =
+        assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &highD);
+    expect(highDOverlaps.size() == 3u
+        && highDOverlaps[1].rightHolds == 2u && highDOverlaps[2].leftHolds == 4u,
+        "a high-priority right neighbor takes more of the middle stage's spare");
+
+    unsigned xLeft = 0u;
+    unsigned xRight = 0u;
+    splitDeviceShadowBudget(5u, 10u, 10u, 4u, 2u, &xLeft, &xRight);
+    expect(xLeft == 3u && xRight == 2u, "a 2:1 weight split gives the larger side the extra layer");
+    splitDeviceShadowBudget(5u, 10u, 10u, 3u, 3u, &xLeft, &xRight);
+    expect(xLeft == 3u && xRight == 2u, "an exact tie goes to the left side");
+    splitDeviceShadowBudget(10u, 2u, 100u, 3u, 3u, &xLeft, &xRight);
+    expect(xLeft == 2u && xRight == 8u, "a capped side hands the rest to its neighbor");
+    splitDeviceShadowBudget(6u, 0u, 6u, 4u, 2u, &xLeft, &xRight);
+    expect(xLeft == 0u && xRight == 6u, "an inactive side keeps nothing and the budget goes across");
+
+    // The example file is the contract for the parser: comment lines are
+    // skipped, missing stages stay mid, and reversed swaps the extremes.
+    const std::string exampleText =
+        "# stage priority reason\n"
+        "# Read only when EDGEVISOR_SHADOW_ALLOCATION=priority or reversed.\n"
+        "# Weights: low=2 mid=3 high=4. Missing stages stay mid.\n"
+        "# reversed swaps low and high. equal ignores this file.\n"
+        "0 low dedicated-and-plugged-in\n"
+        "1 high mobile-unplugged\n"
+        "2 mid shared-workstation\n"
+        "3 low dedicated-and-plugged-in\n";
+    std::vector<unsigned> parsedWeights;
+    std::string parseError;
+    expect(parseShadowPriorityText(exampleText, 4u, &parsedWeights, &parseError), "the example file parses");
+    expect(parsedWeights.size() == 4u
+        && parsedWeights[0] == 2u && parsedWeights[1] == 4u
+        && parsedWeights[2] == 3u && parsedWeights[3] == 2u,
+        "the example file reads as low, high, mid, low");
+    reverseShadowPriorityWeights(&parsedWeights);
+    expect(parsedWeights.size() == 4u
+        && parsedWeights[0] == 4u && parsedWeights[1] == 2u
+        && parsedWeights[2] == 3u && parsedWeights[3] == 4u,
+        "reversed swaps low and high and leaves mid alone");
+    std::vector<unsigned> outOfRange;
+    expect(!parseShadowPriorityText("9 high\n", 4u, &outOfRange, &parseError),
+        "a stage index past the pipeline is rejected");
+
     if (g_failures != 0) {
         std::fprintf(stderr, "%d device profile checks failed\n", g_failures);
         return 1;

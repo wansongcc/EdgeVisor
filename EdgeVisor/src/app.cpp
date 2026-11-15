@@ -6563,11 +6563,13 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     if (args == nullptr || plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return;
     if (!args->enablePpMigration && !bubbleShadowKvEnabled()) return;
     if (args->runtimeRedundantBoundaryLayersExplicit) {
+        std::printf("shadow-alloc: bypass reason=explicit-boundary-layers\n");
         unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
         return;
     }
     const char *pinned = std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
     if (pinned != nullptr && pinned[0] != '\0') {
+        std::printf("shadow-alloc: bypass reason=pinned-depths\n");
         g_autoBoundaryDepths = pinned;
         args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
         return;
@@ -6602,7 +6604,61 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
 
     const std::vector<unsigned> bubbleCap = bubbleShadowLayerCap(primary, layerMs);
-    const std::vector<BoundaryOverlap> overlaps = assignBoundaryOverlap(primary, caps, &bubbleCap);
+
+    // Which neighbor each device protects is an experiment knob, so the mode
+    // only changes the weights fed to the allocator; the caps above still
+    // decide whether a layer may be placed at all.
+    const char *modeEnv = std::getenv("EDGEVISOR_SHADOW_ALLOCATION");
+    std::string mode = modeEnv == nullptr ? std::string("equal") : std::string(modeEnv);
+    std::string modeKey = mode;
+    for (std::size_t i = 0u; i < modeKey.size(); ++i) {
+        if (modeKey[i] >= 'A' && modeKey[i] <= 'Z') modeKey[i] = (char)(modeKey[i] - 'A' + 'a');
+    }
+    bool equalMode = true;
+    bool reversed = false;
+    const char *modeLabel = "equal";
+    if (modeKey.empty() || modeKey == "equal") {
+        equalMode = true;
+    } else if (modeKey == "priority") {
+        equalMode = false;
+        modeLabel = "priority";
+    } else if (modeKey == "reversed") {
+        equalMode = false;
+        reversed = true;
+        modeLabel = "reversed";
+    } else {
+        std::fprintf(stderr, "shadow-alloc: unknown EDGEVISOR_SHADOW_ALLOCATION=%s, using equal\n", mode.c_str());
+        equalMode = true;
+    }
+
+    std::vector<unsigned> weights(plan->nStages, 3u);
+    if (!equalMode) {
+        const char *path = std::getenv("EDGEVISOR_SHADOW_PRIORITY_FILE");
+        bool loaded = false;
+        if (path == nullptr || path[0] == '\0') {
+            std::fprintf(stderr, "shadow-alloc: EDGEVISOR_SHADOW_PRIORITY_FILE is not set, using mid weights\n");
+        } else {
+            std::ifstream file(path);
+            if (!file.is_open()) {
+                std::fprintf(stderr, "shadow-alloc: cannot open %s, using mid weights\n", path);
+            } else {
+                std::ostringstream buffer;
+                buffer << file.rdbuf();
+                std::string error;
+                loaded = parseShadowPriorityText(buffer.str(), (unsigned)plan->nStages, &weights, &error);
+                if (!loaded) {
+                    std::fprintf(stderr, "shadow-alloc: %s: %s, using mid weights\n", path, error.c_str());
+                }
+            }
+        }
+        if (!loaded) weights.assign(plan->nStages, 3u);
+        else if (reversed) reverseShadowPriorityWeights(&weights);
+    }
+
+    const std::vector<BoundaryOverlap> equalOverlaps = assignBoundaryOverlap(primary, caps, &bubbleCap);
+    const std::vector<BoundaryOverlap> overlaps = equalMode
+        ? equalOverlaps
+        : assignBoundaryOverlap(primary, caps, &bubbleCap, &weights);
     g_autoBoundaryDepths = formatBoundaryOverlap(overlaps);
     if (g_autoBoundaryDepths.empty()) {
         unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
@@ -6610,6 +6666,12 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
     setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", g_autoBoundaryDepths.c_str(), 1);
     args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
+    std::printf("shadow-priority: mode=%s applied=", modeLabel);
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        if (s > 0u) std::printf(",");
+        std::printf("%u", weights[s]);
+    }
+    std::printf("\nshadow-equal: %s\n", formatBoundaryOverlap(equalOverlaps).c_str());
     std::printf("redundancy:");
     for (size_t i = 0u; i < overlaps.size(); ++i) {
         std::printf(" %u->%u %u,%u", (unsigned)i, (unsigned)(i + 1u),

@@ -489,11 +489,10 @@ struct DeviceCondition {
 // ran; they are not fitted optimal parameters. Zero means "no evidence", and
 // combineDeviceRiskWeight keeps that out of the low tier.
 inline unsigned thermalRisk(const DeviceCondition &condition) {
+    // A known temperature is evidence even when the throttle flags are missing.
+    // Jetson reports [N/A] for those flags and keeps the real value in sysfs.
     if (condition.thermalLimited == 1 || condition.temperatureC >= 83) return 4u;
-    const bool temperatureKnown = condition.temperatureC >= 0;
-    if (temperatureKnown && condition.thermalLimited == 0) {
-        return condition.temperatureC >= 70 ? 3u : 2u;
-    }
+    if (condition.temperatureC >= 0) return condition.temperatureC >= 70 ? 3u : 2u;
     return 0u;
 }
 

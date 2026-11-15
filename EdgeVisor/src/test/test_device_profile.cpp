@@ -313,6 +313,12 @@ int main() {
     unknownThermal.temperatureC = tempC;
     unknownThermal.thermalLimited = limited;
     expect(thermalRisk(unknownThermal) == 0u, "an unknown thermal state is not a tier");
+    DeviceCondition zoneOnly;
+    zoneOnly.temperatureC = 53;
+    zoneOnly.thermalLimited = -1;
+    expect(thermalRisk(zoneOnly) == 2u, "a sysfs temperature counts when the throttle flags are missing");
+    zoneOnly.temperatureC = 75;
+    expect(thermalRisk(zoneOnly) == 3u, "75C from sysfs is the mid thermal tier");
     expect(!parseNvidiaTemperatureCsv("30, Not Active, Not Active", &tempC, &limited),
         "a short csv line is rejected");
 

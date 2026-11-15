@@ -108,12 +108,37 @@ static int readOnExternalPower() {
 }
 #endif
 
+#if defined(__linux__)
+// nvidia-smi on Jetson often prints [N/A] for temperature. The kernel still
+// publishes gpu-thermal in millidegrees. The hottest zone wins when several
+// GPUs share the node and this process was not given an index.
+static int readGpuThermalZoneC() {
+    DIR *dir = opendir("/sys/class/thermal");
+    if (dir == nullptr) return -1;
+    int best = -1;
+    while (struct dirent *entry = readdir(dir)) {
+        if (std::strncmp(entry->d_name, "thermal_zone", 12) != 0) continue;
+        const std::string base = std::string("/sys/class/thermal/") + entry->d_name;
+        if (readSupplyAttr((base + "/type").c_str()) != "gpu-thermal") continue;
+        const std::string milli = readSupplyAttr((base + "/temp").c_str());
+        char *stop = nullptr;
+        const long parsed = std::strtol(milli.c_str(), &stop, 10);
+        if (stop == milli.c_str() || *stop != '\0' || parsed < 0) continue;
+        const int celsius = (int)(parsed / 1000L);
+        if (celsius > best) best = celsius;
+    }
+    closedir(dir);
+    return best;
+}
+#endif
+
 DeviceCondition measureLocalCondition() {
     DeviceCondition condition;
     // Neither probe is allowed to take the process down: a machine without a
     // GPU or without sysfs simply reports those fields as unknown.
     queryNvidiaCondition(&condition.temperatureC, &condition.thermalLimited);
 #if defined(__linux__)
+    if (condition.temperatureC < 0) condition.temperatureC = readGpuThermalZoneC();
     condition.onExternalPower = readOnExternalPower();
 #endif
     return condition;

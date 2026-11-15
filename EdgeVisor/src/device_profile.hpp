@@ -472,6 +472,109 @@ inline void splitDeviceShadowBudget(
     if (xRight != nullptr) *xRight = right;
 }
 
+// What a device says about itself at startup, plus the round trip this side
+// measured to it. A field keeps -1 (or zero probes) when nothing could be read,
+// and unknown never counts as low risk.
+struct DeviceCondition {
+    int temperatureC = -1;     // -1 unknown
+    int thermalLimited = -1;   // -1 unknown, 0 no, 1 yes
+    int onExternalPower = -1;  // -1 unknown, 0 on battery, 1 on external power
+    unsigned probesSent = 0u;
+    unsigned probesLost = 0u;
+    double rttMeanMs = -1.0;   // <0 unknown
+    double rttJitterMs = -1.0; // <0 unknown. Jitter is the mean absolute deviation from the mean.
+};
+
+// The tier edges below are a fixed starting point chosen before the experiment
+// ran; they are not fitted optimal parameters. Zero means "no evidence", and
+// combineDeviceRiskWeight keeps that out of the low tier.
+inline unsigned thermalRisk(const DeviceCondition &condition) {
+    if (condition.thermalLimited == 1 || condition.temperatureC >= 83) return 4u;
+    const bool temperatureKnown = condition.temperatureC >= 0;
+    if (temperatureKnown && condition.thermalLimited == 0) {
+        return condition.temperatureC >= 70 ? 3u : 2u;
+    }
+    return 0u;
+}
+
+// Loss is part of the tier even though a TCP probe cannot observe it: a caller
+// that does know the loss can set probesLost and get the top tier.
+inline unsigned networkRisk(const DeviceCondition &condition) {
+    if (condition.probesSent == 0u || condition.rttMeanMs < 0.0) return 0u;
+    const double jitter = condition.rttJitterMs < 0.0 ? 0.0 : condition.rttJitterMs;
+    if (condition.probesLost == 0u && condition.rttMeanMs < 20.0 && jitter < 5.0) return 2u;
+    if (condition.probesLost == 0u && condition.rttMeanMs < 80.0 && jitter < 20.0) return 3u;
+    return 4u;
+}
+
+inline unsigned powerRisk(const DeviceCondition &condition) {
+    if (condition.onExternalPower < 0) return 0u;
+    return condition.onExternalPower == 0 ? 4u : 2u;
+}
+
+// The worst known tier wins, because a device only has to be bad in one way to
+// slow the pipeline. With no evidence at all the device lands in the middle
+// tier, since unknown is not the same as healthy.
+inline unsigned combineDeviceRiskWeight(const DeviceCondition &condition) {
+    const unsigned thermal = thermalRisk(condition);
+    const unsigned network = networkRisk(condition);
+    const unsigned power = powerRisk(condition);
+    unsigned weight = thermal > network ? thermal : network;
+    if (power > weight) weight = power;
+    return weight > 0u ? weight : 3u;
+}
+
+// One `nvidia-smi --format=csv,noheader` line: the temperature followed by the
+// hw thermal, sw thermal, and hw power brake slowdown reasons. Fewer than four
+// fields is a malformed line and returns false. A field that does not parse
+// leaves its own value unknown instead of failing the whole line.
+inline bool parseNvidiaTemperatureCsv(const char *line, int *tempC, int *thermalLimited) {
+    if (tempC != nullptr) *tempC = -1;
+    if (thermalLimited != nullptr) *thermalLimited = -1;
+    if (line == nullptr || tempC == nullptr || thermalLimited == nullptr) return false;
+    std::vector<std::string> fields;
+    std::string field;
+    for (const char *cursor = line; ; ++cursor) {
+        const bool atEnd = *cursor == '\0';
+        if (!atEnd && *cursor != ',') {
+            field.push_back(*cursor);
+            continue;
+        }
+        const std::size_t first = field.find_first_not_of(" \t\r\n\v\f");
+        const std::size_t last = field.find_last_not_of(" \t\r\n\v\f");
+        fields.push_back(first == std::string::npos ? std::string() : field.substr(first, last - first + 1u));
+        field.clear();
+        if (atEnd) break;
+    }
+    if (fields.size() < 4u) return false;
+    char *stop = nullptr;
+    const long parsed = std::strtol(fields[0].c_str(), &stop, 10);
+    if (stop != fields[0].c_str() && *stop == '\0') *tempC = (int)parsed;
+    unsigned active = 0u;
+    unsigned notActive = 0u;
+    for (std::size_t i = 1u; i < 4u; ++i) {
+        if (fields[i] == "Active") ++active;
+        else if (fields[i] == "Not Active") ++notActive;
+    }
+    if (active > 0u) *thermalLimited = 1;
+    else if (notActive == 3u) *thermalLimited = 0;
+    return true;
+}
+
+// sysfs reports supplies one line at a time, so the caller does the scanning and
+// this decides the single state. Discharging wins over an online main: a laptop
+// on a weak charger is still spending battery.
+inline int externalPowerFromSupplies(bool sawSupply, bool batteryDischarging, bool externalOnline) {
+    if (!sawSupply) return -1;
+    if (batteryDischarging) return 0;
+    if (externalOnline) return 1;
+    return -1;
+}
+
+// Fills the thermal and power fields from this machine. The network fields stay
+// unknown: only the caller knows the peer it wants to measure.
+DeviceCondition measureLocalCondition();
+
 // Parses a shadow priority file: one stage per line, "<stage> <priority>
 // [reason]". Blank lines and lines whose first non-space character is '#'
 // are skipped, so config/shadow_priorities.example reads as written. The

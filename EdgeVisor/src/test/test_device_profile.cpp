@@ -256,9 +256,14 @@ int main() {
     // skipped, missing stages stay mid, and reversed swaps the extremes.
     const std::string exampleText =
         "# stage priority reason\n"
-        "# Read only when EDGEVISOR_SHADOW_ALLOCATION=priority or reversed.\n"
+        "# Read only when EDGEVISOR_SHADOW_ALLOCATION=file. priority and reversed\n"
+        "# sample at startup instead and never open this file.\n"
+        "# equal:    every stage the same weight.\n"
+        "# priority: sample temperature, power, and TCP round trip at startup; the\n"
+        "#           worst known reading sets the weight.\n"
+        "# reversed: sample as priority, then swap low and high.\n"
+        "# file:     read this file.\n"
         "# Weights: low=2 mid=3 high=4. Missing stages stay mid.\n"
-        "# reversed swaps low and high. equal ignores this file.\n"
         "0 low dedicated-and-plugged-in\n"
         "1 high mobile-unplugged\n"
         "2 mid shared-workstation\n"
@@ -278,6 +283,75 @@ int main() {
     std::vector<unsigned> outOfRange;
     expect(!parseShadowPriorityText("9 high\n", 4u, &outOfRange, &parseError),
         "a stage index past the pipeline is rejected");
+
+    // Device condition tiers. The edges are a fixed starting point, so these
+    // assertions pin the boundaries rather than a fitted curve.
+    int tempC = -2;
+    int limited = -2;
+    expect(parseNvidiaTemperatureCsv("30, Not Active, Not Active, Not Active", &tempC, &limited)
+        && tempC == 30 && limited == 0, "a cool idle card parses as 30C and not limited");
+    DeviceCondition warm;
+    warm.temperatureC = tempC;
+    warm.thermalLimited = limited;
+    expect(thermalRisk(warm) == 2u, "30C without throttling is the low thermal tier");
+    expect(parseNvidiaTemperatureCsv("70, Not Active, Not Active, Not Active", &tempC, &limited)
+        && tempC == 70, "70C parses");
+    warm.temperatureC = tempC;
+    expect(thermalRisk(warm) == 3u, "70C without throttling is the mid thermal tier");
+    expect(parseNvidiaTemperatureCsv("83, Not Active, Not Active, Not Active", &tempC, &limited)
+        && tempC == 83, "83C parses");
+    warm.temperatureC = tempC;
+    expect(thermalRisk(warm) == 4u, "83C is the top thermal tier even without throttling");
+    expect(parseNvidiaTemperatureCsv("60, Active, Not Active, Not Active", &tempC, &limited)
+        && tempC == 60 && limited == 1, "a hw thermal slowdown flag reads as limited");
+    warm.temperatureC = tempC;
+    warm.thermalLimited = limited;
+    expect(thermalRisk(warm) == 4u, "a thermal limit outranks a cool reported temperature");
+    expect(parseNvidiaTemperatureCsv("[N/A], [N/A], [N/A], [N/A]", &tempC, &limited)
+        && tempC == -1 && limited == -1, "N/A fields stay unknown");
+    DeviceCondition unknownThermal;
+    unknownThermal.temperatureC = tempC;
+    unknownThermal.thermalLimited = limited;
+    expect(thermalRisk(unknownThermal) == 0u, "an unknown thermal state is not a tier");
+    expect(!parseNvidiaTemperatureCsv("30, Not Active, Not Active", &tempC, &limited),
+        "a short csv line is rejected");
+
+    DeviceCondition fastNet;
+    fastNet.probesSent = 16u;
+    fastNet.probesLost = 0u;
+    fastNet.rttMeanMs = 1.0;
+    fastNet.rttJitterMs = 0.2;
+    expect(networkRisk(fastNet) == 2u, "a 1ms round trip with no loss is the low network tier");
+    DeviceCondition midNet = fastNet;
+    midNet.rttMeanMs = 40.0;
+    midNet.rttJitterMs = 10.0;
+    expect(networkRisk(midNet) == 3u, "a 40ms round trip is the mid network tier");
+    DeviceCondition slowNet = fastNet;
+    slowNet.rttMeanMs = 100.0;
+    slowNet.rttJitterMs = 1.0;
+    expect(networkRisk(slowNet) == 4u, "a 100ms round trip is the top network tier");
+    DeviceCondition unprobedNet = fastNet;
+    unprobedNet.probesSent = 0u;
+    expect(networkRisk(unprobedNet) == 0u, "no probes means no network tier");
+
+    const int unknownPower = externalPowerFromSupplies(false, false, false);
+    expect(unknownPower == -1, "no supply at all leaves power unknown");
+    expect(externalPowerFromSupplies(true, true, true) == 0, "a discharging battery wins over mains");
+    expect(externalPowerFromSupplies(true, false, true) == 1, "a charge status proves external power");
+
+    DeviceCondition healthy;
+    healthy.temperatureC = 30;
+    healthy.thermalLimited = 0;
+    healthy.onExternalPower = 1;
+    healthy.probesSent = 16u;
+    healthy.probesLost = 0u;
+    healthy.rttMeanMs = 1.0;
+    healthy.rttJitterMs = 0.2;
+    expect(combineDeviceRiskWeight(healthy) == 2u, "a cool, powered, fast device is the low tier");
+    DeviceCondition slowLink = healthy;
+    slowLink.rttMeanMs = 100.0;
+    expect(combineDeviceRiskWeight(slowLink) == 4u, "one bad dimension is enough for the top tier");
+    expect(combineDeviceRiskWeight(DeviceCondition()) == 3u, "a device with no evidence lands in the mid tier");
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d device profile checks failed\n", g_failures);

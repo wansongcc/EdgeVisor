@@ -1240,6 +1240,16 @@ int NnSocket::detach() {
 static int connectSocketWithin(const char *host, int port, int timeoutMs);
 
 static const NnUint kProfileProbeMagic = 0x50524F46u;
+// Same handshake as kProfileProbeMagic, different question: this one asks the
+// worker for temperature, power, and echo round trips instead of layer time.
+static const NnUint kProfileProbeMagicV2 = 0x50524F47u;
+
+// Small enough that one startup probe finishes quickly on a LAN, large enough
+// that the mean and the mean absolute deviation mean something.
+static const uint32_t kConditionProbeCount = 16u;
+// A worker clamps whatever the root asks for so a bad count cannot keep it in
+// the probe loop.
+static const uint32_t kConditionProbeMaxCount = 64u;
 
 struct ProfileWireRequest {
     uint32_t dim;
@@ -1337,6 +1347,84 @@ bool queryWorkerSpeedProfile(
     return ok;
 }
 
+// Worker side of a v2 condition probe. The root sends a count, then that many
+// sequence numbers, and this echoes each one so the root can time the trip. The
+// worker's own condition follows, so one connection answers both questions.
+static void serveProfileProbeV2(int fd) {
+    uint32_t echoCount = 0u;
+    readSocket(fd, &echoCount, sizeof(echoCount));
+    if (echoCount > kConditionProbeMaxCount) echoCount = kConditionProbeMaxCount;
+    for (uint32_t i = 0u; i < echoCount; ++i) {
+        uint32_t sequence = 0u;
+        readSocket(fd, &sequence, sizeof(sequence));
+        writeSocket(fd, &sequence, sizeof(sequence));
+    }
+    const DeviceCondition condition = measureLocalCondition();
+    int32_t fields[3];
+    fields[0] = (int32_t)condition.temperatureC;
+    fields[1] = (int32_t)condition.thermalLimited;
+    fields[2] = (int32_t)condition.onExternalPower;
+    writeSocket(fd, fields, sizeof(fields));
+}
+
+// Root side of a v2 condition probe. TCP cannot tell a retransmit from a lost
+// packet, so probesLost stays zero and only the timing is real.
+bool queryWorkerCondition(const char *host, int port, DeviceCondition *out) {
+    if (host == nullptr || out == nullptr) return false;
+    char hostCopy[256];
+    std::snprintf(hostCopy, sizeof(hostCopy), "%s", host);
+    *out = DeviceCondition();
+    const int fd = connectSocketWithin(hostCopy, port, 3000);
+    if (fd < 0) return false;
+    bool ok = false;
+    try {
+        const NnUint magic = kProfileProbeMagicV2;
+        writeSocket(fd, &magic, sizeof(magic));
+        const uint32_t echoCount = kConditionProbeCount;
+        writeSocket(fd, &echoCount, sizeof(echoCount));
+        double totalMs = 0.0;
+        double samples[kConditionProbeCount];
+        uint32_t completed = 0u;
+        for (uint32_t i = 0u; i < kConditionProbeCount; ++i) {
+            uint32_t sequence = i;
+            const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            writeSocket(fd, &sequence, sizeof(sequence));
+            uint32_t echoed = 0u;
+            readSocket(fd, &echoed, sizeof(echoed));
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (echoed != sequence) break;
+            samples[i] = ms;
+            totalMs += ms;
+            completed += 1u;
+        }
+        if (completed == kConditionProbeCount) {
+            const double mean = totalMs / (double)kConditionProbeCount;
+            double deviation = 0.0;
+            for (uint32_t i = 0u; i < kConditionProbeCount; ++i) {
+                deviation += std::fabs(samples[i] - mean);
+            }
+            int32_t fields[3];
+            std::memset(fields, 0, sizeof(fields));
+            readSocket(fd, fields, sizeof(fields));
+            out->temperatureC = (int)fields[0];
+            out->thermalLimited = (int)fields[1];
+            out->onExternalPower = (int)fields[2];
+            out->probesSent = kConditionProbeCount;
+            out->probesLost = 0u;
+            out->rttMeanMs = mean;
+            // Jitter is the mean absolute deviation from the mean, not a
+            // standard deviation: a single stalled probe should show up.
+            out->rttJitterMs = deviation / (double)kConditionProbeCount;
+            ok = true;
+        }
+    } catch (...) {
+        ok = false;
+    }
+    destroySocket(fd);
+    return ok;
+}
+
 static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
 
     NnUint nSockets;
@@ -1348,6 +1436,10 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
     readSocket(rootSocketFd, &nSockets, sizeof(nSockets));
     if (nSockets == kProfileProbeMagic) {
         serveProfileProbe(rootSocketFd);
+        throw NnProfileProbeException();
+    }
+    if (nSockets == kProfileProbeMagicV2) {
+        serveProfileProbeV2(rootSocketFd);
         throw NnProfileProbeException();
     }
     NnUint nNodes = nSockets - 1; // nSockets - 1 root node

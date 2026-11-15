@@ -6616,14 +6616,22 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
     bool equalMode = true;
     bool reversed = false;
+    bool readPriorityFile = false;
+    bool collectCondition = false;
     const char *modeLabel = "equal";
     if (modeKey.empty() || modeKey == "equal") {
         equalMode = true;
+    } else if (modeKey == "file") {
+        equalMode = false;
+        readPriorityFile = true;
+        modeLabel = "file";
     } else if (modeKey == "priority") {
         equalMode = false;
+        collectCondition = true;
         modeLabel = "priority";
     } else if (modeKey == "reversed") {
         equalMode = false;
+        collectCondition = true;
         reversed = true;
         modeLabel = "reversed";
     } else {
@@ -6632,7 +6640,10 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
 
     std::vector<unsigned> weights(plan->nStages, 3u);
-    if (!equalMode) {
+    // The sample a stage's weight came from, kept for the risk log line.
+    std::vector<DeviceCondition> riskSample(plan->nStages);
+    std::vector<char> riskSampleOk(plan->nStages, 0);
+    if (readPriorityFile) {
         const char *path = std::getenv("EDGEVISOR_SHADOW_PRIORITY_FILE");
         bool loaded = false;
         if (path == nullptr || path[0] == '\0') {
@@ -6652,7 +6663,39 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
             }
         }
         if (!loaded) weights.assign(plan->nStages, 3u);
-        else if (reversed) reverseShadowPriorityWeights(&weights);
+    } else if (collectCondition) {
+        // One probe per node, once, at startup. A node that does not answer is
+        // skipped instead of being recorded as a bad device: a failed query is
+        // missing evidence, and missing evidence must not look like risk.
+        for (NnUint s = 0u; s < plan->nStages; ++s) {
+            unsigned bestWeight = 0u;
+            const NnUint nStageNodes = plan->stages[s].nNodes;
+            for (NnUint n = 0u; n < nStageNodes; ++n) {
+                const NnUint node = plan->stages[s].nodeIndices[n];
+                DeviceCondition sample;
+                bool ok = false;
+                if (node == 0u) {
+                    sample = measureLocalCondition();
+                    // This process talks to itself, so there is no link to time.
+                    sample.probesSent = 16u;
+                    sample.probesLost = 0u;
+                    sample.rttMeanMs = 0.0;
+                    sample.rttJitterMs = 0.0;
+                    ok = true;
+                } else if (args->workerHosts != nullptr && (node - 1u) < args->nWorkers) {
+                    ok = queryWorkerCondition(args->workerHosts[node - 1u], (int)args->workerPorts[node - 1u], &sample);
+                }
+                if (!ok) continue;
+                const unsigned sampleWeight = combineDeviceRiskWeight(sample);
+                if (!riskSampleOk[s] || sampleWeight > bestWeight) {
+                    riskSample[s] = sample;
+                    riskSampleOk[s] = 1;
+                    bestWeight = sampleWeight;
+                }
+            }
+            weights[s] = riskSampleOk[s] ? bestWeight : 3u;
+        }
+        if (reversed) reverseShadowPriorityWeights(&weights);
     }
 
     const std::vector<BoundaryOverlap> equalOverlaps = assignBoundaryOverlap(primary, caps, &bubbleCap);
@@ -6666,6 +6709,19 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
     setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", g_autoBoundaryDepths.c_str(), 1);
     args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
+    if (collectCondition) {
+        for (NnUint s = 0u; s < plan->nStages; ++s) {
+            if (riskSampleOk[s]) {
+                const DeviceCondition &sample = riskSample[s];
+                std::printf("shadow-risk: stage=%u temp=%d limited=%d power=%d rtt=%.3f jitter=%.3f sent=%u lost=%u weight=%u sample=ok\n",
+                    (unsigned)s, sample.temperatureC, sample.thermalLimited, sample.onExternalPower,
+                    sample.rttMeanMs, sample.rttJitterMs, sample.probesSent, sample.probesLost, weights[s]);
+            } else {
+                std::printf("shadow-risk: stage=%u temp=-1 limited=-1 power=-1 rtt=-1.000 jitter=-1.000 sent=0 lost=0 weight=%u sample=failed\n",
+                    (unsigned)s, weights[s]);
+            }
+        }
+    }
     std::printf("shadow-priority: mode=%s applied=", modeLabel);
     for (NnUint s = 0u; s < plan->nStages; ++s) {
         if (s > 0u) std::printf(",");

@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <map>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -11,6 +13,7 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <dirent.h>
 #include <fstream>
 #endif
 
@@ -30,6 +33,90 @@ void publishProfileRuntime(int backend, int gpuIndex, unsigned nThreads) {
     g_backend = backend;
     g_gpuIndex = gpuIndex < 0 ? 0 : gpuIndex;
     g_threads = nThreads == 0u ? 1u : nThreads;
+}
+
+// nvidia-smi is shelled out to rather than linked through NVML: this runs once
+// per stage at startup and a missing driver must not fail the process.
+static bool queryNvidiaCondition(int *tempC, int *thermalLimited) {
+    *tempC = -1;
+    *thermalLimited = -1;
+#if defined(__linux__)
+    char command[512];
+    std::snprintf(command, sizeof(command),
+        "timeout 2 nvidia-smi --query-gpu=temperature.gpu,"
+        "clocks_event_reasons.hw_thermal_slowdown,"
+        "clocks_event_reasons.sw_thermal_slowdown,"
+        "clocks_event_reasons.hw_power_brake_slowdown "
+        "--format=csv,noheader -i %d 2>/dev/null", g_gpuIndex);
+    FILE *pipe = popen(command, "r");
+    if (pipe == nullptr) return false;
+    char line[512];
+    line[0] = '\0';
+    const bool gotLine = std::fgets(line, sizeof(line), pipe) != nullptr;
+    // Closing the pipe reaps the child, so read before this.
+    const int status = pclose(pipe);
+    if (!gotLine || status != 0) return false;
+    int parsedTempC = -1;
+    int parsedThermalLimited = -1;
+    if (!parseNvidiaTemperatureCsv(line, &parsedTempC, &parsedThermalLimited)) return false;
+    *tempC = parsedTempC;
+    *thermalLimited = parsedThermalLimited;
+    return true;
+#else
+    return false;
+#endif
+}
+
+#if defined(__linux__)
+// One attribute of one supply, trimmed. An unreadable file leaves value empty.
+static std::string readSupplyAttr(const char *path) {
+    std::ifstream file(path);
+    if (!file.is_open()) return std::string();
+    std::string value;
+    std::getline(file, value);
+    const std::size_t first = value.find_first_not_of(" \t\r\n\v\f");
+    if (first == std::string::npos) return std::string();
+    const std::size_t last = value.find_last_not_of(" \t\r\n\v\f");
+    return value.substr(first, last - first + 1u);
+}
+
+// Scans /sys/class/power_supply for a battery that is discharging, or anything
+// that proves the machine is on mains. A desktop without a battery only reports
+// online=1 for Mains/USB; a laptop on battery reports Discharging.
+static int readOnExternalPower() {
+    DIR *dir = opendir("/sys/class/power_supply");
+    if (dir == nullptr) return externalPowerFromSupplies(false, false, false);
+    bool sawSupply = false;
+    bool batteryDischarging = false;
+    bool externalOnline = false;
+    while (struct dirent *entry = readdir(dir)) {
+        if (entry->d_name[0] == '.') continue;
+        const std::string base = std::string("/sys/class/power_supply/") + entry->d_name;
+        const std::string type = readSupplyAttr((base + "/type").c_str());
+        if (type.empty()) continue;
+        sawSupply = true;
+        if (type == "Battery") {
+            const std::string status = readSupplyAttr((base + "/status").c_str());
+            if (status == "Discharging") batteryDischarging = true;
+            else if (status == "Charging" || status == "Full" || status == "Not charging") externalOnline = true;
+        } else if (type == "Mains" || type == "USB") {
+            if (readSupplyAttr((base + "/online").c_str()) == "1") externalOnline = true;
+        }
+    }
+    closedir(dir);
+    return externalPowerFromSupplies(sawSupply, batteryDischarging, externalOnline);
+}
+#endif
+
+DeviceCondition measureLocalCondition() {
+    DeviceCondition condition;
+    // Neither probe is allowed to take the process down: a machine without a
+    // GPU or without sysfs simply reports those fields as unknown.
+    queryNvidiaCondition(&condition.temperatureC, &condition.thermalLimited);
+#if defined(__linux__)
+    condition.onExternalPower = readOnExternalPower();
+#endif
+    return condition;
 }
 
 void cacheSpeedProfile(const std::string &key, const SpeedDeviceProfile &profile) {

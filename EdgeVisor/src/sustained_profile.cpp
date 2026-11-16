@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -14,7 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
+#include <linux/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -75,7 +76,14 @@ struct SustainedWireHeader {
     uint32_t nRounds;
     uint32_t nTicks;
     uint32_t nTransfers;
+    uint32_t segmentStatus; // 0 unknown, 1 counts readable (rate still needs a non-zero denominator)
+    uint32_t retransSegs;
+    uint32_t dataSegsOut;
+    uint32_t rebuilds;
+    uint32_t pad;
 };
+
+static_assert(sizeof(SustainedWireHeader) == 32u, "sustained header must have a stable layout");
 
 static_assert(sizeof(SustainedWireJob) == 312u, "sustained job must have a stable layout");
 static_assert(sizeof(SustainedWireRound) == 24u, "sustained round must have a stable layout");
@@ -162,12 +170,27 @@ void setTcpLowLatency(int fd) {
 #endif
 }
 
-int tcpRetrans(int fd) {
+struct TcpSnapshot {
+    bool known;
+    uint32_t totalRetrans;
+    uint32_t dataSegsOut;
+};
+
+TcpSnapshot readTcpSnapshot(int fd) {
+    TcpSnapshot snap;
+    snap.known = false;
+    snap.totalRetrans = 0u;
+    snap.dataSegsOut = 0u;
     struct tcp_info info;
     std::memset(&info, 0, sizeof(info));
     socklen_t len = sizeof(info);
-    if (::getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) != 0) return -1;
-    return (int)info.tcpi_total_retrans;
+    if (::getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) != 0) return snap;
+    const socklen_t need = (socklen_t)(offsetof(struct tcp_info, tcpi_data_segs_out) + sizeof(info.tcpi_data_segs_out));
+    if (len < need) return snap;
+    snap.known = true;
+    snap.totalRetrans = info.tcpi_total_retrans;
+    snap.dataSegsOut = info.tcpi_data_segs_out;
+    return snap;
 }
 
 void setRecvTimeout(int fd, unsigned timeoutMs) {
@@ -216,20 +239,35 @@ int connectWithin(const char *host, int port, int timeoutMs) {
     return fd;
 }
 
-bool sendActivation(int fd, const std::vector<char> &payload, unsigned timeoutMs, double *elapsedMs, int *retransDelta) {
+bool sendActivation(
+    int fd,
+    const std::vector<char> &payload,
+    unsigned timeoutMs,
+    double *elapsedMs,
+    int *retransDelta,
+    TcpSnapshot *beforeOut,
+    TcpSnapshot *afterOut) {
     const uint32_t nbytes = (uint32_t)payload.size();
-    const int before = tcpRetrans(fd);
+    const TcpSnapshot before = readTcpSnapshot(fd);
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    if (!writeFull(fd, &nbytes, sizeof(nbytes))) return false;
-    if (!payload.empty() && !writeFull(fd, payload.data(), payload.size())) return false;
+    bool writeOk = writeFull(fd, &nbytes, sizeof(nbytes));
+    if (writeOk && !payload.empty()) writeOk = writeFull(fd, payload.data(), payload.size());
     uint32_t ack = 0u;
-    const bool got = readFullUntil(
-        fd, &ack, sizeof(ack), start + std::chrono::milliseconds(timeoutMs == 0u ? 1u : timeoutMs));
+    bool got = false;
+    if (writeOk) {
+        got = readFullUntil(
+            fd, &ack, sizeof(ack), start + std::chrono::milliseconds(timeoutMs == 0u ? 1u : timeoutMs));
+    }
     *elapsedMs = elapsedMsSince(start);
-    const int after = tcpRetrans(fd);
-    if (before >= 0 && after >= 0) *retransDelta = after - before;
-    else *retransDelta = -1;
-    return got && ack == 1u;
+    const TcpSnapshot after = readTcpSnapshot(fd);
+    if (beforeOut != nullptr) *beforeOut = before;
+    if (afterOut != nullptr) *afterOut = after;
+    if (before.known && after.known && after.totalRetrans >= before.totalRetrans
+        && after.totalRetrans - before.totalRetrans <= 2147483647u)
+        *retransDelta = (int)(after.totalRetrans - before.totalRetrans);
+    else
+        *retransDelta = -1;
+    return writeOk && got && ack == 1u;
 }
 
 void serveOneLink(int fd, const std::atomic<bool> &stop, const std::chrono::steady_clock::time_point *stopAt) {
@@ -272,6 +310,7 @@ struct LocalObservation {
     std::vector<ComputeRound> rounds;
     std::vector<HardwareTick> ticks;
     std::vector<TransferRound> transfers;
+    LinkCounterWindow linkCounters;
 };
 
 LocalObservation observeLocal(
@@ -290,6 +329,7 @@ LocalObservation observeLocal(
     const bool send = !peerHost.empty() && peerPort > 0 && activationBytes > 0u && activationBytes <= (16u << 20);
     std::vector<char> payload(send ? activationBytes : 0u, 0);
     int linkFd = -1;
+    int accountedFd = -1;
     unsigned failedConnects = 0u;
 
     auto pace = [&](double elapsed) {
@@ -328,8 +368,21 @@ LocalObservation observeLocal(
         }
         double elapsed = 0.0;
         int retrans = -1;
-        const bool ok = sendActivation(linkFd, payload, timeoutMs, &elapsed, &retrans);
+        TcpSnapshot beforeSnap;
+        TcpSnapshot afterSnap;
+        beforeSnap.known = false;
+        afterSnap.known = false;
+        const bool ok = sendActivation(linkFd, payload, timeoutMs, &elapsed, &retrans, &beforeSnap, &afterSnap);
+        if (record) {
+            const bool newConnection = accountedFd != linkFd;
+            noteCountedSend(&observation.linkCounters, newConnection,
+                beforeSnap.known, beforeSnap.totalRetrans, beforeSnap.dataSegsOut,
+                afterSnap.known, afterSnap.totalRetrans, afterSnap.dataSegsOut);
+            accountedFd = linkFd;
+        }
         if (!ok) {
+            if (observation.linkCounters.open) observation.linkCounters.endConnection();
+            accountedFd = -1;
             if (linkFd >= 0) ::close(linkFd);
             linkFd = -1;
             failedConnects += 1u;
@@ -386,12 +439,14 @@ LocalObservation observeLocal(
             if (failedConnects >= 3u) break;
             pace(elapsedMsSince(start));
         }
+        if (observation.linkCounters.open) observation.linkCounters.endConnection();
         if (linkFd >= 0) {
             const uint32_t end = 0u;
             writeFull(linkFd, &end, sizeof(end));
             ::close(linkFd);
             linkFd = -1;
         }
+        accountedFd = -1;
     });
 
     if (layers > 0u) {
@@ -426,6 +481,7 @@ struct RemoteCapture {
     std::vector<ComputeRound> rounds;
     std::vector<HardwareTick> ticks;
     std::vector<TransferRound> transfers;
+    LinkCounterWindow linkCounters;
 };
 
 bool readRemoteResult(int fd, RemoteCapture *capture, const std::chrono::steady_clock::time_point &deadline) {
@@ -470,14 +526,33 @@ bool readRemoteResult(int fd, RemoteCapture *capture, const std::chrono::steady_
         round.retransDelta = wire.retransDelta;
         capture->transfers.push_back(round);
     }
+    if (header.segmentStatus == 1u) {
+        capture->linkCounters.broken = false;
+        capture->linkCounters.committed = 1u;
+        capture->linkCounters.retransSegs = header.retransSegs;
+        capture->linkCounters.dataSegsOut = header.dataSegsOut;
+        capture->linkCounters.rebuilds = header.rebuilds;
+    } else {
+        capture->linkCounters.broken = header.rebuilds > 0u || header.nTransfers > 0u;
+        capture->linkCounters.committed = 0u;
+        capture->linkCounters.rebuilds = header.rebuilds;
+    }
     return true;
 }
 
 void writeRemoteResult(int fd, const LocalObservation &observation) {
     SustainedWireHeader header;
+    std::memset(&header, 0, sizeof(header));
     header.nRounds = (uint32_t)std::min(observation.rounds.size(), (size_t)kMaxRounds);
     header.nTicks = (uint32_t)std::min(observation.ticks.size(), (size_t)kMaxSamples);
     header.nTransfers = (uint32_t)std::min(observation.transfers.size(), (size_t)kMaxRounds);
+    const bool countsKnown = !observation.linkCounters.broken && observation.linkCounters.committed > 0u
+        && observation.linkCounters.retransSegs <= 0xffffffffull
+        && observation.linkCounters.dataSegsOut <= 0xffffffffull;
+    header.segmentStatus = countsKnown ? 1u : 0u;
+    header.retransSegs = countsKnown ? (uint32_t)observation.linkCounters.retransSegs : 0u;
+    header.dataSegsOut = countsKnown ? (uint32_t)observation.linkCounters.dataSegsOut : 0u;
+    header.rebuilds = observation.linkCounters.rebuilds;
     if (!writeFull(fd, &header, sizeof(header))) return;
     for (uint32_t i = 0u; i < header.nRounds; ++i) {
         SustainedWireRound wire;
@@ -591,7 +666,9 @@ void fillLinkMissing(LinkSummary *link) {
     if (!link->meanKnown) link->missing.push_back("meanMs");
     if (!link->jitterKnown) link->missing.push_back("jitterMs");
     if (!link->timeoutKnown) link->missing.push_back("timeoutFraction");
-    if (link->retrans < 0) link->missing.push_back("retrans");
+    if (link->retransSegs < 0) link->missing.push_back("retransSegs");
+    if (link->dataSegsOut < 0) link->missing.push_back("dataSegsOut");
+    if (!link->segmentRateKnown) link->missing.push_back("segmentRetransRate");
 }
 
 bool writeTextFile(const std::string &path, const std::string &text) {
@@ -614,8 +691,14 @@ SustainedRunOutput runSustainedShadowProfile(const SustainedRunConfig &config) {
     output.report.reversed = config.reversed;
     output.report.note =
         "Short stability window recorded before redundancy allocation. "
-        "It can show early degradation and does not show whether a longer run would thermally throttle.";
-    output.devicePriority.assign(config.endpoints.size(), 3u);
+        "A device score of 0 means read indicators stayed at or below their normal point; missing fields did not vote. "
+        "credibility is metadata and is not a fused weight. "
+        "Jitter uses successful transfers only. Timeout fraction uses timed-out attempts over all counted attempts. "
+        "segmentRetransRate is the sender tcpi_total_retrans delta divided by the tcpi_data_segs_out delta on the same connections, warmup excluded. "
+        "affectedRoundRate is the share of readable attempts whose retrans delta was positive, and it is not the segment rate. "
+        "A slower hop finishes fewer paced attempts before the wall-clock window ends. "
+        "The window can show early degradation and does not show whether a longer run would thermally throttle.";
+    output.devicePriority.assign(config.endpoints.size(), kProtectionWeightUnknown);
     if (config.endpoints.size() >= 2u)
         output.linkPriority.assign(config.endpoints.size() - 1u, 0u);
     output.outputDir = config.outputDir.empty() ? std::string("shadow_profile") : config.outputDir;
@@ -732,11 +815,7 @@ SustainedRunOutput runSustainedShadowProfile(const SustainedRunConfig &config) {
         DeviceSummary device = summarizeDevice(config.endpoints[i].stage, config.endpoints[i].host, rounds, ticks);
         if (!answered) device.missing.push_back("probe");
         if (config.endpoints[i].extraNodes > 0u) device.missing.push_back("otherNodesOnStage");
-        if (config.reversed) {
-            if (device.appliedPriority == 2u) device.appliedPriority = 4u;
-            else if (device.appliedPriority == 4u) device.appliedPriority = 2u;
-        }
-        output.devicePriority[i] = device.appliedPriority;
+        output.devicePriority[i] = device.appliedWeight;
         output.report.devices.push_back(device);
         for (std::size_t r = 0u; r < rounds.size(); ++r) {
             ComputeRawRow row;
@@ -755,13 +834,14 @@ SustainedRunOutput runSustainedShadowProfile(const SustainedRunConfig &config) {
         }
         if (i + 1u >= n) continue;
         LinkSummary link = summarizeTransfers(transfers);
+        applyLinkCounterWindow(&link, isLocal ? local.linkCounters : remote[i].linkCounters);
         link.fromStage = config.endpoints[i].stage;
         link.toStage = config.endpoints[i + 1u].stage;
         link.fromHost = hostLabel(config.endpoints[i].host);
         link.toHost = hostLabel(config.endpoints[i + 1u].host);
         link.address = endpointAddress(config.endpoints[i + 1u].host, config.endpoints[i + 1u].port);
         fillLinkMissing(&link);
-        output.linkPriority[i] = link.priority;
+        output.linkPriority[i] = link.appliedWeight;
         output.report.links.push_back(link);
         for (std::size_t r = 0u; r < transfers.size(); ++r) {
             LinkRawRow row;
@@ -776,9 +856,20 @@ SustainedRunOutput runSustainedShadowProfile(const SustainedRunConfig &config) {
         printDoubleOrNa("mean", link.meanMs, link.meanKnown);
         printDoubleOrNa("jitter", link.jitterMs, link.jitterKnown);
         printDoubleOrNa("timeout", link.timeoutFraction, link.timeoutKnown);
-        if (link.retrans < 0) std::printf(" retrans=na");
-        else std::printf(" retrans=%d", link.retrans);
-        std::printf(" priority=%s\n", protectionPriorityName(link.priority));
+        if (link.retransSegs < 0) std::printf(" retrans_segs=na");
+        else std::printf(" retrans_segs=%lld", link.retransSegs);
+        if (link.dataSegsOut < 0) std::printf(" data_segs_out=na");
+        else std::printf(" data_segs_out=%lld", link.dataSegsOut);
+        printDoubleOrNa("segment_retrans_rate", link.segmentRetransRate, link.segmentRateKnown);
+        if (!link.affectedRoundRateKnown) std::printf(" affected_rounds=na");
+        else std::printf(" affected_rounds=%u/%u", link.retransRounds, link.retransRoundsKnown);
+        std::printf(" timeouts=%u/%u finished=%u rebuilds=%u",
+            link.timeouts, link.transfers, link.finishedTransfers, link.rebuilds);
+        printDoubleOrNa("t0", link.firstTransferMs, link.firstTransferMs >= 0.0);
+        printDoubleOrNa("t1", link.lastTransferMs, link.lastTransferMs >= 0.0);
+        if (link.risk < 0.0) std::printf(" risk=na");
+        else std::printf(" risk=%.2f", link.risk);
+        std::printf(" weight=%u priority=%s\n", link.appliedWeight, protectionPriorityName(link.priority));
     }
     for (std::size_t i = 0u; i < output.report.devices.size(); ++i) {
         const DeviceSummary &device = output.report.devices[i];
@@ -791,9 +882,29 @@ SustainedRunOutput runSustainedShadowProfile(const SustainedRunConfig &config) {
         else std::printf(" temp_max=%d", device.thermal.maxTempC);
         printDoubleOrNa("rise", device.thermal.riseCPerSec, device.thermal.riseKnown);
         printDoubleOrNa("throttle", device.thermal.throttleFraction, device.thermal.throttleKnown);
-        std::printf(" power=%s battery=%d priority=%s applied=%s\n",
-            powerStateName(device.power.onExternalPower), device.power.batteryPercent,
-            protectionPriorityName(device.priority), protectionPriorityName(device.appliedPriority));
+        std::printf(" power=%s direction=%s battery=%d",
+            powerStateName(device.power.onExternalPower),
+            powerDirectionName(device.power.direction), device.power.batteryPercent);
+        if (device.computeRisk < 0.0) std::printf(" compute_risk=na");
+        else std::printf(" compute_risk=%.2f", device.computeRisk);
+        if (device.powerRisk < 0.0) std::printf(" power_risk=na");
+        else std::printf(" power_risk=%.2f", device.powerRisk);
+        if (!device.scoreKnown) std::printf(" score=na");
+        else std::printf(" score=%.2f", device.protectionScore);
+        std::printf(" q=%.2f weight=%u priority=%s reasons=",
+            device.credibility, device.appliedWeight, protectionPriorityName(device.appliedPriority));
+        if (device.reasons.empty()) std::printf("-");
+        for (std::size_t r = 0u; r < device.reasons.size(); ++r) {
+            if (r > 0u) std::printf("|");
+            std::printf("%s", device.reasons[r].c_str());
+        }
+        std::printf(" missing=");
+        if (device.missing.empty()) std::printf("-");
+        for (std::size_t r = 0u; r < device.missing.size(); ++r) {
+            if (r > 0u) std::printf("|");
+            std::printf("%s", device.missing[r].c_str());
+        }
+        std::printf("\n");
     }
 
     if (::mkdir(output.outputDir.c_str(), 0755) != 0 && errno != EEXIST) {

@@ -17,6 +17,7 @@ struct HardwareTick {
     int freqMaxMhz = -1;
     int onExternalPower = -1; // -1 unknown, 0 battery, 1 external
     int batteryPercent = -1;
+    int thermalHeadroomC = -1; // degrees below the driver slowdown limit, -1 unknown
 };
 
 // Fills every field except timestampMs from this machine. A missing sensor
@@ -686,6 +687,29 @@ inline void reverseShadowPriorityWeights(std::vector<unsigned> *weights) {
     }
 }
 
+// Exchange the allocation weight of one lowest-risk stage with one
+// highest-risk stage. The multiset of weights is unchanged. Returns false
+// when every stage has the same weight, which is not a mismatch control.
+inline bool permuteExtremeDeviceWeights(
+    std::vector<unsigned> *weights,
+    unsigned *lowStage,
+    unsigned *highStage) {
+    if (weights == nullptr || weights->size() < 2u) return false;
+    unsigned lo = 0u;
+    unsigned hi = 0u;
+    for (unsigned i = 1u; i < (unsigned)weights->size(); ++i) {
+        if ((*weights)[i] < (*weights)[lo]) lo = i;
+        if ((*weights)[i] > (*weights)[hi]) hi = i;
+    }
+    if ((*weights)[lo] == (*weights)[hi]) return false;
+    const unsigned lowWeight = (*weights)[lo];
+    (*weights)[lo] = (*weights)[hi];
+    (*weights)[hi] = lowWeight;
+    if (lowStage != nullptr) *lowStage = lo;
+    if (highStage != nullptr) *highStage = hi;
+    return true;
+}
+
 // After the primary split, each stage may keep extra layers up to the tighter
 // of two caps: leftover memory (70% of free memory, one layer of headroom)
 // and the bubble depth from bubbleShadowLayerCap. A null bubble cap means
@@ -703,20 +727,32 @@ inline void reverseShadowPriorityWeights(std::vector<unsigned> *weights) {
 // only that boundary: the weight used on a side is the larger of the neighbor's
 // device priority and that boundary's link priority. Zero means the link was
 // not measured, and an unmeasured link does not change the device priority.
+inline unsigned stageShadowBudget(
+    unsigned primary,
+    unsigned memoryCap,
+    bool bubbleKnown,
+    unsigned bubbleCap,
+    int experimentCap) {
+    const unsigned memSpare = memoryCap > primary ? memoryCap - primary : 0u;
+    unsigned limit = memSpare;
+    if (bubbleKnown) limit = std::min(limit, bubbleCap);
+    if (experimentCap >= 0) limit = std::min(limit, (unsigned)experimentCap);
+    return limit;
+}
+
 inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
     const std::vector<unsigned> &primary,
     const std::vector<unsigned> &memoryCap,
     const std::vector<unsigned> *bubbleCap = nullptr,
     const std::vector<unsigned> *priorityWeight = nullptr,
-    const std::vector<unsigned> *linkPriority = nullptr) {
+    const std::vector<unsigned> *linkPriority = nullptr,
+    int experimentBudgetCap = -1) {
     const unsigned n = (unsigned)std::min(primary.size(), memoryCap.size());
     std::vector<unsigned> spare(n, 0u);
     for (unsigned i = 0; i < n; ++i) {
-        const unsigned memSpare = memoryCap[i] > primary[i] ? memoryCap[i] - primary[i] : 0u;
-        unsigned limit = memSpare;
-        if (bubbleCap != nullptr && i < bubbleCap->size())
-            limit = std::min(limit, (*bubbleCap)[i]);
-        spare[i] = limit;
+        const bool bubbleKnown = bubbleCap != nullptr && i < bubbleCap->size() && (*bubbleCap)[i] != 0xffffffffu;
+        const unsigned bubble = bubbleKnown ? (*bubbleCap)[i] : 0u;
+        spare[i] = stageShadowBudget(primary[i], memoryCap[i], bubbleKnown, bubble, experimentBudgetCap);
     }
     std::vector<BoundaryOverlap> overlaps(n < 2u ? 0u : n - 1u);
     for (unsigned i = 0; i < n; ++i) {
@@ -748,6 +784,36 @@ inline std::string formatBoundaryOverlap(const std::vector<BoundaryOverlap> &ove
     for (size_t i = 0u; i < overlaps.size(); ++i) {
         if (i > 0u) out << ';';
         out << overlaps[i].leftHolds << ',' << overlaps[i].rightHolds;
+    }
+    return out.str();
+}
+
+// Layer intervals actually placed. A middle stage is placement-complete only
+// when the previous stage's prefix and the next stage's suffix meet or
+// overlap. The sum of the two counts is not that check. This does not mean a
+// takeover ran, and a first or last stage is not a takeover target.
+inline std::string formatShadowPlacement(
+    const std::vector<unsigned> &primary,
+    const std::vector<BoundaryOverlap> &overlaps) {
+    std::ostringstream out;
+    unsigned cursor = 0u;
+    for (unsigned s = 0u; s < (unsigned)primary.size(); ++s) {
+        const unsigned begin = cursor;
+        const unsigned end = cursor + primary[s];
+        cursor = end;
+        if (s > 0u) out << ' ';
+        out << "stage" << s << "=[" << begin << "," << end << ")";
+        if (s == 0u || s + 1u == (unsigned)primary.size()) {
+            out << " edge";
+            continue;
+        }
+        const unsigned prefix = (s - 1u) < overlaps.size() ? overlaps[s - 1u].leftHolds : 0u;
+        const unsigned suffix = s < overlaps.size() ? overlaps[s].rightHolds : 0u;
+        const unsigned prefixEnd = begin + std::min(prefix, end - begin);
+        const unsigned suffixBegin = end - std::min(suffix, end - begin);
+        out << " prefix=[" << begin << "," << prefixEnd << ")";
+        out << " suffix=[" << suffixBegin << "," << end << ")";
+        out << (prefixEnd >= suffixBegin ? " placement-cover=complete" : " placement-cover=gap");
     }
     return out.str();
 }

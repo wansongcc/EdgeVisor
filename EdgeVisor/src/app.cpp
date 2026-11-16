@@ -25,6 +25,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <cstdio>
 #include <fstream>
 #include <thread>
 #include <mutex>
@@ -32,6 +33,7 @@
 #include <cerrno>
 #if defined(__linux__)
 #include <sys/resource.h>
+#include <sys/stat.h>
 #endif
 #if defined(DLLAMA_VULKAN)
 #include <cstdlib>
@@ -6617,6 +6619,47 @@ static double nodeLayerMs(const char *host, int port, const ModelShape *shape) {
     return profile.msPerLayer;
 }
 
+static std::string jsonEscapeText(const std::string &text) {
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0u; i < text.size(); ++i) {
+        const unsigned char c = (unsigned char)text[i];
+        if (c == '"' || c == '\\') {
+            out.push_back('\\');
+            out.push_back((char)c);
+        } else if (c < 0x20u) {
+            out.push_back(' ');
+        } else {
+            out.push_back((char)c);
+        }
+    }
+    return out;
+}
+
+static std::string gitHeadText() {
+    FILE *pipe = ::popen("git rev-parse HEAD 2>/dev/null", "r");
+    if (pipe == nullptr) return std::string("unknown");
+    char buf[96];
+    std::string head;
+    if (std::fgets(buf, sizeof(buf), pipe) != nullptr) head = buf;
+    ::pclose(pipe);
+    while (!head.empty() && (head[head.size() - 1u] == '\n' || head[head.size() - 1u] == '\r'))
+        head.erase(head.size() - 1u);
+    return head.empty() ? std::string("unknown") : head;
+}
+
+static int experimentShadowBudgetCap() {
+    const char *text = std::getenv("EDGEVISOR_SHADOW_BUDGET_CAP");
+    if (text == nullptr || text[0] == '\0') return -1;
+    char *end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || parsed < 0 || parsed > 1000000L) {
+        std::fprintf(stderr, "shadow-budget: ignoring invalid EDGEVISOR_SHADOW_BUDGET_CAP=%s\n", text);
+        return -1;
+    }
+    return (int)parsed;
+}
+
 static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionPlan *plan, const LlmHeader &header) {
     g_autoBoundaryDepths.clear();
     if (args != nullptr) args->boundaryDepthsStr = nullptr;
@@ -6675,9 +6718,10 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
         if (modeKey[i] >= 'A' && modeKey[i] <= 'Z') modeKey[i] = (char)(modeKey[i] - 'A' + 'a');
     }
     bool equalMode = true;
-    bool reversed = false;
     bool readPriorityFile = false;
     bool collectCondition = false;
+    bool useLink = false;
+    bool mismatchMode = false;
     const char *modeLabel = "equal";
     if (modeKey.empty() || modeKey == "equal") {
         equalMode = true;
@@ -6685,19 +6729,32 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
         equalMode = false;
         readPriorityFile = true;
         modeLabel = "file";
-    } else if (modeKey == "priority") {
+    } else if (modeKey == "device_only") {
         equalMode = false;
         collectCondition = true;
-        modeLabel = "priority";
-    } else if (modeKey == "reversed") {
+        modeLabel = "device_only";
+    } else if (modeKey == "device_link_max" || modeKey == "priority") {
         equalMode = false;
         collectCondition = true;
-        reversed = true;
-        modeLabel = "reversed";
+        useLink = true;
+        modeLabel = "device_link_max";
+        if (modeKey == "priority") {
+            std::fprintf(stderr, "shadow-alloc: priority selects device_link_max\n");
+        }
+    } else if (modeKey == "mismatch" || modeKey == "reversed") {
+        equalMode = false;
+        collectCondition = true;
+        mismatchMode = true;
+        modeLabel = "mismatch";
+        if (modeKey == "reversed") {
+            std::fprintf(stderr,
+                "shadow-alloc: reversed permutes device labels and does not invert risk\n");
+        }
     } else {
         std::fprintf(stderr, "shadow-alloc: unknown EDGEVISOR_SHADOW_ALLOCATION=%s, using equal\n", mode.c_str());
         equalMode = true;
     }
+    const int experimentCap = experimentShadowBudgetCap();
 
     std::vector<unsigned> weights(plan->nStages, 3u);
     std::vector<unsigned> linkPriority;
@@ -6724,13 +6781,13 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     } else if (collectCondition) {
         // The one-shot speed profile above already fixed the primary split.
         // This window watches that split under a paced load and on the
-        // addresses inference will use, then hands algorithm 1 a priority.
+        // addresses inference will use, then hands algorithm 1 a weight.
         SustainedRunConfig profileConfig;
         profileConfig.observeSeconds = envPositiveDouble("EDGEVISOR_SHADOW_PROFILE_SECONDS", 25.0, 120.0);
         profileConfig.warmupRounds = envUnsigned("EDGEVISOR_SHADOW_PROFILE_WARMUP", kSustainedDefaultWarmupRounds, 32u);
         profileConfig.timeoutMs = envUnsigned("EDGEVISOR_SHADOW_PROFILE_TIMEOUT_MS", kSustainedDefaultTimeoutMs, 10000u);
         profileConfig.activationBytes = activationBytesForHeader(header);
-        profileConfig.reversed = reversed;
+        profileConfig.reversed = false;
         profileConfig.shape = shape;
         const char *dirEnv = std::getenv("EDGEVISOR_SHADOW_PROFILE_DIR");
         profileConfig.outputDir = (dirEnv != nullptr && dirEnv[0] != '\0') ? std::string(dirEnv) : std::string("shadow_profile");
@@ -6768,11 +6825,26 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
         }
     }
 
-    const std::vector<BoundaryOverlap> equalOverlaps = assignBoundaryOverlap(primary, caps, &bubbleCap);
+    const std::vector<unsigned> measuredWeights = weights;
+    std::string mismatchNote = "not-requested";
+    unsigned mismatchLow = 0u;
+    unsigned mismatchHigh = 0u;
+    if (mismatchMode) {
+        if (permuteExtremeDeviceWeights(&weights, &mismatchLow, &mismatchHigh)) {
+            std::ostringstream note;
+            note << "swapped-stage-" << mismatchLow << "-with-stage-" << mismatchHigh;
+            mismatchNote = note.str();
+        } else {
+            mismatchNote = "unavailable-identical-device-risk";
+            std::printf("shadow-mismatch: 本轮无有效错配对照\n");
+        }
+    }
+    const std::vector<unsigned> *linkForAlloc = (useLink && !linkPriority.empty()) ? &linkPriority : nullptr;
+    const std::vector<BoundaryOverlap> equalOverlaps = assignBoundaryOverlap(
+        primary, caps, &bubbleCap, nullptr, nullptr, experimentCap);
     const std::vector<BoundaryOverlap> overlaps = equalMode
         ? equalOverlaps
-        : assignBoundaryOverlap(primary, caps, &bubbleCap, &weights,
-            linkPriority.empty() ? nullptr : &linkPriority);
+        : assignBoundaryOverlap(primary, caps, &bubbleCap, &weights, linkForAlloc, experimentCap);
     g_autoBoundaryDepths = formatBoundaryOverlap(overlaps);
     if (g_autoBoundaryDepths.empty()) {
         unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
@@ -6780,30 +6852,100 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
     setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", g_autoBoundaryDepths.c_str(), 1);
     args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
-    std::printf("shadow-priority: mode=%s applied=", modeLabel);
+    if (useLink) {
+        std::printf("shadow-link-policy: device_link_max is untested; a high link score does not mean extra copies reduce steady-state traffic\n");
+    }
+    std::printf("shadow-priority: mode=%s mismatch=%s applied=", modeLabel, mismatchNote.c_str());
     for (NnUint s = 0u; s < plan->nStages; ++s) {
         if (s > 0u) std::printf(",");
         std::printf("%u", weights[s]);
     }
     std::printf("\nshadow-equal: %s\n", formatBoundaryOverlap(equalOverlaps).c_str());
-    std::printf("redundancy:");
-    for (size_t i = 0u; i < overlaps.size(); ++i) {
-        std::printf(" %u->%u %u,%u", (unsigned)i, (unsigned)(i + 1u),
-            overlaps[i].leftHolds, overlaps[i].rightHolds);
-    }
-    std::printf("\nshadow-cap:");
+    std::printf("redundancy: %s\n", formatBoundaryOverlap(overlaps).c_str());
+    std::printf("shadow-coverage: %s\n", formatShadowPlacement(primary, overlaps).c_str());
+    std::printf("shadow-coverage-note: placement intervals only; runtime takeover still stops on a gap, an unfilled shadow row, or a first or last stage\n");
+    std::printf("shadow-cap:");
     for (NnUint s = 0u; s < plan->nStages; ++s) {
         const unsigned memSpare = caps[s] > primary[s] ? caps[s] - primary[s] : 0u;
-        const unsigned bubble = s < bubbleCap.size() ? bubbleCap[s] : 0xffffffffu;
-        const unsigned use = std::min(memSpare, bubble);
-        if (bubble == 0xffffffffu) {
-            std::printf(" %u mem=%u bubble=unk use=%u", (unsigned)s, memSpare, use);
+        const bool bubbleKnown = s < bubbleCap.size() && bubbleCap[s] != 0xffffffffu;
+        const unsigned bubble = bubbleKnown ? bubbleCap[s] : 0u;
+        const unsigned realBudget = stageShadowBudget(primary[s], caps[s], bubbleKnown, bubble, -1);
+        const unsigned effective = stageShadowBudget(primary[s], caps[s], bubbleKnown, bubble, experimentCap);
+        unsigned placed = 0u;
+        if (s > 0u && (s - 1u) < overlaps.size()) placed += overlaps[s - 1u].rightHolds;
+        if ((s + 1u) < plan->nStages && s < overlaps.size()) placed += overlaps[s].leftHolds;
+        if (!bubbleKnown) {
+            std::printf(" %u mem=%u bubble=unk real=%u effective=%u placed=%u",
+                (unsigned)s, memSpare, realBudget, effective, placed);
         } else {
-            std::printf(" %u mem=%u bubble=%u use=%u", (unsigned)s, memSpare, bubble, use);
+            std::printf(" %u mem=%u bubble=%u real=%u effective=%u placed=%u",
+                (unsigned)s, memSpare, bubble, realBudget, effective, placed);
         }
     }
+    if (experimentCap < 0) std::printf(" experiment_cap=unset");
+    else std::printf(" experiment_cap=%d", experimentCap);
     std::printf("\n");
     std::fflush(stdout);
+    {
+        const char *dirEnv = std::getenv("EDGEVISOR_SHADOW_PROFILE_DIR");
+        const std::string dir = (dirEnv != nullptr && dirEnv[0] != '\0') ? std::string(dirEnv) : std::string("shadow_profile");
+#if defined(__linux__)
+        ::mkdir(dir.c_str(), 0755);
+#endif
+        std::ofstream record((dir + "/allocation.json").c_str(), std::ios::out | std::ios::trunc);
+        if (record.is_open()) {
+            record << "{\n";
+            record << "  \"gitHead\": \"" << jsonEscapeText(gitHeadText()) << "\",\n";
+            record << "  \"backend\": \"" << jsonEscapeText(args->backendStr != nullptr ? args->backendStr : "") << "\",\n";
+            record << "  \"model\": \"" << jsonEscapeText(args->modelPath != nullptr ? args->modelPath : "") << "\",\n";
+            record << "  \"tokenizer\": \"" << jsonEscapeText(args->tokenizerPath != nullptr ? args->tokenizerPath : "") << "\",\n";
+            record << "  \"prompt\": \"" << jsonEscapeText(args->prompt != nullptr ? args->prompt : "") << "\",\n";
+            record << "  \"maxSeqLen\": " << args->maxSeqLen << ",\n";
+            record << "  \"steps\": " << args->steps << ",\n";
+            record << "  \"mode\": \"" << modeLabel << "\",\n";
+            record << "  \"linkUsedInAllocation\": " << (useLink ? "true" : "false") << ",\n";
+            record << "  \"mismatch\": \"" << jsonEscapeText(mismatchNote) << "\",\n";
+            record << "  \"manualLabels\": " << (readPriorityFile ? "true" : "false") << ",\n";
+            if (experimentCap < 0) record << "  \"experimentCap\": null,\n";
+            else record << "  \"experimentCap\": " << experimentCap << ",\n";
+            record << "  \"primary\": [";
+            for (NnUint s = 0u; s < plan->nStages; ++s) {
+                if (s > 0u) record << ", ";
+                record << primary[s];
+            }
+            record << "],\n  \"stages\": [\n";
+            for (NnUint s = 0u; s < plan->nStages; ++s) {
+                const unsigned memSpare = caps[s] > primary[s] ? caps[s] - primary[s] : 0u;
+                const bool bubbleKnown = s < bubbleCap.size() && bubbleCap[s] != 0xffffffffu;
+                const unsigned bubble = bubbleKnown ? bubbleCap[s] : 0u;
+                const unsigned realBudget = stageShadowBudget(primary[s], caps[s], bubbleKnown, bubble, -1);
+                const unsigned effective = stageShadowBudget(primary[s], caps[s], bubbleKnown, bubble, experimentCap);
+                unsigned placed = 0u;
+                if (s > 0u && (s - 1u) < overlaps.size()) placed += overlaps[s - 1u].rightHolds;
+                if ((s + 1u) < plan->nStages && s < overlaps.size()) placed += overlaps[s].leftHolds;
+                if (s > 0u) record << ",\n";
+                record << "    {\"stage\": " << s
+                    << ", \"measuredWeight\": " << (s < measuredWeights.size() ? measuredWeights[s] : 0u)
+                    << ", \"weight\": " << weights[s]
+                    << ", \"memorySpare\": " << memSpare
+                    << ", \"bubble\": ";
+                if (!bubbleKnown) record << "null";
+                else record << bubble;
+                record << ", \"realBudget\": " << realBudget
+                    << ", \"effectiveBudget\": " << effective
+                    << ", \"placed\": " << placed << "}";
+            }
+            record << "\n  ],\n";
+            record << "  \"redundancy\": \"" << jsonEscapeText(formatBoundaryOverlap(overlaps)) << "\",\n";
+            record << "  \"equalUnderSameCap\": \"" << jsonEscapeText(formatBoundaryOverlap(equalOverlaps)) << "\",\n";
+            record << "  \"coverage\": \"" << jsonEscapeText(formatShadowPlacement(primary, overlaps)) << "\",\n";
+            record << "  \"note\": \"Device score 0 means read indicators stayed within their normal points. "
+                << "q is metadata, not a fused credibility. "
+                << "device_only does not move shadow because a link is jittery. "
+                << "Coverage lists placed intervals; a complete placement is not a claim that takeover ran or that steady-state traffic improved.\"\n";
+            record << "}\n";
+        }
+    }
     if (std::getenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE") == nullptr) {
         unsigned step = 1u;
         for (size_t i = 0u; i < overlaps.size(); ++i) {

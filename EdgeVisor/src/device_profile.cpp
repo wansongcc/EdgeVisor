@@ -367,12 +367,37 @@ static int readBatteryPercent() {
 }
 #endif
 
+#if defined(__linux__)
+// Driver margin to the slowdown temperature. [N/A] and a missing field stay
+// unknown; a guessed limit must not become a headroom.
+static int readGpuHeadroomC() {
+    char command[256];
+    std::snprintf(command, sizeof(command),
+        "timeout 2 nvidia-smi --query-gpu=temperature.gpu.tlimit --format=csv,noheader -i %d 2>/dev/null",
+        g_gpuIndex);
+    FILE *pipe = popen(command, "r");
+    if (pipe == nullptr) return -1;
+    char line[128];
+    line[0] = '\0';
+    const bool gotLine = std::fgets(line, sizeof(line), pipe) != nullptr;
+    const int status = pclose(pipe);
+    if (!gotLine || status != 0) return -1;
+    char *stop = nullptr;
+    const long parsed = std::strtol(line, &stop, 10);
+    if (stop == line || parsed < 0 || parsed > 200) return -1;
+    return (int)parsed;
+}
+#endif
+
 HardwareTick readHardwareTick() {
     HardwareTick tick;
     const DeviceCondition condition = measureLocalCondition();
     tick.temperatureC = condition.temperatureC;
     tick.thermalLimited = condition.thermalLimited;
     tick.onExternalPower = condition.onExternalPower;
+#if defined(__linux__)
+    tick.thermalHeadroomC = readGpuHeadroomC();
+#endif
 #if defined(__linux__)
     tick.batteryPercent = readBatteryPercent();
     readNvidiaClocks(&tick.freqMhz, &tick.freqMaxMhz);

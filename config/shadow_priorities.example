@@ -1,0 +1,13 @@
+# stage priority reason
+# Read only when EDGEVISOR_SHADOW_ALLOCATION=file.
+# priority and reversed run a short sustained profile and do not open this file.
+# equal:    every stage the same weight.
+# priority: sustained compute, thermal, power, and per-link transfers; the
+#           worst known signal sets the weight.
+# reversed: same measurement, then swap low and high.
+# file:     read this file.
+# Weights: low=2 mid=3 high=4. Missing stages stay mid.
+0 low dedicated-and-plugged-in
+1 high mobile-unplugged
+2 mid shared-workstation
+3 low dedicated-and-plugged-in

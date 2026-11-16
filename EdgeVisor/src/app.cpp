@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "terminal_ui.hpp"
 #include "device_profile.hpp"
+#include "sustained_profile.hpp"
 #include "failover_gate.hpp"
 #include "product_log.hpp"
 #include "nn/io-profile.hpp"
@@ -6323,12 +6324,18 @@ void WorkerLlmInference::flushPendingKvAck() {
 
 static NnExecutor *g_failoverExecutor = nullptr;
 
-struct ArmedTakeover {
+struct ArmedSlice {
     bool armed = false;
     bool layersEnabled = false;
     NnUint ownerNode = 0u;
     NnUint begin = 0u;
     NnUint end = 0u;
+};
+
+struct ArmedTakeover {
+    bool accepted = false;
+    ArmedSlice front;
+    ArmedSlice back;
 };
 
 static ArmedTakeover g_armedTakeover;
@@ -6342,26 +6349,73 @@ struct FailoverExecGuard {
     ~FailoverExecGuard() { if (g_failoverExecutor == executor) g_failoverExecutor = nullptr; }
 };
 
-static bool ppStageCoversLayers(const RuntimeStageLayerPlan &roles, NnUint stageIndex, NnUint begin, NnUint end) {
-    if (begin >= end) return false;
-    for (NnUint layer = begin; layer < end; ++layer) {
-        if (roles.getRole(stageIndex, layer) != RUNTIME_LAYER_REDUNDANT) return false;
+static void enableArmedSlice(ArmedSlice *slice, bool replayActivation) {
+    if (slice == nullptr || g_failoverExecutor == nullptr || !slice->armed || slice->layersEnabled) return;
+    if (slice->begin >= slice->end) {
+        slice->layersEnabled = true;
+        return;
+    }
+    for (NnUint layer = slice->begin; layer < slice->end; ++layer)
+        g_failoverExecutor->setRedundantLayerEnabled(layer, true);
+    slice->layersEnabled = true;
+    // The in-flight send already copied the pre-takeover activation out.
+    // Run this slice once on that snapshot, then the retry sends it. Later
+    // tokens run the same layers inside the normal forward.
+    if (replayActivation)
+        g_failoverExecutor->spliceRedundantLayersIntoSend(slice->begin, slice->end);
+}
+
+static bool armedSliceReady(const ArmedSlice &slice) {
+    if (!slice.armed || slice.begin >= slice.end) return true;
+    const NnUint pos = g_failoverExecutor == nullptr ? 0u : g_failoverExecutor->executionPosition();
+    if (g_failoverExecutor == nullptr || !g_failoverExecutor->shadowCovers(slice.begin, slice.end, pos)) {
+        std::printf("⚡ [failover] fast-path reject owner=%u layers=[%u,%u) reason=shadow-unfilled pos=%u\n",
+            (unsigned)slice.ownerNode, (unsigned)slice.begin, (unsigned)slice.end, (unsigned)pos);
+        std::fflush(stdout);
+        return false;
     }
     return true;
 }
 
-static void enableArmedTakeoverLayers(bool replayActivation) {
-    if (g_failoverExecutor == nullptr || !g_armedTakeover.armed) return;
-    if (!g_armedTakeover.layersEnabled) {
-        for (NnUint layer = g_armedTakeover.begin; layer < g_armedTakeover.end; ++layer)
-            g_failoverExecutor->setRedundantLayerEnabled(layer, true);
-        g_armedTakeover.layersEnabled = true;
-        // The in-flight send already copied the pre-takeover activation out.
-        // Run the dead layers on that snapshot once, then the retry sends it.
-        // Later tokens run the same layers inside the normal forward.
-        if (replayActivation)
-            g_failoverExecutor->spliceRedundantLayersIntoSend(g_armedTakeover.begin, g_armedTakeover.end);
+static unsigned neighborCoverRun(
+    const RuntimeStageLayerPlan &roles,
+    const NnStageConfig *holder,
+    NnUint layerBegin,
+    NnUint layerEnd,
+    bool fromFront) {
+    if (holder == nullptr || layerBegin >= layerEnd) return 0u;
+    unsigned count = 0u;
+    const unsigned width = layerEnd - layerBegin;
+    while (count < width) {
+        const NnUint layer = fromFront ? layerBegin + count : layerEnd - 1u - count;
+        const bool alreadyOwns = layer >= holder->startLayer && layer < holder->endLayer;
+        const bool redundant = roles.getRole(holder->stageIndex, layer) == RUNTIME_LAYER_REDUNDANT;
+        if (!alreadyOwns && !redundant) break;
+        count += 1u;
     }
+    return count;
+}
+
+static bool resumeArmedTakeover(NnUint myNodeIndex, NnUint deadNodeIndex, bool replayActivation) {
+    if (!g_armedTakeover.accepted) return false;
+    const bool ownsFront = g_armedTakeover.front.armed && myNodeIndex == g_armedTakeover.front.ownerNode;
+    const bool ownsBack = g_armedTakeover.back.armed && myNodeIndex == g_armedTakeover.back.ownerNode;
+    if (ownsFront && !armedSliceReady(g_armedTakeover.front)) return false;
+    if (ownsBack && !armedSliceReady(g_armedTakeover.back)) return false;
+    if (ownsFront) enableArmedSlice(&g_armedTakeover.front, replayActivation);
+    if (ownsBack) enableArmedSlice(&g_armedTakeover.back, replayActivation);
+    std::printf("⚡ [failover] fast-path already bypassed deadNode=%u\n", (unsigned)deadNodeIndex);
+    std::fflush(stdout);
+    return true;
+}
+
+static bool extendStageRange(NnStageConfig *stage, NnUint newStart, NnUint newEnd) {
+    if (stage == nullptr || newStart > newEnd) return false;
+    if (newEnd < stage->startLayer || newStart > stage->endLayer) return false;
+    if (newStart < stage->startLayer) stage->startLayer = newStart;
+    if (newEnd > stage->endLayer) stage->endLayer = newEnd;
+    stage->nLayers = stage->endLayer - stage->startLayer;
+    return true;
 }
 
 static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex, bool replayActivation) {
@@ -6373,103 +6427,77 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
             break;
         }
     }
-    if (stageIndex == (NnUint)-1) {
-        if (!g_armedTakeover.armed) return false;
-        if (myNodeIndex == g_armedTakeover.ownerNode) {
-            const NnUint pos = g_failoverExecutor == nullptr ? 0u : g_failoverExecutor->executionPosition();
-            if (g_failoverExecutor == nullptr ||
-                !g_failoverExecutor->shadowCovers(g_armedTakeover.begin, g_armedTakeover.end, pos)) {
-                std::printf("⚡ [failover] fast-path reject deadNode=%u reason=shadow-unfilled pos=%u\n",
-                    (unsigned)deadNodeIndex, (unsigned)pos);
-                std::fflush(stdout);
-                return false;
-            }
-            enableArmedTakeoverLayers(replayActivation);
-        }
-        std::printf("⚡ [failover] fast-path already bypassed deadNode=%u\n",
-            (unsigned)deadNodeIndex);
-        std::fflush(stdout);
-        return true;
-    }
-    if (myNodeIndex == 0u) {
-        char uiEvent[96];
-        std::snprintf(uiEvent, sizeof(uiEvent), "node %u offline", (unsigned)deadNodeIndex);
-        edgeVisorUiMarkOffline(stageIndex, uiEvent);
-    }
+    if (stageIndex == (NnUint)-1) return resumeArmedTakeover(myNodeIndex, deadNodeIndex, replayActivation);
     const NnUint prev = getPpPrevStageIndex(plan, stageIndex);
     const NnUint next = getPpNextStageIndex(plan, stageIndex);
-    if (prev == (NnUint)-1 && next == (NnUint)-1) {
-        if (g_armedTakeover.armed && myNodeIndex == g_armedTakeover.ownerNode)
-            enableArmedTakeoverLayers(replayActivation);
-        std::printf("⚡ [failover] fast-path already bypassed deadNode=%u stage=%u\n",
-            (unsigned)deadNodeIndex, (unsigned)stageIndex);
-        std::fflush(stdout);
-        return true;
-    }
-    if (prev == (NnUint)-1 || next == (NnUint)-1) {
-        // Last stage owns final_norm and the logits head. Do not splice a
-        // neighbor into that role; the root restarts the session instead.
-        const char *reason = (next == (NnUint)-1 && prev != (NnUint)-1) ? "last-stage" : "edge-stage";
-        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=%s\n",
-            (unsigned)deadNodeIndex, (unsigned)stageIndex, reason);
-        std::fflush(stdout);
-        return false;
-    }
+    if (prev == (NnUint)-1 && next == (NnUint)-1)
+        return resumeArmedTakeover(myNodeIndex, deadNodeIndex, replayActivation);
+
     NnUint nLayers = 0u;
     for (NnUint s = 0; s < plan->nStages; ++s) nLayers = std::max(nLayers, plan->stages[s].endLayer);
     const RuntimeStageLayerPlan roles = buildRuntimeStageLayerPlan(plan, nLayers);
     const NnStageConfig &dead = plan->stages[stageIndex];
-    // Only the previous stage's shadow KV is the dead layer's real input.
-    // The next stage's left-boundary cache is the dead stage's output.
-    // A joined device borrows a slice the previous stage still has weights for.
-    // Hand that slice back and keep decoding.
-    const bool donorStillHolds =
-        plan->stages[prev].startLayer <= dead.startLayer &&
-        plan->stages[prev].endLayer >= dead.endLayer;
-    if (!donorStillHolds && !ppStageCoversLayers(roles, prev, dead.startLayer, dead.endLayer)) {
-        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u layers=[%u,%u) reason=partial-cover\n",
-            (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)dead.startLayer, (unsigned)dead.endLayer);
+    const NnStageConfig *prevStage = prev == (NnUint)-1 ? nullptr : &plan->stages[prev];
+    const NnStageConfig *nextStage = next == (NnUint)-1 ? nullptr : &plan->stages[next];
+    // Previous stage stores the dead stage's prefix. Next stage stores its
+    // suffix. Takeover needs those two runs to cover every dead layer.
+    const unsigned prefix = neighborCoverRun(roles, prevStage, dead.startLayer, dead.endLayer, true);
+    const unsigned suffix = neighborCoverRun(roles, nextStage, dead.startLayer, dead.endLayer, false);
+    const ShadowTakeoverSplit split = bidirectionalShadowTakeover(
+        dead.startLayer, dead.endLayer, prefix, suffix);
+    if (prev == (NnUint)-1 || next == (NnUint)-1 || !split.complete) {
+        const char *reason = !split.complete ? "partial-cover"
+            : (next == (NnUint)-1 ? "last-stage" : "first-stage");
+        std::printf("⚡ [failover] stop deadNode=%u stage=%u layers=[%u,%u) prefix=%u suffix=%u reason=%s\n",
+            (unsigned)deadNodeIndex, (unsigned)stageIndex,
+            (unsigned)dead.startLayer, (unsigned)dead.endLayer, prefix, suffix, reason);
         std::fflush(stdout);
+        if (myNodeIndex == 0u) {
+            char uiEvent[96];
+            std::snprintf(uiEvent, sizeof(uiEvent), "node %u offline", (unsigned)deadNodeIndex);
+            edgeVisorUiMarkOffline(stageIndex, uiEvent);
+        }
         return false;
     }
-    const NnUint target = prev;
-    const NnUint ownerNode = plan->stages[target].rootNodeIndex;
-    if (donorStillHolds && myNodeIndex == ownerNode && g_failoverExecutor != nullptr) {
-        for (NnUint layer = dead.startLayer; layer < dead.endLayer; ++layer)
-            g_failoverExecutor->setPrimaryLayerEnabled(layer, true);
-    }
-    // The previous stage is the only one that can see whether shadow KV was
-    // written. If it was not, refuse before the plan changes so decode
-    // restarts instead of continuing on an empty cache. Other stages still
-    // update their own routing once the owner has accepted.
-    if (!donorStillHolds && myNodeIndex == ownerNode) {
-        const NnUint pos = g_failoverExecutor == nullptr ? 0u : g_failoverExecutor->executionPosition();
-        if (g_failoverExecutor == nullptr ||
-            !g_failoverExecutor->shadowCovers(dead.startLayer, dead.endLayer, pos)) {
-            std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u layers=[%u,%u) reason=shadow-unfilled pos=%u\n",
-                (unsigned)deadNodeIndex, (unsigned)stageIndex,
-                (unsigned)dead.startLayer, (unsigned)dead.endLayer, (unsigned)pos);
-            std::fflush(stdout);
-            return false;
-        }
-    }
-    g_armedTakeover.armed = true;
-    g_armedTakeover.ownerNode = ownerNode;
-    g_armedTakeover.begin = dead.startLayer;
-    g_armedTakeover.end = dead.endLayer;
-    if (!applyPpStageBypass(plan, stageIndex, target)) {
-        g_armedTakeover.armed = false;
-        std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=bypass-rejected\n",
+
+    // Layers the neighbor already executes stay primary. Shadow has to be
+    // current only for the run past that neighbor's old boundary.
+    const NnUint oldPrevEnd = prevStage->endLayer;
+    const NnUint oldNextStart = nextStage->startLayer;
+    ArmedSlice front;
+    front.ownerNode = prevStage->rootNodeIndex;
+    front.begin = oldPrevEnd;
+    front.end = split.frontEnd;
+    front.armed = front.begin < front.end;
+    ArmedSlice back;
+    back.ownerNode = nextStage->rootNodeIndex;
+    back.begin = split.backBegin;
+    back.end = oldNextStart;
+    back.armed = back.begin < back.end;
+    if (myNodeIndex == front.ownerNode && !armedSliceReady(front)) return false;
+    if (myNodeIndex == back.ownerNode && !armedSliceReady(back)) return false;
+    if (split.frontEnd > oldPrevEnd && !extendStageRange(&plan->stages[prev], split.frontBegin, split.frontEnd))
+        return false;
+    if (split.backBegin < oldNextStart && !extendStageRange(&plan->stages[next], split.backBegin, split.backEnd))
+        return false;
+    g_armedTakeover.accepted = true;
+    g_armedTakeover.front = front;
+    g_armedTakeover.back = back;
+    const NnUint bypassTarget = front.armed ? prev : next;
+    if (!applyPpStageBypass(plan, stageIndex, bypassTarget)) {
+        g_armedTakeover = ArmedTakeover();
+        std::printf("⚡ [failover] stop deadNode=%u stage=%u reason=bypass-rejected\n",
             (unsigned)deadNodeIndex, (unsigned)stageIndex);
         std::fflush(stdout);
         return false;
     }
-    if (!donorStillHolds && myNodeIndex == ownerNode)
-        enableArmedTakeoverLayers(replayActivation);
-    std::printf("⚡ [failover] fast-path deadNode=%u ejectedStage=%u targetStage=%u layers=[%u,%u) myNode=%u replay=%d\n",
-        (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)target,
-        (unsigned)dead.startLayer, (unsigned)dead.endLayer, (unsigned)myNodeIndex,
-        replayActivation ? 1 : 0);
+    if (myNodeIndex == front.ownerNode) enableArmedSlice(&g_armedTakeover.front, replayActivation);
+    if (myNodeIndex == back.ownerNode) enableArmedSlice(&g_armedTakeover.back, replayActivation);
+    std::printf("⚡ [failover] takeover deadNode=%u stage=%u prev=%u layers=[%u,%u) next=%u layers=[%u,%u) myNode=%u\n",
+        (unsigned)deadNodeIndex, (unsigned)stageIndex,
+        (unsigned)prev, split.frontBegin, split.frontEnd,
+        (unsigned)next, split.backBegin, split.backEnd,
+        (unsigned)myNodeIndex);
     std::fflush(stdout);
     if (myNodeIndex == 0u) {
         char uiEvent[96];
@@ -6547,6 +6575,38 @@ static SpeedDeviceProfile profileForLocal(const ModelShape *shape);
 
 // Prefer the speed-pack probe. Explicit ratios never ran that pass, so measure
 // the device once here; the same call fills the memory-cap cache.
+static unsigned activationBytesForHeader(const LlmHeader &header) {
+    if (header.dim == 0u) return 0u;
+    try {
+        const NnSize bytes = getBytes(header.syncType, header.dim);
+        if (bytes == 0u || bytes > (16u << 20)) return 0u;
+        return (unsigned)bytes;
+    } catch (...) {
+        const unsigned fallback = header.dim * (unsigned)sizeof(float);
+        return fallback <= (16u << 20) ? fallback : 0u;
+    }
+}
+
+static unsigned envUnsigned(const char *name, unsigned fallback, unsigned maxValue) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') return fallback;
+    char *stop = nullptr;
+    const unsigned long value = std::strtoul(text, &stop, 10);
+    if (stop == text) return fallback;
+    if (value > (unsigned long)maxValue) return maxValue;
+    return (unsigned)value;
+}
+
+static double envPositiveDouble(const char *name, double fallback, double maxValue) {
+    const char *text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') return fallback;
+    char *stop = nullptr;
+    const double value = std::strtod(text, &stop);
+    if (stop == text || !(value > 0.0)) return fallback;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
 static double nodeLayerMs(const char *host, int port, const ModelShape *shape) {
     const std::string key = host == nullptr ? std::string("local") : std::string(host);
     SpeedDeviceProfile cached;
@@ -6563,11 +6623,13 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     if (args == nullptr || plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return;
     if (!args->enablePpMigration && !bubbleShadowKvEnabled()) return;
     if (args->runtimeRedundantBoundaryLayersExplicit) {
+        std::printf("shadow-alloc: bypass reason=explicit-boundary-layers\n");
         unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
         return;
     }
     const char *pinned = std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
     if (pinned != nullptr && pinned[0] != '\0') {
+        std::printf("shadow-alloc: bypass reason=pinned-depths\n");
         g_autoBoundaryDepths = pinned;
         args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
         return;
@@ -6602,7 +6664,115 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
 
     const std::vector<unsigned> bubbleCap = bubbleShadowLayerCap(primary, layerMs);
-    const std::vector<BoundaryOverlap> overlaps = assignBoundaryOverlap(primary, caps, &bubbleCap);
+
+    // Which neighbor each device protects is an experiment knob, so the mode
+    // only changes the weights fed to the allocator; the caps above still
+    // decide whether a layer may be placed at all.
+    const char *modeEnv = std::getenv("EDGEVISOR_SHADOW_ALLOCATION");
+    std::string mode = modeEnv == nullptr ? std::string("equal") : std::string(modeEnv);
+    std::string modeKey = mode;
+    for (std::size_t i = 0u; i < modeKey.size(); ++i) {
+        if (modeKey[i] >= 'A' && modeKey[i] <= 'Z') modeKey[i] = (char)(modeKey[i] - 'A' + 'a');
+    }
+    bool equalMode = true;
+    bool reversed = false;
+    bool readPriorityFile = false;
+    bool collectCondition = false;
+    const char *modeLabel = "equal";
+    if (modeKey.empty() || modeKey == "equal") {
+        equalMode = true;
+    } else if (modeKey == "file") {
+        equalMode = false;
+        readPriorityFile = true;
+        modeLabel = "file";
+    } else if (modeKey == "priority") {
+        equalMode = false;
+        collectCondition = true;
+        modeLabel = "priority";
+    } else if (modeKey == "reversed") {
+        equalMode = false;
+        collectCondition = true;
+        reversed = true;
+        modeLabel = "reversed";
+    } else {
+        std::fprintf(stderr, "shadow-alloc: unknown EDGEVISOR_SHADOW_ALLOCATION=%s, using equal\n", mode.c_str());
+        equalMode = true;
+    }
+
+    std::vector<unsigned> weights(plan->nStages, 3u);
+    std::vector<unsigned> linkPriority;
+    if (readPriorityFile) {
+        const char *path = std::getenv("EDGEVISOR_SHADOW_PRIORITY_FILE");
+        bool loaded = false;
+        if (path == nullptr || path[0] == '\0') {
+            std::fprintf(stderr, "shadow-alloc: EDGEVISOR_SHADOW_PRIORITY_FILE is not set, using mid weights\n");
+        } else {
+            std::ifstream file(path);
+            if (!file.is_open()) {
+                std::fprintf(stderr, "shadow-alloc: cannot open %s, using mid weights\n", path);
+            } else {
+                std::ostringstream buffer;
+                buffer << file.rdbuf();
+                std::string error;
+                loaded = parseShadowPriorityText(buffer.str(), (unsigned)plan->nStages, &weights, &error);
+                if (!loaded) {
+                    std::fprintf(stderr, "shadow-alloc: %s: %s, using mid weights\n", path, error.c_str());
+                }
+            }
+        }
+        if (!loaded) weights.assign(plan->nStages, 3u);
+    } else if (collectCondition) {
+        // The one-shot speed profile above already fixed the primary split.
+        // This window watches that split under a paced load and on the
+        // addresses inference will use, then hands algorithm 1 a priority.
+        SustainedRunConfig profileConfig;
+        profileConfig.observeSeconds = envPositiveDouble("EDGEVISOR_SHADOW_PROFILE_SECONDS", 25.0, 120.0);
+        profileConfig.warmupRounds = envUnsigned("EDGEVISOR_SHADOW_PROFILE_WARMUP", kSustainedDefaultWarmupRounds, 32u);
+        profileConfig.timeoutMs = envUnsigned("EDGEVISOR_SHADOW_PROFILE_TIMEOUT_MS", kSustainedDefaultTimeoutMs, 10000u);
+        profileConfig.activationBytes = activationBytesForHeader(header);
+        profileConfig.reversed = reversed;
+        profileConfig.shape = shape;
+        const char *dirEnv = std::getenv("EDGEVISOR_SHADOW_PROFILE_DIR");
+        profileConfig.outputDir = (dirEnv != nullptr && dirEnv[0] != '\0') ? std::string(dirEnv) : std::string("shadow_profile");
+        double stepMs = 0.0;
+        bool paceKnown = true;
+        for (NnUint s = 0u; s < plan->nStages; ++s) {
+            if (!(layerMs[s] > 0.0)) paceKnown = false;
+            else stepMs += (double)primary[s] * layerMs[s];
+        }
+        profileConfig.stepMs = paceKnown ? stepMs : 0.0;
+        profileConfig.endpoints.resize(plan->nStages);
+        for (NnUint s = 0u; s < plan->nStages; ++s) {
+            SustainedEndpoint &endpoint = profileConfig.endpoints[s];
+            endpoint.stage = (unsigned)s;
+            endpoint.primaryLayers = primary[s];
+            const NnUint nStageNodes = plan->stages[s].nNodes;
+            endpoint.extraNodes = nStageNodes > 1u ? (unsigned)(nStageNodes - 1u) : 0u;
+            const NnUint node = nStageNodes > 0u ? plan->stages[s].nodeIndices[0] : 0u;
+            if (node == 0u) {
+                endpoint.host.clear();
+                endpoint.port = 0;
+            } else if (args->workerHosts != nullptr && (node - 1u) < args->nWorkers) {
+                endpoint.host = args->workerHosts[node - 1u];
+                endpoint.port = (int)args->workerPorts[node - 1u];
+            }
+        }
+        try {
+            const SustainedRunOutput profile = runSustainedShadowProfile(profileConfig);
+            if (profile.devicePriority.size() == weights.size()) weights = profile.devicePriority;
+            linkPriority = profile.linkPriority;
+        } catch (const std::exception &ex) {
+            std::fprintf(stderr, "shadow-profile: failed (%s), using mid weights\n", ex.what());
+        } catch (...) {
+            std::fprintf(stderr, "shadow-profile: failed, using mid weights\n");
+        }
+    }
+
+    const std::vector<BoundaryOverlap> equalOverlaps = assignBoundaryOverlap(primary, caps, &bubbleCap);
+    const std::vector<BoundaryOverlap> overlaps = equalMode
+        ? equalOverlaps
+        : assignBoundaryOverlap(primary, caps, &bubbleCap, &weights,
+            linkPriority.empty() ? nullptr : &linkPriority);
     g_autoBoundaryDepths = formatBoundaryOverlap(overlaps);
     if (g_autoBoundaryDepths.empty()) {
         unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
@@ -6610,6 +6780,12 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     }
     setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", g_autoBoundaryDepths.c_str(), 1);
     args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
+    std::printf("shadow-priority: mode=%s applied=", modeLabel);
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        if (s > 0u) std::printf(",");
+        std::printf("%u", weights[s]);
+    }
+    std::printf("\nshadow-equal: %s\n", formatBoundaryOverlap(equalOverlaps).c_str());
     std::printf("redundancy:");
     for (size_t i = 0u; i < overlaps.size(); ++i) {
         std::printf(" %u->%u %u,%u", (unsigned)i, (unsigned)(i + 1u),

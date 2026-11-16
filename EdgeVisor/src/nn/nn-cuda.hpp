@@ -14,6 +14,21 @@ double nnCudaProfileGemmMs(NnUint gpuIndex, int n);
 double nnCudaProfileLayerMs(NnUint gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads);
 unsigned long long nnCudaFreeBytes(NnUint gpuIndex);
 
+// One allocated layer, repeated. runOnceMs times a single pass of the same
+// seven projections the one-shot profile averages, and returns a negative
+// value when the context could not be created.
+class NnCudaLayerSoak {
+public:
+    NnCudaLayerSoak(unsigned gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads);
+    ~NnCudaLayerSoak();
+    double runOnceMs();
+private:
+    struct Impl;
+    Impl *impl;
+    NnCudaLayerSoak(const NnCudaLayerSoak &);
+    NnCudaLayerSoak &operator=(const NnCudaLayerSoak &);
+};
+
 struct NnCudaLaunchConfig {
     int computeCapabilityMajor;
     int computeCapabilityMinor;

@@ -3,6 +3,7 @@
 
 #include "nn-executor.hpp"
 #include "nn-core.hpp"
+#include "device_profile.hpp"
 
 #include <atomic>
 #include <vector>
@@ -78,6 +79,13 @@ bool queryWorkerSpeedProfile(
     char *name,
     unsigned nameBytes,
     unsigned long long *freeBytes);
+
+// Same transport as the speed probe, but asks for the worker's thermal state,
+// its power source, and the round trip this side measures over 16 echoes. The
+// network fields in *out are filled here; the worker only supplies the three
+// device fields. Returns false when the worker does not answer, which the
+// caller must treat as "no sample", not as a bad device.
+bool queryWorkerCondition(const char *host, int port, DeviceCondition *out);
 
 // Returns true when the dead node's layers were already covered and the local
 // plan now skips that stage. The target node also enables those redundant layers.

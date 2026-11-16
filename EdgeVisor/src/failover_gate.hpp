@@ -2,9 +2,9 @@
 #define FAILOVER_GATE_HPP
 
 // Fast-path takeover is allowed only when every stolen layer already has
-// shadow KV for positions [0, position). A missing row falls back to a
-// session restart. `filledThrough[layer]` is the exclusive end position
-// written by shadow (or by the chained replay of that layer).
+// shadow KV for positions [0, position). A missing row stops the inference
+// task. `filledThrough[layer]` is the exclusive end position written by
+// shadow (or by the chained replay of that layer).
 inline bool shadowHistoryCovers(const unsigned *filledThrough, unsigned nLayers,
                                 unsigned begin, unsigned end, unsigned position) {
     if (begin >= end) return false;
@@ -14,6 +14,35 @@ inline bool shadowHistoryCovers(const unsigned *filledThrough, unsigned nLayers,
         if (filled < position) return false;
     }
     return true;
+}
+
+// Offline takeover splits one stage across its two neighbors. The previous
+// stage holds a prefix of the dead stage, the next stage holds a suffix, and
+// the two runs must meet. An overlap stays with the previous stage; the next
+// stage runs only the remainder, which is inside its own suffix. A gap, or a
+// missing neighbor that leaves one side at zero, is not a takeover.
+struct ShadowTakeoverSplit {
+    bool complete = false;
+    unsigned frontBegin = 0u;
+    unsigned frontEnd = 0u;
+    unsigned backBegin = 0u;
+    unsigned backEnd = 0u;
+};
+
+inline ShadowTakeoverSplit bidirectionalShadowTakeover(
+    unsigned start, unsigned end, unsigned prefixLayers, unsigned suffixLayers) {
+    ShadowTakeoverSplit split;
+    if (start >= end) return split;
+    const unsigned width = end - start;
+    if (prefixLayers > width) prefixLayers = width;
+    if (suffixLayers > width) suffixLayers = width;
+    if (prefixLayers + suffixLayers < width) return split;
+    split.complete = true;
+    split.frontBegin = start;
+    split.frontEnd = start + prefixLayers;
+    split.backBegin = split.frontEnd;
+    split.backEnd = end;
+    return split;
 }
 
 // Join connect/accept must fail closed instead of blocking the decode loop.

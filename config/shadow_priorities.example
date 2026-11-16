@@ -1,10 +1,10 @@
 # stage priority reason
-# Read only when EDGEVISOR_SHADOW_ALLOCATION=file. priority and reversed
-# sample at startup instead and never open this file.
+# Read only when EDGEVISOR_SHADOW_ALLOCATION=file.
+# priority and reversed run a short sustained profile and do not open this file.
 # equal:    every stage the same weight.
-# priority: sample temperature, power, and TCP round trip at startup; the
-#           worst known reading sets the weight.
-# reversed: sample as priority, then swap low and high.
+# priority: sustained compute, thermal, power, and per-link transfers; the
+#           worst known signal sets the weight.
+# reversed: same measurement, then swap low and high.
 # file:     read this file.
 # Weights: low=2 mid=3 high=4. Missing stages stay mid.
 0 low dedicated-and-plugged-in

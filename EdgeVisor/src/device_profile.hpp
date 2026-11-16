@@ -8,6 +8,21 @@
 #include <string>
 #include <vector>
 
+// One hardware sample. Negative fields are unknown. The caller sets timestampMs.
+struct HardwareTick {
+    double timestampMs = 0.0;
+    int temperatureC = -1;
+    int thermalLimited = -1;  // -1 unknown, 0 no, 1 yes
+    int freqMhz = -1;
+    int freqMaxMhz = -1;
+    int onExternalPower = -1; // -1 unknown, 0 battery, 1 external
+    int batteryPercent = -1;
+};
+
+// Fills every field except timestampMs from this machine. A missing sensor
+// stays unknown and does not throw.
+HardwareTick readHardwareTick();
+
 // Backend used for the one-shot matmul that feeds speed-pack.
 enum ProfileBackend {
     PROFILE_CPU = 0,
@@ -23,6 +38,21 @@ struct ModelShape {
     unsigned maxSeqLen;
     unsigned nLayers;
     int weightType;
+};
+
+// Repeats one representative layer without reallocating, so a short run times
+// the compute itself. runOnceMs returns a negative value when the layer cannot
+// be launched. The one-shot speed profile is unchanged.
+class RepresentativeLayerBench {
+public:
+    explicit RepresentativeLayerBench(const ModelShape &shape);
+    ~RepresentativeLayerBench();
+    double runOnceMs();
+private:
+    struct Impl;
+    Impl *impl;
+    RepresentativeLayerBench(const RepresentativeLayerBench &);
+    RepresentativeLayerBench &operator=(const RepresentativeLayerBench &);
 };
 
 struct SpeedDeviceProfile {
@@ -668,11 +698,17 @@ inline void reverseShadowPriorityWeights(std::vector<unsigned> *weights) {
 // the copy: a high-priority neighbor pulls more shadow onto both of its peers.
 // A null vector, or a vector shorter than the pipeline, means mid weights
 // everywhere, which reproduces the equal split the older callers relied on.
+//
+// linkPriority is per boundary, same order as the returned overlaps. It raises
+// only that boundary: the weight used on a side is the larger of the neighbor's
+// device priority and that boundary's link priority. Zero means the link was
+// not measured, and an unmeasured link does not change the device priority.
 inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
     const std::vector<unsigned> &primary,
     const std::vector<unsigned> &memoryCap,
     const std::vector<unsigned> *bubbleCap = nullptr,
-    const std::vector<unsigned> *priorityWeight = nullptr) {
+    const std::vector<unsigned> *priorityWeight = nullptr,
+    const std::vector<unsigned> *linkPriority = nullptr) {
     const unsigned n = (unsigned)std::min(primary.size(), memoryCap.size());
     std::vector<unsigned> spare(n, 0u);
     for (unsigned i = 0; i < n; ++i) {
@@ -686,10 +722,18 @@ inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
     for (unsigned i = 0; i < n; ++i) {
         const unsigned leftCap = i > 0u && primary[i - 1u] > 0u ? primary[i - 1u] - 1u : 0u;
         const unsigned rightCap = i + 1u < n && primary[i + 1u] > 0u ? primary[i + 1u] - 1u : 0u;
-        const unsigned leftWeight = i > 0u && priorityWeight != nullptr
+        unsigned leftWeight = i > 0u && priorityWeight != nullptr
             && i - 1u < priorityWeight->size() ? (*priorityWeight)[i - 1u] : 3u;
-        const unsigned rightWeight = i + 1u < n && priorityWeight != nullptr
+        unsigned rightWeight = i + 1u < n && priorityWeight != nullptr
             && i + 1u < priorityWeight->size() ? (*priorityWeight)[i + 1u] : 3u;
+        if (linkPriority != nullptr && i > 0u && (i - 1u) < linkPriority->size()
+            && (*linkPriority)[i - 1u] > leftWeight) {
+            leftWeight = (*linkPriority)[i - 1u];
+        }
+        if (linkPriority != nullptr && i + 1u < n && i < linkPriority->size()
+            && (*linkPriority)[i] > rightWeight) {
+            rightWeight = (*linkPriority)[i];
+        }
         unsigned xLeft = 0u;
         unsigned xRight = 0u;
         splitDeviceShadowBudget(spare[i], leftCap, rightCap, leftWeight, rightWeight, &xLeft, &xRight);

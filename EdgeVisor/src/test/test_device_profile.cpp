@@ -1,4 +1,5 @@
 #include "device_profile.hpp"
+#include "sustained_profile.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -256,12 +257,12 @@ int main() {
     // skipped, missing stages stay mid, and reversed swaps the extremes.
     const std::string exampleText =
         "# stage priority reason\n"
-        "# Read only when EDGEVISOR_SHADOW_ALLOCATION=file. priority and reversed\n"
-        "# sample at startup instead and never open this file.\n"
+        "# Read only when EDGEVISOR_SHADOW_ALLOCATION=file.\n"
+        "# priority and reversed run a short sustained profile and do not open this file.\n"
         "# equal:    every stage the same weight.\n"
-        "# priority: sample temperature, power, and TCP round trip at startup; the\n"
-        "#           worst known reading sets the weight.\n"
-        "# reversed: sample as priority, then swap low and high.\n"
+        "# priority: sustained compute, thermal, power, and per-link transfers; the\n"
+        "#           worst known signal sets the weight.\n"
+        "# reversed: same measurement, then swap low and high.\n"
         "# file:     read this file.\n"
         "# Weights: low=2 mid=3 high=4. Missing stages stay mid.\n"
         "0 low dedicated-and-plugged-in\n"
@@ -358,6 +359,134 @@ int main() {
     slowLink.rttMeanMs = 100.0;
     expect(combineDeviceRiskWeight(slowLink) == 4u, "one bad dimension is enough for the top tier");
     expect(combineDeviceRiskWeight(DeviceCondition()) == 3u, "a device with no evidence lands in the mid tier");
+
+    // Sustained-window rules. The edges are the same kind of fixed starting
+    // point as the one-shot tiers. A stable but slow device stays low, because
+    // the speed profile already spent that fact on the primary split.
+    std::vector<ComputeRound> stable(8u);
+    for (std::size_t i = 0u; i < stable.size(); ++i) {
+        stable[i].elapsedMs = 50.0;
+        stable[i].layerCount = 1u;
+    }
+    const ComputeSummary stableSummary = summarizeComputeRounds(stable);
+    expect(stableSummary.meanKnown && stableSummary.meanLayerMs > 49.0 && stableSummary.meanLayerMs < 51.0,
+        "a sustained window keeps the mean layer time");
+    expect(stableSummary.ratioKnown && stableSummary.lateEarlyRatio > 0.99 && stableSummary.lateEarlyRatio < 1.01,
+        "a flat window has a late/early ratio of one");
+    expect(computeStabilityPriority(stableSummary) == 2u, "stable slowness stays in the low tier");
+
+    std::vector<ComputeRound> degrading(8u);
+    for (std::size_t i = 0u; i < degrading.size(); ++i) {
+        degrading[i].elapsedMs = i < 4u ? 10.0 : 13.0;
+        degrading[i].layerCount = 1u;
+    }
+    expect(computeStabilityPriority(summarizeComputeRounds(degrading)) == 4u,
+        "a late/early ratio of 1.30 is the high tier");
+    for (std::size_t i = 0u; i < degrading.size(); ++i)
+        degrading[i].elapsedMs = i < 4u ? 10.0 : 11.2;
+    expect(computeStabilityPriority(summarizeComputeRounds(degrading)) == 3u,
+        "a late/early ratio of 1.12 is the mid tier");
+    expect(computeStabilityPriority(summarizeComputeRounds(std::vector<ComputeRound>(2u))) == 0u,
+        "fewer than four rounds is not a stability measurement");
+
+    std::vector<ComputeRound> spiky(8u);
+    for (std::size_t i = 0u; i < spiky.size(); ++i) {
+        spiky[i].elapsedMs = (i == 2u || i == 6u) ? 30.0 : 10.0;
+        spiky[i].layerCount = 1u;
+    }
+    expect(computeStabilityPriority(summarizeComputeRounds(spiky)) == 4u,
+        "a large spread is the high tier even when the two halves match");
+
+    std::vector<HardwareTick> cool;
+    HardwareTick coolTick;
+    coolTick.timestampMs = 0.0;
+    coolTick.temperatureC = 40;
+    coolTick.thermalLimited = 0;
+    cool.push_back(coolTick);
+    coolTick.timestampMs = 2000.0;
+    coolTick.temperatureC = 42;
+    cool.push_back(coolTick);
+    const ThermalSummary coolThermal = summarizeThermalTicks(cool);
+    expect(coolThermal.maxTempC == 42 && coolThermal.riseKnown && coolThermal.riseCPerSec > 0.9 && coolThermal.riseCPerSec < 1.1,
+        "rise is the change from the first sample to the last over the window");
+    expect(coolThermal.tempChangeC == 2, "the window records the temperature change itself");
+    expect(thermalWindowPriority(coolThermal) == 4u, "two degrees in two seconds is the high thermal tier");
+    cool[1].temperatureC = 41;
+    expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 2u,
+        "a one-degree step is sensor resolution and does not raise the tier");
+    cool[1].temperatureC = 42;
+    cool[0].temperatureC = 40;
+    cool[1].temperatureC = 40;
+    expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 2u, "a cool card with no throttle is the low thermal tier");
+    cool[0].temperatureC = 75;
+    cool[1].temperatureC = 75;
+    expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 3u, "75C in the window is the mid thermal tier");
+    cool[1].thermalLimited = 1;
+    expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 4u, "any throttle sample is the high thermal tier");
+
+    std::vector<HardwareTick> powered;
+    HardwareTick powerTick;
+    powerTick.onExternalPower = 1;
+    powerTick.batteryPercent = 98;
+    powered.push_back(powerTick);
+    expect(powerWindowPriority(summarizePowerTicks(powered)) == 2u, "external power is the low power tier");
+    powered[0].onExternalPower = 0;
+    expect(powerWindowPriority(summarizePowerTicks(powered)) == 4u, "battery power is the high power tier");
+    powered.push_back(powerTick);
+    expect(powerWindowPriority(summarizePowerTicks(powered)) == 4u, "a source that changes during the window is the high power tier");
+    expect(summarizePowerTicks(std::vector<HardwareTick>()).onExternalPower < 0, "no power sample stays unknown");
+
+    std::vector<TransferRound> quick(4u);
+    for (std::size_t i = 0u; i < quick.size(); ++i) {
+        quick[i].elapsedMs = 4.0;
+        quick[i].bytes = 3840u;
+        quick[i].retransDelta = 0;
+    }
+    LinkSummary quickLink = summarizeTransfers(quick);
+    expect(quickLink.priority == 2u && quickLink.retrans == 0, "a short quiet transfer is the low link tier");
+    for (std::size_t i = 0u; i < quick.size(); ++i) quick[i].elapsedMs = 30.0;
+    expect(summarizeTransfers(quick).priority == 3u, "a 30ms transfer is the mid link tier");
+    quick[0].retransDelta = 2;
+    expect(summarizeTransfers(quick).priority == 4u, "a retransmission is the high link tier");
+    TransferRound timedOut;
+    timedOut.elapsedMs = 500.0;
+    timedOut.bytes = 3840u;
+    timedOut.timedOut = 1;
+    timedOut.retransDelta = 0;
+    std::vector<TransferRound> timeouts(1u, timedOut);
+    expect(summarizeTransfers(timeouts).priority == 4u, "a timeout is the high link tier");
+    expect(summarizeTransfers(std::vector<TransferRound>()).priority == 0u, "no transfers leave the link unknown");
+
+    const DeviceSummary emptyDevice = summarizeDevice(1u, "", std::vector<ComputeRound>(), std::vector<HardwareTick>());
+    expect(emptyDevice.priority == 3u && emptyDevice.appliedPriority == 3u,
+        "a device with no sustained evidence is mid");
+    expect(!emptyDevice.missing.empty(), "missing sustained fields are listed");
+    SustainedProfileReport report;
+    report.observeSeconds = 25.0;
+    report.warmupRounds = 3u;
+    report.pace = "pipeline";
+    report.note = "short";
+    report.devices.push_back(summarizeDevice(0u, "10.0.0.2", stable, cool));
+    report.links.push_back(quickLink);
+    const std::string json = formatSustainedSummaryJson(report);
+    expect(json.find("\"meanLayerMs\"") != std::string::npos && json.find("\"lateEarlyRatio\"") != std::string::npos,
+        "the summary keeps the measured compute statistics");
+    expect(json.find("\"batteryPercent\": null") != std::string::npos, "an unread battery stays null");
+    expect(json.find("short") != std::string::npos, "the summary keeps the window note");
+    const std::string csv = formatComputeCsv(std::vector<ComputeRawRow>(1u));
+    expect(csv.find("timestamp_ms,stage,round,layer_count,elapsed_ms\n") == 0u,
+        "the compute csv starts with the raw columns");
+
+    std::vector<unsigned> linkRaise(3u, 2u);
+    linkRaise[0] = 4u;
+    const std::vector<unsigned> lowDevices(4u, 2u);
+    expect(formatBoundaryOverlap(assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &lowDevices, &linkRaise))
+        == "6,4;2,3;3,6",
+        "a bad link raises only the boundary it belongs to");
+    const std::vector<unsigned> unknownLinks(3u, 0u);
+    expect(formatBoundaryOverlap(assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &lowDevices, &unknownLinks))
+        == "6,3;3,3;3,6",
+        "an unmeasured link does not change the device priorities");
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d device profile checks failed\n", g_failures);

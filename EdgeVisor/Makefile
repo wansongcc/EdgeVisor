@@ -126,7 +126,7 @@ else
     DELETE_CMD = rm -fv
 endif
 
-DEPS += io-profile.o product-log.o device-profile.o
+DEPS += io-profile.o product-log.o device-profile.o sustained-profile.o
 
 .PHONY: clean dllama
 
@@ -147,6 +147,8 @@ io-profile.o: src/nn/io-profile.cpp
 product-log.o: src/product_log.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 device-profile.o: src/device_profile.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+sustained-profile.o: src/sustained_profile.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-network-local.o: src/nn/nn-network-local.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@

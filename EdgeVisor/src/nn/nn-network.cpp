@@ -15,6 +15,7 @@ typedef SSIZE_T ssize_t;
 #include "nn-network.hpp"
 #include "failover_gate.hpp"
 #include "device_profile.hpp"
+#include "sustained_profile.hpp"
 #include "product_log.hpp"
 #include "nn/io-profile.hpp"
 #include "nn-core.hpp"
@@ -1440,6 +1441,10 @@ static std::unique_ptr<NnNetwork> serveFromSocket(NnSocket *socketSocket) {
     }
     if (nSockets == kProfileProbeMagicV2) {
         serveProfileProbeV2(rootSocketFd);
+        throw NnProfileProbeException();
+    }
+    if (nSockets == kSustainedProfileMagic) {
+        serveSustainedProfileProbe(rootSocketFd, socketSocket->fd);
         throw NnProfileProbeException();
     }
     NnUint nNodes = nSockets - 1; // nSockets - 1 root node

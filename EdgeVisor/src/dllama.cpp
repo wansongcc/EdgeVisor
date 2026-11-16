@@ -864,7 +864,9 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         try {
             context->inference->forward();
         } catch (const NnPeerOfflineException &e) {
-            armSessionRestart(e.peerNodeIndex);
+            std::printf("inference stopped peer=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
+            std::fflush(stdout);
+            throw std::runtime_error(std::string("inference stopped: ") + e.what());
         } catch (const NnPeerTimeoutException &e) {
             armSessionRestart(e.peerNodeIndex, true);
         }
@@ -1166,7 +1168,9 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 context->network != nullptr &&
                 context->inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr);
         } catch (const NnPeerOfflineException &e) {
-            armSessionRestart(e.peerNodeIndex);
+            std::printf("inference stopped peer=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
+            std::fflush(stdout);
+            throw std::runtime_error(std::string("inference stopped: ") + e.what());
         } catch (const NnPeerTimeoutException &e) {
             armSessionRestart(e.peerNodeIndex, true);
         }

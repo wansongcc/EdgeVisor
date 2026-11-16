@@ -10,6 +10,7 @@
 #include "app.hpp"
 #include "product_log.hpp"
 #include "token_timing.hpp"
+#include "dynamic/algo2.hpp"
 #include "terminal_ui.hpp"
 #include <stdexcept>
 #include <cmath>
@@ -1131,6 +1132,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     // forward(), worker/profile waits, sampling/decoding, and token output/flush.
     if (context->args->showTerminalUi) edgeVisorUiOpen();
     const auto predWallStart = std::chrono::steady_clock::now();
+    dllama::dynamic_tpot::algo2ResetTokenClock();
     // Anchor timestamps for every position a degradation can start at. The
     // matrix injects several faults in one episode, so one mark is not enough.
     std::vector<NnUint> markPositions;
@@ -1518,6 +1520,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
 #endif
         token = haveLastStageToken ? (int)lastStageToken : context->sampler->sample(context->inference->logitsPipe);
+        dllama::dynamic_tpot::algo2NoteTokenComplete((NnUint)pos, pos + 1u, true);
         // Per-token completion timestamps. The matrix measures "trigger to the
         // first token emitted on the new route", which needs the emission time
         // of individual tokens, not just the episode total.

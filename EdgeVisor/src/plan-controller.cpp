@@ -299,7 +299,8 @@ static json perfPacketToJson(const LlmPerfPacket &p) {
         {"bubbleDrainUs", p.bubbleDrainUs},
         {"bubbleCompleted", p.bubbleCompleted},
         {"leftBoundaryLayerUs", p.leftBoundaryLayerUs},
-        {"rightBoundaryLayerUs", p.rightBoundaryLayerUs}
+        {"rightBoundaryLayerUs", p.rightBoundaryLayerUs},
+        {"shadowFilledThrough", p.shadowFilledThrough}
     };
 }
 

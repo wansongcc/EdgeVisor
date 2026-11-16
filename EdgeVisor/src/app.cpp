@@ -8,6 +8,7 @@
 #include "plan-controller.hpp"
 #include "dynamic/dynamic_layer.hpp"
 #include "dynamic/dynamic_tpot.hpp"
+#include "dynamic/algo2.hpp"
 #include "dynamic/kv_collector.hpp"
 #include <cassert>
 #include <cstring>
@@ -4547,6 +4548,8 @@ LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
     rootPacket.bubbleSkippedSyncs = lastBubbleShadowStats.skippedSyncSteps;
     rootPacket.bubbleDrainUs = lastBubbleShadowStats.drainUs;
     rootPacket.bubbleCompleted = lastBubbleShadowStats.completed;
+    rootPacket.shadowFilledThrough = 0xFFFFFFFFu;
+    if (executor != nullptr) executor->redundantShadowCursor(&rootPacket.shadowFilledThrough);
     fillBoundaryLayerPerfPacket(rootPacket, plan, 0u, execution);
     return rootPacket;
 }
@@ -5716,6 +5719,14 @@ void RootLlmInference::forward(bool collectProfile) {
                             "layers=%zu posRange=[0,%u] status=ok\n",
                     migrateToLaterStage ? "forward" : "backward",
                     migrationLayers.size(), (unsigned)endPos);
+                std::fflush(stdout);
+            } else if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback()) {
+                applyOk = false;
+                fallbackReason = "algo2_shadow_miss_no_fallback";
+                std::printf("🧩 [kv-migrate] %s route reservation refused "
+                            "layer=%u pos=%u; revised mode does not copy the full KV\n",
+                    migrateToLaterStage ? "forward" : "backward",
+                    (unsigned)takeoverRejectLayer, (unsigned)takeoverRejectPos);
                 std::fflush(stdout);
             } else {
                 std::printf("🧩 [kv-migrate] %s route reservation refused "
@@ -8469,6 +8480,8 @@ void runWorkerApp(AppCliArgs *args) {
                         p.bubbleSkippedSyncs = toolWindowBubbleStats.skippedSyncSteps;
                         p.bubbleDrainUs = toolWindowBubbleStats.drainUs;
                         p.bubbleCompleted = toolWindowBubbleStats.completed;
+                        p.shadowFilledThrough = 0xFFFFFFFFu;
+                        executor.redundantShadowCursor(&p.shadowFilledThrough);
                         fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                         writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                     }
@@ -8513,6 +8526,8 @@ void runWorkerApp(AppCliArgs *args) {
                     p.bubbleSkippedSyncs = bubbleStats.skippedSyncSteps;
                     p.bubbleDrainUs = bubbleStats.drainUs;
                     p.bubbleCompleted = bubbleStats.completed;
+                    p.shadowFilledThrough = 0xFFFFFFFFu;
+                    executor.redundantShadowCursor(&p.shadowFilledThrough);
                     fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                     writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                 }

@@ -438,6 +438,9 @@ typedef struct {
     NnUint bubbleCompleted;
     NnUint leftBoundaryLayerUs;
     NnUint rightBoundaryLayerUs;
+    // Exclusive shadow end across this node's redundant layers.
+    // 0xFFFFFFFF means this node holds no such layer. 0 means not filled.
+    NnUint shadowFilledThrough;
 } LlmPerfPacket;
 
 typedef struct {

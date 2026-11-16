@@ -1,6 +1,7 @@
 #include "dynamic/dynamic_tpot.hpp"
 
 #include "app.hpp"
+#include "dynamic/algo2.hpp"
 #include "dynamic/tpot_algorithm.hpp"
 #include "dynamic/tpot_log.hpp"
 #include "json.hpp"
@@ -108,6 +109,15 @@ struct ControllerRuntime {
     int pollMs = 200;
     int timeoutMs = 2000;
     std::string logPath;
+    bool captureAlgo2 = false;
+    std::vector<tpot::Algo2TokenObs> freshTokens;
+    std::unique_ptr<tpot::Algo2Session> algo2;
+    tpot::Algo2Mode algo2Mode = tpot::Algo2Mode::LEGACY;
+    bool algo2WaitApply = false;
+    bool algo2Rollback = false;
+    tpot::Candidate algo2Pending;
+    unsigned long long algo2BaselineGen = 0ull;
+    uint32_t algo2WaitStartPos = 0u;
     uint32_t lastObservedPos = 0xFFFFFFFFu;
     bool haveObservedPos = false;
     unsigned long long lastPerfSeq = 0ull;
@@ -328,6 +338,7 @@ static bool updateWindowFromPerfArray(ControllerRuntime &rt, const json &arr, ui
     std::map<uint32_t, double> stageBoundaryMs;
     std::map<uint32_t, double> stageLeftBoundaryMaxMs;
     std::map<uint32_t, double> stageRightBoundaryMaxMs;
+    std::map<uint32_t, int> stageCursor;
     std::map<uint32_t, std::map<uint32_t, double> > nodeMs;
     std::map<uint32_t, std::map<uint32_t, double> > nodeComputeMs;
 
@@ -365,6 +376,13 @@ static bool updateWindowFromPerfArray(ControllerRuntime &rt, const json &arr, ui
         }
         nodeMs[stageIndex][nodeIndex] = ms;
         nodeComputeMs[stageIndex][nodeIndex] = computeMs;
+        if (p.contains("shadowFilledThrough") && p.at("shadowFilledThrough").is_number()) {
+            const uint32_t raw = p.value("shadowFilledThrough", 0xFFFFFFFFu);
+            const int cur = raw == 0xFFFFFFFFu ? -2 : (int)raw;
+            std::map<uint32_t, int>::iterator cit = stageCursor.find(stageIndex);
+            if (cit == stageCursor.end() || cit->second < 0) stageCursor[stageIndex] = cur;
+            else if (cur >= 0 && cur < cit->second) cit->second = cur;
+        }
     }
 
     // Eval phase uses batchSize>1 and has fundamentally different TPOT
@@ -412,6 +430,20 @@ static bool updateWindowFromPerfArray(ControllerRuntime &rt, const json &arr, ui
         }
     }
     rt.window.tpotMs += tokenTpot;
+    if (rt.captureAlgo2) {
+        tpot::Algo2TokenObs obs;
+        obs.tokenId = samplePos;
+        obs.contextLength = samplePos + 1u;
+        obs.stageSumKnown = true;
+        obs.stageComputeSumMs = tokenTpot;
+        obs.shadowCursor = stageCursor;
+        for (std::map<uint32_t, double>::const_iterator it = stageComputeMaxMs.begin(); it != stageComputeMaxMs.end(); ++it) {
+            obs.stageComputeMs[it->first] = it->second;
+            std::map<uint32_t, double>::const_iterator comm = stageBoundaryMs.find(it->first);
+            if (comm != stageBoundaryMs.end()) obs.stageCommMs[it->first] = comm->second;
+        }
+        rt.freshTokens.push_back(obs);
+    }
     if (tokenTpot > rt.metrics.maxObservedTpotMs) rt.metrics.maxObservedTpotMs = tokenTpot;
     if (rt.metrics.baselineTpotMs <= 0.0) rt.metrics.baselineTpotMs = tokenTpot;
     return true;
@@ -934,6 +966,203 @@ DynamicTpotController::~DynamicTpotController() {
     if (worker_.joinable()) worker_.join();
 }
 
+#ifndef _WIN32
+static std::vector<tpot::Algo2Boundary> parseAlgo2Boundaries(const char *text) {
+    std::vector<tpot::Algo2Boundary> out;
+    if (text == nullptr || text[0] == '\0') return out;
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ';')) {
+        const size_t comma = item.find(',');
+        if (comma == std::string::npos) continue;
+        tpot::Algo2Boundary boundary;
+        boundary.leftReady = (uint32_t)std::strtoul(item.substr(0, comma).c_str(), nullptr, 10);
+        boundary.rightReady = (uint32_t)std::strtoul(item.substr(comma + 1).c_str(), nullptr, 10);
+        boundary.memorySpareLayers = -1;
+        out.push_back(boundary);
+    }
+    return out;
+}
+
+static void logAlgo2(const std::string &path, const tpot::Algo2TokenObs &obs, const tpot::Algo2Decision &decision) {
+    std::ostringstream line;
+    line << "algo2 token=" << obs.tokenId
+        << " phase=" << tpot::algo2PhaseName(decision.phase)
+        << " health=" << tpot::algo2HealthName(decision.health)
+        << " cause=" << (decision.cause.empty() ? "unknown" : decision.cause)
+        << " note=" << (decision.note.empty() ? "none" : decision.note)
+        << " issue=" << (decision.issue ? 1 : 0)
+        << " rollback=" << (decision.rollback ? 1 : 0)
+        << " k=" << decision.candidate.layerCount
+        << " gain_ms=" << decision.candidate.gainMs
+        << " threshold_ms=" << decision.candidate.thresholdMs
+        << " from=" << decision.candidate.fromStageIndex
+        << " to=" << decision.candidate.toStageIndex
+        << " metric=" << (obs.e2eKnown ? "e2e" : (obs.stageSumKnown ? "stage_compute_sum" : "missing"))
+        << " cursors=";
+    if (obs.shadowCursor.empty()) line << "none";
+    for (std::map<uint32_t, int>::const_iterator it = obs.shadowCursor.begin(); it != obs.shadowCursor.end(); ++it) {
+        if (it != obs.shadowCursor.begin()) line << ",";
+        line << it->first << ":" << it->second;
+    }
+    line << " reference_ms=" << decision.referenceMs
+        << " median_ms=" << decision.windowMedianMs
+        << " p95_ms=" << decision.windowP95Ms
+        << " noise=" << (decision.noiseCalibrated ? "calibrated" : "uncalibrated");
+    appendLog(path, line.str());
+    const char *outDir = std::getenv("DLLAMA_ALGO2_OUT");
+    if (outDir == nullptr || outDir[0] == '\0') return;
+    const std::string events = std::string(outDir) + "/migration_events.jsonl";
+    FILE *f = std::fopen(events.c_str(), "a");
+    if (f == nullptr) return;
+    std::fprintf(f,
+        "{\"token\":%u,\"phase\":\"%s\",\"health\":\"%s\",\"cause\":\"%s\",\"note\":\"%s\",\"issue\":%d,\"rollback\":%d,\"k\":%u,\"gain_ms\":%.6f,\"from\":%u,\"to\":%u,\"layer\":%u,\"metric\":\"%s\"}\n",
+        obs.tokenId,
+        tpot::algo2PhaseName(decision.phase),
+        tpot::algo2HealthName(decision.health),
+        decision.cause.c_str(),
+        decision.note.c_str(),
+        decision.issue ? 1 : 0,
+        decision.rollback ? 1 : 0,
+        decision.candidate.layerCount,
+        decision.candidate.gainMs,
+        decision.candidate.fromStageIndex,
+        decision.candidate.toStageIndex,
+        decision.candidate.layerIndex,
+        obs.e2eKnown ? "e2e" : "stage_compute_sum");
+    std::fclose(f);
+}
+
+static void stepAlgo2(
+    ControllerRuntime &rt,
+    const json &status,
+    const NnUnevenPartitionPlan *plan,
+    RootLlmInference *inference,
+    const std::string &socketPath) {
+    if (rt.algo2 == nullptr || inference == nullptr) return;
+    const std::vector<tpot::Algo2CompletedToken> completed = tpot::algo2DrainTokenCompletes();
+    std::map<uint32_t, double> e2eByToken;
+    for (size_t i = 0u; i < completed.size(); ++i) e2eByToken[completed[i].tokenId] = completed[i].intervalMs;
+    rt.algo2->setBoundaries(parseAlgo2Boundaries(std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS")));
+    rt.algo2->setSerialRequest(true);
+
+    if (rt.freshTokens.empty()) {
+        const double nowMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const tpot::Algo2Decision idle = rt.algo2->pollIdle(nowMs);
+        if (idle.health == tpot::Algo2Health::NO_PROGRESS) {
+            tpot::Algo2TokenObs empty;
+            logAlgo2(rt.logPath, empty, idle);
+        }
+        if (rt.algo2WaitApply) {
+            const uint32_t pos = status.value("position", rt.algo2WaitStartPos);
+            const uint32_t elapsed = pos >= rt.algo2WaitStartPos ? pos - rt.algo2WaitStartPos : 0u;
+            PendingAction pending;
+            pending.active = true;
+            pending.candidate = rt.algo2Pending;
+            pending.appliedGenerationBaseline = rt.algo2BaselineGen;
+            unsigned long long generation = 0ull;
+            if (appliedPpMatches(status, pending, &generation)) {
+                rt.algo2->noteCommitResult(true, "");
+                rt.algo2WaitApply = false;
+            } else if (elapsed >= rt.topologyFenceTimeoutTokens) {
+                rt.algo2->noteCommitResult(false, rt.algo2Rollback ? "rollback_unsupported" : "pp_apply_timeout");
+                rt.algo2WaitApply = false;
+            }
+        }
+        return;
+    }
+
+    for (size_t n = 0u; n < rt.freshTokens.size(); ++n) {
+        tpot::Algo2TokenObs obs = rt.freshTokens[n];
+        std::map<uint32_t, double>::const_iterator e2e = e2eByToken.find(obs.tokenId);
+        if (e2e != e2eByToken.end()) {
+            obs.e2eKnown = true;
+            obs.e2eMs = e2e->second;
+        }
+        if (rt.algo2WaitApply) {
+            PendingAction pending;
+            pending.active = true;
+            pending.candidate = rt.algo2Pending;
+            pending.appliedGenerationBaseline = rt.algo2BaselineGen;
+            unsigned long long generation = 0ull;
+            const uint32_t elapsed = obs.tokenId >= rt.algo2WaitStartPos ? obs.tokenId - rt.algo2WaitStartPos : 0u;
+            if (appliedPpMatches(status, pending, &generation)) {
+                rt.algo2->noteCommitResult(true, "");
+                rt.algo2WaitApply = false;
+            } else if (elapsed >= rt.topologyFenceTimeoutTokens) {
+                rt.algo2->noteCommitResult(false, rt.algo2Rollback ? "rollback_unsupported" : "pp_apply_timeout");
+                rt.algo2WaitApply = false;
+            }
+        }
+
+        WindowSummary one;
+        one.samples = 1u;
+        one.posEnd = obs.tokenId;
+        for (std::map<uint32_t, double>::const_iterator it = obs.stageComputeMs.begin(); it != obs.stageComputeMs.end(); ++it) {
+            StageWindowStats &st = one.stages[it->first];
+            st.stageComputeMs = it->second;
+            st.stageTotalMs = it->second;
+            st.samples = 1u;
+            std::map<uint32_t, double>::const_iterator comm = obs.stageCommMs.find(it->first);
+            if (comm != obs.stageCommMs.end()) st.boundaryCommMs = comm->second;
+        }
+        const std::vector<tpot::StageSnapshot> snaps = buildStageSnapshots(
+            rt, plan, one, status, inference->getRuntimePrimaryOwnershipSnapshot());
+        std::vector<tpot::Algo2StageInput> inputs;
+        for (size_t i = 0u; i < snaps.size(); ++i) {
+            tpot::Algo2StageInput input;
+            input.snapshot = snaps[i];
+            std::map<uint32_t, int>::const_iterator cursor = obs.shadowCursor.find(snaps[i].stageIndex);
+            input.shadowCursor = cursor == obs.shadowCursor.end() ? -1 : cursor->second;
+            inputs.push_back(input);
+        }
+        rt.algo2->setStages(inputs);
+        const double nowMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        tpot::Algo2Decision decision = rt.algo2->observe(obs, nowMs);
+        if (!rt.algo2WaitApply && decision.rollback) {
+            tpot::Candidate reverse = tpot::reversePpCandidate(decision.candidate);
+            reverse.valid = true;
+            json resp;
+            if (issueCandidate(socketPath, rt.timeoutMs, rt.seq++, reverse, &resp)) {
+                rt.algo2WaitApply = true;
+                rt.algo2Rollback = true;
+                rt.algo2Pending = reverse;
+                rt.algo2BaselineGen = status.value("ppMigration", json::object()).value("appliedGeneration", 0ull);
+                rt.algo2WaitStartPos = obs.tokenId;
+                rt.metrics.rollbackCount += 1u;
+            } else {
+                rt.algo2->noteCommitResult(false, "rollback_unsupported");
+            }
+        } else if (!rt.algo2WaitApply && decision.issue) {
+            PlanCommand command = makeEmptyPlanCommand();
+            command.version = DLLAMA_PLAN_CMD_VERSION_V2;
+            command.mode = PLAN_CMD_MODE_NEXT_BARRIER;
+            command.fromNodeIndex = decision.candidate.fromNodeIndex;
+            command.toNodeIndex = decision.candidate.toNodeIndex;
+            command.triggerLayer = decision.candidate.layerIndex;
+            command.reserved0 = decision.candidate.layerCount;
+            std::string reason;
+            json resp;
+            if (!inference->validatePpMigrationCommand(command, &reason) ||
+                    !issueCandidate(socketPath, rt.timeoutMs, rt.seq++, decision.candidate, &resp)) {
+                if (reason.empty()) reason = resp.value("reason", resp.value("error", std::string("migration_issue_failed")));
+                rt.algo2->noteCommitResult(false, reason);
+            } else {
+                rt.algo2WaitApply = true;
+                rt.algo2Rollback = false;
+                rt.algo2Pending = decision.candidate;
+                rt.algo2BaselineGen = status.value("ppMigration", json::object()).value("appliedGeneration", 0ull);
+                rt.algo2WaitStartPos = obs.tokenId;
+                rt.metrics.migrationCount += 1u;
+            }
+        }
+        logAlgo2(rt.logPath, obs, decision);
+    }
+}
+#endif
+
 void DynamicTpotController::run() {
 #ifdef _WIN32
     return;
@@ -946,6 +1175,13 @@ void DynamicTpotController::run() {
         parseEnvInt("DLLAMA_TPOT_TOPOLOGY_TIMEOUT_TOKENS", std::max(32, rt.cfg.rollbackWindow * 2)));
     const char *logEnv = std::getenv("DLLAMA_TPOT_LOG");
     rt.logPath = (logEnv != nullptr && logEnv[0] != '\0') ? std::string(logEnv) : std::string("/tmp/dllama_tpot_scheduler.log");
+    rt.algo2Mode = tpot::parseAlgo2Mode(std::getenv("DLLAMA_ALGO2_MODE"));
+    if (rt.algo2Mode != tpot::Algo2Mode::LEGACY) {
+        rt.captureAlgo2 = true;
+        rt.algo2.reset(new tpot::Algo2Session(tpot::algo2ConfigFromEnvironment()));
+        rt.algo2->setMode(rt.algo2Mode);
+        appendLog(rt.logPath, std::string("algo2 ") + rt.algo2->effectiveConfigText());
+    }
 
     std::vector<double> recentTpotWindows;
 
@@ -978,6 +1214,13 @@ void DynamicTpotController::run() {
             const uint32_t statusPos = status.value("position", 0u);
             (void)updateWindowFromPerf(rt, perf, statusPos);
             rt.lastPerfSeq = perf.value("latestSeq", rt.lastPerfSeq);
+            if (rt.algo2) {
+                stepAlgo2(rt, status, plan, inference_, socketPath_);
+                rt.freshTokens.clear();
+                rt.window = WindowSummary();
+                std::this_thread::sleep_for(std::chrono::milliseconds(rt.pollMs));
+                continue;
+            }
 
             const bool enoughTokens = rt.window.samples >= (uint32_t)rt.cfg.windowTokens;
             const bool enoughSamples = rt.window.samples >= (uint32_t)rt.cfg.minSamples;

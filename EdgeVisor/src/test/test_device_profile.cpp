@@ -420,7 +420,12 @@ int main() {
     expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 2u, "a cool card with no throttle is the low thermal tier");
     cool[0].temperatureC = 75;
     cool[1].temperatureC = 75;
-    expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 3u, "75C in the window is the mid thermal tier");
+    expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 2u,
+        "absolute temperature is not a risk signal while throttle is off and the limit is unknown");
+    cool[1].thermalHeadroomC = 4;
+    expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 4u,
+        "a known headroom of four degrees is the high thermal tier");
+    cool[1].thermalHeadroomC = -1;
     cool[1].thermalLimited = 1;
     expect(thermalWindowPriority(summarizeThermalTicks(cool)) == 4u, "any throttle sample is the high thermal tier");
 
@@ -431,10 +436,40 @@ int main() {
     powered.push_back(powerTick);
     expect(powerWindowPriority(summarizePowerTicks(powered)) == 2u, "external power is the low power tier");
     powered[0].onExternalPower = 0;
-    expect(powerWindowPriority(summarizePowerTicks(powered)) == 4u, "battery power is the high power tier");
+    expect(powerWindowPriority(summarizePowerTicks(powered)) == 3u,
+        "a nearly full battery is a discharge sign, not a strong capacity sign");
     powered.push_back(powerTick);
-    expect(powerWindowPriority(summarizePowerTicks(powered)) == 4u, "a source that changes during the window is the high power tier");
-    expect(summarizePowerTicks(std::vector<HardwareTick>()).onExternalPower < 0, "no power sample stays unknown");
+    const PowerSummary pluggedBack = summarizePowerTicks(powered);
+    expect(pluggedBack.direction == kPowerBatteryToExternal
+        && powerWindowPriority(pluggedBack) == 2u,
+        "battery to external is recorded and is not a strong risk");
+    std::vector<HardwareTick> unplugged;
+    HardwareTick unplugTick;
+    unplugTick.onExternalPower = 1;
+    unplugTick.batteryPercent = 90;
+    unplugged.push_back(unplugTick);
+    unplugTick.onExternalPower = -1;
+    unplugged.push_back(unplugTick);
+    unplugTick.onExternalPower = 0;
+    unplugTick.batteryPercent = 80;
+    unplugged.push_back(unplugTick);
+    const PowerSummary lostExternal = summarizePowerTicks(unplugged);
+    expect(lostExternal.direction == kPowerExternalToBattery
+        && powerWindowPriority(lostExternal) == 4u,
+        "external to battery is a strong power risk; an unknown sample is not itself a switch");
+    std::vector<HardwareTick> flapped;
+    HardwareTick flapTick;
+    flapTick.onExternalPower = 1;
+    flapped.push_back(flapTick);
+    flapTick.onExternalPower = 0;
+    flapped.push_back(flapTick);
+    flapTick.onExternalPower = 1;
+    flapped.push_back(flapTick);
+    const PowerSummary bothWays = summarizePowerTicks(flapped);
+    expect(bothWays.direction == kPowerBothDirections && powerWindowPriority(bothWays) == 4u,
+        "returning to external power does not erase an unplug during the window");
+    expect(summarizePowerTicks(std::vector<HardwareTick>()).direction == kPowerUnknown,
+        "no power sample stays unknown");
 
     std::vector<TransferRound> quick(4u);
     for (std::size_t i = 0u; i < quick.size(); ++i) {
@@ -443,11 +478,50 @@ int main() {
         quick[i].retransDelta = 0;
     }
     LinkSummary quickLink = summarizeTransfers(quick);
-    expect(quickLink.priority == 2u && quickLink.retrans == 0, "a short quiet transfer is the low link tier");
+    expect(quickLink.priority == 2u && quickLink.retransSegs < 0 && quickLink.finishedTransfers == 4u,
+        "a short quiet transfer is low, and per-attempt deltas are not a segment count");
     for (std::size_t i = 0u; i < quick.size(); ++i) quick[i].elapsedMs = 30.0;
-    expect(summarizeTransfers(quick).priority == 3u, "a 30ms transfer is the mid link tier");
+    expect(summarizeTransfers(quick).priority == 2u, "a steady delay is recorded and does not raise link risk");
     quick[0].retransDelta = 2;
-    expect(summarizeTransfers(quick).priority == 4u, "a retransmission is the high link tier");
+    const LinkSummary deltaOnly = summarizeTransfers(quick);
+    expect(!deltaOnly.segmentRateKnown && deltaOnly.affectedRoundRateKnown
+        && deltaOnly.retransRounds == 1u && deltaOnly.priority == 2u,
+        "per-attempt retrans deltas do not invent a segment retransmission rate");
+    LinkCounterWindow segmentWindow;
+    noteCountedSend(&segmentWindow, true, true, 0u, 0u, true, 13u, 300u);
+    segmentWindow.endConnection();
+    LinkSummary segmentLink = deltaOnly;
+    applyLinkCounterWindow(&segmentLink, segmentWindow);
+    expect(segmentLink.segmentRateKnown && segmentLink.segmentRetransRate > 0.04
+        && segmentLink.segmentRetransRate < 0.05 && segmentLink.affectedRoundRate > 0.2
+        && segmentLink.risk > 0.8 && segmentLink.risk < 0.9 && segmentLink.priority == 3u,
+        "the score follows the segment rate, which is a different number from the affected-round rate");
+    LinkCounterWindow strongWindow;
+    noteCountedSend(&strongWindow, true, true, 0u, 0u, true, 5u, 100u);
+    strongWindow.endConnection();
+    noteCountedSend(&strongWindow, true, true, 0u, 0u, true, 7u, 100u);
+    strongWindow.endConnection();
+    LinkSummary strongLink = summarizeTransfers(quick);
+    applyLinkCounterWindow(&strongLink, strongWindow);
+    expect(strongWindow.rebuilds == 1u && strongLink.retransSegs == 12 && strongLink.dataSegsOut == 200
+        && strongLink.segmentRetransRate > 0.05 && strongLink.priority == 4u,
+        "readable connection snapshots add across a rebuild");
+    LinkCounterWindow brokenWindow;
+    noteCountedSend(&brokenWindow, true, true, 10u, 10u, true, 12u, 40u);
+    brokenWindow.endConnection();
+    noteCountedSend(&brokenWindow, true, false, 0u, 0u, false, 0u, 0u);
+    brokenWindow.endConnection();
+    LinkSummary brokenLink = summarizeTransfers(quick);
+    applyLinkCounterWindow(&brokenLink, brokenWindow);
+    expect(brokenLink.retransSegs < 0 && !brokenLink.segmentRateKnown,
+        "an unreadable counter leaves the segment rate unknown");
+    LinkCounterWindow zeroDenom;
+    noteCountedSend(&zeroDenom, true, true, 0u, 0u, true, 0u, 0u);
+    zeroDenom.endConnection();
+    LinkSummary zeroLink = summarizeTransfers(quick);
+    applyLinkCounterWindow(&zeroLink, zeroDenom);
+    expect(zeroLink.dataSegsOut == 0 && !zeroLink.segmentRateKnown,
+        "a zero data-segment denominator does not become a zero rate");
     TransferRound timedOut;
     timedOut.elapsedMs = 500.0;
     timedOut.bytes = 3840u;
@@ -458,8 +532,23 @@ int main() {
     expect(summarizeTransfers(std::vector<TransferRound>()).priority == 0u, "no transfers leave the link unknown");
 
     const DeviceSummary emptyDevice = summarizeDevice(1u, "", std::vector<ComputeRound>(), std::vector<HardwareTick>());
-    expect(emptyDevice.priority == 3u && emptyDevice.appliedPriority == 3u,
+    expect(emptyDevice.priority == 3u && emptyDevice.appliedPriority == 3u
+        && !emptyDevice.scoreKnown && emptyDevice.appliedWeight == kProtectionWeightUnknown,
         "a device with no sustained evidence is mid");
+    std::vector<HardwareTick> quietPower;
+    HardwareTick quietTick;
+    quietTick.timestampMs = 0.0;
+    quietTick.temperatureC = 40;
+    quietTick.thermalLimited = 0;
+    quietTick.onExternalPower = 1;
+    quietTick.batteryPercent = 98;
+    quietPower.push_back(quietTick);
+    quietTick.timestampMs = 2000.0;
+    quietPower.push_back(quietTick);
+    const DeviceSummary quietDevice = summarizeDevice(0u, "local", stable, quietPower);
+    expect(quietDevice.scoreKnown && quietDevice.protectionScore == 0.0
+        && quietDevice.appliedWeight == kProtectionWeightLow,
+        "a measured quiet device keeps the low weight and does not look unread");
     expect(!emptyDevice.missing.empty(), "missing sustained fields are listed");
     SustainedProfileReport report;
     report.observeSeconds = 25.0;
@@ -469,8 +558,9 @@ int main() {
     report.devices.push_back(summarizeDevice(0u, "10.0.0.2", stable, cool));
     report.links.push_back(quickLink);
     const std::string json = formatSustainedSummaryJson(report);
-    expect(json.find("\"meanLayerMs\"") != std::string::npos && json.find("\"lateEarlyRatio\"") != std::string::npos,
-        "the summary keeps the measured compute statistics");
+    expect(json.find("\"meanLayerMs\"") != std::string::npos && json.find("\"lateEarlyRatio\"") != std::string::npos
+        && json.find("\"protectionScore\"") != std::string::npos,
+        "the summary keeps the measured compute statistics and the protection score");
     expect(json.find("\"batteryPercent\": null") != std::string::npos, "an unread battery stays null");
     expect(json.find("short") != std::string::npos, "the summary keeps the window note");
     const std::string csv = formatComputeCsv(std::vector<ComputeRawRow>(1u));
@@ -483,10 +573,42 @@ int main() {
     expect(formatBoundaryOverlap(assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &lowDevices, &linkRaise))
         == "6,4;2,3;3,6",
         "a bad link raises only the boundary it belongs to");
+    std::vector<unsigned> linkMilli(3u, kProtectionWeightLow);
+    linkMilli[0] = kProtectionWeightLow + kProtectionWeightSpan;
+    const std::vector<unsigned> lowMilli(4u, kProtectionWeightLow);
+    expect(formatBoundaryOverlap(assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &lowMilli, &linkMilli))
+        == "6,4;2,3;3,6",
+        "a strong measured link risk uses the same split as the old high tier");
     const std::vector<unsigned> unknownLinks(3u, 0u);
     expect(formatBoundaryOverlap(assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &lowDevices, &unknownLinks))
         == "6,3;3,3;3,6",
         "an unmeasured link does not change the device priorities");
+    expect(formatBoundaryOverlap(assignBoundaryOverlap(fourPrimary, fourCaps, nullptr, &lowDevices, nullptr, 4))
+        == "4,2;2,2;2,4",
+        "an experiment budget cap creates left and right competition without changing memory");
+    std::vector<unsigned> distinct = lowMilli;
+    distinct[1] = kProtectionWeightLow + kProtectionWeightSpan;
+    unsigned lowStage = 99u;
+    unsigned highStage = 99u;
+    std::vector<unsigned> sameMilli = lowMilli;
+    expect(!permuteExtremeDeviceWeights(&sameMilli, &lowStage, &highStage),
+        "identical device weights are not a mismatch control");
+    expect(permuteExtremeDeviceWeights(&distinct, &lowStage, &highStage)
+        && lowStage == 0u && highStage == 1u
+        && distinct[0] == kProtectionWeightLow + kProtectionWeightSpan
+        && distinct[1] == kProtectionWeightLow,
+        "mismatch swaps the low and high device labels and keeps the same values");
+    const std::vector<unsigned> threePrimary(3u, 7u);
+    std::vector<BoundaryOverlap> placed(2u);
+    placed[0].leftHolds = 3u;
+    placed[0].rightHolds = 0u;
+    placed[1].leftHolds = 0u;
+    placed[1].rightHolds = 2u;
+    const std::string placement = formatShadowPlacement(threePrimary, placed);
+    expect(placement.find("prefix=[7,10)") != std::string::npos
+        && placement.find("suffix=[12,14)") != std::string::npos
+        && placement.find("placement-cover=gap") != std::string::npos,
+        "coverage reports the gap instead of adding the two side counts");
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d device profile checks failed\n", g_failures);

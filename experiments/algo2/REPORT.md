@@ -33,12 +33,12 @@ Default decode remains one request in `inferenceRunOnce`. The token clock is tha
 
 ## T4 smoke
 
-Four Tesla T4 GPUs, CUDA arch 75, driver 13020, runtime 12080. Model `llama3.2-3b-instruct` Q40, tokenizer `llama_3_1`. Split `1@7*1@7*1@7*1@7`. Algorithm-1 equal shadow under cap 6: `6,3;3,3;3,6`. Prompt `Hi`, temperature 0, seed 1, `DLLAMA_IGNORE_EOS=1`. The decision window, settle, and verify were shortened for this smoke. Those overrides are in `run_t4_smoke.sh`. They are not new defaults.
+Four Tesla T4 GPUs, CUDA arch 75, driver 13020, runtime 12080. Model `llama3.2-3b-instruct` Q40, tokenizer `llama_3_1`. Split `1@7*1@7*1@7*1@7`. Algorithm-1 equal shadow under cap 6: `6,3;3,3;3,6`. Prompt `Hi`, temperature 0, seed 1, `DLLAMA_IGNORE_EOS=1`. The decision window, settle, and verify were shortened for this smoke. Those overrides are in `t4_smoke.sh`. They are not new defaults.
 
 Raw logs:
 
-- `logs/t4_static_root.log`, `logs/t4_static_tpot.log`
-- `logs/t4_revised_delay_root.log`, `logs/t4_revised_delay_tpot.log`
+- `logs/t4_static_root.txt`, `logs/t4_static_tpot.txt`
+- `logs/t4_revised_delay_root.txt`, `logs/t4_revised_delay_tpot.txt`
 
 ### Static, 48 steps, no injection
 
@@ -78,7 +78,7 @@ cd /home/byh/B01/EdgeVisor-wansongcc/EdgeVisor
 make algo2-test dynamic-tpot-test dllama
 ./algo2-test
 ./dynamic-tpot-test
-bash ../experiments/algo2/run_t4_smoke.sh
+bash ../experiments/algo2/t4_smoke.sh
 ```
 
 `algo2-test` and `dynamic-tpot-test` passed after the controller was linked. `dllama` was built with `DLLAMA_CUDA` and arch 75.

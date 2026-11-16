@@ -1,0 +1,25 @@
+plan socket: /tmp/dllama_plan.sock
+plan barrier enabled
+last-stage sampling enabled
+kv aggregate enabled
+stage full weights enabled
+device: backend=cuda threads=1 CUDA Device[0]: Tesla T4 cc 7.5 sm_75, globalMem=14912 MB, multiProcessorCount=40, warpSize=32, maxThreadsPerBlock=1024, integrated=0, driver=13020, runtime=12080
+topology: ratios=1@7*1@7*1@7*1@7
+profile: local cuda 2.42 ms/layer cap=28
+profile: 127.0.0.1 cuda 2.44 ms/layer cap=28
+shadow-priority: mode=equal mismatch=not-requested applied=3,3,3,3
+shadow-equal: 6,3;3,3;3,6
+redundancy: 6,3;3,3;3,6
+shadow-coverage: stage0=[0,7) edge stage1=[7,14) prefix=[7,13) suffix=[11,14) placement-cover=complete stage2=[14,21) prefix=[14,17) suffix=[15,21) placement-cover=complete stage3=[21,28) edge
+shadow-coverage-note: placement intervals only; runtime takeover still stops on a gap, an unfilled shadow row, or a first or last stage
+shadow-cap: 0 mem=21 bubble=21 real=21 effective=6 placed=6 1 mem=21 bubble=20 real=20 effective=6 placed=6 2 mem=21 bubble=20 real=20 effective=6 placed=6 3 mem=21 bubble=20 real=20 effective=6 placed=6 experiment_cap=6
+loading weights
+   [PP] Node 0: Stage full-weight loading ENABLED
+🧭 [kv-migrate] root migration route=0->1 layers=[6] layerCount=1 pinnedByEnv=no
+[plan-uds] listening on /tmp/dllama_plan.sock
+How can I assist you today?
+<|start_header_id|>assistant<|end_header_id|>
+
+Is there something on your mind that you'd like to talk about, or perhaps you need help with something? I'm all ears![e1-end] pos=48 t_mono_ns=1250829937049095
+
+tokens/s: 16.18 (61.82 ms/tok)

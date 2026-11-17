@@ -103,8 +103,8 @@ static constexpr NnUint NN_WORKER_FRAME_DELIVERY_NEED = 5u;
 static constexpr NnUint NN_PP_DELIVERY_NEED_MAGIC = 0x444E4550u; // 'PEND'
 
 // The stage after a dead one answers the delivery question with this frame on
-// its root socket: it does not have the in-flight activation, so the caller has
-// to replay it. Three NnUint words, written with the worker-frame writer.
+// the socket of the stage that now precedes it. That is the root socket only
+// when the root itself is the previous stage. Three NnUint words.
 typedef struct {
     NnUint magic;
     NnUint position;
@@ -125,8 +125,9 @@ typedef struct {
 // app and the PP transport use it so the framing cannot drift. Declared at the
 // bottom of this header, after NnNetwork.
 
-// How long the root waits for the stage after a dead one to say whether it has
-// the in-flight token. Silence keeps the safe stop.
+// How long the root waits for the stage after a dead one to say it still needs
+// the in-flight token. A reset peer wakes a blocked recv immediately, so
+// silence means that stage is already computing the token.
 static constexpr long long NN_PP_DELIVERY_ASK_TIMEOUT_MS = 500ll;
 
 // True when a normal worker frame for this position is already queued from the
@@ -209,6 +210,11 @@ private:
     NnUint currentPosition_ = 0u;
     const NnUnevenPartitionPlan *ppPlan_ = nullptr;
     std::vector<NnByte> lastPpActivation_;
+    // The send pipe the copy was taken from. A front-slice splice writes the
+    // post-takeover activation back into this pipe; the vector stays the
+    // pre-takeover bytes.
+    const void *lastPpLive_ = nullptr;
+    NnSize lastPpLiveBytes_ = 0u;
     struct PpDeliveryNeedNote {
         NnUint position = 0u;
         NnUint deadNode = 0u;
@@ -275,9 +281,9 @@ public:
     // A dead next hop while waiting for results is answered by an explicit
     // delivery probe on the hop after it. HAVE means the stage that follows the
     // dead one already has this token, so later tokens just skip the dead stage.
-    // NEED replays the saved activation once. No answer within
-    // NN_PP_DELIVERY_ASK_TIMEOUT_MS is still ambiguous and stops the session.
-    // Throw for session restart; do not replay the activation.
+    // NEED replays the saved activation once. Silence after the wait is the
+    // same as HAVE: the next stage is computing, so only later tokens skip
+    // the dead one. A missing shadow still stops the session.
     void checkPpNextWhileWaiting(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex);
     // The stage root calls this before its PP send so a delivery probe can name
     // the position it is asking about.

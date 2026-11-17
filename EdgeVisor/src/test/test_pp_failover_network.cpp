@@ -330,8 +330,8 @@ static void testBufferedSendHaveFromCache(bool turbo) {
     setNnPpFailoverHook(nullptr); close(tail[1]);
 }
 
-// Silence is still ambiguous: no answer within the ask window keeps the safe
-// stop and writes nothing.
+// Silence after the wait is HAVE: the next stage is computing this token,
+// so the plan relinks and nothing is written onto its socket.
 static void testBufferedSendNoAnswer(bool turbo) {
     int middle[2], tail[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
@@ -351,24 +351,22 @@ static void testBufferedSendNoAnswer(bool turbo) {
         s.startLayer = i; s.endLayer = i+1; s.nLayers = s.nNodes = 1;
         s.nodeIndices = new NnUint[1]{i};
     }
-    int activation = 17, result = 0;
+    int activation = 17;
     network.setCurrentPosition(0u);
     network.setPpPlan(&plan);
     network.noteLastPpActivation(&activation, sizeof(activation));
     close(middle[1]);
     calls = 0u; replayCalls = 0u; covered = true; setNnPpFailoverHook(bypass);
-    NnSocketIo io{1u, &result, sizeof(result)};
     bool offline = false;
     const auto start = std::chrono::steady_clock::now();
     try {
-        network.readMany(1u, &io, [&]() { network.checkPpNextWhileWaiting(&plan, 0u); });
+        network.checkPpNextWhileWaiting(&plan, 0u);
     } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
-    assert(offline);
-    assert(calls == 0u && replayCalls == 0u);
-    // No plan change and no activation on the tail: the session restarts.
-    assert(getPpNextStageIndex(&plan, 0u) == 1u);
+    assert(!offline);
+    assert(calls == 1u && replayCalls == 0u);
+    assert(getPpNextStageIndex(&plan, 0u) == 2u);
     int duplicate;
     assert(recv(tail[1], &duplicate, sizeof(duplicate), MSG_DONTWAIT) == -1);
     assert(elapsed >= 400 && elapsed < 2500);
@@ -376,7 +374,8 @@ static void testBufferedSendNoAnswer(bool turbo) {
 }
 
 // A queued frame from an earlier token is not proof that this one arrived.
-// It must keep waiting rather than answer HAVE, and then time out safely.
+// The probe waits out the window, then relinks without replaying. The stale
+// frame stays on the socket for the reader that owns it.
 static void testBufferedSendStaleFrame(bool turbo) {
     int middle[2], tail[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
@@ -425,8 +424,8 @@ static void testBufferedSendStaleFrame(bool turbo) {
     } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
-    assert(offline && calls == 0u && replayCalls == 0u);
-    assert(getPpNextStageIndex(&plan, 0u) == 1u);
+    assert(!offline && calls == 1u && replayCalls == 0u);
+    assert(getPpNextStageIndex(&plan, 0u) == 2u);
     assert(elapsed >= 400 && elapsed < 2500);
     // The stale frame was never consumed; the reader that owns it still can.
     LlmWorkerFrameHeader kept{};
@@ -530,6 +529,59 @@ static void testShadowOnce(const char *async) {
     releaseNetConfig(&config); releaseNodeConfig(&node);
     unsetenv("DLLAMA_BUBBLE_SHADOW_KV"); unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
 }
+// The root is waiting on the tail, so a dead middle stage is not its next hop.
+// The wait must still relink that stage once, without replaying.
+static unsigned sideCalls = 0u;
+static bool sideSawReplay = false;
+static bool sideBypass(NnUnevenPartitionPlan *plan, NnUint self, NnUint dead, bool replay) {
+    assert(self == 0u && dead == 2u);
+    sideCalls += 1u;
+    sideSawReplay = sideSawReplay || replay;
+    return applyPpStageBypass(plan, 2u, 1u);
+}
+static void testDeadHopBeyondNext(bool turbo) {
+    int hop1[2], hop2[2], hop3[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, hop1) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, hop2) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, hop3) == 0);
+    std::vector<NnSocket> sockets;
+    sockets.reserve(3u);
+    sockets.emplace_back(hop1[0]);
+    sockets.emplace_back(hop2[0]);
+    sockets.emplace_back(hop3[0]);
+    std::vector<NnUint> peers{1u, 2u, 3u};
+    NnNetwork network(&sockets, &peers);
+    network.resetStats();
+    network.setTurbo(turbo);
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 4u;
+    plan.stages = new NnStageConfig[4];
+    plan.ppPrevStageIndex = new NnUint[4]{(NnUint)-1, 0u, 1u, 2u};
+    plan.ppNextStageIndex = new NnUint[4]{1u, 2u, 3u, (NnUint)-1};
+    for (NnUint i = 0u; i < 4u; ++i) {
+        auto &s = plan.stages[i];
+        s.stageIndex = s.rootNodeIndex = i;
+        s.startLayer = i;
+        s.endLayer = i + 1u;
+        s.nLayers = s.nNodes = 1u;
+        s.nodeIndices = new NnUint[1]{i};
+    }
+    network.setCurrentPosition(0u);
+    network.setPpPlan(&plan);
+    close(hop2[1]);
+    sideCalls = 0u;
+    sideSawReplay = false;
+    setNnPpFailoverHook(sideBypass);
+    network.checkPpNextWhileWaiting(&plan, 0u);
+    assert(sideCalls == 1u && !sideSawReplay);
+    assert(getPpNextStageIndex(&plan, 1u) == 3u);
+    assert(getPpPrevStageIndex(&plan, 3u) == 1u);
+    network.checkPpNextWhileWaiting(&plan, 0u);
+    assert(sideCalls == 1u && !sideSawReplay);
+    setNnPpFailoverHook(nullptr);
+    close(hop1[1]);
+    close(hop3[1]);
+}
 int main() {
     setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
     setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
@@ -551,6 +603,7 @@ int main() {
     testBeforePpSend(true, false); testBeforePpSend(true, true);
     testBeforePpSend(false, false); testBeforePpSend(false, true);
     testBeforePpSend(true, false, true); testBeforePpSend(false, true, true);
+    testDeadHopBeyondNext(false); testDeadHopBeyondNext(true);
     testShadowOnce("0"); testShadowOnce("1");
     std::puts("PP recovery, buffered tail frames, bounded timeouts, protocol rejection and shadow KV passed");
 }

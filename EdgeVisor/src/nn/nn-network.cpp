@@ -2395,9 +2395,8 @@ void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const voi
         if (peerLooksOffline(targetNodeIndex)) {
             deactivateNode(targetNodeIndex, 0u);
             // The write may or may not have reached the dead stage, so ask the
-            // stage after it. HAVE: the token moved on, only the plan changes.
-            // NEED: replay the saved activation once on the new next stage.
-            // Silence is still ambiguous: stop the session, write nothing.
+            // stage after it. HAVE or silence: the token moved on, only the
+            // plan changes. NEED: replay the saved activation once.
             if (ppResolveDeadNextHop(ppPlan_, myNodeIndex, targetNodeIndex)) return;
             throw NnPeerOfflineException(targetNodeIndex,
                 "PP delivery is ambiguous after a buffered send; restart required");
@@ -2454,9 +2453,13 @@ void NnNetwork::setPpDeliveryHaveHook(NnPpDeliveryHaveFn fn, void *context) {
 
 void NnNetwork::saveLastPpActivation(const void *data, NnSize size) {
     lastPpActivation_.clear();
+    lastPpLive_ = nullptr;
+    lastPpLiveBytes_ = 0u;
     if (data == nullptr || size == 0u) return;
     const NnByte *bytes = (const NnByte *)data;
     lastPpActivation_.assign(bytes, bytes + size);
+    lastPpLive_ = data;
+    lastPpLiveBytes_ = size;
 }
 
 bool NnNetwork::takePpDeliveryNeedNote(NnUint position, NnUint deadNode) {
@@ -2570,26 +2573,52 @@ bool NnNetwork::ppResolveDeadNextHop(const NnUnevenPartitionPlan *plan, NnUint m
     const NnUint newNextNode = plan->stages[newNextStage].rootNodeIndex;
 
     const int answer = askPpDeliveryState(plan, myNodeIndex, deadNode);
-    if (answer == 1) {
-        // The stage after the dead one already has this token: only later
-        // tokens need to skip the dead stage. Nothing is written.
+    if (answer != 2) {
+        // HAVE, or silence. A stage still blocked in recv would have written
+        // NEED as soon as the reset arrived. Silence means it already has
+        // this token and is computing it, so another copy would be a second
+        // token. Later tokens skip the dead stage.
         return g_ppFailover(mutablePlan, myNodeIndex, deadNode, false);
     }
-    if (answer != 2) return false;
     // No saved bytes means we cannot replay unambiguously; treat it as silence.
     if (lastPpActivation_.empty()) return false;
     if (!g_ppFailover(mutablePlan, myNodeIndex, deadNode, true)) return false;
 
-    // Replay the exact activation bytes the dead hop received, once, to the
-    // stage that follows it. The plan now routes directly there.
+    // The front slice has already run against the send pipe. That pipe is what
+    // the next stage must receive; the saved copy is only the pre-takeover bytes.
+    const void *replay = lastPpLive_ != nullptr ? lastPpLive_ : (const void *)lastPpActivation_.data();
+    const NnSize replayBytes = lastPpLive_ != nullptr ? lastPpLiveBytes_ : (NnSize)lastPpActivation_.size();
+    if (replay == nullptr || replayBytes == 0u) return false;
     const int socketIndex = getSocketIndexForNode(newNextNode, myNodeIndex);
     if (socketIndex < 0) return false;
-    write((NnUint)socketIndex, lastPpActivation_.data(), (NnSize)lastPpActivation_.size());
+    write((NnUint)socketIndex, replay, replayBytes);
     return true;
+}
+
+// The immediate next hop has its own ask/replay path. Any other dead stage is
+// only relinked here, so the root records the dropout and paints the panel
+// even though it is waiting on the tail rather than on that hop.
+static void relinkOtherDeadStages(NnNetwork *network, const NnUnevenPartitionPlan *plan, NnUint myNodeIndex) {
+    if (network == nullptr || plan == nullptr || plan->stages == nullptr || g_ppFailover == nullptr) return;
+    NnUint mySlot = 0u;
+    const bool amStageRoot = ppStageForNode(plan, myNodeIndex, &mySlot) != nullptr
+        && plan->stages[mySlot].rootNodeIndex == myNodeIndex;
+    const NnUint myNext = amStageRoot ? getPpNextStageIndex(plan, mySlot) : (NnUint)-1;
+    NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
+    for (NnUint s = 0u; s < plan->nStages; ++s) {
+        if (amStageRoot && (s == mySlot || s == myNext)) continue;
+        const NnUint node = plan->stages[s].rootNodeIndex;
+        if (node == myNodeIndex) continue;
+        if (getPpPrevStageIndex(plan, s) == (NnUint)-1 && getPpNextStageIndex(plan, s) == (NnUint)-1) continue;
+        if (network->getSocketIndexForNode(node, myNodeIndex) < 0 || !network->peerLooksOffline(node)) continue;
+        network->deactivateNode(node, myNodeIndex);
+        g_ppFailover(mutablePlan, myNodeIndex, node, false);
+    }
 }
 
 void NnNetwork::checkPpNextWhileWaiting(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex) {
     if (plan == nullptr) return;
+    relinkOtherDeadStages(this, plan, myNodeIndex);
     NnUint slot = 0u;
     const NnStageConfig *myStage = ppStageForNode(plan, myNodeIndex, &slot);
     if (myStage == nullptr || myStage->rootNodeIndex != myNodeIndex) return;
@@ -2598,9 +2627,9 @@ void NnNetwork::checkPpNextWhileWaiting(const NnUnevenPartitionPlan *plan, NnUin
     const NnUint nextNode = plan->stages[nextStageIndex].rootNodeIndex;
     if (getSocketIndexForNode(nextNode, myNodeIndex) >= 0 && !peerLooksOffline(nextNode)) return;
     // A successful buffered send does not prove whether the dead stage
-    // forwarded this token. Ask the stage after it before deciding: HAVE only
-    // relinks the plan, NEED replays the saved activation once. Silence keeps
-    // today's safe stop, because either choice could duplicate or lose work.
+    // forwarded this token. Ask the stage after it before deciding: HAVE, or
+    // silence from a stage that is already computing, only relinks the plan.
+    // NEED replays the saved activation once.
     deactivateNode(nextNode, myNodeIndex);
     if (ppResolveDeadNextHop(plan, myNodeIndex, nextNode)) return;
     throw NnPeerOfflineException(nextNode, "PP delivery is ambiguous after a buffered send; restart required");
@@ -3237,16 +3266,27 @@ static void sendPpToNext(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer,
     network->sendToNode(plan->stages[nextStageIndex].rootNodeIndex, myNodeIndex, buffer, nBytes);
 }
 
-// Same framing as writeWorkerFrame in app.cpp: one header then the payload, on
-// the root socket. A worker answers a dead upstream hop with this so the root
-// learns the in-flight activation never arrived instead of guessing.
-static void writePpDeliveryNeedFrame(NnNetwork *network, NnUint position, NnUint deadNode) {
+// The previous stage is whoever must replay. It is listening on its socket to
+// us, which is the root socket only when the root is that previous stage.
+static void writePpDeliveryNeedFrame(NnNetwork *network, NnUint destNode, NnUint position, NnUint deadNode) {
     if (network == nullptr || network->nSockets == 0u) return;
     NnPpDeliveryNeedPacket need{};
     need.magic = NN_PP_DELIVERY_NEED_MAGIC;
     need.position = position;
     need.deadNode = deadNode;
-    nnWriteWorkerFrame(network, NN_WORKER_FRAME_DELIVERY_NEED, &need, sizeof(need));
+    if (destNode == 0u) {
+        nnWriteWorkerFrame(network, NN_WORKER_FRAME_DELIVERY_NEED, &need, sizeof(need));
+        return;
+    }
+    const int socketIndex = network->getSocketIndexForNode(destNode, 0u);
+    if (socketIndex < 0) return;
+    NnWorkerFrameHeader header{};
+    header.magic = NN_WORKER_FRAME_MAGIC;
+    header.version = NN_WORKER_FRAME_VERSION;
+    header.kind = NN_WORKER_FRAME_DELIVERY_NEED;
+    header.payloadBytes = (NnUint)sizeof(need);
+    network->write((NnUint)socketIndex, &header, sizeof(header));
+    network->write((NnUint)socketIndex, &need, sizeof(need));
 }
 
 static void recvPpFromPrev(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, const NnUnevenPartitionPlan *plan) {
@@ -3288,11 +3328,17 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
     } catch (const NnPeerOfflineException &offline) {
         NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
         if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex, false)) throw;
-        // The previous hop died before this token arrived. Tell the root on our
-        // own stream so it can replay the activation instead of restarting.
-        // Written after the relink: the root asks only once it sees the plan
-        // skip the dead stage, and this note names that same dead peer.
-        writePpDeliveryNeedFrame(network, network->getCurrentPosition(), offline.peerNodeIndex);
+        // The previous hop died before this token arrived. Tell the stage that
+        // now precedes us, on the socket it is watching, so it replays once.
+        NnUint destNode = 0u;
+        NnUint slot = 0u;
+        const NnStageConfig *mine = ppStageForNode(plan, myNodeIndex, &slot);
+        if (mine != nullptr) {
+            const NnUint prevStage = getPpPrevStageIndex(plan, slot);
+            if (prevStage != (NnUint)-1 && prevStage < plan->nStages)
+                destNode = plan->stages[prevStage].rootNodeIndex;
+        }
+        writePpDeliveryNeedFrame(network, destNode, network->getCurrentPosition(), offline.peerNodeIndex);
         recvPpFromPrev(network, myNodeIndex, buffer, nBytes, plan);
     }
 }

@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 static unsigned calls;
+static unsigned replayCalls;
 static bool covered;
 
 // A worker uninvolved in KV installation may still have profile/sample
@@ -142,9 +143,11 @@ static void testTailFrameClose(bool turbo, bool complete, bool profileFirst, uns
         } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
         catch (const NnPeerTimeoutException &e) { timeout = true; assert(e.peerNodeIndex == 1u); }
         catch (const std::runtime_error &) { invalid = true; }
-        assert(offline == (!complete && !stalled));
+        // fault 3 carries a sample for another position: it is skipped, so the
+        // wait ends on the tail's EOF rather than on an invalid frame.
+        assert(offline == ((!complete && !stalled) || fault == 3u));
         assert(timeout == stalled);
-        assert(invalid == (fault == 3u || fault == 4u));
+        assert(invalid == (fault == 4u));
         assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
         if (stalled) { assert(network.isSocketActive(0u)); close(pair[1]); }
         if (complete && !stalled && !invalid) {
@@ -185,13 +188,14 @@ static void testBoundedFrameProbe(bool turbo) {
     close(pair[1]);
 }
 static bool bypass(NnUnevenPartitionPlan *plan, NnUint self, NnUint dead, bool replay) {
-    assert(self == 0u && dead == 1u && replay);
+    assert(self == 0u && dead == 1u);
     ++calls;
+    if (replay) replayCalls += 1u;
     return covered && applyPpStageBypass(plan, 1u, 0u);
 }
 
-// A dead middle hop can have already forwarded the token. A result wait
-// cannot distinguish that from a lost activation, so it must never resend.
+// A dead middle hop can have already forwarded the token, or not. The stage
+// after it answers the question: HAVE relinks only, NEED replays once.
 static void testBufferedSend(bool alreadyDelivered, bool turbo) {
     int middle[2], tail[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
@@ -212,10 +216,19 @@ static void testBufferedSend(bool alreadyDelivered, bool turbo) {
         s.nodeIndices = new NnUint[1]{i};
     }
     int activation = 17, result = 0;
-    network.write(0u, &activation, sizeof(activation));
-    int consumed; assert(recv(middle[1], &consumed, sizeof(consumed), MSG_WAITALL) == sizeof(consumed));
-    assert(consumed == activation); close(middle[1]);
-    calls = 0u; covered = true; setNnPpFailoverHook(bypass);
+    network.setCurrentPosition(0u);
+    network.setPpPlan(&plan);
+    if (alreadyDelivered) {
+        network.write(0u, &activation, sizeof(activation));
+        int consumed; assert(recv(middle[1], &consumed, sizeof(consumed), MSG_WAITALL) == sizeof(consumed));
+        assert(consumed == activation);
+    } else {
+        // Not delivered: keep the bytes the dead hop never got, so the NEED
+        // answer can replay exactly them.
+        network.noteLastPpActivation(&activation, sizeof(activation));
+    }
+    close(middle[1]);
+    calls = 0u; replayCalls = 0u; covered = true; setNnPpFailoverHook(bypass);
     std::thread worker;
     if (alreadyDelivered) worker = std::thread([&]() {
         // This stage already has the activation and is computing; delaying
@@ -224,13 +237,201 @@ static void testBufferedSend(bool alreadyDelivered, bool turbo) {
         const int answer = 12345;
         assert(send(tail[1], &answer, sizeof(answer), 0) == sizeof(answer));
     });
+    else worker = std::thread([&]() {
+        // One DELIVERY_NEED frame: header plus three NnUint payload words.
+        LlmWorkerFrameHeader frame{};
+        frame.magic = LLM_WORKER_FRAME_MAGIC; frame.version = LLM_WORKER_FRAME_VERSION;
+        frame.kind = LLM_WORKER_FRAME_DELIVERY_NEED;
+        frame.payloadBytes = 3u * sizeof(NnUint);
+        NnUint payload[3] = {NN_PP_DELIVERY_NEED_MAGIC, 0u, 1u};
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        assert(send(tail[1], &frame, sizeof(frame), 0) == sizeof(frame));
+        assert(send(tail[1], payload, sizeof(payload), 0) == sizeof(payload));
+        // The replay is exactly one activation value.
+        int replayed = 0;
+        assert(recv(tail[1], &replayed, sizeof(replayed), MSG_WAITALL) == sizeof(replayed));
+        assert(replayed == activation);
+        // The stage then finishes the token it was given: one result value.
+        const int answer = 12345;
+        assert(send(tail[1], &answer, sizeof(answer), 0) == sizeof(answer));
+    });
     NnSocketIo io{1u, &result, sizeof(result)};
     bool offline = false;
+    const auto start = std::chrono::steady_clock::now();
     try {
         network.readMany(1u, &io, [&]() { network.checkPpNextWhileWaiting(&plan, 0u); });
     } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
     if (worker.joinable()) worker.join();
-    assert(offline && calls == 0u && getPpNextStageIndex(&plan, 0u) == 1u);
+    assert(!offline);
+    assert(calls == 1u);
+    // Either answer skips the dead stage for later tokens.
+    assert(getPpNextStageIndex(&plan, 0u) == 2u);
+    if (alreadyDelivered) {
+        // The delayed result stays readable and nothing was replayed.
+        assert(result == 12345);
+        assert(replayCalls == 0u);
+        // The wait itself returned without writing anything to the tail.
+    } else {
+        // The replay let the stage finish, and its result arrived once.
+        assert(result == 12345);
+        assert(replayCalls == 1u);
+    }
+    int duplicate;
+    assert(recv(tail[1], &duplicate, sizeof(duplicate), MSG_DONTWAIT) == -1);
+    assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+    setNnPpFailoverHook(nullptr); close(tail[1]);
+}
+
+// A frame already read into the root's caches is the other HAVE signal: the
+// token reached the stage after the dead hop even though its socket is quiet.
+static void testBufferedSendHaveFromCache(bool turbo) {
+    int middle[2], tail[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, tail) == 0);
+    std::vector<NnSocket> sockets; sockets.reserve(2u);
+    sockets.emplace_back(middle[0]); sockets.emplace_back(tail[0]);
+    std::vector<NnUint> peers{1u, 2u};
+    NnNetwork network(&sockets, &peers);
+    network.resetStats(); network.setTurbo(turbo);
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 3u;
+    plan.stages = new NnStageConfig[3];
+    plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, 1u};
+    plan.ppNextStageIndex = new NnUint[3]{1u, 2u, (NnUint)-1};
+    for (NnUint i = 0; i < 3u; ++i) {
+        auto &s = plan.stages[i]; s.stageIndex = s.rootNodeIndex = i;
+        s.startLayer = i; s.endLayer = i+1; s.nLayers = s.nNodes = 1;
+        s.nodeIndices = new NnUint[1]{i};
+    }
+    int activation = 17;
+    network.setCurrentPosition(4u);
+    network.setPpPlan(&plan);
+    network.noteLastPpActivation(&activation, sizeof(activation));
+    close(middle[1]);
+    bool haveCalled = false;
+    network.setPpDeliveryHaveHook(
+        [](void *ctx, NnUint downstream, NnUint position) -> bool {
+            bool *called = (bool *)ctx;
+            *called = true;
+            return downstream == 2u && position == 4u;
+        }, &haveCalled);
+    calls = 0u; replayCalls = 0u; covered = true; setNnPpFailoverHook(bypass);
+    const auto start = std::chrono::steady_clock::now();
+    // Must return normally: HAVE relinks the plan and writes nothing.
+    network.checkPpNextWhileWaiting(&plan, 0u);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    assert(haveCalled && calls == 1u && replayCalls == 0u);
+    assert(getPpNextStageIndex(&plan, 0u) == 2u);
+    assert(elapsed < 400);
+    int duplicate;
+    assert(recv(tail[1], &duplicate, sizeof(duplicate), MSG_DONTWAIT) == -1);
+    network.setPpDeliveryHaveHook(nullptr, nullptr);
+    setNnPpFailoverHook(nullptr); close(tail[1]);
+}
+
+// Silence is still ambiguous: no answer within the ask window keeps the safe
+// stop and writes nothing.
+static void testBufferedSendNoAnswer(bool turbo) {
+    int middle[2], tail[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, tail) == 0);
+    std::vector<NnSocket> sockets; sockets.reserve(2u);
+    sockets.emplace_back(middle[0]); sockets.emplace_back(tail[0]);
+    std::vector<NnUint> peers{1u, 2u};
+    NnNetwork network(&sockets, &peers);
+    network.resetStats(); network.setTurbo(turbo);
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 3u;
+    plan.stages = new NnStageConfig[3];
+    plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, 1u};
+    plan.ppNextStageIndex = new NnUint[3]{1u, 2u, (NnUint)-1};
+    for (NnUint i = 0; i < 3u; ++i) {
+        auto &s = plan.stages[i]; s.stageIndex = s.rootNodeIndex = i;
+        s.startLayer = i; s.endLayer = i+1; s.nLayers = s.nNodes = 1;
+        s.nodeIndices = new NnUint[1]{i};
+    }
+    int activation = 17, result = 0;
+    network.setCurrentPosition(0u);
+    network.setPpPlan(&plan);
+    network.noteLastPpActivation(&activation, sizeof(activation));
+    close(middle[1]);
+    calls = 0u; replayCalls = 0u; covered = true; setNnPpFailoverHook(bypass);
+    NnSocketIo io{1u, &result, sizeof(result)};
+    bool offline = false;
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        network.readMany(1u, &io, [&]() { network.checkPpNextWhileWaiting(&plan, 0u); });
+    } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    assert(offline);
+    assert(calls == 0u && replayCalls == 0u);
+    // No plan change and no activation on the tail: the session restarts.
+    assert(getPpNextStageIndex(&plan, 0u) == 1u);
+    int duplicate;
+    assert(recv(tail[1], &duplicate, sizeof(duplicate), MSG_DONTWAIT) == -1);
+    assert(elapsed >= 400 && elapsed < 2500);
+    setNnPpFailoverHook(nullptr); close(tail[1]);
+}
+
+// A queued frame from an earlier token is not proof that this one arrived.
+// It must keep waiting rather than answer HAVE, and then time out safely.
+static void testBufferedSendStaleFrame(bool turbo) {
+    int middle[2], tail[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, middle) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, tail) == 0);
+    std::vector<NnSocket> sockets; sockets.reserve(2u);
+    sockets.emplace_back(middle[0]); sockets.emplace_back(tail[0]);
+    std::vector<NnUint> peers{1u, 2u};
+    NnNetwork network(&sockets, &peers);
+    network.resetStats(); network.setTurbo(turbo);
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = plan.nStages = 3u;
+    plan.stages = new NnStageConfig[3];
+    plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, 1u};
+    plan.ppNextStageIndex = new NnUint[3]{1u, 2u, (NnUint)-1};
+    for (NnUint i = 0; i < 3u; ++i) {
+        auto &s = plan.stages[i]; s.stageIndex = s.rootNodeIndex = i;
+        s.startLayer = i; s.endLayer = i+1; s.nLayers = s.nNodes = 1;
+        s.nodeIndices = new NnUint[1]{i};
+    }
+    int activation = 17;
+    network.setCurrentPosition(9u);    network.setPpPlan(&plan);
+    network.noteLastPpActivation(&activation, sizeof(activation));
+    network.setPpFramePositionHook(
+        [](void *, NnUint, NnUint kind, const void *payload, NnSize bytes, NnUint *position) -> bool {
+            if (kind != LLM_WORKER_FRAME_PROFILE || bytes != sizeof(LlmPerfPacket)) return false;
+            LlmPerfPacket pkt{};
+            std::memcpy(&pkt, payload, sizeof(pkt));
+            *position = pkt.position;
+            return true;
+        }, nullptr);
+    // A profile for the previous token is already on the stream.
+    LlmWorkerFrameHeader frame{};
+    frame.magic = LLM_WORKER_FRAME_MAGIC; frame.version = LLM_WORKER_FRAME_VERSION;
+    frame.kind = LLM_WORKER_FRAME_PROFILE; frame.payloadBytes = sizeof(LlmPerfPacket);
+    LlmPerfPacket stale{}; stale.position = 8u; stale.nodeIndex = 2u;
+    assert(send(tail[1], &frame, sizeof(frame), 0) == sizeof(frame));
+    assert(send(tail[1], &stale, sizeof(stale), 0) == sizeof(stale));
+    close(middle[1]);
+    calls = 0u; replayCalls = 0u; covered = true; setNnPpFailoverHook(bypass);
+    // Call the probe directly: readMany would consume the queued frame as the
+    // result and never reach the wait path.
+    bool offline = false;
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        network.checkPpNextWhileWaiting(&plan, 0u);
+    } catch (const NnPeerOfflineException &e) { offline = true; assert(e.peerNodeIndex == 1u); }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    assert(offline && calls == 0u && replayCalls == 0u);
+    assert(getPpNextStageIndex(&plan, 0u) == 1u);
+    assert(elapsed >= 400 && elapsed < 2500);
+    // The stale frame was never consumed; the reader that owns it still can.
+    LlmWorkerFrameHeader kept{};
+    assert(network.tryPeekWithMaxAttempts(1u, &kept, sizeof(kept), 1ul));
+    assert(kept.kind == LLM_WORKER_FRAME_PROFILE && kept.payloadBytes == sizeof(LlmPerfPacket));
     int duplicate;
     assert(recv(tail[1], &duplicate, sizeof(duplicate), MSG_DONTWAIT) == -1);
     setNnPpFailoverHook(nullptr); close(tail[1]);
@@ -344,6 +545,9 @@ int main() {
     testBoundedFrameProbe(false); testBoundedFrameProbe(true);
     testBufferedSend(true, false); testBufferedSend(true, true);
     testBufferedSend(false, false); testBufferedSend(false, true);
+    testBufferedSendHaveFromCache(false); testBufferedSendHaveFromCache(true);
+    testBufferedSendNoAnswer(false); testBufferedSendNoAnswer(true);
+    testBufferedSendStaleFrame(false); testBufferedSendStaleFrame(true);
     testBeforePpSend(true, false); testBeforePpSend(true, true);
     testBeforePpSend(false, false); testBeforePpSend(false, true);
     testBeforePpSend(true, false, true); testBeforePpSend(false, true, true);

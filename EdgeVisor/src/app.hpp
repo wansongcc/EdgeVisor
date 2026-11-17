@@ -225,6 +225,10 @@ static constexpr NnUint LLM_DEVICE_JOIN_VERSION = 1u;
 static constexpr NnUint LLM_DEVICE_JOIN_ACCEPT = 1u;
 static constexpr NnUint LLM_DEVICE_JOIN_INSERT = 2u;
 static constexpr NnUint LLM_DEVICE_JOIN_DISABLE = 3u;
+// Restores a stage's primary range after the device that owns it rejoined.
+// stageIndex + layerBegin/layerEnd are that stage's restored range; every live
+// worker and the root apply it so startLayer/endLayer/nLayers agree again.
+static constexpr NnUint LLM_DEVICE_JOIN_RESTORE = 4u;
 
 typedef struct {
     NnUint magic;
@@ -382,8 +386,8 @@ static constexpr NnUint LLM_KV_ACK_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_STAGE_BYPASS_ACK_VERSION = 1u;
 
-static constexpr NnUint LLM_WORKER_FRAME_MAGIC = 0x4d465756u; // 'VWFM'
-static constexpr NnUint LLM_WORKER_FRAME_VERSION = 1u;
+static constexpr NnUint LLM_WORKER_FRAME_MAGIC = NN_WORKER_FRAME_MAGIC; // 'VWFM'
+static constexpr NnUint LLM_WORKER_FRAME_VERSION = NN_WORKER_FRAME_VERSION;
 enum LlmWorkerFrameKind : NnUint {
     LLM_WORKER_FRAME_PROFILE = 1u,
     LLM_WORKER_FRAME_SAMPLED_TOKEN = 2u,
@@ -391,6 +395,9 @@ enum LlmWorkerFrameKind : NnUint {
     // Reply to a layer switch the receiving stage cannot honour because it does
     // not hold a current shadow copy of the layers being handed over.
     LLM_WORKER_FRAME_TAKEOVER_REJECT = 4u,
+    // A queueable delivery note for the PP transport. Declared in nn-network.hpp
+    // because the network writes and recognises it without the app layer.
+    LLM_WORKER_FRAME_DELIVERY_NEED = NN_WORKER_FRAME_DELIVERY_NEED,
 };
 
 // A receiving stage answers a layer switch with this when its reservation does
@@ -415,6 +422,9 @@ typedef struct {
     NnUint kind;
     NnUint payloadBytes;
 } LlmWorkerFrameHeader;
+// One layout, shared with the PP transport so both sides write identical framing.
+static_assert(sizeof(LlmWorkerFrameHeader) == sizeof(NnWorkerFrameHeader),
+    "worker frame header must match the network layer's view");
 static constexpr NnUint LLM_KV_EXPORT_REQUEST_VERSION = 1u;
 static constexpr NnUint LLM_KV_EXPORT_RESPONSE_VERSION = 1u;
 
@@ -606,6 +616,10 @@ private:
     void tryVerifyStageBypassAcks();
     void pollStageBypassAckFrames();
     void pumpWorkerFrames(NnUint socketIndex, int timeoutMs = -1);
+    // True when a complete normal worker frame for this position is already
+    // cached from that node. A delivery probe treats that as HAVE: the token
+    // reached the stage after the dead hop before the hop died.
+    bool hasQueuedWorkerFrameFor(NnUint nodeIndex, NnUint position) const;
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
@@ -785,6 +799,11 @@ public:
     unsigned long long runPipeLivePatch(NnUint pos);
     void collectDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out);
     LlmPerfPacket makeRootPerfPacket() const;
+    // True when a complete normal worker frame for this position is already
+    // cached from that node. The PP delivery probe treats this as HAVE.
+    bool ppHasQueuedFrameFor(NnUint nodeIndex, NnUint position) const {
+        return hasQueuedWorkerFrameFor(nodeIndex, position);
+    }
     void finish();
 };
 
@@ -855,6 +874,10 @@ typedef struct {
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
 // Between tokens, connect a reserved pool member and move a slice of the slowest donor onto it.
 void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position);
+// Between tokens, probe a device that dropped mid-session. When its port
+// accepts again it reloads its original layers and takes its range back from
+// the neighbours that covered it. Root only; workers never probe.
+void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position);
 void failoverArmSessionRestart(const std::string &prompt, NnUint steps, NnUint nLayers);
 void runWorkerApp(AppCliArgs *args);
 

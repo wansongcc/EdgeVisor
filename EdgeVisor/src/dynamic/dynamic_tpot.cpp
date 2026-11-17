@@ -115,6 +115,7 @@ struct ControllerRuntime {
     tpot::Algo2Mode algo2Mode = tpot::Algo2Mode::LEGACY;
     bool algo2WaitApply = false;
     bool algo2Rollback = false;
+    bool algo2DoubtNoted = false;
     tpot::Candidate algo2Pending;
     unsigned long long algo2BaselineGen = 0ull;
     uint32_t algo2WaitStartPos = 0u;
@@ -1006,8 +1007,14 @@ static void logAlgo2(const std::string &path, const tpot::Algo2TokenObs &obs, co
         line << it->first << ":" << it->second;
     }
     line << " reference_ms=" << decision.referenceMs
+        << " health_reference_ms=" << decision.healthReferenceMs
+        << " partition_reference_ms=" << decision.partitionReferenceMs
+        << " pre_action_median_ms=" << decision.preActionMedianMs
         << " median_ms=" << decision.windowMedianMs
         << " p95_ms=" << decision.windowP95Ms
+        << " cost_confidence=" << (decision.costConfidence.empty() ? "none" : decision.costConfidence)
+        << " tail_strikes=" << decision.tailStrikes
+        << " catchup=" << (decision.catchupMode.empty() ? "none" : decision.catchupMode)
         << " noise=" << (decision.noiseCalibrated ? "calibrated" : "uncalibrated");
     appendLog(path, line.str());
     const char *outDir = std::getenv("DLLAMA_ALGO2_OUT");
@@ -1031,6 +1038,23 @@ static void logAlgo2(const std::string &path, const tpot::Algo2TokenObs &obs, co
         decision.candidate.layerIndex,
         obs.e2eKnown ? "e2e" : "stage_compute_sum");
     std::fclose(f);
+}
+
+static void noteAlgo2ApplyTimeout(ControllerRuntime &rt, const nlohmann::json &status) {
+    const bool revised = rt.algo2Mode == tpot::Algo2Mode::REVISED_SINGLE
+        || rt.algo2Mode == tpot::Algo2Mode::REVISED_VARIABLE;
+    bool inDoubt = false;
+    if (status.contains("ppMigration") && status["ppMigration"].is_object())
+        inDoubt = status["ppMigration"].value("commitInDoubt", false);
+    if (revised && inDoubt) {
+        if (!rt.algo2DoubtNoted) {
+            rt.algo2->noteCommitInDoubt("commit_ack_timeout");
+            rt.algo2DoubtNoted = true;
+        }
+        return;
+    }
+    rt.algo2->noteCommitResult(false, rt.algo2Rollback ? "rollback_unsupported" : "pp_apply_timeout");
+    rt.algo2WaitApply = false;
 }
 
 static void stepAlgo2(
@@ -1065,9 +1089,9 @@ static void stepAlgo2(
             if (appliedPpMatches(status, pending, &generation)) {
                 rt.algo2->noteCommitResult(true, "");
                 rt.algo2WaitApply = false;
+                rt.algo2DoubtNoted = false;
             } else if (elapsed >= rt.topologyFenceTimeoutTokens) {
-                rt.algo2->noteCommitResult(false, rt.algo2Rollback ? "rollback_unsupported" : "pp_apply_timeout");
-                rt.algo2WaitApply = false;
+                noteAlgo2ApplyTimeout(rt, status);
             }
         }
         return;
@@ -1090,9 +1114,9 @@ static void stepAlgo2(
             if (appliedPpMatches(status, pending, &generation)) {
                 rt.algo2->noteCommitResult(true, "");
                 rt.algo2WaitApply = false;
+                rt.algo2DoubtNoted = false;
             } else if (elapsed >= rt.topologyFenceTimeoutTokens) {
-                rt.algo2->noteCommitResult(false, rt.algo2Rollback ? "rollback_unsupported" : "pp_apply_timeout");
-                rt.algo2WaitApply = false;
+                noteAlgo2ApplyTimeout(rt, status);
             }
         }
 

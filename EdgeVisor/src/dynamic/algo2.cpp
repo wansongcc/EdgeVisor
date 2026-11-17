@@ -109,21 +109,18 @@ LayerEstimate estimateStage(const Algo2StageInput &stage) {
         }
     }
     if (n > 0u && stage.fixedOverheadMs >= 0.0 && stage.snapshot.stageTimeMs >= stage.fixedOverheadMs) {
-        out.perLayerMs = (stage.snapshot.stageTimeMs - stage.fixedOverheadMs) / (double)n;
+        double movable = stage.snapshot.stageTimeMs - stage.fixedOverheadMs;
+        if (stage.commIncludedInStageTime && stage.commWaitMs > 0.0) movable -= stage.commWaitMs;
+        if (movable < 0.0) movable = 0.0;
+        out.perLayerMs = movable / (double)n;
         out.known = true;
         out.fixedSeparated = true;
-        out.method = "stage_average_excluding_fixed";
+        out.method = "stage_average_excluding_fixed_monotonic_k";
         return out;
     }
-    double avg = stage.snapshot.avgLayerMs;
-    if (!(avg > 0.0) && n > 0u && stage.snapshot.stageTimeMs > 0.0) avg = stage.snapshot.stageTimeMs / (double)n;
-    if (!(avg > 0.0)) {
-        out.method = "unknown";
-        return out;
-    }
-    out.perLayerMs = avg;
-    out.known = true;
-    out.method = "stage_average_linear";
+    // A stage average that still contains an unknown fixed cost is not a
+    // movable layer cost. Naming it is not enough to let it drive a move.
+    out.method = "fixed_overhead_not_separated";
     return out;
 }
 
@@ -232,6 +229,7 @@ const char *algo2PhaseName(Algo2Phase phase) {
         case Algo2Phase::KEEP: return "KEEP";
         case Algo2Phase::ROLLBACK: return "ROLLBACK";
         case Algo2Phase::COOLDOWN: return "COOLDOWN";
+        case Algo2Phase::RECONCILE: return "RECONCILE";
         default: return "OBSERVE";
     }
 }
@@ -263,6 +261,8 @@ Algo2Config algo2ConfigFromEnvironment() {
     cfg.watchdogMs = envInt("DLLAMA_ALGO2_WATCHDOG_MS", cfg.watchdogMs, 1);
     cfg.watchdogFactor = envDouble("DLLAMA_ALGO2_WATCHDOG_FACTOR", cfg.watchdogFactor);
     cfg.reverseSuppressDecisions = envInt("DLLAMA_ALGO2_REVERSE_SUPPRESS", cfg.reverseSuppressDecisions, 0);
+    cfg.tailConfirmations = envInt("DLLAMA_ALGO2_TAIL_CONFIRMATIONS", cfg.tailConfirmations, 2);
+    cfg.rollbackCatchupTokens = envInt("DLLAMA_ALGO2_ROLLBACK_CATCHUP", cfg.rollbackCatchupTokens, 0);
     if (cfg.verifyMaxTokens < cfg.verifyTokens) cfg.verifyMaxTokens = cfg.verifyTokens;
     return cfg;
 }
@@ -332,6 +332,8 @@ std::string Algo2Session::effectiveConfigText() const {
         << " verify_max=" << cfg_.verifyMaxTokens
         << " verify_ratio=" << cfg_.verifyRatio
         << " verify_band=fixed_conservative_uncalibrated"
+        << " tail_confirmations=" << cfg_.tailConfirmations
+        << " rollback_catchup_tokens=" << cfg_.rollbackCatchupTokens
         << " cooldown_tokens=" << cfg_.cooldownTokens
         << " cooldown_min_ms=" << cfg_.cooldownMinMs
         << " min_layers=" << cfg_.minLayersPerStage
@@ -355,6 +357,16 @@ Algo2Decision Algo2Session::make(const std::string &note) const {
     d.recovered = recovered_;
     d.locateStage = locateStage_;
     d.referenceMs = referenceValid_ ? referenceMs_ : -1.0;
+    d.healthReferenceValid = referenceValid_;
+    d.healthReferenceMs = referenceValid_ ? referenceMs_ : -1.0;
+    d.healthReferenceContext = referenceContext_;
+    d.healthReferenceReason = healthReferenceReason_;
+    d.partitionReferenceValid = partitionReferenceValid_;
+    d.partitionReferenceMs = partitionReferenceValid_ ? partitionReferenceMs_ : -1.0;
+    d.preActionMedianMs = beforeMedian_;
+    d.preActionP95Ms = beforeP95_;
+    d.tailStrikes = tailStrikes_;
+    d.verifySamples = verifySamplesSeen_;
     d.noiseCalibrated = cfg_.predictionNoiseMs >= 0.0;
     d.candidate.kind = CandidateKind::PP_MOVE;
     d.candidate.reason = note;
@@ -380,11 +392,37 @@ void Algo2Session::captureStageReference(size_t windowTokens) {
         referenceComm_[it->first] = medianOf(it->second);
 }
 
+void Algo2Session::capturePartitionReference(const std::vector<Sample> &window) {
+    partitionCompute_.clear();
+    partitionComm_.clear();
+    if (window.empty()) return;
+    std::map<uint32_t, std::vector<double>> comp;
+    std::map<uint32_t, std::vector<double>> comm;
+    double metricSum = 0.0;
+    for (size_t i = 0u; i < window.size(); ++i) {
+        metricSum += window[i].metric;
+        for (std::map<uint32_t, double>::const_iterator it = window[i].compute.begin(); it != window[i].compute.end(); ++it)
+            comp[it->first].push_back(it->second);
+        for (std::map<uint32_t, double>::const_iterator it = window[i].comm.begin(); it != window[i].comm.end(); ++it)
+            comm[it->first].push_back(it->second);
+    }
+    std::vector<double> metrics;
+    for (size_t i = 0u; i < window.size(); ++i) metrics.push_back(window[i].metric);
+    partitionReferenceMs_ = medianOf(metrics);
+    partitionReferenceValid_ = true;
+    (void)metricSum;
+    for (std::map<uint32_t, std::vector<double>>::iterator it = comp.begin(); it != comp.end(); ++it)
+        partitionCompute_[it->first] = medianOf(it->second);
+    for (std::map<uint32_t, std::vector<double>>::iterator it = comm.begin(); it != comm.end(); ++it)
+        partitionComm_[it->first] = medianOf(it->second);
+}
+
 void Algo2Session::updateHealth(const std::vector<double> &window, double median, double p95) {
     if (!referenceValid_) {
         referenceValid_ = true;
         referenceMs_ = median;
         referenceContext_ = samples_.empty() ? 0u : samples_.back().contextLength;
+        healthReferenceReason_ = "established";
         captureStageReference(window.size());
         health_ = Algo2Health::NORMAL;
         breachCount_ = 0;
@@ -406,6 +444,7 @@ void Algo2Session::updateHealth(const std::vector<double> &window, double median
                 recovered_ = true;
                 referenceMs_ = median;
                 referenceContext_ = samples_.empty() ? referenceContext_ : samples_.back().contextLength;
+                healthReferenceReason_ = "recovered_to_health_anchor";
                 captureStageReference(window.size());
                 breachCount_ = 0;
                 recoveryCount_ = 0;
@@ -428,6 +467,7 @@ void Algo2Session::updateHealth(const std::vector<double> &window, double median
         health_ = Algo2Health::NORMAL;
         referenceMs_ = median;
         referenceContext_ = samples_.empty() ? referenceContext_ : samples_.back().contextLength;
+        healthReferenceReason_ = "normal_update";
         captureStageReference(window.size());
         recovered_ = false;
     }
@@ -437,18 +477,24 @@ void Algo2Session::updateHealth(const std::vector<double> &window, double median
     bool commUp = false;
     double worst = 1.0;
     if (!samples_.empty() && window.size() > 0u) {
-        const size_t begin = samples_.size() > window.size() ? samples_.size() - window.size() : 0u;
+        std::vector<const Sample *> epochSamples;
+        for (size_t i = 0u; i < samples_.size(); ++i) {
+            if (samples_[i].epoch == partitionEpoch_) epochSamples.push_back(&samples_[i]);
+        }
+        if (epochSamples.size() > window.size())
+            epochSamples.erase(epochSamples.begin(), epochSamples.end() - (std::ptrdiff_t)window.size());
         std::map<uint32_t, std::vector<double>> comp;
         std::map<uint32_t, std::vector<double>> comm;
-        for (size_t i = begin; i < samples_.size(); ++i) {
-            for (std::map<uint32_t, double>::const_iterator it = samples_[i].compute.begin(); it != samples_[i].compute.end(); ++it)
+        for (size_t i = 0u; i < epochSamples.size(); ++i) {
+            for (std::map<uint32_t, double>::const_iterator it = epochSamples[i]->compute.begin(); it != epochSamples[i]->compute.end(); ++it)
                 comp[it->first].push_back(it->second);
-            for (std::map<uint32_t, double>::const_iterator it = samples_[i].comm.begin(); it != samples_[i].comm.end(); ++it)
+            for (std::map<uint32_t, double>::const_iterator it = epochSamples[i]->comm.begin(); it != epochSamples[i]->comm.end(); ++it)
                 comm[it->first].push_back(it->second);
         }
         for (std::map<uint32_t, std::vector<double>>::iterator it = comp.begin(); it != comp.end(); ++it) {
-            std::map<uint32_t, double>::const_iterator ref = referenceCompute_.find(it->first);
-            if (ref == referenceCompute_.end() || !(ref->second > 0.0)) continue;
+            const std::map<uint32_t, double> &computeRef = partitionReferenceValid_ ? partitionCompute_ : referenceCompute_;
+            std::map<uint32_t, double>::const_iterator ref = computeRef.find(it->first);
+            if (ref == computeRef.end() || !(ref->second > 0.0)) continue;
             const double now = medianOf(it->second);
             const double ratio = now / ref->second;
             if (ratio > 1.0 + cfg_.degradationTriggerRatio) {
@@ -460,8 +506,9 @@ void Algo2Session::updateHealth(const std::vector<double> &window, double median
             }
         }
         for (std::map<uint32_t, std::vector<double>>::iterator it = comm.begin(); it != comm.end(); ++it) {
-            std::map<uint32_t, double>::const_iterator ref = referenceComm_.find(it->first);
-            if (ref == referenceComm_.end() || !(ref->second > 0.0)) continue;
+            const std::map<uint32_t, double> &commRef = partitionReferenceValid_ ? partitionComm_ : referenceComm_;
+            std::map<uint32_t, double>::const_iterator ref = commRef.find(it->first);
+            if (ref == commRef.end() || !(ref->second > 0.0)) continue;
             const double now = medianOf(it->second);
             if (now > ref->second * (1.0 + cfg_.degradationTriggerRatio)) commUp = true;
         }
@@ -472,7 +519,36 @@ void Algo2Session::updateHealth(const std::vector<double> &window, double median
     else cause_ = "unknown";
 }
 
-Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::string *reject) const {
+bool Algo2Session::rollbackCatchup(uint32_t tokenId, uint32_t *gap, std::string *block) const {
+    if (gap != nullptr) *gap = 0u;
+    const Algo2StageInput *receiver = nullptr;
+    for (size_t i = 0u; i < stages_.size(); ++i) {
+        if (stages_[i].snapshot.stageIndex == pending_.fromStageIndex) {
+            receiver = &stages_[i];
+            break;
+        }
+    }
+    if (receiver == nullptr) {
+        if (block != nullptr) *block = "rollback_kv_unknown";
+        return false;
+    }
+    if (receiver->shadowCursor < 0) {
+        if (block != nullptr) *block = receiver->shadowCursor == -2 ? "rollback_shadow_missing" : "rollback_kv_unknown";
+        return false;
+    }
+    const uint32_t need = tokenId + 1u;
+    if ((uint32_t)receiver->shadowCursor >= need) return true;
+    const uint32_t missing = need - (uint32_t)receiver->shadowCursor;
+    if (cfg_.rollbackCatchupTokens >= 0 && (int)missing <= cfg_.rollbackCatchupTokens) {
+        if (gap != nullptr) *gap = missing;
+        return true;
+    }
+    if (block != nullptr) *block = "rollback_kv_gap_too_large";
+    return false;
+}
+
+Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::string *reject,
+        double *sourceCost, double *targetCost, std::string *confidence) const {
     Candidate best;
     best.kind = CandidateKind::PP_MOVE;
     best.reason = "no eligible pp candidate";
@@ -521,16 +597,18 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
             const LayerEstimate targetEst = estimateStage(target);
             if (!sourceEst.known || !targetEst.known) {
                 anyReject = true;
-                rejectReason = "layer_cost_unknown";
+                const bool unseparated = sourceEst.method == "fixed_overhead_not_separated" ||
+                    targetEst.method == "fixed_overhead_not_separated";
+                rejectReason = unseparated ? "fixed_overhead_not_separated" : "layer_cost_unknown";
                 continue;
             }
             const double pairMs = std::max(0.0, source.snapshot.stageTimeMs) + std::max(0.0, target.snapshot.stageTimeMs);
             double threshold = std::max(cfg_.gainAbsMs, cfg_.gainRelativePair * pairMs);
             if (cfg_.predictionNoiseMs >= 0.0) threshold = std::max(threshold, cfg_.predictionNoiseMs);
             for (uint32_t k = 1u; k <= kmax; ++k) {
-                const double sourceCost = movedSourceCost(source, k, takeSuffix);
-                if (!(sourceCost >= 0.0)) continue;
-                const double gain = sourceCost - targetEst.perLayerMs * (double)k;
+                const double movedCost = movedSourceCost(source, k, takeSuffix);
+                if (!(movedCost >= 0.0)) continue;
+                const double gain = movedCost - targetEst.perLayerMs * (double)k;
                 Candidate cand;
                 cand.kind = CandidateKind::PP_MOVE;
                 cand.fromStageIndex = source.snapshot.stageIndex;
@@ -542,8 +620,7 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
                 cand.gainMs = gain;
                 cand.thresholdMs = threshold;
                 cand.valid = gain > threshold;
-                std::string used = sourceEst.method;
-                if (!sourceEst.fixedSeparated || !targetEst.fixedSeparated) used += "_fixed_overhead_not_separated";
+                const std::string used = sourceEst.method;
                 cand.reason = cand.valid ? used : "gain_below_threshold";
                 if (sawKeptMove_ && reverseLeft_ > 0 && cand.fromStageIndex == keptTo_ && cand.toStageIndex == keptFrom_) {
                     cand.valid = false;
@@ -555,6 +632,11 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
                         best = cand;
                         bestMargin = margin;
                         if (method != nullptr) *method = used;
+                        if (sourceCost != nullptr) *sourceCost = movedCost;
+                        if (targetCost != nullptr) *targetCost = targetEst.perLayerMs * (double)k;
+                        if (confidence != nullptr) {
+                            *confidence = sourceEst.haveLayers ? "high" : "medium";
+                        }
                     }
                 } else {
                     anyReject = true;
@@ -582,13 +664,14 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
     if (token.prefill) return make("prefill_excluded");
     const bool useE2e = token.e2eKnown && token.e2eMs >= 0.0;
     const bool useSum = token.stageSumKnown && token.stageComputeSumMs >= 0.0;
-    if (!useE2e && !useSum) return make("metric_missing");
+    if (!useE2e) return make(useSum ? "e2e_missing" : "metric_missing");
 
     Sample sample;
     sample.tokenId = token.tokenId;
     sample.contextLength = token.contextLength;
-    sample.metric = useE2e ? token.e2eMs : token.stageComputeSumMs;
-    sample.e2e = useE2e;
+    sample.metric = token.e2eMs;
+    sample.e2e = true;
+    sample.epoch = partitionEpoch_;
     sample.compute = token.stageComputeMs;
     sample.comm = token.stageCommMs;
 
@@ -600,32 +683,43 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
     haveTokenTime_ = true;
 
     if (phase_ == Algo2Phase::COMMIT) return make("commit_wait");
+    if (phase_ == Algo2Phase::RECONCILE) return make("reconcile_wait");
     if (phase_ == Algo2Phase::ROLLBACK) return make(rollbackBlocked_ ? "rollback_failed" : "rollback_wait");
     if (phase_ == Algo2Phase::SETTLE) {
         if (settleLeft_ > 0) settleLeft_ -= 1;
         if (settleLeft_ <= 0) {
             phase_ = Algo2Phase::VERIFY;
             verify_.clear();
+            verifySamplesSeen_ = 0;
+            tailStrikes_ = 0;
             return make("settle_done");
         }
         return make("settle");
     }
     if (phase_ == Algo2Phase::VERIFY) {
         verify_.push_back(sample.metric);
-        if ((int)verify_.size() < cfg_.verifyTokens) return make("verify_wait");
+        verifySamplesSeen_ += 1;
+        if ((int)verify_.size() < cfg_.verifyTokens && verifySamplesSeen_ < cfg_.verifyMaxTokens)
+            return make("verify_wait");
         const double med = medianOf(verify_);
         const double p95 = p95Of(verify_);
         const double mean = meanOf(verify_);
-        double tol = std::max(0.0, cfg_.verifyRatio * beforeMedian_);
-        if (cfg_.predictionNoiseMs >= 0.0) tol = std::max(tol, cfg_.predictionNoiseMs);
-        const bool medianBetter = med < beforeMedian_ - tol;
-        const bool medianWorse = med > beforeMedian_ + tol;
-        const bool tailWorse = p95 > beforeP95_ + tol;
+        double tol50 = std::max(0.0, cfg_.verifyRatio * beforeMedian_);
+        double tol95 = std::max(0.0, cfg_.verifyRatio * beforeP95_);
+        if (cfg_.predictionNoiseMs >= 0.0) {
+            tol50 = std::max(tol50, cfg_.predictionNoiseMs);
+            tol95 = std::max(tol95, cfg_.predictionNoiseMs);
+        }
+        const bool medianBetter = med < beforeMedian_ - tol50;
+        const bool medianWorse = med > beforeMedian_ + tol50;
+        const bool tailWorse = beforeP95_ >= 0.0 && p95 > beforeP95_ + tol95;
         Algo2Decision d = make("verify");
         d.windowMedianMs = med;
         d.windowMeanMs = mean;
         d.windowP95Ms = p95;
-        if (medianBetter && !tailWorse) {
+        d.preActionMedianMs = beforeMedian_;
+        d.preActionP95Ms = beforeP95_;
+        auto finishKeep = [&](const char *note) -> Algo2Decision {
             phase_ = Algo2Phase::COOLDOWN;
             cooldownLeft_ = cfg_.cooldownTokens;
             cooldownUntilMs_ = nowMs + (double)cfg_.cooldownMinMs;
@@ -636,31 +730,58 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
                 reverseLeft_ = cfg_.reverseSuppressDecisions;
             }
             havePending_ = false;
-            referenceValid_ = false;
+            pendingIsRollback_ = false;
             recovered_ = false;
+            tailStrikes_ = 0;
             d.phase = phase_;
-            d.note = "clear_improvement";
+            d.note = note;
             d.recovered = false;
+            d.healthReferenceValid = referenceValid_;
+            d.healthReferenceMs = referenceValid_ ? referenceMs_ : -1.0;
             return d;
-        }
-        if (medianWorse || (tailWorse && !medianBetter)) {
+        };
+        auto finishRollback = [&](const char *note) -> Algo2Decision {
+            uint32_t gap = 0u;
+            std::string block;
+            if (!rollbackCatchup(token.tokenId, &gap, &block)) {
+                phase_ = Algo2Phase::ROLLBACK;
+                rollbackBlocked_ = true;
+                havePending_ = false;
+                pendingIsRollback_ = false;
+                d.phase = phase_;
+                d.rollback = false;
+                d.note = block;
+                return d;
+            }
             phase_ = Algo2Phase::ROLLBACK;
+            pendingIsRollback_ = true;
             d.phase = phase_;
             d.rollback = true;
-            d.note = "clear_regression";
+            d.note = note;
             d.candidate = pending_;
+            d.catchupTokens = gap;
+            d.catchupMode = gap == 0u ? "reservation" : "retransmit";
+            return d;
+        };
+        if (medianWorse) return finishRollback("clear_regression");
+        if (tailWorse) {
+            tailStrikes_ += 1;
+            verify_.clear();
+            d.tailStrikes = tailStrikes_;
+            if (tailStrikes_ >= cfg_.tailConfirmations) return finishRollback("tail_confirmed_rollback");
+            if (verifySamplesSeen_ >= cfg_.verifyMaxTokens) {
+                if (medianBetter) return finishKeep("clear_improvement");
+                return finishRollback("inconclusive_rollback");
+            }
+            d.note = "tail_unconfirmed";
             return d;
         }
-        if ((int)verify_.size() < cfg_.verifyMaxTokens) {
+        if (medianBetter) return finishKeep(tailStrikes_ > 0 ? "spike_not_sustained" : "clear_improvement");
+        if (verifySamplesSeen_ < cfg_.verifyMaxTokens) {
             d.note = "inconclusive";
             return d;
         }
-        phase_ = Algo2Phase::ROLLBACK;
-        d.phase = phase_;
-        d.rollback = true;
-        d.note = "inconclusive_rollback";
-        d.candidate = pending_;
-        return d;
+        return finishRollback("inconclusive_rollback");
     }
     if (phase_ == Algo2Phase::COOLDOWN) {
         if (cooldownLeft_ > 0) cooldownLeft_ -= 1;
@@ -682,14 +803,26 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
         return make("insufficient_data");
     }
 
+    std::vector<Sample> epochSamples;
+    for (size_t i = 0u; i < samples_.size(); ++i) {
+        if (samples_[i].epoch == partitionEpoch_) epochSamples.push_back(samples_[i]);
+    }
+    if ((int)epochSamples.size() < cfg_.decisionWindowTokens) {
+        lastDecisionTokens_ = observeTokens_;
+        lastDecisionMs_ = nowMs;
+        return make("partition_window_incomplete");
+    }
+
     lastDecisionTokens_ = observeTokens_;
     lastDecisionMs_ = nowMs;
+    const size_t epochBegin = epochSamples.size() - (size_t)cfg_.decisionWindowTokens;
+    std::vector<Sample> epochWindow(epochSamples.begin() + (std::ptrdiff_t)epochBegin, epochSamples.end());
     std::vector<double> window;
-    for (size_t i = samples_.size() - (size_t)cfg_.decisionWindowTokens; i < samples_.size(); ++i)
-        window.push_back(samples_[i].metric);
+    for (size_t i = 0u; i < epochWindow.size(); ++i) window.push_back(epochWindow[i].metric);
     const double med = medianOf(window);
     const double p95 = p95Of(window);
     const double mean = meanOf(window);
+    if (!partitionReferenceValid_) capturePartitionReference(epochWindow);
     if (health_ != Algo2Health::NO_PROGRESS) updateHealth(window, med, p95);
 
     Algo2Decision d = make("observe");
@@ -716,13 +849,21 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
     phase_ = Algo2Phase::PLAN;
     std::string method;
     std::string reject;
-    Candidate chosen = search(token.tokenId, &method, &reject);
+    double sourceCost = -1.0;
+    double targetCost = -1.0;
+    std::string confidence;
+    Candidate chosen = search(token.tokenId, &method, &reject, &sourceCost, &targetCost, &confidence);
+    d.sourceCostMs = sourceCost;
+    d.targetCostMs = targetCost;
+    d.costConfidence = confidence;
     if (reverseLeft_ > 0) reverseLeft_ -= 1;
     if (!chosen.valid) {
         phase_ = Algo2Phase::OBSERVE;
         d.phase = phase_;
-        d.note = reject.empty() ? "no_eligible_candidate" : reject;
+        const bool nothingReady = reject.empty() || reject == "no eligible pp candidate";
+        d.note = (degraded && nothingReady) ? "degraded_no_improving_candidate" : (reject.empty() ? "no_eligible_candidate" : reject);
         d.candidate = chosen;
+        d.estimateMethod = method;
         return d;
     }
     phase_ = Algo2Phase::COMMIT;
@@ -738,31 +879,55 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
     return d;
 }
 
+void Algo2Session::noteCommitInDoubt(const std::string &reason) {
+    if (phase_ != Algo2Phase::COMMIT && phase_ != Algo2Phase::ROLLBACK && phase_ != Algo2Phase::RECONCILE) return;
+    phase_ = Algo2Phase::RECONCILE;
+    commitInDoubt_ = true;
+    lastNote_ = reason.empty() ? "commit_ack_timeout" : reason;
+}
+
 void Algo2Session::noteCommitResult(bool applied, const std::string &reason) {
-    if (phase_ != Algo2Phase::COMMIT && phase_ != Algo2Phase::ROLLBACK) return;
+    if (phase_ != Algo2Phase::COMMIT && phase_ != Algo2Phase::ROLLBACK && phase_ != Algo2Phase::RECONCILE) return;
     if (!applied) {
         if (phase_ == Algo2Phase::ROLLBACK) {
             rollbackBlocked_ = true;
             havePending_ = false;
+            pendingIsRollback_ = false;
             lastNote_ = reason.empty() ? "rollback_failed" : reason;
+            return;
+        }
+        if (phase_ == Algo2Phase::RECONCILE && reason != "commit_not_applied") {
+            commitInDoubt_ = true;
+            lastNote_ = reason.empty() ? "commit_confirm_timeout" : reason;
             return;
         }
         phase_ = Algo2Phase::OBSERVE;
         havePending_ = false;
+        pendingIsRollback_ = false;
+        commitInDoubt_ = false;
         lastNote_ = reason.empty() ? "commit_rejected" : reason;
         settleLeft_ = 0;
         return;
     }
-    if (phase_ == Algo2Phase::ROLLBACK) {
+    partitionEpoch_ += 1u;
+    partitionReferenceValid_ = false;
+    partitionReferenceMs_ = -1.0;
+    partitionCompute_.clear();
+    partitionComm_.clear();
+    commitInDoubt_ = false;
+    recovered_ = false;
+    if (phase_ == Algo2Phase::ROLLBACK || pendingIsRollback_) {
         phase_ = Algo2Phase::COOLDOWN;
         cooldownLeft_ = cfg_.cooldownTokens;
         cooldownUntilMs_ = lastTokenMs_ + (double)cfg_.cooldownMinMs;
         havePending_ = false;
+        pendingIsRollback_ = false;
         lastNote_ = "rollback_applied";
         return;
     }
     phase_ = Algo2Phase::SETTLE;
     settleLeft_ = cfg_.settleTokens;
+    pendingIsRollback_ = false;
     lastNote_ = "commit_applied";
 }
 

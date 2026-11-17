@@ -13,9 +13,15 @@ This is a mechanism report for the revised online controller. It does not claim 
 | `revised_single_layer` | One ready layer, and only when the whole action clears the threshold |
 | `revised_variable_step` | The largest ready k whose predicted per-token gain clears the threshold. Ties prefer the smaller k |
 
-The revised path compares per-token gain with `max(3 ms, 0.03 * (source + target))`. Uncalibrated prediction noise stays out of that threshold. A move is issued only when the recorded shadow cursor covers the current token. A reservation miss aborts. It does not copy KV from position 0. The legacy path still does.
+The revised path compares per-token gain with `max(3 ms, 0.03 * (source + target))`, plus calibrated noise when that value is set. A per-layer vector is a high-confidence cost. A declared fixed overhead of 0 or more is a stage average with the fixed part and any included communication wait removed; that average is monotonic in k and is medium confidence. An unknown fixed overhead is not a layer cost, so the search does not issue. The live controller still does not pass a per-layer vector or a declared fixed overhead, so a revised run will not move until one of those is supplied. Uncalibrated noise stays out of the threshold.
 
-Default decode remains one request in `inferenceRunOnce`. The token clock is that request's completion interval on the root. The first completed token has no interval, so its metric is the stage-compute sum. Later tokens use the completion interval. Continuous batching is not on this path.
+A move is issued only when the recorded shadow cursor covers the current token. In revised mode the receiver must answer that transaction. Silence is not acceptance: the root waits up to 200 ms, and a missing answer stays unconfirmed. One later token may replay that same transaction id. A second miss stays unconfirmed and does not start another transaction. The legacy path still treats silence as acceptance and can still copy KV from position 0.
+
+A revised reservation miss with a known gap of at most `DLLAMA_ALGO2_ROLLBACK_CATCHUP` tokens (default 128) may retransmit that tail, or recompute it if the retransmit does not install. That is catch-up, not a ready reservation. A larger or unknown gap aborts.
+
+The health reference is the recovery anchor. A kept move does not replace it and does not mark the run recovered. The next search uses the new allocation's own window. One worse tail sub-window is not a rollback. A worse median rolls back immediately. A tail that stays worse for two non-overlapping verify windows rolls back. A spike that does not repeat is kept.
+
+Default decode remains one request in `inferenceRunOnce`. The token clock is that request's completion interval on the root. A token with no completion interval is not a health sample. Continuous batching is not on this path.
 
 ## Audit
 
@@ -27,9 +33,23 @@ Default decode remains one request in `inferenceRunOnce`. The token clock is tha
 | Legacy verify | The old path still uses its 1.05 window. The revised path uses its own settle, verify, and cooldown |
 | Shadow cursor | `shadowFilledThrough` is the minimum exclusive end of redundant and shadow-KV layers on that node. `0xFFFFFFFF` means the node has no such layer |
 | Readiness | Cursor `>= token + 1` is ready. Unknown stays unknown. Weights being present is not readiness |
-| Foreground switch | Not measured below 1 ms. The reservation-hit path waits a fixed 200 ms grace because silence means acceptance. The recorded stall was 200.615 ms with `stateBytes=0` |
+| Foreground switch | Not measured below 1 ms. The old revised path treated 200 ms of silence as acceptance, and the smoke below recorded 200.615 ms for that wait. The current revised path names that wait as protocol wait and accepts only an explicit applied acknowledgement |
 | Containers | Docker is installed and the nvidia runtime is present. Pulling `nvidia/cuda:12.0.0-base-ubuntu22.04` failed: the configured proxy `192.168.1.11:10810` refused the connection. The T4 run was on the host. No host `tc`, no clock change, no power change |
 | Edge set | nx1, nx2, nano1, nano2, and rog answered SSH. The Q40 model is on nx1. nvcc 12.6 is on nx1. No algorithm-2 inference was run there |
+
+## Refinement against the smoke
+
+The smoke below was produced by the previous revised binary. It is not a re-run of the current code.
+
+| Point | Previous run | Current code |
+| --- | --- | --- |
+| Health anchor | Keeping the 179 ms move cleared the 58 ms reference, and the next window stored about 180 ms as healthy | The 58 ms anchor stays. The move can be kept, health stays unrecovered, and after cooldown the search continues against the new allocation |
+| Commit | 200 ms of silence was recorded as a successful switch | Revised mode requires an applied acknowledgement for that transaction. Timeout is unconfirmed. One same-id replay is allowed |
+| Short KV gap | Any reservation miss aborted | A known gap of at most 128 tokens may be retransmitted or recomputed. A longer gap still aborts, with no copy from position 0 |
+| Cost | The k=6 prediction used a stage average that mixed fixed and communication time into the layer cost | That prediction is not issued unless a per-layer vector or an explicit fixed overhead is supplied |
+| Tail | One verify window decided keep or rollback | A worse median rolls back. A worse tail must repeat on a second non-overlapping window |
+
+`algo2-test`, `dynamic-tpot-test`, and `dllama` were rebuilt after this change. The tests passed. No new T4 or edge inference was run, so the acknowledgement path and the tail catch-up have not been shown on a live pipeline.
 
 ## T4 smoke
 
@@ -46,7 +66,7 @@ Exit 0. 16.18 tokens/s, 61.82 ms/token. The controller logged 36 observe records
 
 ### Revised variable step, 120 steps, injected sleep
 
-This is an injected per-step sleep, not a GPU throttle and not a natural fault. Node 2 slept 15 ms on its compute steps after 24 decode tokens.
+These numbers are from the previous binary. This is an injected per-step sleep, not a GPU throttle and not a natural fault. Node 2 slept 15 ms on its compute steps after 24 decode tokens.
 
 Exit 0. The whole run, including the healthy prefix and the stall, was 4.57 tokens/s, 219.02 ms/token. That average is not the post-move speed.
 
@@ -58,7 +78,7 @@ Stage 3's cursor stopped at 52 after the move, while the other stages kept advan
 
 The statistics are the logs above: one serial Q40 run per mode, with per-token phase, health, cursor, and the root migration line.
 
-The mechanism fired on the injected run. Static mode with the same initial split did not move. The revised transaction checked a live cursor, used the reservation, passed settle and verify, and kept the move. The unit tests cover the smaller cases: k=1 below the 3 ms bar, unknown and behind cursors, no shadow, zero memory spare, overlapping requests, fixed overhead, regression, inconclusive rollback, a failed rollback, and a local-search case that is not the exhaustive optimum.
+The previous binary fired on the injected run. Static mode with the same initial split did not move. That transaction checked a live cursor, used the reservation, passed settle and verify, and kept the move under the old rule that then cleared the health reference. The unit tests now also cover an unseparated fixed overhead, a kept move that leaves the health anchor in place, one tail spike, a repeated tail, a missing end-to-end sample, an unconfirmed commit, and a short versus long rollback gap.
 
 A net benefit is not shown. There is no paired static run under the same injection. The kept move improved 558 ms to 179 ms inside one injected run, and the rebuilt reference stayed near 180 ms, far from the 58 ms healthy reference. The 200.615 ms stall is the acceptance grace, so the foreground switch itself was not shown to be under 1 ms.
 

@@ -37,6 +37,7 @@ enum class Algo2Phase {
     KEEP,
     ROLLBACK,
     COOLDOWN,
+    RECONCILE,
 };
 
 struct Algo2Config {
@@ -66,6 +67,13 @@ struct Algo2Config {
     double stableBand = 0.10;
     // Fixed conservative verify band. Not a claim that 5% was calibrated here.
     double verifyRatio = 0.05;
+    // A single tail spike does not roll back. The tail has to stay worse
+    // across this many non-overlapping verify windows.
+    int tailConfirmations = 2;
+    // A rollback may retransmit or recompute at most this many missing tokens.
+    // A longer gap is refused. This is not permission to copy KV from position 0
+    // when the missing range is the whole history.
+    int rollbackCatchupTokens = 128;
     int watchdogMs = 5000;
     double watchdogFactor = 5.0;
     int reverseSuppressDecisions = 2;
@@ -82,7 +90,12 @@ struct Algo2Boundary {
 struct Algo2StageInput {
     StageSnapshot snapshot;
     // Negative: fixed stage overhead was not separated from the layer average.
+    // Zero is an explicit claim that this stage time contains no fixed overhead.
     double fixedOverheadMs = -1.0;
+    // Communication or wait that is known separately. It is not layer cost.
+    // Subtracted only when it is also included in snapshot.stageTimeMs.
+    double commWaitMs = 0.0;
+    bool commIncludedInStageTime = false;
     // Empty, or one entry per layer in [startLayer, endLayer).
     std::vector<double> layerMs;
     // Exclusive shadow cursor for this stage. -1 unknown. -2 this stage has
@@ -119,6 +132,21 @@ struct Algo2Decision {
     bool recovered = false;
     uint32_t locateStage = 0xFFFFFFFFu;
     double referenceMs = -1.0;
+    bool healthReferenceValid = false;
+    double healthReferenceMs = -1.0;
+    uint32_t healthReferenceContext = 0u;
+    std::string healthReferenceReason;
+    bool partitionReferenceValid = false;
+    double partitionReferenceMs = -1.0;
+    double preActionMedianMs = -1.0;
+    double preActionP95Ms = -1.0;
+    double sourceCostMs = -1.0;
+    double targetCostMs = -1.0;
+    std::string costConfidence;
+    int tailStrikes = 0;
+    int verifySamples = 0;
+    uint32_t catchupTokens = 0u;
+    std::string catchupMode;
     double windowMedianMs = -1.0;
     double windowMeanMs = -1.0;
     double windowP95Ms = -1.0;
@@ -166,6 +194,9 @@ public:
     Algo2Decision observe(const Algo2TokenObs &token, double nowMs);
     Algo2Decision pollIdle(double nowMs);
     void noteCommitResult(bool applied, const std::string &reason);
+    // The switch may have landed, but this process does not have an explicit
+    // applied acknowledgement. No new migration is started from this state.
+    void noteCommitInDoubt(const std::string &reason);
 
     const Algo2Config &config() const { return cfg_; }
     std::string effectiveConfigText() const;
@@ -174,7 +205,9 @@ private:
     Algo2Decision make(const std::string &note) const;
     void captureStageReference(size_t windowTokens);
     void updateHealth(const std::vector<double> &window, double median, double p95);
-    Candidate search(uint32_t tokenId, std::string *method, std::string *reject) const;
+    bool rollbackCatchup(uint32_t tokenId, uint32_t *gap, std::string *block) const;
+    Candidate search(uint32_t tokenId, std::string *method, std::string *reject,
+        double *sourceCost, double *targetCost, std::string *confidence) const;
 
     Algo2Config cfg_;
     Algo2Mode mode_ = Algo2Mode::LEGACY;
@@ -187,9 +220,11 @@ private:
         uint32_t contextLength = 0u;
         double metric = 0.0;
         bool e2e = false;
+        uint32_t epoch = 0u;
         std::map<uint32_t, double> compute;
         std::map<uint32_t, double> comm;
     };
+    void capturePartitionReference(const std::vector<Sample> &window);
     std::vector<Sample> samples_;
     Algo2Phase phase_ = Algo2Phase::OBSERVE;
     Algo2Health health_ = Algo2Health::INSUFFICIENT;
@@ -198,8 +233,18 @@ private:
     bool referenceValid_ = false;
     double referenceMs_ = -1.0;
     uint32_t referenceContext_ = 0u;
+    std::string healthReferenceReason_ = "not_established";
     std::map<uint32_t, double> referenceCompute_;
     std::map<uint32_t, double> referenceComm_;
+    bool partitionReferenceValid_ = false;
+    double partitionReferenceMs_ = -1.0;
+    uint32_t partitionEpoch_ = 0u;
+    std::map<uint32_t, double> partitionCompute_;
+    std::map<uint32_t, double> partitionComm_;
+    int tailStrikes_ = 0;
+    int verifySamplesSeen_ = 0;
+    bool commitInDoubt_ = false;
+    bool pendingIsRollback_ = false;
     int breachCount_ = 0;
     int recoveryCount_ = 0;
     bool recovered_ = false;

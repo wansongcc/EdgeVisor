@@ -921,6 +921,8 @@ void PlanUdsController::run() {
                     pp["ackPos"] = inference_->getMigrationAckPos();
                     pp["ackLayer"] = inference_->getMigrationAckLayer();
                     pp["appliedGeneration"] = inference_->getPpMigrationAppliedGeneration();
+        pp["commitInDoubt"] = inference_->revisedSwitchCommitInDoubt();
+        pp["commitTransaction"] = inference_->revisedSwitchTransactionId();
                     pp["appliedFromNodeIndex"] = inference_->getPpMigrationAppliedFromNodeIndex();
                     pp["appliedToNodeIndex"] = inference_->getPpMigrationAppliedToNodeIndex();
                     json layers = json::array();

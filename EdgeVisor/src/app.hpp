@@ -327,6 +327,10 @@ enum LlmLayerSwitchFlags : NnUint {
     // receiver must install the layer even when its own shadow pass has not
     // covered the position, because refusing would strand the transfer.
     LLM_LAYER_SWITCH_INSTALL = 1u << 3,
+    // Revised mode asks the receiver to answer. Silence is not acceptance.
+    // reserved1 carries the transaction id when this flag is set and the
+    // packet is not a stage-bypass packet.
+    LLM_LAYER_SWITCH_EXPLICIT_ACK = 1u << 4,
 };
 
 typedef struct {
@@ -391,6 +395,7 @@ enum LlmWorkerFrameKind : NnUint {
     // Reply to a layer switch the receiving stage cannot honour because it does
     // not hold a current shadow copy of the layers being handed over.
     LLM_WORKER_FRAME_TAKEOVER_REJECT = 4u,
+    LLM_WORKER_FRAME_TAKEOVER_ACK = 5u,
 };
 
 // A receiving stage answers a layer switch with this when its reservation does
@@ -409,6 +414,33 @@ typedef struct {
 } LlmTakeoverRejectPacket;
 static constexpr NnUint LLM_TAKEOVER_REJECT_MAGIC = 0x52544b54u; // 'TKTR'
 static constexpr NnUint LLM_TAKEOVER_REJECT_VERSION = 1u;
+
+// Explicit result of a revised-mode layer switch. APPLIED means the receiver
+// changed its layer binding. STALE means a late older transaction was ignored.
+enum LlmTakeoverAckStatus : NnUint {
+    LLM_TAKEOVER_ACK_APPLIED = 1u,
+    LLM_TAKEOVER_ACK_STALE = 3u,
+};
+enum LlmTakeoverAckFlags : NnUint {
+    LLM_TAKEOVER_ACK_KV_OK = 1u << 0,
+    LLM_TAKEOVER_ACK_WEIGHTS_OK = 1u << 1,
+};
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint nodeIndex;
+    NnUint transactionId;
+    NnUint fromNodeIndex;
+    NnUint toNodeIndex;
+    NnUint firstLayer;
+    NnUint endLayer;
+    NnUint position;
+    NnUint filledThrough;
+    NnUint status;
+    NnUint flags;
+} LlmTakeoverAckPacket;
+static constexpr NnUint LLM_TAKEOVER_ACK_MAGIC = 0x4b414b54u; // 'TKAK'
+static constexpr NnUint LLM_TAKEOVER_ACK_VERSION = 1u;
 typedef struct {
     NnUint magic;
     NnUint version;
@@ -565,6 +597,10 @@ public:
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
     unsigned long long getPpMigrationAppliedGeneration() const { return ppMigrationAppliedGeneration; }
+    bool revisedSwitchCommitInDoubt() const { return switchCommitInDoubt; }
+    NnUint revisedSwitchTransactionId() const { return explicitSwitchTransaction; }
+    // One idempotent replay, or acceptance of a late ACK, at a token boundary.
+    void pollRevisedSwitchReconcile();
     NnUint getPpMigrationAppliedFromNodeIndex() const { return ppMigrationAppliedFromNodeIndex; }
     NnUint getPpMigrationAppliedToNodeIndex() const { return ppMigrationAppliedToNodeIndex; }
     const std::vector<NnUint>& getPpMigrationAppliedLayers() const { return ppMigrationAppliedLayers; }
@@ -697,6 +733,18 @@ private:
     NnUint takeoverRejectNode = 0u;
     NnUint takeoverRejectLayer = 0u;
     NnUint takeoverRejectPos = 0u;
+    NnUint takeoverRejectFilled = 0xFFFFFFFFu;
+    bool takeoverAcked = false;
+    LlmTakeoverAckPacket takeoverAck{};
+    bool switchCommitInDoubt = false;
+    bool explicitSwitchReplayPending = false;
+    bool explicitSwitchReplayUsed = false;
+    NnUint explicitSwitchTransaction = 0u;
+    NnUint explicitSwitchFrom = 0u;
+    NnUint explicitSwitchTo = 0u;
+    NnUint explicitSwitchPosition = 0u;
+    std::vector<NnUint> explicitSwitchLayers;
+    bool explicitSwitchAckMatches() const;
     unsigned long long ppMigrationAppliedGeneration = 0ull;
     NnUint ppMigrationAppliedFromNodeIndex = 0u;
     NnUint ppMigrationAppliedToNodeIndex = (NnUint)-1;
@@ -757,7 +805,7 @@ private:
         bool selfIsSource,
         bool selfIsTarget);
     void collectProfilePackets();
-    bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
+    bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens, NnUint startPos = 0u);
     bool replayHistoryForHeadMigrationRecompute(const PlanCommand &cmd, NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
     bool recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUint triggerPos);
     void emitPpMigrationRecoverEvent(

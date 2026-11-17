@@ -57,6 +57,7 @@ static tpot::Algo2StageInput stage(uint32_t id, uint32_t root, uint32_t start, u
     s.snapshot.stageTimeMs = perLayer * (double)n;
     s.snapshot.recentAvgMs = perLayer * 3.0;
     s.snapshot.previousAvgMs = perLayer;
+    s.fixedOverheadMs = 0.0;
     s.shadowCursor = 100;
     return s;
 }
@@ -111,9 +112,8 @@ int main() {
         require(d.candidate.layerCount == 2u, "k=1 stays under the 3 ms bar and k=2 clears it");
         require(near(d.candidate.gainMs, 4.0), "gain is k times the layer gap, with no 1.3 multiplier");
         require(d.candidate.fromStageIndex == 0u && d.candidate.toStageIndex == 1u, "move follows the cheaper neighbor");
-        require(d.estimateMethod.find("stage_average_linear") != std::string::npos, "average estimate is named");
-        require(d.estimateMethod.find("fixed_overhead_not_separated") != std::string::npos,
-            "unseparated fixed overhead stays visible");
+        require(d.estimateMethod.find("stage_average_excluding_fixed") != std::string::npos, "average estimate names the separated fixed overhead");
+        require(d.costConfidence == "medium", "a declared zero fixed overhead is a medium-confidence average");
         require(d.cause == "compute_degradation", "stage compute locates the slowdown");
         require(!d.recovered, "issuing a move is not a recovery");
     }
@@ -295,6 +295,194 @@ int main() {
         require(shortOf.exhaustive && !shortOf.localIsOptimal, "local search can stop short of the exhaustive assignment");
         require(near(shortOf.localMs, 21.0) && near(shortOf.optimalMs, 18.0),
             "the checker reports both the local stop and the better legal assignment");
+    }
+
+    {
+        tpot::Algo2Session session(testConfig());
+        std::vector<tpot::Algo2StageInput> stages;
+        stages.push_back(stage(0u, 0u, 0u, 4u, 10.0));
+        stages.push_back(stage(1u, 1u, 4u, 4u, 8.0));
+        stages[0].fixedOverheadMs = -1.0;
+        stages[1].fixedOverheadMs = -1.0;
+        session.setMode(tpot::Algo2Mode::REVISED_VARIABLE);
+        session.setSerialRequest(true);
+        session.setStages(stages);
+        tpot::Algo2Boundary b;
+        b.rightReady = 2u;
+        session.setBoundaries(std::vector<tpot::Algo2Boundary>(1u, b));
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) d = session.observe(tok((uint32_t)i, 20.0), (double)i);
+        require(!d.issue && d.note == "fixed_overhead_not_separated" && d.costConfidence != "high",
+            "an average with unknown fixed overhead does not move");
+    }
+
+    {
+        tpot::Algo2Session session(testConfig());
+        std::vector<tpot::Algo2StageInput> stages;
+        stages.push_back(stage(0u, 0u, 0u, 4u, 10.0));
+        stages.push_back(stage(1u, 1u, 4u, 4u, 8.0));
+        stages[0].snapshot.stageTimeMs = 40.0;
+        stages[0].fixedOverheadMs = 0.0;
+        stages[0].commWaitMs = 32.0;
+        stages[0].commIncludedInStageTime = true;
+        session.setMode(tpot::Algo2Mode::REVISED_VARIABLE);
+        session.setSerialRequest(true);
+        session.setStages(stages);
+        tpot::Algo2Boundary b;
+        b.rightReady = 2u;
+        session.setBoundaries(std::vector<tpot::Algo2Boundary>(1u, b));
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) d = session.observe(tok((uint32_t)i, 20.0), (double)i);
+        require(!d.issue && d.note == "gain_below_threshold",
+            "communication included in the stage time is not counted as movable gain");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.decisionWindowTokens = 4;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 4; ++i) d = session.observe(tok((uint32_t)i, 58.0), (double)i);
+        require(d.health == tpot::Algo2Health::NORMAL && d.healthReferenceValid, "58 ms establishes the health anchor");
+        for (int i = 4; i < 12; ++i) d = session.observe(tok((uint32_t)i, 558.0), (double)i);
+        require(d.issue, "the 558 ms fault issues the first move");
+        const double healthAnchor = d.healthReferenceMs;
+        session.noteCommitResult(true, "");
+        session.observe(tok(12u, 558.0), 12.0);
+        session.observe(tok(13u, 179.0), 13.0);
+        d = session.observe(tok(14u, 179.0), 14.0);
+        require(d.note == "clear_improvement" && !d.recovered && d.health != tpot::Algo2Health::NORMAL,
+            "179 ms can keep the move without becoming the healthy state");
+        require(near(d.healthReferenceMs, healthAnchor), "the health anchor stays at the pre-fault reference");
+        d = session.observe(tok(15u, 179.0), 15.0);
+        require(d.note == "cooldown_done", "cooldown ends without declaring recovery");
+        for (int i = 16; i < 19; ++i) d = session.observe(tok((uint32_t)i, 179.0), (double)i);
+        d = session.observe(tok(19u, 179.0), 19.0);
+        require(d.issue && !d.recovered && d.health != tpot::Algo2Health::NORMAL,
+            "after cooldown a still-unrecovered request can take another positive move");
+        session.noteCommitResult(false, "stop_second");
+        session.setBoundaries(std::vector<tpot::Algo2Boundary>(1u, tpot::Algo2Boundary()));
+        for (int i = 20; i < 24; ++i) d = session.observe(tok((uint32_t)i, 179.0), (double)i);
+        require(!d.issue && d.note == "degraded_no_improving_candidate" && d.health != tpot::Algo2Health::NORMAL,
+            "no feasible candidate leaves the request unrecovered and does not spin");
+        d = session.observe(tok(24u, 179.0), 24.0);
+        require(d.note == "stride" && !d.issue, "the next token waits for the decision stride");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.verifyTokens = 4;
+        cfg.verifyMaxTokens = 12;
+        cfg.tailConfirmations = 2;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) session.observe(tok((uint32_t)i, 20.0), (double)i);
+        session.noteCommitResult(true, "");
+        session.observe(tok(12u, 20.0), 12.0);
+        const double spiked[4] = {12.0, 12.0, 12.0, 40.0};
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 4; ++i) d = session.observe(tok(13u + (uint32_t)i, spiked[i]), 13.0 + i);
+        require(d.note == "tail_unconfirmed" && !d.rollback, "one tail spike does not roll back");
+        for (int i = 0; i < 4; ++i) d = session.observe(tok(17u + (uint32_t)i, 12.0), 17.0 + i);
+        require((d.note == "spike_not_sustained" || d.note == "clear_improvement") && !d.rollback,
+            "a tail spike that does not repeat is kept when the median improved");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.verifyTokens = 4;
+        cfg.verifyMaxTokens = 12;
+        cfg.tailConfirmations = 2;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) session.observe(tok((uint32_t)i, 20.0), (double)i);
+        session.noteCommitResult(true, "");
+        session.observe(tok(12u, 20.0), 12.0);
+        tpot::Algo2Decision d;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int i = 0; i < 3; ++i) d = session.observe(tok(13u + (uint32_t)(pass * 4 + i), 12.0), 13.0);
+            d = session.observe(tok(16u + (uint32_t)(pass * 4), 40.0), 16.0);
+        }
+        require(d.rollback && d.note == "tail_confirmed_rollback",
+            "a tail that stays worse across two windows rolls back even if the median improved");
+    }
+
+    {
+        tpot::Algo2Session session(testConfig());
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        tpot::Algo2TokenObs sumOnly;
+        sumOnly.tokenId = 0u;
+        sumOnly.stageSumKnown = true;
+        sumOnly.stageComputeSumMs = 10.0;
+        tpot::Algo2Decision d = session.observe(sumOnly, 0.0);
+        require(d.note == "e2e_missing", "a stage-compute sum is not an end-to-end health sample");
+        for (int i = 0; i < 4; ++i) d = session.observe(tok((uint32_t)i, 58.0), (double)i);
+        require(d.health == tpot::Algo2Health::NORMAL && near(d.healthReferenceMs, 58.0),
+            "the health anchor is built only from end-to-end intervals");
+    }
+
+    {
+        tpot::Algo2Session session(testConfig());
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) session.observe(tok((uint32_t)i, 20.0), (double)i);
+        session.noteCommitInDoubt("commit_ack_timeout");
+        tpot::Algo2Decision d = session.observe(tok(12u, 20.0), 12.0);
+        require(d.phase == tpot::Algo2Phase::RECONCILE && d.note == "reconcile_wait" && !d.issue,
+            "a missing commit acknowledgement does not start another move");
+        session.noteCommitResult(false, "commit_confirm_timeout");
+        d = session.observe(tok(13u, 20.0), 13.0);
+        require(d.phase == tpot::Algo2Phase::RECONCILE && !d.issue, "an unresolved commit stays in reconcile");
+        session.noteCommitResult(true, "");
+        d = session.observe(tok(14u, 20.0), 14.0);
+        require(d.note == "settle" || d.note == "settle_done", "a later explicit acknowledgement can still settle the same transaction");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.rollbackCatchupTokens = 4;
+        cfg.verifyTokens = 2;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) session.observe(tok((uint32_t)i, 20.0), (double)i);
+        session.noteCommitResult(true, "");
+        session.observe(tok(12u, 20.0), 12.0);
+        std::vector<tpot::Algo2StageInput> behind;
+        behind.push_back(stage(0u, 0u, 0u, 4u, 10.0));
+        behind.push_back(stage(1u, 1u, 4u, 4u, 8.0));
+        behind[0].shadowCursor = 0;
+        session.setStages(behind);
+        tpot::Algo2Decision d = session.observe(tok(13u, 40.0), 13.0);
+        d = session.observe(tok(14u, 40.0), 14.0);
+        require(!d.rollback && d.note == "rollback_kv_gap_too_large", "a long KV gap is not rolled back from stale state");
+        d = session.observe(tok(15u, 40.0), 15.0);
+        require(d.note == "rollback_failed", "a blocked rollback stays failed");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.rollbackCatchupTokens = 8;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) session.observe(tok((uint32_t)i, 20.0), (double)i);
+        session.noteCommitResult(true, "");
+        session.observe(tok(12u, 20.0), 12.0);
+        std::vector<tpot::Algo2StageInput> closeGap;
+        closeGap.push_back(stage(0u, 0u, 0u, 4u, 10.0));
+        closeGap.push_back(stage(1u, 1u, 4u, 4u, 8.0));
+        closeGap[0].shadowCursor = 12;
+        session.setStages(closeGap);
+        session.observe(tok(13u, 40.0), 13.0);
+        tpot::Algo2Decision d = session.observe(tok(14u, 40.0), 14.0);
+        require(d.rollback && d.note == "clear_regression" && d.catchupTokens > 0u && d.catchupMode == "retransmit",
+            "a short KV gap may be retransmitted or recomputed on rollback");
     }
 
     std::printf("algo2 checks passed\n");

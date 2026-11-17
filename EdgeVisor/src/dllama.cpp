@@ -1521,6 +1521,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
 #endif
         token = haveLastStageToken ? (int)lastStageToken : context->sampler->sample(context->inference->logitsPipe);
         dllama::dynamic_tpot::algo2NoteTokenComplete((NnUint)pos, pos + 1u, true);
+        context->inference->pollRevisedSwitchReconcile();
         // Per-token completion timestamps. The matrix measures "trigger to the
         // first token emitted on the new route", which needs the emission time
         // of individual tokens, not just the episode total.

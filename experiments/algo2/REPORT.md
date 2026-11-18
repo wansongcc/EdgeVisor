@@ -80,12 +80,34 @@ The statistics are the logs above: one serial Q40 run per mode, with per-token p
 
 The previous binary fired on the injected run. Static mode with the same initial split did not move. That transaction checked a live cursor, used the reservation, passed settle and verify, and kept the move under the old rule that then cleared the health reference. The unit tests now also cover an unseparated fixed overhead, a kept move that leaves the health anchor in place, a gradual climb that stays under 10 percent per step, context-adjusted growth, one tail spike, a recovered tail whose median is not good enough, a missing end-to-end sample, an unconfirmed commit, separate predicted and measured gain, and a short versus long rollback gap.
 
-A net benefit is not shown. There is no paired static run under the same injection. The kept move improved 558 ms to 179 ms inside one injected run, and the rebuilt reference stayed near 180 ms, far from the 58 ms healthy reference. The 200.615 ms stall is the acceptance grace, so the foreground switch itself was not shown to be under 1 ms.
+That older run is one injected episode. Its 200.615 ms stall is the acceptance grace of the previous binary. The paired runs below use the current build.
+
+## Paired T4 diagnostic
+
+Build `8a23bff`. Host GPUs 0–3, not a container. Model Llama 3.2 3B Q40, split `1@7*1@7*1@7*1@7`, prompt `Hi`, 80 steps, seed 1. Node 2 sleeps 15 ms before each executed op after 24 decode tokens. Three pairs, order alternating, logs in `logs/t4_pair_b/`. Command: `experiments/algo2/t4_pair.sh`.
+
+The 4 ms and 379 ms figures are not one action. The 4 ms figure is the unit test whose layers cost 10 ms and 8 ms. The 379 ms figure is 558 − 179 from the older smoke, copied into that same test so the two clocks are stored separately. The older smoke itself predicted 380.919 ms.
+
+All six runs exited 0. Static observed the slowdown and issued nothing. Revised, at token 50 on every pair, moved k=6 from stage 2 to stage 3. The candidate table also contained smaller steps on that boundary and on the boundary with stage 1. k=6 had the largest predicted gain, about 415 ms, against a threshold of about 15 ms. The cost source is `boundary_measured_interior_extrapolated`, confidence medium. The receiver answered transaction 1. The stall was 1.619 ms, 1.586 ms, and 1.589 ms. The health anchor stayed near 59 ms.
+
+End-to-end medians, ms/token:
+
+| Pair | Before the move, tokens 33–49, static | Before, revised | After, tokens 64–74, static | After, revised | Paired end-to-end difference | Predicted gain | Revised's own median change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 555.8 | 555.8 | 557.3 | 178.8 | 378.5 | 415.0 | 555.6 → 178.6 |
+| 2 | 556.0 | 556.2 | 556.4 | 178.9 | 377.5 | 414.6 | 556.2 → 178.4 |
+| 3 | 555.7 | 556.2 | 556.6 | 178.1 | 378.4 | 415.2 | 556.5 → 178.6 |
+
+The paired difference and the controller's own before/after median agree at about 378 ms/token. The frozen cost table predicts about 415 ms/token, so it overstates the end-to-end change by about 37 ms/token. The sleep sits inside the step timer, so the layer-cost snapshot counts it as compute. Most of that timed cost did move with the six layers. The logs do not separate the remaining 37 ms into communication, a fixed part of the sleep, or the one layer left on node 2.
+
+No other step was executed. The table shows the program selected the highest passing score. It does not show that a smaller k would have ranked the same way on the machine. Stage 3's shadow cursor stopped advancing after the move, so a later move onto that stage was not ready. One repeat was kept by `clear_improvement` and then `reverse_suppressed`.
+
+An earlier pair on the previous build, `logs/t4_pair/`, refused every boundary with `fixed_overhead_not_separated` because the decision snapshot did not yet receive the boundary-layer timers.
 
 ## Not run
 
-- The 512-token, four-strategy, three-repeat matrix
-- A paired static run with the same injection
+- The 512-token, four-strategy matrix
+- A forced alternative step at the same position
 - A natural GPU fault, clock cap, or power cap
 - Edge-set Q40 inference
 - Noise calibration. The threshold noise term stayed uncalibrated
@@ -99,6 +121,7 @@ make algo2-test dynamic-tpot-test dllama
 ./algo2-test
 ./dynamic-tpot-test
 bash ../experiments/algo2/t4_smoke.sh
+OUT=../experiments/algo2/logs/t4_pair_b bash ../experiments/algo2/t4_pair.sh
 ```
 
 `algo2-test` and `dynamic-tpot-test` passed after the controller was linked. `dllama` was built with `DLLAMA_CUDA` and arch 75.

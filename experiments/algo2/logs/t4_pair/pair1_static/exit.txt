@@ -1,0 +1,1 @@
+pair1_static mode=static exit=0

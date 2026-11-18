@@ -1355,6 +1355,14 @@ bool applyPpStageInsert(NnUnevenPartitionPlan *plan, NnUint newStageIndex, NnUin
     if (plan == nullptr || plan->ppPrevStageIndex == nullptr || plan->ppNextStageIndex == nullptr) return false;
     if (newStageIndex >= plan->nStages || afterStageIndex >= plan->nStages) return false;
     if (newStageIndex == afterStageIndex) return false;
+    // A rejoining worker can arrive with the full static chain still linked
+    // (stage s -> s+1). Splicing there would make newStage its own successor.
+    // It is already seated at this position, so only reaffirm the back link and
+    // keep its forward link, which still points at the following stage.
+    if (plan->ppNextStageIndex[afterStageIndex] == newStageIndex) {
+        plan->ppPrevStageIndex[newStageIndex] = afterStageIndex;
+        return true;
+    }
     const NnUint oldNext = plan->ppNextStageIndex[afterStageIndex];
     plan->ppNextStageIndex[afterStageIndex] = newStageIndex;
     plan->ppPrevStageIndex[newStageIndex] = afterStageIndex;

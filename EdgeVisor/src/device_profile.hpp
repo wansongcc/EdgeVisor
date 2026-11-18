@@ -82,11 +82,14 @@ inline SpeedDeviceProfile unknownSpeedProfile() {
 // Lab data-plane addresses. An explicit --ratios still wins over this table.
 inline bool knownSpeedProfile(const char *host, SpeedDeviceProfile *out) {
     if (host == nullptr || out == nullptr) return false;
-    if (std::strcmp(host, "192.168.137.13") == 0 || std::strcmp(host, "192.168.137.15") == 0) {
+    // 192.168.8.* are the same machines on the lab WiFi.
+    if (std::strcmp(host, "192.168.137.13") == 0 || std::strcmp(host, "192.168.8.46") == 0
+        || std::strcmp(host, "192.168.137.15") == 0 || std::strcmp(host, "192.168.8.23") == 0) {
         *out = makeSpeedProfile(5.8, 22u, "nx");
         return true;
     }
-    if (std::strcmp(host, "192.168.137.16") == 0 || std::strcmp(host, "192.168.137.18") == 0) {
+    if (std::strcmp(host, "192.168.137.16") == 0 || std::strcmp(host, "192.168.8.45") == 0
+        || std::strcmp(host, "192.168.137.18") == 0 || std::strcmp(host, "192.168.8.53") == 0) {
         *out = makeSpeedProfile(7.4, 8u, "nano");
         return true;
     }

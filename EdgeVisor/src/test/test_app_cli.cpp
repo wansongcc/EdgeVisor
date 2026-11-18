@@ -128,9 +128,33 @@ static void testReservedMigrationAdmission() {
     delete[] net.nodeConfigs; releaseNetConfig(&net.netConfig);
 }
 
+static void testPpStageInsertReaffirm() {
+    // Same shape createPartitionPlan builds: the chain is fully linked before
+    // any migration runs, so 0 -> 1 -> 2 -> tail.
+    NnUnevenPartitionPlan plan{};
+    plan.nStages = 3u;
+    plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, 1u};
+    plan.ppNextStageIndex = new NnUint[3]{1u, 2u, (NnUint)-1};
+    // A rejoining worker re-inserts stage 1 after stage 0. Stage 1 is already
+    // seated there, so the insert must leave the forward link to stage 2 alone
+    // instead of splicing stage 1 into itself.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        assert(applyPpStageInsert(&plan, 1u, 0u));
+        assert(plan.ppNextStageIndex[0] == 1u);
+        assert(plan.ppPrevStageIndex[1] == 0u);
+        assert(plan.ppNextStageIndex[1] == 2u);
+        assert(plan.ppPrevStageIndex[2] == 1u);
+    }
+    delete[] plan.ppPrevStageIndex;
+    plan.ppPrevStageIndex = nullptr;
+    delete[] plan.ppNextStageIndex;
+    plan.ppNextStageIndex = nullptr;
+}
+
 int main() {
     unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
     testReservedMigrationAdmission();
+    testPpStageInsertReaffirm();
     {
         char program[] = "dllama", action[] = "inference";
         char *defaults[] = {program, action};

@@ -442,6 +442,10 @@ static bool updateWindowFromPerfArray(ControllerRuntime &rt, const json &arr, ui
             obs.stageComputeMs[it->first] = it->second;
             std::map<uint32_t, double>::const_iterator comm = stageBoundaryMs.find(it->first);
             if (comm != stageBoundaryMs.end()) obs.stageCommMs[it->first] = comm->second;
+            std::map<uint32_t, double>::const_iterator left = stageLeftBoundaryMaxMs.find(it->first);
+            if (left != stageLeftBoundaryMaxMs.end()) obs.leftBoundaryLayerMs[it->first] = left->second;
+            std::map<uint32_t, double>::const_iterator right = stageRightBoundaryMaxMs.find(it->first);
+            if (right != stageRightBoundaryMaxMs.end()) obs.rightBoundaryLayerMs[it->first] = right->second;
         }
         rt.freshTokens.push_back(obs);
     }
@@ -1145,6 +1149,10 @@ static void stepAlgo2(
         for (size_t i = 0u; i < snaps.size(); ++i) {
             tpot::Algo2StageInput input;
             input.snapshot = snaps[i];
+            std::map<uint32_t, double>::const_iterator left = obs.leftBoundaryLayerMs.find(snaps[i].stageIndex);
+            std::map<uint32_t, double>::const_iterator right = obs.rightBoundaryLayerMs.find(snaps[i].stageIndex);
+            if (left != obs.leftBoundaryLayerMs.end()) input.snapshot.leftBoundaryLayerMs = left->second;
+            if (right != obs.rightBoundaryLayerMs.end()) input.snapshot.rightBoundaryLayerMs = right->second;
             input.commWaitMs = snaps[i].boundaryCommMs;
             input.commIncludedInStageTime = false;
             input.fixedOverheadMs = -1.0;

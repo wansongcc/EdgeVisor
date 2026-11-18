@@ -121,6 +121,8 @@ struct Algo2TokenObs {
     bool stageSumKnown = false;
     std::map<uint32_t, double> stageComputeMs;
     std::map<uint32_t, double> stageCommMs;
+    std::map<uint32_t, double> leftBoundaryLayerMs;
+    std::map<uint32_t, double> rightBoundaryLayerMs;
     // Per stage: -1 unknown, -2 no redundant layers, otherwise exclusive shadow end.
     std::map<uint32_t, int> shadowCursor;
     bool prefill = false;

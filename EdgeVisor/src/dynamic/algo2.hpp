@@ -81,6 +81,13 @@ struct Algo2Config {
     int watchdogMs = 5000;
     double watchdogFactor = 5.0;
     int reverseSuppressDecisions = 2;
+    // Experiment override. Negative means the search keeps its own best step.
+    // A matching legal step is issued even when another step scores higher.
+    int forceFromStage = -1;
+    int forceToStage = -1;
+    int forceK = -1;
+    // 0 means no cap. A positive cap stops later moves so one step can be measured alone.
+    int maxIssues = 0;
 };
 
 struct Algo2Boundary {
@@ -303,6 +310,7 @@ private:
     uint32_t keptTo_ = 0u;
     int reverseLeft_ = 0;
     bool rollbackBlocked_ = false;
+    int issues_ = 0;
     std::string lastNote_;
     double longMs_ = -1.0;
     uint32_t longContext_ = 0u;

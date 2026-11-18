@@ -666,6 +666,43 @@ int main() {
         require(d.costConfidence == "high", "measured source and target layers are high confidence");
     }
 
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.forceFromStage = 0;
+        cfg.forceToStage = 1;
+        cfg.forceK = 1;
+        cfg.maxIssues = 1;
+        tpot::Algo2Session session(cfg);
+        session.setMode(tpot::Algo2Mode::REVISED_VARIABLE);
+        session.setSerialRequest(true);
+        tpot::Algo2StageInput source = stage(0u, 0u, 0u, 4u, 10.0);
+        tpot::Algo2StageInput target = stage(1u, 1u, 4u, 4u, 8.0);
+        source.fixedOverheadMs = -1.0;
+        target.fixedOverheadMs = -1.0;
+        source.layerMs = {10.0, 10.0, 20.0, 12.0};
+        source.layerMeasured = {1u, 1u, 1u, 1u};
+        source.snapshot.stageTimeMs = 52.0;
+        target.layerMs = {8.0, 8.0, 8.0, 8.0};
+        target.layerMeasured = {1u, 1u, 1u, 1u};
+        target.snapshot.stageTimeMs = 32.0;
+        target.shadowCursor = 100;
+        std::vector<tpot::Algo2StageInput> stages;
+        stages.push_back(source);
+        stages.push_back(target);
+        session.setStages(stages);
+        tpot::Algo2Boundary b;
+        b.rightReady = 2u;
+        session.setBoundaries(std::vector<tpot::Algo2Boundary>(1u, b));
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) d = session.observe(tok((uint32_t)i, 30.0), (double)i);
+        require(d.issue && d.candidate.layerCount == 1u && near(d.candidate.gainMs, 4.0),
+            "a forced one-layer step is issued even though two layers score higher");
+        session.noteCommitResult(false, "stop");
+        for (int i = 12; i < 16; ++i) d = session.observe(tok((uint32_t)i, 30.0), (double)i);
+        require(!d.issue && d.note == "issue_cap", "a one-move cap does not issue the next step");
+    }
+
     std::printf("algo2 checks passed\n");
     return 0;
 }

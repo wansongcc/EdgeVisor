@@ -309,6 +309,13 @@ Algo2Config algo2ConfigFromEnvironment() {
     cfg.tailConfirmations = envInt("DLLAMA_ALGO2_TAIL_CONFIRMATIONS", cfg.tailConfirmations, 2);
     cfg.longReferenceSpanTokens = envInt("DLLAMA_ALGO2_LONG_SPAN", cfg.longReferenceSpanTokens, 1);
     cfg.rollbackCatchupTokens = envInt("DLLAMA_ALGO2_ROLLBACK_CATCHUP", cfg.rollbackCatchupTokens, 0);
+    if (std::getenv("DLLAMA_ALGO2_FORCE_FROM") != nullptr)
+        cfg.forceFromStage = envInt("DLLAMA_ALGO2_FORCE_FROM", cfg.forceFromStage, -1);
+    if (std::getenv("DLLAMA_ALGO2_FORCE_TO") != nullptr)
+        cfg.forceToStage = envInt("DLLAMA_ALGO2_FORCE_TO", cfg.forceToStage, -1);
+    if (std::getenv("DLLAMA_ALGO2_FORCE_K") != nullptr)
+        cfg.forceK = envInt("DLLAMA_ALGO2_FORCE_K", cfg.forceK, -1);
+    cfg.maxIssues = envInt("DLLAMA_ALGO2_MAX_ISSUES", cfg.maxIssues, 0);
     if (cfg.verifyMaxTokens < cfg.verifyTokens) cfg.verifyMaxTokens = cfg.verifyTokens;
     return cfg;
 }
@@ -671,6 +678,13 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
     best.kind = CandidateKind::PP_MOVE;
     best.reason = "no eligible pp candidate";
     uint32_t bestMargin = 0u;
+    Candidate forced;
+    bool sawForced = false;
+    double forcedMoved = -1.0;
+    double forcedTarget = -1.0;
+    std::string forcedMethod;
+    std::string forcedConfidence;
+    const bool forceOn = cfg_.forceK > 0 && cfg_.forceFromStage >= 0 && cfg_.forceToStage >= 0;
     bool anyReject = false;
     std::string rejectReason = "no eligible pp candidate";
     if (method != nullptr) method->clear();
@@ -766,6 +780,25 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
                         << ",why=" << cand.reason;
                     *trace += row.str();
                 }
+                if (forceOn && (int)k == cfg_.forceK &&
+                        (int)cand.fromStageIndex == cfg_.forceFromStage &&
+                        (int)cand.toStageIndex == cfg_.forceToStage) {
+                    forced = cand;
+                    sawForced = true;
+                    forcedMoved = movedCost;
+                    forcedTarget = targetEst.perLayerMs * (double)k;
+                    forcedMethod = used;
+                    bool movedMeasured = sourceEst.haveLayers;
+                    if (source.layerMs.size() == (size_t)source.snapshot.nLayers &&
+                            source.layerMeasured.size() == source.layerMs.size()) {
+                        movedMeasured = true;
+                        const uint32_t begin = takeSuffix ? source.snapshot.nLayers - k : 0u;
+                        for (uint32_t li = 0u; li < k; ++li) {
+                            if (source.layerMeasured[(size_t)begin + (size_t)li] == 0u) movedMeasured = false;
+                        }
+                    }
+                    forcedConfidence = (movedMeasured && targetEst.haveLayers) ? "high" : "medium";
+                }
                 if (cand.valid) {
                     const uint32_t margin = ready - k;
                     if (betterMove(cand, best, margin, bestMargin)) {
@@ -793,6 +826,19 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
                 }
             }
         }
+    }
+    if (forceOn) {
+        if (sawForced && forced.valid) {
+            if (method != nullptr) *method = forcedMethod;
+            if (sourceCost != nullptr) *sourceCost = forcedMoved;
+            if (targetCost != nullptr) *targetCost = forcedTarget;
+            if (confidence != nullptr) *confidence = forcedConfidence;
+            return forced;
+        }
+        best.valid = false;
+        best.reason = sawForced ? "force_below_threshold" : "force_unavailable";
+        if (reject != nullptr) *reject = best.reason;
+        return best;
     }
     if (!best.valid && reject != nullptr) *reject = anyReject ? rejectReason : best.reason;
     if (!best.valid) best.reason = anyReject ? rejectReason : best.reason;
@@ -1021,6 +1067,14 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
     d.targetCostMs = targetCost;
     d.costConfidence = confidence;
     if (reverseLeft_ > 0) reverseLeft_ -= 1;
+    if (chosen.valid && cfg_.maxIssues > 0 && issues_ >= cfg_.maxIssues) {
+        phase_ = Algo2Phase::OBSERVE;
+        d.phase = phase_;
+        d.note = "issue_cap";
+        d.candidate = chosen;
+        d.estimateMethod = method;
+        return d;
+    }
     if (!chosen.valid) {
         phase_ = Algo2Phase::OBSERVE;
         d.phase = phase_;
@@ -1030,6 +1084,7 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
         d.estimateMethod = method;
         return d;
     }
+    issues_ += 1;
     phase_ = Algo2Phase::COMMIT;
     pending_ = chosen;
     havePending_ = true;

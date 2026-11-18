@@ -1024,6 +1024,15 @@ static void logAlgo2(const std::string &path, const tpot::Algo2TokenObs &obs, co
         << " predicted_gain_ms=" << decision.predictedGainMs
         << " measured_gain_ms=" << decision.measuredGainMs
         << " prediction_error_ms=" << decision.predictionErrorMs
+        << " stage_compute=";
+    if (obs.stageComputeMs.empty()) line << "none";
+    double stageComputeSum = 0.0;
+    for (std::map<uint32_t, double>::const_iterator it = obs.stageComputeMs.begin(); it != obs.stageComputeMs.end(); ++it) {
+        if (it != obs.stageComputeMs.begin()) line << ",";
+        line << it->first << ":" << it->second;
+        stageComputeSum += it->second;
+    }
+    line << " stage_compute_sum_ms=" << (obs.stageComputeMs.empty() ? -1.0 : stageComputeSum)
         << " candidates=" << (decision.candidateTrace.empty() ? "none" : decision.candidateTrace)
         << " context_slope=" << decision.contextSlopeMsPerToken
         << " slope_trusted=" << (decision.contextSlopeTrusted ? 1 : 0)

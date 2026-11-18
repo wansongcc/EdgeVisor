@@ -1020,6 +1020,7 @@ static void logAlgo2(const std::string &path, const tpot::Algo2TokenObs &obs, co
         << " predicted_gain_ms=" << decision.predictedGainMs
         << " measured_gain_ms=" << decision.measuredGainMs
         << " prediction_error_ms=" << decision.predictionErrorMs
+        << " candidates=" << (decision.candidateTrace.empty() ? "none" : decision.candidateTrace)
         << " context_slope=" << decision.contextSlopeMsPerToken
         << " slope_trusted=" << (decision.contextSlopeTrusted ? 1 : 0)
         << " noise=" << (decision.noiseCalibrated ? "calibrated" : "uncalibrated");

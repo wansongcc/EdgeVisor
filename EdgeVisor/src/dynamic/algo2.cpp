@@ -666,7 +666,7 @@ bool Algo2Session::rollbackCatchup(uint32_t tokenId, uint32_t *gap, std::string 
 }
 
 Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::string *reject,
-        double *sourceCost, double *targetCost, std::string *confidence) const {
+        double *sourceCost, double *targetCost, std::string *confidence, std::string *trace) const {
     Candidate best;
     best.kind = CandidateKind::PP_MOVE;
     best.reason = "no eligible pp candidate";
@@ -709,6 +709,10 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
             if (kmax == 0u) {
                 anyReject = true;
                 if (!why.empty()) rejectReason = why;
+                if (trace != nullptr) {
+                    if (!trace->empty()) *trace += ";";
+                    *trace += "b=" + std::to_string(i) + ",k=0,ok=0,why=" + (why.empty() ? "no_room" : why);
+                }
                 continue;
             }
             const LayerEstimate sourceEst = estimateStage(source);
@@ -718,6 +722,11 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
                 const bool unseparated = sourceEst.method == "fixed_overhead_not_separated" ||
                     targetEst.method == "fixed_overhead_not_separated";
                 rejectReason = unseparated ? "fixed_overhead_not_separated" : "layer_cost_unknown";
+                if (trace != nullptr) {
+                    if (!trace->empty()) *trace += ";";
+                    *trace += "b=" + std::to_string(i) + ",from=" + std::to_string(source.snapshot.stageIndex) +
+                        ",to=" + std::to_string(target.snapshot.stageIndex) + ",k=0,ok=0,why=" + rejectReason;
+                }
                 continue;
             }
             const double pairMs = std::max(0.0, source.snapshot.stageTimeMs) + std::max(0.0, target.snapshot.stageTimeMs);
@@ -743,6 +752,19 @@ Candidate Algo2Session::search(uint32_t tokenId, std::string *method, std::strin
                 if (sawKeptMove_ && reverseLeft_ > 0 && cand.fromStageIndex == keptTo_ && cand.toStageIndex == keptFrom_) {
                     cand.valid = false;
                     cand.reason = "reverse_suppressed";
+                }
+                if (trace != nullptr) {
+                    if (!trace->empty()) *trace += ";";
+                    std::ostringstream row;
+                    row << "b=" << i
+                        << ",from=" << cand.fromStageIndex
+                        << ",to=" << cand.toStageIndex
+                        << ",k=" << k
+                        << ",gain=" << gain
+                        << ",thr=" << threshold
+                        << ",ok=" << (cand.valid ? 1 : 0)
+                        << ",why=" << cand.reason;
+                    *trace += row.str();
                 }
                 if (cand.valid) {
                     const uint32_t margin = ready - k;
@@ -992,7 +1014,9 @@ Algo2Decision Algo2Session::observe(const Algo2TokenObs &token, double nowMs) {
     double sourceCost = -1.0;
     double targetCost = -1.0;
     std::string confidence;
-    Candidate chosen = search(token.tokenId, &method, &reject, &sourceCost, &targetCost, &confidence);
+    std::string trace;
+    Candidate chosen = search(token.tokenId, &method, &reject, &sourceCost, &targetCost, &confidence, &trace);
+    d.candidateTrace = trace;
     d.sourceCostMs = sourceCost;
     d.targetCostMs = targetCost;
     d.costConfidence = confidence;

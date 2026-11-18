@@ -164,6 +164,8 @@ struct Algo2Decision {
     double predictedGainMs = -1.0;
     double measuredGainMs = -1.0;
     double predictionErrorMs = -1.0;
+    // Every scored step from the frozen snapshot, including steps under the threshold.
+    std::string candidateTrace;
     double windowMedianMs = -1.0;
     double windowMeanMs = -1.0;
     double windowP95Ms = -1.0;
@@ -240,7 +242,7 @@ private:
     void updateHealth(const std::vector<double> &window, double median, double p95);
     bool rollbackCatchup(uint32_t tokenId, uint32_t *gap, std::string *block) const;
     Candidate search(uint32_t tokenId, std::string *method, std::string *reject,
-        double *sourceCost, double *targetCost, std::string *confidence) const;
+        double *sourceCost, double *targetCost, std::string *confidence, std::string *trace) const;
 
     Algo2Config cfg_;
     Algo2Mode mode_ = Algo2Mode::LEGACY;

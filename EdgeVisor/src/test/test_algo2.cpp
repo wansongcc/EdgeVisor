@@ -627,6 +627,45 @@ int main() {
             "the switch token stays in the request latency and out of the controller window");
     }
 
+    {
+        // Frozen device-layer costs. The boundary layer is 1 ms worse on the
+        // source than on the target, and the layer inside it is 5 ms better.
+        // k=1 stays under the 3 ms bar. k=2 clears it. The score is the full
+        // assignment difference on that same table.
+        tpot::Algo2Session session(testConfig());
+        session.setMode(tpot::Algo2Mode::REVISED_VARIABLE);
+        session.setSerialRequest(true);
+        tpot::Algo2StageInput source = stage(0u, 0u, 0u, 4u, 10.0);
+        tpot::Algo2StageInput target = stage(1u, 1u, 4u, 4u, 8.0);
+        source.fixedOverheadMs = -1.0;
+        target.fixedOverheadMs = -1.0;
+        source.layerMs = {10.0, 10.0, 13.0, 7.0};
+        source.layerMeasured = {1u, 1u, 1u, 1u};
+        source.snapshot.stageTimeMs = 40.0;
+        target.layerMs = {8.0, 8.0, 8.0, 8.0};
+        target.layerMeasured = {1u, 1u, 1u, 1u};
+        target.snapshot.stageTimeMs = 32.0;
+        target.shadowCursor = 100;
+        std::vector<tpot::Algo2StageInput> stages;
+        stages.push_back(source);
+        stages.push_back(target);
+        session.setStages(stages);
+        tpot::Algo2Boundary b;
+        b.rightReady = 2u;
+        session.setBoundaries(std::vector<tpot::Algo2Boundary>(1u, b));
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) d = session.observe(tok((uint32_t)i, 30.0), (double)i);
+        const double before = 10.0 + 10.0 + 13.0 + 7.0 + 32.0;
+        const double after = 10.0 + 10.0 + 8.0 * 6.0;
+        require(d.issue && d.candidate.layerCount == 2u && near(d.candidate.gainMs, before - after),
+            "the selected step equals the frozen assignment difference");
+        require(near(before - after, 4.0), "two layers clear a bar that one negative layer misses");
+        require(d.candidateTrace.find("k=1,gain=-1") != std::string::npos, "the negative first layer stays in the candidate table");
+        require(d.candidateTrace.find("k=2,gain=4") != std::string::npos, "the positive two-layer step stays in the candidate table");
+        require(d.costConfidence == "high", "measured source and target layers are high confidence");
+    }
+
     std::printf("algo2 checks passed\n");
     return 0;
 }

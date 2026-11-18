@@ -1163,6 +1163,28 @@ NnUint NnExecutor::executionPosition() const {
     return netExecution == nullptr ? 0u : netExecution->position;
 }
 
+bool NnExecutor::redundantShadowCursor(NnUint *filledThrough) const {
+    bool any = false;
+    NnUint minimum = 0xFFFFFFFFu;
+    for (size_t s = 0u; s < segmentRuntimeRoles.size(); ++s) {
+        const NnByte role = segmentRuntimeRoles[s];
+        if (role != SEG_ROLE_REDUNDANT && role != SEG_ROLE_SHADOW_KV) continue;
+        if (s >= segmentLayerIndex.size()) continue;
+        const int layer = segmentLayerIndex[s];
+        if (layer < 0) continue;
+        any = true;
+        const NnUint filled = (size_t)layer < shadowFilledThrough_.size()
+            ? shadowFilledThrough_[(size_t)layer] : 0u;
+        if (filled < minimum) minimum = filled;
+    }
+    if (!any) {
+        if (filledThrough != nullptr) *filledThrough = 0xFFFFFFFFu;
+        return false;
+    }
+    if (filledThrough != nullptr) *filledThrough = minimum;
+    return true;
+}
+
 bool NnExecutor::shadowCovers(NnUint beginLayer, NnUint endLayer, NnUint position) const {
     return shadowHistoryCovers(
         shadowFilledThrough_.empty() ? nullptr : shadowFilledThrough_.data(),

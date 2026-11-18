@@ -1,0 +1,25 @@
+{
+  "gitHead": "82bc5e888fb892db23b1fd0c4b7808af49f395da",
+  "backend": "cuda",
+  "model": "/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m",
+  "tokenizer": "/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t",
+  "prompt": "Hi",
+  "maxSeqLen": 256,
+  "steps": 80,
+  "mode": "equal",
+  "linkUsedInAllocation": false,
+  "mismatch": "not-requested",
+  "manualLabels": false,
+  "experimentCap": 6,
+  "primary": [7, 7, 7, 7],
+  "stages": [
+    {"stage": 0, "measuredWeight": 3, "weight": 3, "memorySpare": 21, "bubble": 22, "realBudget": 21, "effectiveBudget": 6, "placed": 6},
+    {"stage": 1, "measuredWeight": 3, "weight": 3, "memorySpare": 21, "bubble": 20, "realBudget": 20, "effectiveBudget": 6, "placed": 6},
+    {"stage": 2, "measuredWeight": 3, "weight": 3, "memorySpare": 21, "bubble": 20, "realBudget": 20, "effectiveBudget": 6, "placed": 6},
+    {"stage": 3, "measuredWeight": 3, "weight": 3, "memorySpare": 21, "bubble": 20, "realBudget": 20, "effectiveBudget": 6, "placed": 6}
+  ],
+  "redundancy": "6,3;3,3;3,6",
+  "equalUnderSameCap": "6,3;3,3;3,6",
+  "coverage": "stage0=[0,7) edge stage1=[7,14) prefix=[7,13) suffix=[11,14) placement-cover=complete stage2=[14,21) prefix=[14,17) suffix=[15,21) placement-cover=complete stage3=[21,28) edge",
+  "note": "Device score 0 means read indicators stayed within their normal points. q is metadata, not a fused credibility. device_only does not move shadow because a link is jittery. Coverage lists placed intervals; a complete placement is not a claim that takeover ran or that steady-state traffic improved."
+}

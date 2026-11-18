@@ -299,7 +299,8 @@ static json perfPacketToJson(const LlmPerfPacket &p) {
         {"bubbleDrainUs", p.bubbleDrainUs},
         {"bubbleCompleted", p.bubbleCompleted},
         {"leftBoundaryLayerUs", p.leftBoundaryLayerUs},
-        {"rightBoundaryLayerUs", p.rightBoundaryLayerUs}
+        {"rightBoundaryLayerUs", p.rightBoundaryLayerUs},
+        {"shadowFilledThrough", p.shadowFilledThrough}
     };
 }
 
@@ -920,6 +921,8 @@ void PlanUdsController::run() {
                     pp["ackPos"] = inference_->getMigrationAckPos();
                     pp["ackLayer"] = inference_->getMigrationAckLayer();
                     pp["appliedGeneration"] = inference_->getPpMigrationAppliedGeneration();
+        pp["commitInDoubt"] = inference_->revisedSwitchCommitInDoubt();
+        pp["commitTransaction"] = inference_->revisedSwitchTransactionId();
                     pp["appliedFromNodeIndex"] = inference_->getPpMigrationAppliedFromNodeIndex();
                     pp["appliedToNodeIndex"] = inference_->getPpMigrationAppliedToNodeIndex();
                     json layers = json::array();

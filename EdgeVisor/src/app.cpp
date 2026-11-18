@@ -8,6 +8,7 @@
 #include "plan-controller.hpp"
 #include "dynamic/dynamic_layer.hpp"
 #include "dynamic/dynamic_tpot.hpp"
+#include "dynamic/algo2.hpp"
 #include "dynamic/kv_collector.hpp"
 #include <cassert>
 #include <cstring>
@@ -372,6 +373,17 @@ static void appendUniqueLayer(std::vector<NnUint> &layers, NnUint layer) {
         layers.push_back(layer);
     }
 }
+
+struct WorkerSwitchMemory {
+    bool valid = false;
+    NnUint transactionId = 0u;
+    NnUint position = 0u;
+    NnUint firstLayer = 0u;
+    NnUint endLayer = 0u;
+    NnUint fromNode = 0u;
+    NnUint toNode = 0u;
+};
+static WorkerSwitchMemory g_workerSwitchMemory;
 
 static void writeWorkerFrame(NnNetwork *network, NnUint kind, const void *payload, NnSize payloadBytes) {
     nnWriteWorkerFrame(network, kind, payload, payloadBytes);
@@ -4288,6 +4300,65 @@ bool RootLlmInference::sendWeightLoadRequest(const std::vector<NnUint> &layers) 
     return true;
 }
 
+bool RootLlmInference::explicitSwitchAckMatches() const {
+    return takeoverAcked
+        && takeoverAck.magic == LLM_TAKEOVER_ACK_MAGIC
+        && takeoverAck.version == LLM_TAKEOVER_ACK_VERSION
+        && takeoverAck.status == LLM_TAKEOVER_ACK_APPLIED
+        && takeoverAck.transactionId == explicitSwitchTransaction
+        && takeoverAck.position == explicitSwitchPosition
+        && (takeoverAck.flags & LLM_TAKEOVER_ACK_KV_OK) != 0u;
+}
+
+void RootLlmInference::pollRevisedSwitchReconcile() {
+    if (!dllama::dynamic_tpot::algo2ForbidsFullKvFallback()) return;
+    if (switchCommitInDoubt && explicitSwitchAckMatches()) {
+        recordPpMigrationApplied();
+        explicitCommitRecorded = true;
+        switchCommitInDoubt = false;
+        migrationAckSeen = true;
+        std::printf("🧩 [kv-migrate] commit reconciled by explicit ack txn=%u pos=%u\n",
+            (unsigned)explicitSwitchTransaction, (unsigned)explicitSwitchPosition);
+        std::fflush(stdout);
+        return;
+    }
+    if (!switchCommitInDoubt || explicitSwitchReplayUsed || explicitSwitchLayers.empty() || network == nullptr) return;
+    explicitSwitchReplayUsed = true;
+    explicitSwitchReplayPending = true;
+    {
+        std::lock_guard<std::mutex> lk(kvTransferMutex);
+        pendingLayerSwitchLayers = explicitSwitchLayers;
+    }
+    migrationFromNodeIndex = explicitSwitchFrom;
+    nextStageRootNode = explicitSwitchTo;
+    switchCommitInDoubt = false;
+    const bool sent = sendPendingLayerSwitchControlOnly(false);
+    const int targetSocket = network->getSocketIndexForNode(nextStageRootNode, 0u);
+    if (sent && targetSocket >= 0 && nextStageRootNode != 0u) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (std::chrono::steady_clock::now() < deadline && !explicitSwitchAckMatches() && !takeoverRejected) {
+            LlmWorkerFrameHeader peek{};
+            if (network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek, sizeof(peek), 1ul))
+                pumpWorkerFrames((NnUint)targetSocket, 200);
+            else
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    if (explicitSwitchAckMatches()) {
+        recordPpMigrationApplied();
+        explicitCommitRecorded = true;
+        migrationAckSeen = true;
+        std::printf("🧩 [kv-migrate] commit reconciled by idempotent replay txn=%u pos=%u\n",
+            (unsigned)explicitSwitchTransaction, (unsigned)explicitSwitchPosition);
+        std::fflush(stdout);
+        return;
+    }
+    switchCommitInDoubt = true;
+    std::printf("🧩 [kv-migrate] commit still unconfirmed after replay txn=%u pos=%u\n",
+        (unsigned)explicitSwitchTransaction, (unsigned)explicitSwitchPosition);
+    std::fflush(stdout);
+}
+
 bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
     if (network == nullptr) return false;
     std::vector<NnUint> switchLayers;
@@ -4300,21 +4371,46 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
         if (pendingLayerSwitchLayers.empty()) return false;
         switchLayers = pendingLayerSwitchLayers;
+        if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !pendingStageBypass) {
+            if (!explicitSwitchReplayPending) {
+                explicitSwitchTransaction += 1u;
+                if (explicitSwitchTransaction == 0u) explicitSwitchTransaction = 1u;
+                explicitSwitchReplayUsed = false;
+                takeoverRejected = false;
+                // The forward for controlPacket.position has already run. The
+                // next token needs KV through that position, so the cursor
+                // boundary is the following position. A replay keeps it.
+                const NnUint batch = controlPacket.batchSize > 0u ? controlPacket.batchSize : 1u;
+                explicitSwitchPosition = controlPacket.position + batch;
+                explicitSwitchFrom = migrationFromNodeIndex;
+                explicitSwitchTo = nextStageRootNode;
+                explicitSwitchLayers = switchLayers;
+            }
+            explicitSwitchReplayPending = false;
+            takeoverAcked = false;
+            takeoverAck = LlmTakeoverAckPacket{};
+            switchCommitInDoubt = false;
+        }
         // A reservation probe that the root itself must execute has to be
         // answered here: no worker will get the chance to refuse it.  Check
         // before the binding moves and before the layers are cleared so the
         // caller can still fall back to a real transfer.
         if (!installKv && executor != nullptr &&
                 areNodesInSameStageLocal(plan, 0u, nextStageRootNode)) {
+            const bool revisedBoundary = dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !pendingStageBypass;
+            const NnUint coverPos = revisedBoundary ? explicitSwitchPosition : controlPacket.position;
             for (NnUint layer : switchLayers) {
-                if (!executor->shadowCovers(layer, layer + 1u, controlPacket.position)) {
+                if (!executor->shadowCovers(layer, layer + 1u, coverPos)) {
                     takeoverRejected = true;
                     takeoverRejectNode = 0u;
                     takeoverRejectLayer = layer;
-                    takeoverRejectPos = controlPacket.position;
-                    std::printf("🔁 [takeover-reject] node=0 layer=%u pos=%u "
+                    takeoverRejectPos = coverPos;
+                    NnUint filled = 0xFFFFFFFFu;
+                    if (!executor->redundantShadowCursor(&filled)) filled = 0xFFFFFFFFu;
+                    takeoverRejectFilled = filled;
+                    std::printf("🔁 [takeover-reject] node=0 layer=%u pos=%u filled=%u "
                                 "reason=root_shadow_not_covered\n",
-                        (unsigned)layer, (unsigned)controlPacket.position);
+                        (unsigned)layer, (unsigned)coverPos, (unsigned)filled);
                     std::fflush(stdout);
                     return false;
                 }
@@ -4403,8 +4499,10 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         switchPkt.reserved0 = carryStageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
         if (layer == ppStartBoundaryLayer) switchPkt.reserved0 |= ppStartFlag;
         if (installKv) switchPkt.reserved0 |= LLM_LAYER_SWITCH_INSTALL;
-        switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : 0u;
-        switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : 0u;
+        const bool explicitAck = dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !stageBypass;
+        if (explicitAck) switchPkt.reserved0 |= LLM_LAYER_SWITCH_EXPLICIT_ACK;
+        switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : (explicitAck ? explicitSwitchTransaction : 0u);
+        switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : (explicitAck ? explicitSwitchPosition : 0u);
         stageBypassFlagEmitted = stageBypassFlagEmitted || carryStageBypass;
         network->writeAll(&switchPkt, sizeof(switchPkt));
         // A failed send did not complete a layer-binding packet at the local
@@ -4412,7 +4510,24 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         // successful packet the state is conservatively treated as committed.
         layerSwitchControlWriteStarted = true;
     }
-    layerSwitchControlWriteStarted = false;
+        layerSwitchControlWriteStarted = false;
+    if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !stageBypass &&
+            (nextStageRootNode == 0u || areNodesInSameStageLocal(plan, 0u, nextStageRootNode))) {
+        takeoverAcked = true;
+        takeoverAck.magic = LLM_TAKEOVER_ACK_MAGIC;
+        takeoverAck.version = LLM_TAKEOVER_ACK_VERSION;
+        takeoverAck.status = LLM_TAKEOVER_ACK_APPLIED;
+        takeoverAck.transactionId = explicitSwitchTransaction;
+        takeoverAck.position = explicitSwitchPosition;
+        takeoverAck.fromNodeIndex = explicitSwitchFrom;
+        takeoverAck.toNodeIndex = explicitSwitchTo;
+        takeoverAck.nodeIndex = 0u;
+        takeoverAck.flags = LLM_TAKEOVER_ACK_KV_OK | LLM_TAKEOVER_ACK_WEIGHTS_OK;
+        if (!switchLayers.empty()) {
+            takeoverAck.firstLayer = *std::min_element(switchLayers.begin(), switchLayers.end());
+            takeoverAck.endLayer = *std::max_element(switchLayers.begin(), switchLayers.end()) + 1u;
+        }
+    }
     if (stageBypass) {
         NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
         pendingBypassPreviousStage = getPpPrevStageIndex(plan, bypassEjectedStage);
@@ -4660,9 +4775,23 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex, int timeoutMs) {
                 takeoverRejectNode = reject.nodeIndex;
                 takeoverRejectLayer = reject.firstLayer;
                 takeoverRejectPos = reject.position;
+                takeoverRejectFilled = reject.filledThrough;
                 std::printf("🔁 [takeover-reject] node=%u layer=%u pos=%u\n",
                     (unsigned)reject.nodeIndex, (unsigned)reject.firstLayer,
                     (unsigned)reject.position);
+                std::fflush(stdout);
+            }
+        } else if (frame.kind == LLM_WORKER_FRAME_TAKEOVER_ACK &&
+                   payload.size() == sizeof(LlmTakeoverAckPacket)) {
+            LlmTakeoverAckPacket ack{};
+            std::memcpy(&ack, payload.data(), sizeof(ack));
+            if (ack.magic == LLM_TAKEOVER_ACK_MAGIC && ack.version == LLM_TAKEOVER_ACK_VERSION) {
+                takeoverAck = ack;
+                takeoverAcked = true;
+                std::printf("🔁 [takeover-ack] node=%u txn=%u status=%u pos=%u layers=[%u,%u) filled=%u\n",
+                    (unsigned)ack.nodeIndex, (unsigned)ack.transactionId, (unsigned)ack.status,
+                    (unsigned)ack.position, (unsigned)ack.firstLayer, (unsigned)ack.endLayer,
+                    (unsigned)ack.filledThrough);
                 std::fflush(stdout);
             }
         } else if (frame.kind == LLM_WORKER_FRAME_PROFILE && payload.size() == sizeof(LlmPerfPacket)) {
@@ -4700,6 +4829,8 @@ LlmPerfPacket RootLlmInference::makeRootPerfPacket() const {
     rootPacket.bubbleSkippedSyncs = lastBubbleShadowStats.skippedSyncSteps;
     rootPacket.bubbleDrainUs = lastBubbleShadowStats.drainUs;
     rootPacket.bubbleCompleted = lastBubbleShadowStats.completed;
+    rootPacket.shadowFilledThrough = 0xFFFFFFFFu;
+    if (executor != nullptr) executor->redundantShadowCursor(&rootPacket.shadowFilledThrough);
     fillBoundaryLayerPerfPacket(rootPacket, plan, 0u, execution);
     return rootPacket;
 }
@@ -4897,14 +5028,15 @@ unsigned long long RootLlmInference::runPipeLivePatch(NnUint pos) {
     return elapsedUs;
 }
 
-bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens) {
+bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens, NnUint startPos) {
     if (recomputeMs != nullptr) *recomputeMs = 0.0;
     if (recomputeTokens != nullptr) *recomputeTokens = 0u;
     if (executor == nullptr || execution == nullptr || header == nullptr) return false;
     if (endPos >= header->seqLen) return false;
     if (tokenHistory.size() <= endPos) return false;
-    for (NnUint pos = 0u; pos <= endPos; ++pos) {
-        if (tokenHistory[pos] < 0) return false;
+    if (startPos > endPos) return false;
+    for (NnUint pos = startPos; pos <= endPos; ++pos) {
+        if ((size_t)pos >= tokenHistory.size() || tokenHistory[pos] < 0) return false;
     }
 
     const NnUint savedBatchSize = controlPacket.batchSize;
@@ -4922,7 +5054,7 @@ bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double 
 
     auto t0 = std::chrono::steady_clock::now();
     const NnUint replayBatch = 1u;
-    for (NnUint pos = 0u; pos <= endPos; ++pos) {
+    for (NnUint pos = startPos; pos <= endPos; ++pos) {
         execution->setBatchSize(replayBatch);
         execution->setPosition(pos);
         controlPacket.batchSize = replayBatch;
@@ -4970,7 +5102,7 @@ bool RootLlmInference::replayHistoryForMigrationRecompute(NnUint endPos, double 
         *recomputeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
     if (recomputeTokens != nullptr) {
-        *recomputeTokens = (uint64_t)(endPos + 1u) * (uint64_t)migrationLayers.size();
+        *recomputeTokens = (uint64_t)(endPos - startPos + 1u) * (uint64_t)migrationLayers.size();
     }
     return true;
 }
@@ -5847,27 +5979,29 @@ void RootLlmInference::forward(bool collectProfile) {
             const bool switched = sendPendingLayerSwitchControlOnly(false);
             const int targetSocket = (network != nullptr)
                 ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
+            const bool requireExplicitAck = dllama::dynamic_tpot::algo2ForbidsFullKvFallback();
             if (switched && targetSocket >= 0 && nextStageRootNode != 0u) {
-                // The receiver answers only if it must refuse, so waiting for a
-                // refusal means polling for a short grace period: silence is
-                // acceptance. Drain whatever the socket has before concluding,
-                // otherwise a refusal that lands a millisecond later would be
-                // read as a successful takeover.
+                // Legacy mode treats silence during this grace as acceptance.
+                // Revised mode does not: it leaves as soon as an explicit ACK
+                // or a rejection arrives, and a timeout stays unconfirmed.
                 const int graceMs = 200;
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(graceMs);
                 while (std::chrono::steady_clock::now() < deadline) {
+                    if (requireExplicitAck && explicitSwitchAckMatches()) break;
                     LlmWorkerFrameHeader peek{};
                     if (network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek,
                                                          sizeof(peek), 1ul)) {
                         pumpWorkerFrames((NnUint)targetSocket, graceMs);
                         if (takeoverRejected) break;
+                        if (requireExplicitAck && explicitSwitchAckMatches()) break;
                         continue;
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
-            const bool servedFromReservation = switched && !takeoverRejected;
+            const bool explicitOk = !requireExplicitAck || explicitSwitchAckMatches();
+            const bool servedFromReservation = switched && !takeoverRejected && explicitOk;
             if (servedFromReservation) {
                 applyOk = true;
                 auto t1 = std::chrono::steady_clock::now();
@@ -5878,6 +6012,93 @@ void RootLlmInference::forward(bool collectProfile) {
                     migrateToLaterStage ? "forward" : "backward",
                     migrationLayers.size(), (unsigned)endPos);
                 std::fflush(stdout);
+            } else if (requireExplicitAck && switched && !takeoverRejected) {
+                switchCommitInDoubt = true;
+                // Replay the same transaction before the next token is forwarded.
+                pollRevisedSwitchReconcile();
+                const double protocolWaitMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                if (!switchCommitInDoubt && explicitSwitchAckMatches()) {
+                    applyOk = true;
+                    fallbackReason = "algo2_commit_acked";
+                } else {
+                    applyOk = false;
+                    switchCommitInDoubt = true;
+                    fallbackReason = "algo2_commit_unconfirmed";
+                    std::printf("🧩 [kv-migrate] commit unconfirmed txn=%u pos=%u protocol_wait_ms=%.3f\n",
+                        (unsigned)explicitSwitchTransaction,
+                        (unsigned)explicitSwitchPosition,
+                        protocolWaitMs);
+                    std::fflush(stdout);
+                }
+            } else if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback()) {
+                const char *catchupEnv = std::getenv("DLLAMA_ALGO2_ROLLBACK_CATCHUP");
+                const int catchupLimit = (catchupEnv != nullptr && catchupEnv[0] != '\0')
+                    ? std::atoi(catchupEnv) : 128;
+                const int cursor = takeoverRejectFilled == 0xFFFFFFFFu ? -1 : (int)takeoverRejectFilled;
+                bool gapKnown = false;
+                const unsigned gap = dllama::dynamic_tpot::exclusiveCursorGap(
+                    cursor, explicitSwitchPosition, &gapKnown);
+                bool caughtUp = false;
+                if (gapKnown && gap > 0u && (int)gap <= catchupLimit) {
+                    NnUint exported = 0u;
+                    NnUint queued = 0u;
+                    uint64_t sourceBytes = 0u;
+                    const NnUint inclusiveEnd = explicitSwitchPosition > 0u ? explicitSwitchPosition - 1u : endPos;
+                    const bool transferred = collectSourceStageKvTransfers(
+                        inclusiveEnd, &exported, &queued, &sourceBytes, takeoverRejectFilled);
+                    if (transferred) {
+                        std::lock_guard<std::mutex> lk(kvTransferMutex);
+                        pendingLayerSwitchLayers = migrationLayers;
+                    }
+                    const bool installed = transferred && sendPendingLayerSwitchControlOnly(true);
+                    if (installed && targetSocket >= 0 && nextStageRootNode != 0u) {
+                        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+                        while (std::chrono::steady_clock::now() < deadline && !explicitSwitchAckMatches()) {
+                            LlmWorkerFrameHeader peek{};
+                            if (network != nullptr &&
+                                    network->tryPeekWithMaxAttempts((NnUint)targetSocket, &peek, sizeof(peek), 1ul))
+                                pumpWorkerFrames((NnUint)targetSocket, 200);
+                            else
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                    }
+                    caughtUp = installed && explicitSwitchAckMatches();
+                    if (!caughtUp) {
+                        double replayMs = 0.0;
+                        uint64_t replayUnits = 0u;
+                        const bool recomputed = replayHistoryForMigrationRecompute(
+                            explicitSwitchPosition > 0u ? explicitSwitchPosition - 1u : endPos,
+                            &replayMs, &replayUnits, takeoverRejectFilled);
+                        if (recomputed) {
+                            {
+                                std::lock_guard<std::mutex> lk(kvTransferMutex);
+                                pendingLayerSwitchLayers = migrationLayers;
+                            }
+                            const bool replayInstalled = sendPendingLayerSwitchControlOnly(true);
+                            caughtUp = replayInstalled && explicitSwitchAckMatches();
+                        }
+                        recomputeUnits = replayUnits;
+                    }
+                    if (caughtUp) {
+                        applyOk = true;
+                        stateBytes = sourceBytes;
+                        fallbackReason = "algo2_tail_catchup";
+                        std::printf("🧩 [kv-migrate] tail catchup gap=%u start=%u pos=%u status=ok\n",
+                            gap, (unsigned)takeoverRejectFilled, (unsigned)explicitSwitchPosition);
+                        std::fflush(stdout);
+                    }
+                }
+                if (!caughtUp) {
+                    applyOk = false;
+                    fallbackReason = gapKnown && (int)gap > catchupLimit
+                        ? "algo2_shadow_gap_too_large" : "algo2_shadow_miss_no_fallback";
+                    std::printf("🧩 [kv-migrate] %s route reservation refused "
+                                "layer=%u pos=%u gap=%u; revised mode does not copy the full KV\n",
+                        migrateToLaterStage ? "forward" : "backward",
+                        (unsigned)takeoverRejectLayer, (unsigned)takeoverRejectPos, gap);
+                    std::fflush(stdout);
+                }
             } else {
                 std::printf("🧩 [kv-migrate] %s route reservation refused "
                             "layer=%u pos=%u; falling back to a full transfer\n",
@@ -6033,7 +6254,8 @@ void RootLlmInference::forward(bool collectProfile) {
             migrationAckSeen = true;
             migrationAckPos = (int)endPos;
             migrationAckLayer = !migrationLayers.empty() ? (int)migrationLayers.back() : migrationAckLayer;
-            recordPpMigrationApplied();
+            if (!explicitCommitRecorded) recordPpMigrationApplied();
+            explicitCommitRecorded = false;
         }
         std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu layers=%u posRange=[0,%u]\n",
             toString(ablationCfg.shadowKvMode),
@@ -8781,6 +9003,16 @@ void runWorkerApp(AppCliArgs *args) {
                 NnUint bypassEjectedStage = 0xFFFFFFFFu;
                 NnUint bypassTargetStage = 0xFFFFFFFFu;
                 std::vector<NnUint> bypassLayers;
+                bool explicitBatch = false;
+                bool explicitRejected = false;
+                bool explicitStale = false;
+                bool explicitApplied = false;
+                NnUint explicitTxn = 0u;
+                NnUint explicitPos = 0u;
+                NnUint explicitFirst = 0xFFFFFFFFu;
+                NnUint explicitEnd = 0u;
+                NnUint explicitFrom = 0u;
+                NnUint explicitTo = 0u;
                 while (inference.consumeLayerSwitch(switchPkt)) {
                     bool localIsSourceStage = (switchPkt.fromNodeIndex == nodeConfig.nodeIndex);
                     bool localIsTargetStage = (switchPkt.toNodeIndex == nodeConfig.nodeIndex);
@@ -8810,6 +9042,25 @@ void runWorkerApp(AppCliArgs *args) {
                         }
                     }
 
+                    const bool explicitAck = (switchPkt.reserved0 & LLM_LAYER_SWITCH_EXPLICIT_ACK) != 0u;
+                    if (explicitAck) {
+                        explicitBatch = true;
+                        explicitTxn = switchPkt.reserved1;
+                        explicitPos = switchPkt.reserved2;
+                        explicitFrom = switchPkt.fromNodeIndex;
+                        explicitTo = switchPkt.toNodeIndex;
+                        if (switchPkt.boundaryLayer < explicitFirst) explicitFirst = switchPkt.boundaryLayer;
+                        if (switchPkt.boundaryLayer + 1u > explicitEnd) explicitEnd = switchPkt.boundaryLayer + 1u;
+                        if (g_workerSwitchMemory.valid && explicitTxn < g_workerSwitchMemory.transactionId) {
+                            explicitStale = true;
+                            continue;
+                        }
+                        if (g_workerSwitchMemory.valid && explicitTxn == g_workerSwitchMemory.transactionId &&
+                                explicitPos == g_workerSwitchMemory.position) {
+                            explicitApplied = true;
+                            continue;
+                        }
+                    }
                     if (localIsSourceStage) {
                         executor.setPrimaryLayerEnabled(switchPkt.boundaryLayer, false);
                         executor.setRedundantLayerEnabled(switchPkt.boundaryLayer, false);
@@ -8831,7 +9082,7 @@ void runWorkerApp(AppCliArgs *args) {
                         // up to this position, promoting the segment would hand
                         // the pipeline empty history. Say so instead of switching,
                         // and let the root move the KV.
-                        const NnUint takeoverPos = inference.position();
+                        const NnUint takeoverPos = explicitAck ? switchPkt.reserved2 : inference.position();
                         // A packet that carries the install flag says the root
                         // already moved the KV for this layer, so the shadow
                         // check has nothing left to protect against: install it.
@@ -8848,7 +9099,10 @@ void runWorkerApp(AppCliArgs *args) {
                             reject.firstLayer = switchPkt.boundaryLayer;
                             reject.endLayer = switchPkt.boundaryLayer + 1u;
                             reject.position = takeoverPos;
-                            reject.filledThrough = 0xFFFFFFFFu;
+                            NnUint filled = 0xFFFFFFFFu;
+                            if (!executor.redundantShadowCursor(&filled)) filled = 0xFFFFFFFFu;
+                            reject.filledThrough = filled;
+                            if (explicitAck) explicitRejected = true;
                             writeWorkerFrame(network, LLM_WORKER_FRAME_TAKEOVER_REJECT,
                                              &reject, sizeof(reject));
                             std::printf("🔁 [worker-switch] node=%u reject layer=%u pos=%u "
@@ -8871,6 +9125,7 @@ void runWorkerApp(AppCliArgs *args) {
                             (unsigned)switchPkt.boundaryLayer);
                         std::fflush(stdout);
                     }
+                    if (explicitAck && (localIsSourceStage || localIsTargetStage)) explicitApplied = true;
                     if (planPtr != nullptr) {
                         const NnStageConfig *fromStage = findStageForNodeLocal(planPtr.get(), switchPkt.fromNodeIndex);
                         const NnStageConfig *toStage = findStageForNodeLocal(planPtr.get(), switchPkt.toNodeIndex);
@@ -8911,6 +9166,34 @@ void runWorkerApp(AppCliArgs *args) {
                         }
                     }
                     if (sawStageBypass) bypassLayers.push_back(switchPkt.boundaryLayer);
+                }
+                if (explicitBatch && explicitTo == nodeConfig.nodeIndex && !explicitRejected &&
+                        (explicitApplied || explicitStale) && network != nullptr) {
+                    if (!explicitStale) {
+                        g_workerSwitchMemory.valid = true;
+                        g_workerSwitchMemory.transactionId = explicitTxn;
+                        g_workerSwitchMemory.position = explicitPos;
+                        g_workerSwitchMemory.firstLayer = explicitFirst;
+                        g_workerSwitchMemory.endLayer = explicitEnd;
+                        g_workerSwitchMemory.fromNode = explicitFrom;
+                        g_workerSwitchMemory.toNode = explicitTo;
+                    }
+                    LlmTakeoverAckPacket ack{};
+                    ack.magic = LLM_TAKEOVER_ACK_MAGIC;
+                    ack.version = LLM_TAKEOVER_ACK_VERSION;
+                    ack.nodeIndex = nodeConfig.nodeIndex;
+                    ack.transactionId = explicitStale ? g_workerSwitchMemory.transactionId : explicitTxn;
+                    ack.fromNodeIndex = explicitFrom;
+                    ack.toNodeIndex = explicitTo;
+                    ack.firstLayer = explicitStale ? g_workerSwitchMemory.firstLayer : explicitFirst;
+                    ack.endLayer = explicitStale ? g_workerSwitchMemory.endLayer : explicitEnd;
+                    ack.position = explicitStale ? g_workerSwitchMemory.position : explicitPos;
+                    NnUint filled = 0xFFFFFFFFu;
+                    executor.redundantShadowCursor(&filled);
+                    ack.filledThrough = filled;
+                    ack.status = explicitStale ? LLM_TAKEOVER_ACK_STALE : LLM_TAKEOVER_ACK_APPLIED;
+                    ack.flags = LLM_TAKEOVER_ACK_KV_OK | LLM_TAKEOVER_ACK_WEIGHTS_OK;
+                    writeWorkerFrame(network, LLM_WORKER_FRAME_TAKEOVER_ACK, &ack, sizeof(ack));
                 }
                 if (sawStageBypass && network != nullptr && planPtr != nullptr) {
                     LlmStageBypassAckPacket ack{};
@@ -8985,6 +9268,8 @@ void runWorkerApp(AppCliArgs *args) {
                         p.bubbleSkippedSyncs = toolWindowBubbleStats.skippedSyncSteps;
                         p.bubbleDrainUs = toolWindowBubbleStats.drainUs;
                         p.bubbleCompleted = toolWindowBubbleStats.completed;
+                        p.shadowFilledThrough = 0xFFFFFFFFu;
+                        executor.redundantShadowCursor(&p.shadowFilledThrough);
                         fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                         writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                     }
@@ -9029,6 +9314,8 @@ void runWorkerApp(AppCliArgs *args) {
                     p.bubbleSkippedSyncs = bubbleStats.skippedSyncSteps;
                     p.bubbleDrainUs = bubbleStats.drainUs;
                     p.bubbleCompleted = bubbleStats.completed;
+                    p.shadowFilledThrough = 0xFFFFFFFFu;
+                    executor.redundantShadowCursor(&p.shadowFilledThrough);
                     fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                     writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                 }

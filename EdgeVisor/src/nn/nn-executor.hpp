@@ -239,6 +239,10 @@ public:
     void spliceRedundantLayersIntoSend(NnUint beginLayer, NnUint endLayer);
     NnUint executionPosition() const;
     bool shadowCovers(NnUint beginLayer, NnUint endLayer, NnUint position) const;
+    // False when this node has no redundant or shadow-KV layer. Otherwise
+    // filledThrough is the minimum exclusive end position across those layers.
+    // A layer that has not been written contributes 0, which is not ready.
+    bool redundantShadowCursor(NnUint *filledThrough) const;
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     bool isSegmentEnabled(NnUint segmentIndex) const;
     void setPpSyncEnabled(bool enabled);

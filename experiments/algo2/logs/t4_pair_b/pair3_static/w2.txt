@@ -1,0 +1,1 @@
+device: backend=cuda threads=1 CUDA Device[2]: Tesla T4 cc 7.5 sm_75, globalMem=14912 MB, multiProcessorCount=40, warpSize=32, maxThreadsPerBlock=1024, integrated=0, driver=13020, runtime=13020

@@ -739,6 +739,7 @@ private:
     bool switchCommitInDoubt = false;
     bool explicitSwitchReplayPending = false;
     bool explicitSwitchReplayUsed = false;
+    bool explicitCommitRecorded = false;
     NnUint explicitSwitchTransaction = 0u;
     NnUint explicitSwitchFrom = 0u;
     NnUint explicitSwitchTo = 0u;

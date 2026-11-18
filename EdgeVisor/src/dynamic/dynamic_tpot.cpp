@@ -1015,6 +1015,13 @@ static void logAlgo2(const std::string &path, const tpot::Algo2TokenObs &obs, co
         << " cost_confidence=" << (decision.costConfidence.empty() ? "none" : decision.costConfidence)
         << " tail_strikes=" << decision.tailStrikes
         << " catchup=" << (decision.catchupMode.empty() ? "none" : decision.catchupMode)
+        << " request_interval_ms=" << decision.requestIntervalMs
+        << " interval_role=" << (decision.intervalRole.empty() ? "none" : decision.intervalRole)
+        << " predicted_gain_ms=" << decision.predictedGainMs
+        << " measured_gain_ms=" << decision.measuredGainMs
+        << " prediction_error_ms=" << decision.predictionErrorMs
+        << " context_slope=" << decision.contextSlopeMsPerToken
+        << " slope_trusted=" << (decision.contextSlopeTrusted ? 1 : 0)
         << " noise=" << (decision.noiseCalibrated ? "calibrated" : "uncalibrated");
     appendLog(path, line.str());
     const char *outDir = std::getenv("DLLAMA_ALGO2_OUT");
@@ -1137,6 +1144,9 @@ static void stepAlgo2(
         for (size_t i = 0u; i < snaps.size(); ++i) {
             tpot::Algo2StageInput input;
             input.snapshot = snaps[i];
+            input.commWaitMs = snaps[i].boundaryCommMs;
+            input.commIncludedInStageTime = false;
+            input.fixedOverheadMs = -1.0;
             std::map<uint32_t, int>::const_iterator cursor = obs.shadowCursor.find(snaps[i].stageIndex);
             input.shadowCursor = cursor == obs.shadowCursor.end() ? -1 : cursor->second;
             inputs.push_back(input);

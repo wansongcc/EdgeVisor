@@ -4196,6 +4196,7 @@ void RootLlmInference::pollRevisedSwitchReconcile() {
     if (!dllama::dynamic_tpot::algo2ForbidsFullKvFallback()) return;
     if (switchCommitInDoubt && explicitSwitchAckMatches()) {
         recordPpMigrationApplied();
+        explicitCommitRecorded = true;
         switchCommitInDoubt = false;
         migrationAckSeen = true;
         std::printf("🧩 [kv-migrate] commit reconciled by explicit ack txn=%u pos=%u\n",
@@ -4227,6 +4228,7 @@ void RootLlmInference::pollRevisedSwitchReconcile() {
     }
     if (explicitSwitchAckMatches()) {
         recordPpMigrationApplied();
+        explicitCommitRecorded = true;
         migrationAckSeen = true;
         std::printf("🧩 [kv-migrate] commit reconciled by idempotent replay txn=%u pos=%u\n",
             (unsigned)explicitSwitchTransaction, (unsigned)explicitSwitchPosition);
@@ -4257,12 +4259,16 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
                 if (explicitSwitchTransaction == 0u) explicitSwitchTransaction = 1u;
                 explicitSwitchReplayUsed = false;
                 takeoverRejected = false;
+                // The forward for controlPacket.position has already run. The
+                // next token needs KV through that position, so the cursor
+                // boundary is the following position. A replay keeps it.
+                const NnUint batch = controlPacket.batchSize > 0u ? controlPacket.batchSize : 1u;
+                explicitSwitchPosition = controlPacket.position + batch;
+                explicitSwitchFrom = migrationFromNodeIndex;
+                explicitSwitchTo = nextStageRootNode;
+                explicitSwitchLayers = switchLayers;
             }
             explicitSwitchReplayPending = false;
-            explicitSwitchFrom = migrationFromNodeIndex;
-            explicitSwitchTo = nextStageRootNode;
-            explicitSwitchPosition = controlPacket.position;
-            explicitSwitchLayers = switchLayers;
             takeoverAcked = false;
             takeoverAck = LlmTakeoverAckPacket{};
             switchCommitInDoubt = false;
@@ -4273,18 +4279,20 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         // caller can still fall back to a real transfer.
         if (!installKv && executor != nullptr &&
                 areNodesInSameStageLocal(plan, 0u, nextStageRootNode)) {
+            const bool revisedBoundary = dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !pendingStageBypass;
+            const NnUint coverPos = revisedBoundary ? explicitSwitchPosition : controlPacket.position;
             for (NnUint layer : switchLayers) {
-                if (!executor->shadowCovers(layer, layer + 1u, controlPacket.position)) {
+                if (!executor->shadowCovers(layer, layer + 1u, coverPos)) {
                     takeoverRejected = true;
                     takeoverRejectNode = 0u;
                     takeoverRejectLayer = layer;
-                    takeoverRejectPos = controlPacket.position;
+                    takeoverRejectPos = coverPos;
                     NnUint filled = 0xFFFFFFFFu;
                     if (!executor->redundantShadowCursor(&filled)) filled = 0xFFFFFFFFu;
                     takeoverRejectFilled = filled;
                     std::printf("🔁 [takeover-reject] node=0 layer=%u pos=%u filled=%u "
                                 "reason=root_shadow_not_covered\n",
-                        (unsigned)layer, (unsigned)controlPacket.position, (unsigned)filled);
+                        (unsigned)layer, (unsigned)coverPos, (unsigned)filled);
                     std::fflush(stdout);
                     return false;
                 }
@@ -5844,30 +5852,40 @@ void RootLlmInference::forward(bool collectProfile) {
                     migrationLayers.size(), (unsigned)endPos);
                 std::fflush(stdout);
             } else if (requireExplicitAck && switched && !takeoverRejected) {
-                applyOk = false;
                 switchCommitInDoubt = true;
-                fallbackReason = "algo2_commit_unconfirmed";
+                // Replay the same transaction before the next token is forwarded.
+                pollRevisedSwitchReconcile();
                 const double protocolWaitMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
-                std::printf("🧩 [kv-migrate] commit unconfirmed txn=%u pos=%u protocol_wait_ms=%.3f\n",
-                    (unsigned)explicitSwitchTransaction,
-                    (unsigned)explicitSwitchPosition,
-                    protocolWaitMs);
-                std::fflush(stdout);
+                if (!switchCommitInDoubt && explicitSwitchAckMatches()) {
+                    applyOk = true;
+                    fallbackReason = "algo2_commit_acked";
+                } else {
+                    applyOk = false;
+                    switchCommitInDoubt = true;
+                    fallbackReason = "algo2_commit_unconfirmed";
+                    std::printf("🧩 [kv-migrate] commit unconfirmed txn=%u pos=%u protocol_wait_ms=%.3f\n",
+                        (unsigned)explicitSwitchTransaction,
+                        (unsigned)explicitSwitchPosition,
+                        protocolWaitMs);
+                    std::fflush(stdout);
+                }
             } else if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback()) {
                 const char *catchupEnv = std::getenv("DLLAMA_ALGO2_ROLLBACK_CATCHUP");
                 const int catchupLimit = (catchupEnv != nullptr && catchupEnv[0] != '\0')
                     ? std::atoi(catchupEnv) : 128;
-                const NnUint pos = controlPacket.position;
-                const bool gapKnown = takeoverRejectFilled != 0xFFFFFFFFu && pos >= takeoverRejectFilled;
-                const unsigned gap = gapKnown ? (unsigned)(pos - takeoverRejectFilled) : 0u;
+                const int cursor = takeoverRejectFilled == 0xFFFFFFFFu ? -1 : (int)takeoverRejectFilled;
+                bool gapKnown = false;
+                const unsigned gap = dllama::dynamic_tpot::exclusiveCursorGap(
+                    cursor, explicitSwitchPosition, &gapKnown);
                 bool caughtUp = false;
                 if (gapKnown && gap > 0u && (int)gap <= catchupLimit) {
                     NnUint exported = 0u;
                     NnUint queued = 0u;
                     uint64_t sourceBytes = 0u;
+                    const NnUint inclusiveEnd = explicitSwitchPosition > 0u ? explicitSwitchPosition - 1u : endPos;
                     const bool transferred = collectSourceStageKvTransfers(
-                        endPos, &exported, &queued, &sourceBytes, takeoverRejectFilled);
+                        inclusiveEnd, &exported, &queued, &sourceBytes, takeoverRejectFilled);
                     if (transferred) {
                         std::lock_guard<std::mutex> lk(kvTransferMutex);
                         pendingLayerSwitchLayers = migrationLayers;
@@ -5889,7 +5907,8 @@ void RootLlmInference::forward(bool collectProfile) {
                         double replayMs = 0.0;
                         uint64_t replayUnits = 0u;
                         const bool recomputed = replayHistoryForMigrationRecompute(
-                            endPos, &replayMs, &replayUnits, takeoverRejectFilled);
+                            explicitSwitchPosition > 0u ? explicitSwitchPosition - 1u : endPos,
+                            &replayMs, &replayUnits, takeoverRejectFilled);
                         if (recomputed) {
                             {
                                 std::lock_guard<std::mutex> lk(kvTransferMutex);
@@ -5905,7 +5924,7 @@ void RootLlmInference::forward(bool collectProfile) {
                         stateBytes = sourceBytes;
                         fallbackReason = "algo2_tail_catchup";
                         std::printf("🧩 [kv-migrate] tail catchup gap=%u start=%u pos=%u status=ok\n",
-                            gap, (unsigned)takeoverRejectFilled, (unsigned)pos);
+                            gap, (unsigned)takeoverRejectFilled, (unsigned)explicitSwitchPosition);
                         std::fflush(stdout);
                     }
                 }
@@ -6074,7 +6093,8 @@ void RootLlmInference::forward(bool collectProfile) {
             migrationAckSeen = true;
             migrationAckPos = (int)endPos;
             migrationAckLayer = !migrationLayers.empty() ? (int)migrationLayers.back() : migrationAckLayer;
-            recordPpMigrationApplied();
+            if (!explicitCommitRecorded) recordPpMigrationApplied();
+            explicitCommitRecorded = false;
         }
         std::printf("🧩 [kv-migrate] recover mode=%s status=%s stallMs=%.3f stateBytes=%llu recomputeUnits=%llu layers=%u posRange=[0,%u]\n",
             toString(ablationCfg.shadowKvMode),

@@ -357,6 +357,11 @@ int main() {
         require(d.note == "clear_improvement" && !d.recovered && d.health != tpot::Algo2Health::NORMAL,
             "179 ms can keep the move without becoming the healthy state");
         require(near(d.healthReferenceMs, healthAnchor), "the health anchor stays at the pre-fault reference");
+        require(near(d.predictedGainMs, 4.0) && near(d.measuredGainMs, 379.0),
+            "predicted layer gain and measured end-to-end gain are separate");
+        require(near(d.predictionErrorMs, 4.0 - 379.0), "prediction error is predicted minus measured");
+        require(d.intervalRole == "verify" && d.intervalInController && near(d.requestIntervalMs, 179.0),
+            "a verify sample stays in the controller window");
         d = session.observe(tok(15u, 179.0), 15.0);
         require(d.note == "cooldown_done", "cooldown ends without declaring recovery");
         for (int i = 16; i < 19; ++i) d = session.observe(tok((uint32_t)i, 179.0), (double)i);
@@ -481,8 +486,145 @@ int main() {
         session.setStages(closeGap);
         session.observe(tok(13u, 40.0), 13.0);
         tpot::Algo2Decision d = session.observe(tok(14u, 40.0), 14.0);
-        require(d.rollback && d.note == "clear_regression" && d.catchupTokens > 0u && d.catchupMode == "retransmit",
-            "a short KV gap may be retransmitted or recomputed on rollback");
+        require(d.rollback && d.note == "clear_regression" && d.catchupTokens == 3u && d.catchupMode == "retransmit",
+            "a completed token 14 with cursor 12 is three missing positions");
+    }
+
+    {
+        bool known = false;
+        require(tpot::exclusiveCursorGap(81, 81u, &known) == 0u && known, "cursor 81 is ready for the token after 80");
+        require(tpot::exclusiveCursorGap(70, 81u, &known) == 11u && known, "cursor 70 after token 80 misses 11 positions");
+        known = true;
+        require(tpot::exclusiveCursorGap(-1, 81u, &known) == 0u && !known, "an unknown cursor is not a gap of zero");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.longReferenceSpanTokens = 128;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        const double medians[4] = {40.0, 43.0, 46.0, 49.0};
+        const uint32_t contexts[4] = {100u, 132u, 164u, 196u};
+        tpot::Algo2Decision d;
+        for (int w = 0; w < 4; ++w) {
+            for (int i = 0; i < 4; ++i) {
+                tpot::Algo2TokenObs t = tok((uint32_t)(w * 4 + i), medians[w]);
+                t.contextLength = contexts[w];
+                d = session.observe(t, (double)(w * 4 + i));
+            }
+        }
+        require(d.health == tpot::Algo2Health::DEGRADED || d.health == tpot::Algo2Health::STABLE_DEGRADED,
+            "40 to 49 ms within each 10 percent step is still degradation");
+        require(near(d.healthReferenceMs, 40.0), "the long anchor does not walk up with each normal window");
+        require(!d.contextSlopeTrusted, "a climb shorter than the context span is not treated as context growth");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.longReferenceSpanTokens = 128;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::STATIC, 100, -1, 2u);
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 4; ++i) {
+            tpot::Algo2TokenObs t = tok((uint32_t)i, 40.0);
+            t.contextLength = 100u;
+            d = session.observe(t, (double)i);
+        }
+        for (int i = 0; i < 4; ++i) {
+            tpot::Algo2TokenObs t = tok(4u + (uint32_t)i, 42.0);
+            t.contextLength = 228u;
+            d = session.observe(t, 4.0 + i);
+        }
+        require(d.health == tpot::Algo2Health::NORMAL && d.contextSlopeTrusted, "a long context line can explain a small increase");
+        for (int i = 0; i < 4; ++i) {
+            tpot::Algo2TokenObs t = tok(8u + (uint32_t)i, 44.0);
+            t.contextLength = 356u;
+            d = session.observe(t, 8.0 + i);
+        }
+        require(d.health == tpot::Algo2Health::NORMAL && near(d.healthReferenceMs, 44.0),
+            "the context-adjusted anchor follows the fitted line");
+        for (int i = 0; i < 4; ++i) {
+            tpot::Algo2TokenObs t = tok(12u + (uint32_t)i, 60.0);
+            t.contextLength = 484u;
+            d = session.observe(t, 12.0 + i);
+        }
+        require(d.health == tpot::Algo2Health::SUSPECT, "a jump off the context line is suspect");
+    }
+
+    {
+        tpot::Algo2Config cfg = testConfig();
+        cfg.verifyTokens = 4;
+        cfg.verifyMaxTokens = 12;
+        tpot::Algo2Session session(cfg);
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 20.0), (double)i);
+        for (int i = 4; i < 12; ++i) session.observe(tok((uint32_t)i, 40.0), (double)i);
+        session.noteCommitResult(true, "");
+        session.observe(tok(12u, 40.0), 12.0);
+        tpot::Algo2Decision d;
+        for (int i = 0; i < 3; ++i) d = session.observe(tok(13u + (uint32_t)i, 20.0), 13.0);
+        d = session.observe(tok(16u, 50.0), 16.0);
+        require(d.note == "tail_unconfirmed" && !d.rollback, "the first worse tail is only a strike");
+        for (int i = 0; i < 4; ++i) d = session.observe(tok(17u + (uint32_t)i, 40.0), 17.0);
+        require(d.note == "inconclusive" && !d.rollback,
+            "a recovered tail still has to clear the median improvement bar");
+    }
+
+    {
+        auto feed = [](tpot::Algo2Session *session, double rightMs, double commMs) -> tpot::Algo2Decision {
+            std::vector<tpot::Algo2StageInput> stages;
+            stages.push_back(stage(0u, 0u, 0u, 4u, 10.0));
+            stages.push_back(stage(1u, 1u, 4u, 4u, 5.0));
+            stages[0].fixedOverheadMs = -1.0;
+            stages[0].snapshot.stageTimeMs = 56.0;
+            stages[0].snapshot.leftBoundaryLayerMs = 8.0;
+            stages[0].snapshot.rightBoundaryLayerMs = rightMs;
+            stages[0].commWaitMs = commMs;
+            stages[0].commIncludedInStageTime = false;
+            stages[1].fixedOverheadMs = -1.0;
+            stages[1].snapshot.stageTimeMs = 20.0;
+            stages[1].snapshot.leftBoundaryLayerMs = 5.0;
+            stages[1].snapshot.rightBoundaryLayerMs = 5.0;
+            stages[1].shadowCursor = 100;
+            session->setStages(stages);
+            tpot::Algo2Boundary b;
+            b.rightReady = 2u;
+            session->setBoundaries(std::vector<tpot::Algo2Boundary>(1u, b));
+            tpot::Algo2Decision out;
+            for (int i = 0; i < 4; ++i) session->observe(tok((uint32_t)i, 10.0), (double)i);
+            for (int i = 4; i < 12; ++i) out = session->observe(tok((uint32_t)i, 30.0), (double)i);
+            return out;
+        };
+        tpot::Algo2Session waited(testConfig());
+        waited.setMode(tpot::Algo2Mode::REVISED_VARIABLE);
+        waited.setSerialRequest(true);
+        tpot::Algo2Decision withWait = feed(&waited, 20.0, 30.0);
+        tpot::Algo2Session waitedMore(testConfig());
+        waitedMore.setMode(tpot::Algo2Mode::REVISED_VARIABLE);
+        waitedMore.setSerialRequest(true);
+        tpot::Algo2Decision moreWait = feed(&waitedMore, 20.0, 80.0);
+        require(withWait.issue && moreWait.issue && near(withWait.candidate.gainMs, moreWait.candidate.gainMs),
+            "a larger communication wait does not increase movable gain");
+        require(withWait.costConfidence == "medium" &&
+            withWait.estimateMethod.find("interior_extrapolated") != std::string::npos,
+            "an interior average is recorded as extrapolation");
+        tpot::Algo2Session slower(testConfig());
+        slower.setMode(tpot::Algo2Mode::REVISED_VARIABLE);
+        slower.setSerialRequest(true);
+        tpot::Algo2Decision slowLayer = feed(&slower, 30.0, 30.0);
+        require(slowLayer.issue && slowLayer.candidate.gainMs > withWait.candidate.gainMs,
+            "a slower measured boundary layer increases the gain");
+    }
+
+    {
+        tpot::Algo2Session session(testConfig());
+        arm(&session, tpot::Algo2Mode::REVISED_VARIABLE, 100, -1, 2u);
+        for (int i = 0; i < 4; ++i) session.observe(tok((uint32_t)i, 10.0), (double)i);
+        for (int i = 4; i < 12; ++i) session.observe(tok((uint32_t)i, 20.0), (double)i);
+        tpot::Algo2Decision d = session.observe(tok(12u, 50.0), 12.0);
+        require(d.note == "commit_wait" && d.intervalRole == "request_only" && !d.intervalInController &&
+            near(d.requestIntervalMs, 50.0),
+            "the switch token stays in the request latency and out of the controller window");
     }
 
     std::printf("algo2 checks passed\n");

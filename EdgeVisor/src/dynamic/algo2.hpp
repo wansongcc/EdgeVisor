@@ -70,6 +70,10 @@ struct Algo2Config {
     // A single tail spike does not roll back. The tail has to stay worse
     // across this many non-overlapping verify windows.
     int tailConfirmations = 2;
+    // Context growth can raise the long health anchor only after the normal
+    // windows span at least this many tokens and sit on one line. A shorter
+    // climb is gradual degradation, not context growth.
+    int longReferenceSpanTokens = 128;
     // A rollback may retransmit or recompute at most this many missing tokens.
     // A longer gap is refused. This is not permission to copy KV from position 0
     // when the missing range is the whole history.
@@ -96,8 +100,11 @@ struct Algo2StageInput {
     // Subtracted only when it is also included in snapshot.stageTimeMs.
     double commWaitMs = 0.0;
     bool commIncludedInStageTime = false;
-    // Empty, or one entry per layer in [startLayer, endLayer).
+    // Empty, or one entry per layer in [startLayer, endLayer). A negative
+    // entry is unknown. layerMeasured is 1 when that entry is a measured
+    // layer compute time and 0 when it is an interior average.
     std::vector<double> layerMs;
+    std::vector<unsigned char> layerMeasured;
     // Exclusive shadow cursor for this stage. -1 unknown. -2 this stage has
     // no redundant layers. Any other value is the exclusive end position whose
     // shadow KV has been written on every redundant layer.
@@ -147,6 +154,16 @@ struct Algo2Decision {
     int verifySamples = 0;
     uint32_t catchupTokens = 0u;
     std::string catchupMode;
+    double contextSlopeMsPerToken = 0.0;
+    bool contextSlopeTrusted = false;
+    // Completion interval of this token. Controller windows can exclude the
+    // switch stall; the request latency still keeps it.
+    double requestIntervalMs = -1.0;
+    bool intervalInController = false;
+    std::string intervalRole;
+    double predictedGainMs = -1.0;
+    double measuredGainMs = -1.0;
+    double predictionErrorMs = -1.0;
     double windowMedianMs = -1.0;
     double windowMeanMs = -1.0;
     double windowP95Ms = -1.0;
@@ -166,6 +183,22 @@ const char *algo2HealthName(Algo2Health health);
 const char *algo2PhaseName(Algo2Phase phase);
 Algo2Config algo2ConfigFromEnvironment();
 bool algo2ForbidsFullKvFallback();
+
+// cursor is the next position still to be written. nextPosition is the first
+// position the following token will execute. Token 80 complete and cursor 70
+// against next position 81 is a gap of 11. A negative cursor is unknown.
+inline uint32_t exclusiveCursorGap(int cursor, uint32_t nextPosition, bool *known) {
+    if (known != nullptr) *known = false;
+    if (cursor < 0) return 0u;
+    if (known != nullptr) *known = true;
+    if ((uint32_t)cursor >= nextPosition) return 0u;
+    return nextPosition - (uint32_t)cursor;
+}
+
+// Fill layerMs from measured boundary-layer compute. Communication stays in
+// commWaitMs. Interior layers are averages only when both boundaries and the
+// stage compute time are known; those entries are marked unmeasured.
+void deriveMovableLayerCosts(Algo2StageInput *stage);
 
 // Root decode loop. The first completion only starts the clock. Later calls
 // record complete(t) - complete(t-1) on this host. The interval includes
@@ -267,6 +300,23 @@ private:
     int reverseLeft_ = 0;
     bool rollbackBlocked_ = false;
     std::string lastNote_;
+    double longMs_ = -1.0;
+    uint32_t longContext_ = 0u;
+    double contextSlope_ = 0.0;
+    bool slopeTrusted_ = false;
+    struct LongPoint {
+        uint32_t context = 0u;
+        double median = 0.0;
+    };
+    std::vector<LongPoint> longPoints_;
+    double lastRequestIntervalMs_ = -1.0;
+    bool lastIntervalInController_ = false;
+    std::string lastIntervalRole_ = "request_only";
+    double pendingPredictedGain_ = -1.0;
+
+    double healthExpectedMs(uint32_t context) const;
+    void resetLongReference(uint32_t context, double median, const char *reason);
+    void noteHealthyPoint(uint32_t context, double median);
 };
 
 // costByLayerDevice[layer][device]. initialCounts sums to the layer count.

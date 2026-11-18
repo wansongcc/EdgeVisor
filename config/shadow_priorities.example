@@ -1,0 +1,20 @@
+# stage priority reason
+# Read only when EDGEVISOR_SHADOW_ALLOCATION=file.
+# priority and reversed run a short sustained profile and do not open this file.
+# equal:    every stage the same weight.
+# device_only:     sustained window. Device weight only, from 2000
+#                  (measured, no sign) to 4000 (strong sign). An unread
+#                  device stays 3000. Link scores are recorded and not used.
+# device_link_max: same measurement, then max(device weight, that hop's
+#                  link weight). This is an untested hypothesis.
+# priority:        alias of device_link_max.
+# mismatch:        same device weights, with the lowest and highest labels
+#                  exchanged. Identical weights are not a mismatch control.
+# reversed:        alias of mismatch. It does not replace risk with 1-risk.
+# file:            read this file. This file still uses low=2 mid=3 high=4.
+# EDGEVISOR_SHADOW_BUDGET_CAP, when set, limits each stage's shadow budget
+# without changing the measured memory spare.
+0 low dedicated-and-plugged-in
+1 high mobile-unplugged
+2 mid shared-workstation
+3 low dedicated-and-plugged-in

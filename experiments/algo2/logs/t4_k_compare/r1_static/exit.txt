@@ -1,0 +1,1 @@
+r1_static mode=static arm=static exit=0

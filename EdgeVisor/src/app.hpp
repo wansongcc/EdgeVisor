@@ -127,13 +127,6 @@ public:
 
 void printAvailableDevices();
 
-bool resolvePpMigrationLayers(
-    const PlanCommand &command,
-    const NnUnevenPartitionPlan *plan,
-    const RuntimeStageLayerPlan *runtimePlan,
-    std::vector<NnUint> &layers,
-    std::string *reason = nullptr);
-
 // Mutable primary ownership is intentionally distinct from the immutable
 // runtime provision map.  PP moves change ownership only after their switch
 // succeeds; bypass admission uses that ownership but validates the target
@@ -143,6 +136,26 @@ struct RuntimePrimaryOwnership {
     NnUint nStages = 0u;
     std::vector<NnUint> ownerByLayer;
 };
+
+bool resolvePpMigrationLayers(
+    const PlanCommand &command,
+    const NnUnevenPartitionPlan *plan,
+    const RuntimeStageLayerPlan *runtimePlan,
+    std::vector<NnUint> &layers,
+    std::string *reason = nullptr);
+
+// Same admission rules, but the candidate layers come from current primary
+// ownership rather than the static stage boundary. A repeated migration would
+// otherwise ask for the boundary layer again, which the source no longer owns
+// after the first move. Chooses the highest still-owned layer adjacent to the
+// target, so successive single-layer moves walk the boundary inward.
+bool resolvePpMigrationLayersByOwnership(
+    const PlanCommand &command,
+    const NnUnevenPartitionPlan *plan,
+    const RuntimeStageLayerPlan *runtimePlan,
+    const RuntimePrimaryOwnership &ownership,
+    std::vector<NnUint> &layers,
+    std::string *reason = nullptr);
 
 bool initializeRuntimePrimaryOwnership(
     const RuntimeStageLayerPlan *provisionMap,
@@ -188,13 +201,34 @@ enum LlmControlFlags : NnUint {
     LLM_CTRL_PRECOMMIT_PROBE = 1u << 8, // control-only liveness ACK before a PP binding hand-off
     LLM_CTRL_TOOL_WINDOW_SHADOW = 1u << 9, // execute actual redundant ShadowKV work during a control-only tool window
     LLM_CTRL_DEVICE_JOIN = 1u << 10,
+    LLM_CTRL_HAS_WEIGHT_LOAD = 1u << 11, // resident-weight upload for layers a migration is about to bring in
 };
+
+static constexpr NnUint LLM_WEIGHT_LOAD_MAGIC = 0x444c574cu; // 'LWLD'
+static constexpr NnUint LLM_WEIGHT_LOAD_VERSION = 1u;
+
+// Sent to the receiving stage right before the binding switch. The receiver
+// owns no weights for these layers yet (that residency is exactly what EV
+// pre-allocates and the reactive baselines do not), so this is the point where
+// a reactive baseline pays for them. The payload lists one layer per entry and
+// the worker streams that layer's tensors from the model file into VRAM,
+// charging the time to the migration stall.
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint layerCount;
+    NnUint reserved;
+} LlmWeightLoadHeader;
 
 static constexpr NnUint LLM_DEVICE_JOIN_MAGIC = 0x4e4f4a44u; // 'DJON'
 static constexpr NnUint LLM_DEVICE_JOIN_VERSION = 1u;
 static constexpr NnUint LLM_DEVICE_JOIN_ACCEPT = 1u;
 static constexpr NnUint LLM_DEVICE_JOIN_INSERT = 2u;
 static constexpr NnUint LLM_DEVICE_JOIN_DISABLE = 3u;
+// Restores a stage's primary range after the device that owns it rejoined.
+// stageIndex + layerBegin/layerEnd are that stage's restored range; every live
+// worker and the root apply it so startLayer/endLayer/nLayers agree again.
+static constexpr NnUint LLM_DEVICE_JOIN_RESTORE = 4u;
 
 typedef struct {
     NnUint magic;
@@ -293,6 +327,14 @@ enum LlmLayerSwitchFlags : NnUint {
     LLM_LAYER_SWITCH_STAGE_BYPASS = 1u << 0,
     LLM_LAYER_SWITCH_NEW_PP_START = 1u << 1,
     LLM_LAYER_SWITCH_RESTORE_PP_START = 1u << 2,
+    // The KV for these layers has already been moved by the sender.  The
+    // receiver must install the layer even when its own shadow pass has not
+    // covered the position, because refusing would strand the transfer.
+    LLM_LAYER_SWITCH_INSTALL = 1u << 3,
+    // Revised mode asks the receiver to answer. Silence is not acceptance.
+    // reserved1 carries the transaction id when this flag is set and the
+    // packet is not a stage-bypass packet.
+    LLM_LAYER_SWITCH_EXPLICIT_ACK = 1u << 4,
 };
 
 typedef struct {
@@ -313,6 +355,10 @@ typedef struct {
     NnUint kvDim;
     NnUint rangeStart;
     NnUint rangeLen;
+    // First token position to export. Older callers leave this 0 and still
+    // export [0, endPosition]. PipeLive sets it so a remote stage does not
+    // resend the prefix on every chunk.
+    NnUint startPosition;
 } LlmKvExportRequestHeader;
 
 typedef struct {
@@ -344,19 +390,75 @@ static constexpr NnUint LLM_KV_ACK_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_LAYER_SWITCH_BATCH_VERSION = 1u;
 static constexpr NnUint LLM_STAGE_BYPASS_ACK_VERSION = 1u;
 
-static constexpr NnUint LLM_WORKER_FRAME_MAGIC = 0x4d465756u; // 'VWFM'
-static constexpr NnUint LLM_WORKER_FRAME_VERSION = 1u;
+static constexpr NnUint LLM_WORKER_FRAME_MAGIC = NN_WORKER_FRAME_MAGIC; // 'VWFM'
+static constexpr NnUint LLM_WORKER_FRAME_VERSION = NN_WORKER_FRAME_VERSION;
 enum LlmWorkerFrameKind : NnUint {
     LLM_WORKER_FRAME_PROFILE = 1u,
     LLM_WORKER_FRAME_SAMPLED_TOKEN = 2u,
     LLM_WORKER_FRAME_STAGE_BYPASS_ACK = 3u,
+    // Reply to a layer switch the receiving stage cannot honour because it does
+    // not hold a current shadow copy of the layers being handed over.
+    LLM_WORKER_FRAME_TAKEOVER_REJECT = 4u,
+    // Kind 5 is NN_WORKER_FRAME_DELIVERY_NEED. The takeover reply is a
+    // different frame, so it cannot reuse that number.
+    LLM_WORKER_FRAME_TAKEOVER_ACK = 6u,
+    // A queueable delivery note for the PP transport. Declared in nn-network.hpp
+    // because the network writes and recognises it without the app layer.
+    LLM_WORKER_FRAME_DELIVERY_NEED = NN_WORKER_FRAME_DELIVERY_NEED,
 };
+
+// A receiving stage answers a layer switch with this when its reservation does
+// not cover the range yet. The root then falls back to moving the KV instead.
+// The check belongs on the worker because that is where shadowFilledThrough_
+// lives; the root cannot see it, and asking would cost a round trip anyway.
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint nodeIndex;
+    NnUint fromNodeIndex;
+    NnUint firstLayer;
+    NnUint endLayer;
+    NnUint position;
+    NnUint filledThrough;
+} LlmTakeoverRejectPacket;
+static constexpr NnUint LLM_TAKEOVER_REJECT_MAGIC = 0x52544b54u; // 'TKTR'
+static constexpr NnUint LLM_TAKEOVER_REJECT_VERSION = 1u;
+
+// Explicit result of a revised-mode layer switch. APPLIED means the receiver
+// changed its layer binding. STALE means a late older transaction was ignored.
+enum LlmTakeoverAckStatus : NnUint {
+    LLM_TAKEOVER_ACK_APPLIED = 1u,
+    LLM_TAKEOVER_ACK_STALE = 3u,
+};
+enum LlmTakeoverAckFlags : NnUint {
+    LLM_TAKEOVER_ACK_KV_OK = 1u << 0,
+    LLM_TAKEOVER_ACK_WEIGHTS_OK = 1u << 1,
+};
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint nodeIndex;
+    NnUint transactionId;
+    NnUint fromNodeIndex;
+    NnUint toNodeIndex;
+    NnUint firstLayer;
+    NnUint endLayer;
+    NnUint position;
+    NnUint filledThrough;
+    NnUint status;
+    NnUint flags;
+} LlmTakeoverAckPacket;
+static constexpr NnUint LLM_TAKEOVER_ACK_MAGIC = 0x4b414b54u; // 'TKAK'
+static constexpr NnUint LLM_TAKEOVER_ACK_VERSION = 1u;
 typedef struct {
     NnUint magic;
     NnUint version;
     NnUint kind;
     NnUint payloadBytes;
 } LlmWorkerFrameHeader;
+// One layout, shared with the PP transport so both sides write identical framing.
+static_assert(sizeof(LlmWorkerFrameHeader) == sizeof(NnWorkerFrameHeader),
+    "worker frame header must match the network layer's view");
 static constexpr NnUint LLM_KV_EXPORT_REQUEST_VERSION = 1u;
 static constexpr NnUint LLM_KV_EXPORT_RESPONSE_VERSION = 1u;
 
@@ -380,6 +482,9 @@ typedef struct {
     NnUint bubbleCompleted;
     NnUint leftBoundaryLayerUs;
     NnUint rightBoundaryLayerUs;
+    // Exclusive shadow end across this node's redundant layers.
+    // 0xFFFFFFFF means this node holds no such layer. 0 means not filled.
+    NnUint shadowFilledThrough;
 } LlmPerfPacket;
 
 typedef struct {
@@ -504,6 +609,10 @@ public:
     int getMigrationAckPos() const { return migrationAckPos; }
     int getMigrationAckLayer() const { return migrationAckLayer; }
     unsigned long long getPpMigrationAppliedGeneration() const { return ppMigrationAppliedGeneration; }
+    bool revisedSwitchCommitInDoubt() const { return switchCommitInDoubt; }
+    NnUint revisedSwitchTransactionId() const { return explicitSwitchTransaction; }
+    // One idempotent replay, or acceptance of a late ACK, at a token boundary.
+    void pollRevisedSwitchReconcile();
     NnUint getPpMigrationAppliedFromNodeIndex() const { return ppMigrationAppliedFromNodeIndex; }
     NnUint getPpMigrationAppliedToNodeIndex() const { return ppMigrationAppliedToNodeIndex; }
     const std::vector<NnUint>& getPpMigrationAppliedLayers() const { return ppMigrationAppliedLayers; }
@@ -548,6 +657,10 @@ private:
     void tryVerifyStageBypassAcks();
     void pollStageBypassAckFrames();
     void pumpWorkerFrames(NnUint socketIndex, int timeoutMs = -1);
+    // True when a complete normal worker frame for this position is already
+    // cached from that node. A delivery probe treats that as HAVE: the token
+    // reached the stage after the dead hop before the hop died.
+    bool hasQueuedWorkerFrameFor(NnUint nodeIndex, NnUint position) const;
     float *tokenPipe = nullptr;
     float *positionPipe = nullptr;
     float *slotPipe = nullptr;
@@ -585,9 +698,26 @@ private:
     // background during idle windows; the trigger only transfers the delta.
     bool bgPrecopyEnabled = false;
     NnUint bgPrecopyMaxPasses = 0u;   // 0 = unlimited (DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES)
+    // EV reserves residency for the layers it may take over, before the fault.
+    // Every other arm learns the layer only at the trigger and therefore pays a
+    // weight upload inside the stall. Set by EDGEVISOR_WEIGHT_RESIDENCY=preallocated
+    // (EV hit) vs `on_demand` (everything else); the default is on_demand so a
+    // missing setting charges the cost rather than hiding it.
+    bool weightResidencyPreallocated = false;
     NnUint bgCopiedPos = 0u;
     unsigned long long bgPrecopyBytesTotal = 0u;
     unsigned long long bgPrecopyPasses = 0u;
+    // PipeLive online patch (DLLAMA_PIPELIVE_PATCH=1): each decode step copies
+    // a bounded chunk of already-written KV and leaves `pipeLiveTau` positions
+    // for the trigger. Chunk acks must not switch ownership.
+    bool pipeLivePatchEnabled = false;
+    NnUint pipeLiveChunk = 8u;
+    NnUint pipeLiveTau = 8u;
+    // 0xFFFFFFFF: patch from the first decoded token (the earlier experiment).
+    // Any other value: ignore positions before this one, then pull the switch
+    // forward to the next token once the residual is down to tau.
+    NnUint pipeLiveArmPos = 0xFFFFFFFFu;
+    bool kvAckDeferSwitch = false;
     NnUint waitingKvAckExpectedCount = 0u;
     std::vector<NnUint> waitingKvAckLayers;
     NnUint waitingKvAckReceivedCount = 0u;
@@ -613,6 +743,25 @@ private:
     bool migrationAckSeen = false;
     int migrationAckPos = -1;
     int migrationAckLayer = -1;
+    // Set when a receiving stage refuses a layer switch because its shadow copy
+    // of those layers is not current. The root then moves the KV instead.
+    bool takeoverRejected = false;
+    NnUint takeoverRejectNode = 0u;
+    NnUint takeoverRejectLayer = 0u;
+    NnUint takeoverRejectPos = 0u;
+    NnUint takeoverRejectFilled = 0xFFFFFFFFu;
+    bool takeoverAcked = false;
+    LlmTakeoverAckPacket takeoverAck{};
+    bool switchCommitInDoubt = false;
+    bool explicitSwitchReplayPending = false;
+    bool explicitSwitchReplayUsed = false;
+    bool explicitCommitRecorded = false;
+    NnUint explicitSwitchTransaction = 0u;
+    NnUint explicitSwitchFrom = 0u;
+    NnUint explicitSwitchTo = 0u;
+    NnUint explicitSwitchPosition = 0u;
+    std::vector<NnUint> explicitSwitchLayers;
+    bool explicitSwitchAckMatches() const;
     unsigned long long ppMigrationAppliedGeneration = 0ull;
     NnUint ppMigrationAppliedFromNodeIndex = 0u;
     NnUint ppMigrationAppliedToNodeIndex = (NnUint)-1;
@@ -658,7 +807,14 @@ private:
     bool flushPendingKvTransfersControlOnly(uint64_t *targetTransferBytes);
     void resetPendingKvMigrationState(const char *reason);
     bool verifyPendingLayerSwitchPrecommit();
-    bool sendPendingLayerSwitchControlOnly();
+    // installKv: the caller already moved the KV, so the receiver must install
+    // the layers unconditionally.  When false this is a reservation probe: a
+    // root-local target that has not covered the position refuses instead of
+    // taking a layer it cannot execute.
+    bool sendPendingLayerSwitchControlOnly(bool installKv);
+    // Asks the receiving stage to upload weights for these layers and waits for
+    // the upload to finish. No-op for arms that pre-reserved them at boot.
+    bool sendWeightLoadRequest(const std::vector<NnUint> &layers);
     void maybeApplyShiftedPpStartForStageMove(
         const std::vector<NnUint> &switchLayers,
         NnUint sourceNodeIndex,
@@ -666,7 +822,7 @@ private:
         bool selfIsSource,
         bool selfIsTarget);
     void collectProfilePackets();
-    bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
+    bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens, NnUint startPos = 0u);
     bool replayHistoryForHeadMigrationRecompute(const PlanCommand &cmd, NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
     bool recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUint triggerPos);
     void emitPpMigrationRecoverEvent(
@@ -691,9 +847,17 @@ public:
     void forward(bool collectProfile = true);
     // Returns elapsed microseconds; zero means the operation was not run.
     unsigned long long runToolWindowShadow();
-    unsigned long long runBackgroundPreCopy(NnUint endPos);
+    // deferSwitch: ack completes the copy but does not move layer ownership.
+    // PipeLive uses this so the trigger still performs the residual switch.
+    unsigned long long runBackgroundPreCopy(NnUint endPos, bool deferSwitch = false);
+    unsigned long long runPipeLivePatch(NnUint pos);
     void collectDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out);
     LlmPerfPacket makeRootPerfPacket() const;
+    // True when a complete normal worker frame for this position is already
+    // cached from that node. The PP delivery probe treats this as HAVE.
+    bool ppHasQueuedFrameFor(NnUint nodeIndex, NnUint position) const {
+        return hasQueuedWorkerFrameFor(nodeIndex, position);
+    }
     void finish();
 };
 
@@ -734,6 +898,19 @@ public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, NnUint localNodeIndex, NnUint logitsPipeIndex, Sampler *lastStageSampler);
     bool isSkipLogits() const { return (controlPacket.flags & LLM_CTRL_SKIP_LOGITS) != 0u; }
     bool tryReadControlPacket();
+
+    // Weight residency for migrated-in layers. `weightHostPath` is the local
+    // model file this worker booted from; a stage that did not pre-reserve a
+    // layer pulls its tensors from there when the migration reaches it.
+    void setWeightHostPath(const char *path) { weightHostPath_ = (path != nullptr) ? path : ""; }
+    bool hasPendingWeightLoads() const { return !pendingWeightLayers_.empty(); }
+    // Uploads every queued layer and returns the wall-clock cost in ms.
+    double applyPendingWeightLoads(NnExecutor *executor, const NnUnevenPartitionPlan *plan);
+    NnSize lastWeightLoadBytes() const { return lastWeightLoadBytes_; }
+private:
+    std::string weightHostPath_;
+    std::deque<NnUint> pendingWeightLayers_;
+    NnSize lastWeightLoadBytes_ = 0u;
 };
 
 typedef struct {
@@ -751,6 +928,10 @@ typedef struct {
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
 // Between tokens, connect a reserved pool member and move a slice of the slowest donor onto it.
 void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position);
+// Between tokens, probe a device that dropped mid-session. When its port
+// accepts again it reloads its original layers and takes its range back from
+// the neighbours that covered it. Root only; workers never probe.
+void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position);
 void failoverArmSessionRestart(const std::string &prompt, NnUint steps, NnUint nLayers);
 void runWorkerApp(AppCliArgs *args);
 

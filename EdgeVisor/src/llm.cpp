@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <functional>
 #include <algorithm>
+#include <unordered_set>
 #include <thread>
 
 // Global flag to enable plan barrier (set from app via bootstrap packet)
@@ -2834,8 +2835,22 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
 
 void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *loader, 
                             const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
-    
-    // 1. 自动计算层范围
+    loadLlmNetWeightUnevenFiltered(path, net, loader, plan, nodeIndex, nullptr);
+}
+
+NnSize predictLlmLayerWeightBytes(const char *path) {
+    LlmHeader h = loadLlmHeader(path, 0u, F_32);
+    const NnSize3D moeGate = size2D(F_32, h.dim, std::max<unsigned int>(h.nExperts, 1u));
+    return calculateLayerBytes(&h, moeGate, size1D(F_32, h.dim), size1D(F_32, h.headDim));
+}
+
+// `onlyLayers != nullptr` loads just those transformer layers and skips the
+// embedding/final blocks. That is the on-demand upload a reactive baseline
+// performs after the fault, for a layer it does not yet hold. Boot-time
+// residency passes nullptr and loads everything the runtime plan assigns.
+void loadLlmNetWeightUnevenFiltered(const char *path, LlmNet *net, NnLocalWeightLoader *loader,
+                                    const NnUnevenPartitionPlan* plan, NnUint nodeIndex,
+                                    const std::unordered_set<NnUint> *onlyLayers) {
     NnUint startLayer = 0;
     NnUint endLayer = net->header->nLayers;
     bool isFirstStage = true;
@@ -2915,7 +2930,7 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         ? (nodeIndex == 0u)
         : (nodeIndex == myStage->rootNodeIndex);
     const NnSize embeddingBytes = tokenEmbeddingFileSize(h).nBytes;
-    if (isFirstStage && isStageRoot) {
+    if (onlyLayers == nullptr && isFirstStage && isStageRoot) {
         const NnUint rowsPerMap = 1024u;
         for (NnUint rowStart = 0u; rowStart < h->vocabSize; rowStart += rowsPerMap) {
             const NnUint rows = std::min(rowsPerMap, h->vocabSize - rowStart);
@@ -2936,7 +2951,11 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         bool shouldLoadLayer = false;
         bool isPrimaryLayer = false;
         bool isRedundantLayer = false;
-        if (hasRuntimeRolePlan) {
+        if (onlyLayers != nullptr) {
+            shouldLoadLayer = onlyLayers->count(layerIndex) != 0u;
+            isPrimaryLayer = shouldLoadLayer;
+            isRedundantLayer = false;
+        } else if (hasRuntimeRolePlan) {
             const RuntimeLayerRole role = runtimePlan->getRole(myStage->stageIndex, layerIndex);
             isPrimaryLayer = (role == RUNTIME_LAYER_PRIMARY);
             isRedundantLayer = (role == RUNTIME_LAYER_REDUNDANT);
@@ -3038,7 +3057,7 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
     // --- 3. Final Layers ---
     NnSize finalBlockBytes = net->rmsNormSize.nBytes + size2D(h->weightType, h->dim, h->vocabSize).nBytes;
     
-    if (isLastStage) {
+    if (onlyLayers == nullptr && isLastStage) {
         NnByte *b = mapWeightRange(fileOffset, finalBlockBytes);
         NnByte* finalStart = b;
         b += loader->loadAll("final_norm", 0u, net->rmsNormSize.nBytes, b);

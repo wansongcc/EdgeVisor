@@ -128,9 +128,33 @@ static void testReservedMigrationAdmission() {
     delete[] net.nodeConfigs; releaseNetConfig(&net.netConfig);
 }
 
+static void testPpStageInsertReaffirm() {
+    // Same shape createPartitionPlan builds: the chain is fully linked before
+    // any migration runs, so 0 -> 1 -> 2 -> tail.
+    NnUnevenPartitionPlan plan{};
+    plan.nStages = 3u;
+    plan.ppPrevStageIndex = new NnUint[3]{(NnUint)-1, 0u, 1u};
+    plan.ppNextStageIndex = new NnUint[3]{1u, 2u, (NnUint)-1};
+    // A rejoining worker re-inserts stage 1 after stage 0. Stage 1 is already
+    // seated there, so the insert must leave the forward link to stage 2 alone
+    // instead of splicing stage 1 into itself.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        assert(applyPpStageInsert(&plan, 1u, 0u));
+        assert(plan.ppNextStageIndex[0] == 1u);
+        assert(plan.ppPrevStageIndex[1] == 0u);
+        assert(plan.ppNextStageIndex[1] == 2u);
+        assert(plan.ppPrevStageIndex[2] == 1u);
+    }
+    delete[] plan.ppPrevStageIndex;
+    plan.ppPrevStageIndex = nullptr;
+    delete[] plan.ppNextStageIndex;
+    plan.ppNextStageIndex = nullptr;
+}
+
 int main() {
     unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
     testReservedMigrationAdmission();
+    testPpStageInsertReaffirm();
     {
         char program[] = "dllama", action[] = "inference";
         char *defaults[] = {program, action};
@@ -244,6 +268,86 @@ int main() {
         provision.setRole(2u, 1u, RUNTIME_LAYER_REDUNDANT);
         assert(ppStartLayerSwitchFlag(&provision, 1u, 2u, 1u, &plan) == LLM_LAYER_SWITCH_NEW_PP_START);
     }
+    {
+        // Each boundary in DLLAMA_REDUNDANT_BOUNDARY_DEPTHS is a
+        // `backward,forward` pair: the left stage reserves the right stage's
+        // prefix (reachable by a right-to-left move), the right stage reserves
+        // the left stage's suffix (reachable by a left-to-right move).  1,3 on
+        // the middle boundary therefore allows one backward layer and three
+        // forward ones, and the resolvers must stop at exactly those depths.
+        NnUnevenPartitionPlan depthPlan{};
+        depthPlan.nNodes = 4u;
+        depthPlan.nStages = 4u;
+        depthPlan.stages = new NnStageConfig[4]{};
+        // ppPrevStageIndex/ppNextStageIndex stay null, so the active chain is
+        // the static one and stage i's neighbours are i-1 and i+1.
+        for (NnUint stageIndex = 0u; stageIndex < depthPlan.nStages; ++stageIndex) {
+            NnStageConfig &stage = depthPlan.stages[stageIndex];
+            stage.stageIndex = stageIndex;
+            stage.startLayer = stageIndex * 4u;
+            stage.endLayer = stage.startLayer + 4u;
+            stage.nLayers = 4u;
+            stage.rootNodeIndex = stageIndex;
+            stage.nNodes = 1u;
+            stage.nodeIndices = new NnUint[1]{stageIndex};
+        }
+
+        setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", "0,0;1,3;0,0", 1);
+        const RuntimeStageLayerPlan depthRoles = buildRuntimeStageLayerPlan(&depthPlan, 16u);
+
+        // Boundary 1|2: forward depth 3 -> stage 2 holds 5,6,7.
+        for (NnUint layer = 5u; layer < 8u; ++layer) {
+            assert(depthRoles.getRole(2u, layer) == RUNTIME_LAYER_REDUNDANT);
+        }
+        assert(depthRoles.getRole(2u, 4u) != RUNTIME_LAYER_REDUNDANT);
+        // Boundary 1|2: backward depth 1 -> stage 1 holds 8 only.
+        assert(depthRoles.getRole(1u, 8u) == RUNTIME_LAYER_REDUNDANT);
+        for (NnUint layer = 9u; layer < 12u; ++layer) {
+            assert(depthRoles.getRole(1u, layer) != RUNTIME_LAYER_REDUNDANT);
+        }
+        // The outer boundaries are explicitly 0,0.
+        for (NnUint layer = 0u; layer < 16u; ++layer) {
+            assert(depthRoles.getRole(0u, layer) != RUNTIME_LAYER_REDUNDANT);
+            assert(depthRoles.getRole(3u, layer) != RUNTIME_LAYER_REDUNDANT);
+        }
+
+        RuntimePrimaryOwnership depthOwnership;
+        assert(initializeRuntimePrimaryOwnership(&depthRoles, depthOwnership, nullptr, &depthPlan));
+        std::string depthReason;
+        std::vector<NnUint> depthLayers;
+
+        PlanCommand depthForward{};
+        depthForward.fromNodeIndex = 1u;
+        depthForward.toNodeIndex = 2u;
+        depthForward.reserved0 = 3u;
+        assert(resolvePpMigrationLayersByOwnership(
+            depthForward, &depthPlan, &depthRoles, depthOwnership, depthLayers, &depthReason));
+        assert((depthLayers == std::vector<NnUint>{5u, 6u, 7u}));
+        depthForward.reserved0 = 4u;
+        assert(resolvePpMigrationLayersByOwnership(
+            depthForward, &depthPlan, &depthRoles, depthOwnership, depthLayers, &depthReason));
+        assert((depthLayers == std::vector<NnUint>{5u, 6u, 7u}));
+
+        PlanCommand depthBackward{};
+        depthBackward.fromNodeIndex = 2u;
+        depthBackward.toNodeIndex = 1u;
+        depthBackward.reserved0 = 1u;
+        assert(resolvePpMigrationLayersByOwnership(
+            depthBackward, &depthPlan, &depthRoles, depthOwnership, depthLayers, &depthReason));
+        assert((depthLayers == std::vector<NnUint>{8u}));
+        depthBackward.reserved0 = 2u;
+        assert(resolvePpMigrationLayersByOwnership(
+            depthBackward, &depthPlan, &depthRoles, depthOwnership, depthLayers, &depthReason));
+        assert((depthLayers == std::vector<NnUint>{8u}));
+
+        // Later buildRuntimeStageLayerPlan calls in this process must see the
+        // default spec, not this one.
+        unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        // NnStageConfig owns nodeIndices and releases it from its destructor.
+        delete[] depthPlan.stages;
+        depthPlan.stages = nullptr;
+    }
+
     clearTpotEnvironment();
     {
         const dllama::dynamic_tpot::SchedulerConfig cfg =

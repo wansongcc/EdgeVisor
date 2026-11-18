@@ -208,6 +208,10 @@ private:
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
     NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool allowWhileRunning);
     bool isRedundantLayerActive(NnUint layerIndex) const;
+    // Layers this node currently executes, derived from the runtime gate. The
+    // fault penalty scales by this so a stage that gave layers away does not
+    // keep paying for work it no longer does.
+    NnUint countExecutedLayers() const;
     void noteShadowFilled(NnUint layerIndex);
     void replayRedundantLayer(NnUint layerIndex);
     void resetBubbleShadowStateForForward();
@@ -235,6 +239,10 @@ public:
     void spliceRedundantLayersIntoSend(NnUint beginLayer, NnUint endLayer);
     NnUint executionPosition() const;
     bool shadowCovers(NnUint beginLayer, NnUint endLayer, NnUint position) const;
+    // False when this node has no redundant or shadow-KV layer. Otherwise
+    // filledThrough is the minimum exclusive end position across those layers.
+    // A layer that has not been written contributes 0, which is not ready.
+    bool redundantShadowCursor(NnUint *filledThrough) const;
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
     bool isSegmentEnabled(NnUint segmentIndex) const;
     void setPpSyncEnabled(bool enabled);

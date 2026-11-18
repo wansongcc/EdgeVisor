@@ -1303,6 +1303,82 @@ static double cudaGemvMs(cublasHandle_t handle, float *weight, float *input, flo
     return ms / (double)iters;
 }
 
+struct NnCudaLayerSoak::Impl {
+    bool ok;
+    int dim;
+    int hidden;
+    int kv;
+    cublasHandle_t handle;
+    float *weight;
+    float *input;
+    float *output;
+    Impl() : ok(false), dim(0), hidden(0), kv(0), handle(nullptr), weight(nullptr), input(nullptr), output(nullptr) {}
+};
+
+NnCudaLayerSoak::NnCudaLayerSoak(unsigned gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads)
+    : impl(new Impl()) {
+    if (dim == 0u) return;
+    const unsigned hidden = hiddenDim == 0u ? dim : hiddenDim;
+    const unsigned heads = nHeads == 0u ? 1u : nHeads;
+    const unsigned kvHeads = nKvHeads == 0u ? heads : nKvHeads;
+    const unsigned kvDim = (unsigned)(((unsigned long long)dim / heads) * kvHeads);
+    const unsigned kv = kvDim == 0u ? dim : kvDim;
+    const unsigned long long shapes[4] = {
+        (unsigned long long)dim * dim,
+        (unsigned long long)kv * dim,
+        (unsigned long long)hidden * dim,
+        (unsigned long long)dim * hidden
+    };
+    unsigned long long maxElems = shapes[0];
+    for (int i = 1; i < 4; ++i) if (shapes[i] > maxElems) maxElems = shapes[i];
+    const unsigned maxVector = std::max(dim, std::max(hidden, kv));
+    try {
+        NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+        NN_CUDA_CHECK(cudaMalloc(&impl->weight, (size_t)maxElems * sizeof(float)));
+        NN_CUDA_CHECK(cudaMalloc(&impl->input, (size_t)maxVector * sizeof(float)));
+        NN_CUDA_CHECK(cudaMalloc(&impl->output, (size_t)maxVector * sizeof(float)));
+        NN_CUDA_CHECK(cudaMemset(impl->weight, 0, (size_t)maxElems * sizeof(float)));
+        NN_CUBLAS_CHECK(cublasCreate(&impl->handle));
+        impl->dim = (int)dim;
+        impl->hidden = (int)hidden;
+        impl->kv = (int)kv;
+        impl->ok = true;
+    } catch (...) {
+        impl->ok = false;
+    }
+}
+
+NnCudaLayerSoak::~NnCudaLayerSoak() {
+    if (impl != nullptr) {
+        if (impl->handle != nullptr) cublasDestroy(impl->handle);
+        if (impl->weight != nullptr) cudaFree(impl->weight);
+        if (impl->input != nullptr) cudaFree(impl->input);
+        if (impl->output != nullptr) cudaFree(impl->output);
+        delete impl;
+    }
+}
+
+double NnCudaLayerSoak::runOnceMs() {
+    if (impl == nullptr || !impl->ok) return -1.0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    try {
+        const auto start = std::chrono::steady_clock::now();
+        const int rows[7] = {impl->dim, impl->dim, impl->kv, impl->kv, impl->hidden, impl->hidden, impl->dim};
+        const int cols[7] = {impl->dim, impl->dim, impl->dim, impl->dim, impl->dim, impl->dim, impl->hidden};
+        for (int i = 0; i < 7; ++i) {
+            NN_CUBLAS_CHECK(cublasSgemv(
+                impl->handle, CUBLAS_OP_N, rows[i], cols[i], &alpha,
+                impl->weight, rows[i], impl->input, 1, &beta, impl->output, 1));
+        }
+        NN_CUDA_CHECK(cudaDeviceSynchronize());
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    } catch (...) {
+        return -1.0;
+    }
+}
+
 double nnCudaProfileLayerMs(NnUint gpuIndex, unsigned dim, unsigned hiddenDim, unsigned nHeads, unsigned nKvHeads) {
     if (dim == 0u) return 0.0;
     const unsigned hidden = hiddenDim == 0u ? dim : hiddenDim;

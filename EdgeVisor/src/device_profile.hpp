@@ -8,6 +8,22 @@
 #include <string>
 #include <vector>
 
+// One hardware sample. Negative fields are unknown. The caller sets timestampMs.
+struct HardwareTick {
+    double timestampMs = 0.0;
+    int temperatureC = -1;
+    int thermalLimited = -1;  // -1 unknown, 0 no, 1 yes
+    int freqMhz = -1;
+    int freqMaxMhz = -1;
+    int onExternalPower = -1; // -1 unknown, 0 battery, 1 external
+    int batteryPercent = -1;
+    int thermalHeadroomC = -1; // degrees below the driver slowdown limit, -1 unknown
+};
+
+// Fills every field except timestampMs from this machine. A missing sensor
+// stays unknown and does not throw.
+HardwareTick readHardwareTick();
+
 // Backend used for the one-shot matmul that feeds speed-pack.
 enum ProfileBackend {
     PROFILE_CPU = 0,
@@ -23,6 +39,21 @@ struct ModelShape {
     unsigned maxSeqLen;
     unsigned nLayers;
     int weightType;
+};
+
+// Repeats one representative layer without reallocating, so a short run times
+// the compute itself. runOnceMs returns a negative value when the layer cannot
+// be launched. The one-shot speed profile is unchanged.
+class RepresentativeLayerBench {
+public:
+    explicit RepresentativeLayerBench(const ModelShape &shape);
+    ~RepresentativeLayerBench();
+    double runOnceMs();
+private:
+    struct Impl;
+    Impl *impl;
+    RepresentativeLayerBench(const RepresentativeLayerBench &);
+    RepresentativeLayerBench &operator=(const RepresentativeLayerBench &);
 };
 
 struct SpeedDeviceProfile {
@@ -51,11 +82,14 @@ inline SpeedDeviceProfile unknownSpeedProfile() {
 // Lab data-plane addresses. An explicit --ratios still wins over this table.
 inline bool knownSpeedProfile(const char *host, SpeedDeviceProfile *out) {
     if (host == nullptr || out == nullptr) return false;
-    if (std::strcmp(host, "192.168.137.13") == 0 || std::strcmp(host, "192.168.137.15") == 0) {
+    // 192.168.8.* are the same machines on the lab WiFi.
+    if (std::strcmp(host, "192.168.137.13") == 0 || std::strcmp(host, "192.168.8.46") == 0
+        || std::strcmp(host, "192.168.137.15") == 0 || std::strcmp(host, "192.168.8.23") == 0) {
         *out = makeSpeedProfile(5.8, 22u, "nx");
         return true;
     }
-    if (std::strcmp(host, "192.168.137.16") == 0 || std::strcmp(host, "192.168.137.18") == 0) {
+    if (std::strcmp(host, "192.168.137.16") == 0 || std::strcmp(host, "192.168.8.45") == 0
+        || std::strcmp(host, "192.168.137.18") == 0 || std::strcmp(host, "192.168.8.53") == 0) {
         *out = makeSpeedProfile(7.4, 8u, "nano");
         return true;
     }
@@ -88,9 +122,32 @@ inline double estimateLayerWeightBytes(const ModelShape &shape) {
     return (double)params * bytesPerWeight;
 }
 
+// Test hook: pretend a device has this much free memory, whatever cudaMemGetInfo
+// reports. Edge deployments are memory-constrained in ways a lab T4 is not, and
+// the only honest way to study the shadow budget under that constraint is to
+// vary it directly instead of hoping a bigger model happens to fit worse.
+// 0 means "use the measured value".
+inline unsigned long long &freeBytesOverride() {
+    static unsigned long long value = 0ull;
+    return value;
+}
+
+// Share of free memory the planner is allowed to spend. Defaults to 0.70, the
+// same figure the caps have always used.
+inline double &memoryBudgetFraction() {
+    static double value = 0.70;
+    return value;
+}
+
+inline unsigned long long effectiveFreeBytes(unsigned long long measured) {
+    const unsigned long long overrideValue = freeBytesOverride();
+    return overrideValue > 0ull ? overrideValue : measured;
+}
+
 inline unsigned capFromLayerBytes(unsigned long long freeBytes, double perLayer, unsigned nLayers) {
     if (perLayer < 1.0) return nLayers == 0u ? 8u : nLayers;
-    const double budget = (double)freeBytes * 0.70;
+    const double fraction = memoryBudgetFraction();
+    const double budget = (double)effectiveFreeBytes(freeBytes) * fraction;
     if (budget <= perLayer) return 1u;
     unsigned cap = (unsigned)((budget - perLayer) / perLayer);
     if (cap < 1u) cap = 1u;
@@ -117,8 +174,21 @@ inline unsigned estimateResidentLayerCap(unsigned long long freeBytes, const Mod
     return capFromLayerBytes(freeBytes, perLayer, shape.nLayers);
 }
 
-// Preserve pipeline order. Faster devices fill first, up to cap.
-// Leftover layers stay on the fastest device, matching the lab speed-pack.
+// Distribute layers so the pipeline is balanced, not so the fastest device
+// gets the most.
+//
+// A pipeline's token rate is set by its slowest stage. Stage time is
+// layers * msPerLayer, so throughput is maximised by making those products
+// equal, subject to each device's memory cap. Filling the fastest device first
+// is right for replica serving, where a faster replica should absorb more
+// requests, but in a pipeline it only moves the bottleneck: with four identical
+// T4s it produced 25/1/1/1, which runs at the speed of a single card.
+//
+// Assignment is proportional: device i gets layers proportional to 1/ms_i, so
+// layers_i * ms_i is the same everywhere. Devices whose share exceeds their cap
+// are pinned at the cap and dropped from the pool, and the remaining layers are
+// re-split among the rest. If every device hits its cap there is no balanced
+// solution; the surplus goes to the slowest device, where it costs least.
 inline std::string assignSpeedPack(
     const std::vector<SpeedDeviceProfile> &profiles,
     unsigned nLayers,
@@ -129,32 +199,81 @@ inline std::string assignSpeedPack(
         return liveNodes == nullptr || node >= liveNodes->size() || (*liveNodes)[node] != 0;
     };
     if (nNodes == 0u || nLayers == 0u) return std::string();
-    const unsigned base = nLayers >= nNodes ? 1u : 0u;
-    unsigned left = nLayers;
-    for (unsigned i = 0; i < nNodes && left > 0u; ++i) {
-        if (!isLive(i)) continue;
-        const unsigned give = std::min(base, left);
-        layers[i] = give;
-        left -= give;
-    }
-    std::vector<unsigned> order;
-    order.reserve(nNodes);
+
+    std::vector<unsigned> pool;
+    pool.reserve(nNodes);
     for (unsigned i = 0; i < nNodes; ++i) {
-        if (isLive(i)) order.push_back(i);
+        if (isLive(i)) pool.push_back(i);
     }
-    std::stable_sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
-        if (profiles[a].msPerLayer != profiles[b].msPerLayer)
-            return profiles[a].msPerLayer < profiles[b].msPerLayer;
-        return a < b;
-    });
-    for (unsigned index : order) {
+    if (pool.empty()) return std::string();
+
+    // Every stage needs at least one layer or the chain breaks.
+    unsigned left = nLayers;
+    for (unsigned i : pool) {
         if (left == 0u) break;
-        const unsigned room = profiles[index].cap > layers[index] ? profiles[index].cap - layers[index] : 0u;
-        const unsigned take = std::min(room, left);
-        layers[index] += take;
-        left -= take;
+        layers[i] = 1u;
+        left -= 1u;
     }
-    if (left > 0u && !order.empty()) layers[order[0]] += left;
+
+    // Repeatedly split the remainder proportionally; pin and drop any device
+    // whose proportional share no longer fits under its cap.
+    while (left > 0u && !pool.empty()) {
+        double sumInv = 0.0;
+        for (unsigned i : pool) {
+            const double ms = profiles[i].msPerLayer > 0.0 ? profiles[i].msPerLayer : 1.0;
+            sumInv += 1.0 / ms;
+        }
+        if (sumInv <= 0.0) break;
+
+        unsigned assigned = 0u;
+        std::vector<unsigned> next;
+        next.reserve(pool.size());
+        for (unsigned i : pool) {
+            const double ms = profiles[i].msPerLayer > 0.0 ? profiles[i].msPerLayer : 1.0;
+            const double share = ((1.0 / ms) / sumInv) * (double)left;
+            unsigned give = (unsigned)(share + 0.5);
+            if (give == 0u) give = 1u;
+            const unsigned room = profiles[i].cap > layers[i] ? profiles[i].cap - layers[i] : 0u;
+            const unsigned take = std::min(give, room);
+            layers[i] += take;
+            assigned += take;
+            // Under the cap and still had room: eligible for another round.
+            if (layers[i] < profiles[i].cap) next.push_back(i);
+        }
+        if (assigned == 0u) break;
+        left = left >= assigned ? left - assigned : 0u;
+        if (left == 0u) break;
+        if (next.size() == pool.size()) {
+            // Nothing got pinned, so the split is already balanced; hand the
+            // rounding remainder to the device with the smallest stage time.
+            unsigned best = next[0];
+            for (unsigned i : next) {
+                const double ti = (double)(layers[i] + 1u) * profiles[i].msPerLayer;
+                const double tb = (double)(layers[best] + 1u) * profiles[best].msPerLayer;
+                if (ti < tb) best = i;
+            }
+            const unsigned room = profiles[best].cap > layers[best]
+                ? profiles[best].cap - layers[best] : 0u;
+            if (room == 0u) break;
+            layers[best] += 1u;
+            left -= 1u;
+        }
+        pool.swap(next);
+    }
+
+    // Unplaceable surplus. This should be rare: it only happens when every
+    // device is at its cap and layers remain, which means the model does not
+    // fit. Put the overflow on the slowest device and let the existing
+    // allocation-failure path shrink it, rather than silently exceeding a cap
+    // that was derived from free memory.
+    if (left > 0u) {
+        unsigned slowest = 0u;
+        for (unsigned i = 0; i < nNodes; ++i) {
+            if (isLive(i) && profiles[i].msPerLayer > profiles[slowest].msPerLayer) slowest = i;
+        }
+        layers[slowest] += left;
+    }
+
     std::ostringstream out;
     for (unsigned i = 0; i < nNodes; ++i) {
         if (i > 0u) out << '*';
@@ -280,39 +399,385 @@ struct BoundaryOverlap {
     unsigned rightHolds = 0u;
 };
 
-// After the primary split, each stage may keep extra layers in the memory
-// cap that estimateLayerCap already computed (70% of free memory, one layer
-// of headroom). A stage with two neighbors spends that spare on both
-// boundaries. A stage is never emptied, so a neighbor with N primary layers
-// can donate at most N-1.
+// How many extra layers fit in each device's pipeline bubble.
+//
+// A single-batch token walks the stages one after another, so device i is
+// free for the whole time the other stages are computing. The startup probe
+// already measured that compute as msPerLayer, and the primary split says how
+// many layers each stage owns. idle_i / ms_i is therefore the shadow depth
+// that finishes before the token moves on. A shadow pass skips the peer sync,
+// so charging the full layer time is a little tighter than the real bubble.
+// An unknown rate (ms <= 0) leaves the device uncapped rather than wiping its
+// shadow on a missed probe.
+inline std::vector<unsigned> bubbleShadowLayerCap(
+    const std::vector<unsigned> &primary,
+    const std::vector<double> &msPerLayer) {
+    const unsigned n = (unsigned)std::min(primary.size(), msPerLayer.size());
+    std::vector<unsigned> cap(primary.size(), 0xffffffffu);
+    for (unsigned i = 0; i < n; ++i) {
+        if (!(msPerLayer[i] > 0.0)) continue;
+        double otherMs = 0.0;
+        bool blocked = false;
+        for (unsigned j = 0; j < n; ++j) {
+            if (j == i || primary[j] == 0u) continue;
+            if (!(msPerLayer[j] > 0.0)) {
+                blocked = true;
+                break;
+            }
+            otherMs += (double)primary[j] * msPerLayer[j];
+        }
+        if (blocked) continue;
+        const double layers = otherMs / msPerLayer[i];
+        if (!(layers > 0.0)) {
+            cap[i] = 0u;
+        } else if (layers >= (double)0xffffffffu) {
+            cap[i] = 0xffffffffu;
+        } else {
+            cap[i] = (unsigned)(layers + 1e-9);
+        }
+    }
+    return cap;
+}
+
+// Split one device's shadow budget between the two directions it can serve.
+//
+// budget is what this device can hold on top of its own primary layers.
+// leftCap and rightCap are the most the left and right neighbor can take
+// without being emptied, so nothing here can hand a neighbor more than
+// primary-1. A zero cap or a zero weight means that side does not take part:
+// the whole budget then goes to the other side, still under its cap. Two
+// inactive sides leave both directions at zero.
+//
+// Both sides take their proportional floor first, computed with the largest
+// remainder method so integer rounding is decided once instead of drifting
+// over calls. The leftover goes one layer at a time to a side that is still
+// under its cap and has the larger remainder; an exact tie goes left. A side
+// that just took a layer drops its remainder to zero, so the next tie does not
+// keep feeding the same side.
+//
+// The weights are a starting point for experiments, not a tuned result: they
+// exist so a run can be biased without touching the caps.
+inline void splitDeviceShadowBudget(
+    unsigned budget,
+    unsigned leftCap,
+    unsigned rightCap,
+    unsigned leftWeight,
+    unsigned rightWeight,
+    unsigned *xLeft,
+    unsigned *xRight) {
+    unsigned left = 0u;
+    unsigned right = 0u;
+    const bool leftActive = leftCap > 0u && leftWeight > 0u;
+    const bool rightActive = rightCap > 0u && rightWeight > 0u;
+    if (leftActive && rightActive) {
+        const unsigned long long weightSum =
+            (unsigned long long)leftWeight + (unsigned long long)rightWeight;
+        const unsigned long long wanted = std::min<unsigned long long>(
+            (unsigned long long)budget, (unsigned long long)leftCap + (unsigned long long)rightCap);
+        const unsigned long long leftScaled = wanted * (unsigned long long)leftWeight;
+        const unsigned long long rightScaled = wanted * (unsigned long long)rightWeight;
+        left = (unsigned)std::min<unsigned long long>(leftScaled / weightSum, (unsigned long long)leftCap);
+        right = (unsigned)std::min<unsigned long long>(rightScaled / weightSum, (unsigned long long)rightCap);
+        unsigned long long leftRemainder = leftScaled % weightSum;
+        unsigned long long rightRemainder = rightScaled % weightSum;
+        unsigned long long leftover =
+            wanted - (unsigned long long)left - (unsigned long long)right;
+        while (leftover > 0ull) {
+            const bool leftRoom = left < leftCap;
+            const bool rightRoom = right < rightCap;
+            if (!leftRoom && !rightRoom) break;
+            bool takeLeft = leftRoom;
+            if (leftRoom && rightRoom) takeLeft = leftRemainder >= rightRemainder;
+            if (takeLeft) {
+                left += 1u;
+                leftRemainder = 0ull;
+            } else {
+                right += 1u;
+                rightRemainder = 0ull;
+            }
+            leftover -= 1ull;
+        }
+    } else if (leftActive) {
+        left = std::min(budget, leftCap);
+    } else if (rightActive) {
+        right = std::min(budget, rightCap);
+    }
+    if (xLeft != nullptr) *xLeft = left;
+    if (xRight != nullptr) *xRight = right;
+}
+
+// What a device says about itself at startup, plus the round trip this side
+// measured to it. A field keeps -1 (or zero probes) when nothing could be read,
+// and unknown never counts as low risk.
+struct DeviceCondition {
+    int temperatureC = -1;     // -1 unknown
+    int thermalLimited = -1;   // -1 unknown, 0 no, 1 yes
+    int onExternalPower = -1;  // -1 unknown, 0 on battery, 1 on external power
+    unsigned probesSent = 0u;
+    unsigned probesLost = 0u;
+    double rttMeanMs = -1.0;   // <0 unknown
+    double rttJitterMs = -1.0; // <0 unknown. Jitter is the mean absolute deviation from the mean.
+};
+
+// The tier edges below are a fixed starting point chosen before the experiment
+// ran; they are not fitted optimal parameters. Zero means "no evidence", and
+// combineDeviceRiskWeight keeps that out of the low tier.
+inline unsigned thermalRisk(const DeviceCondition &condition) {
+    // A known temperature is evidence even when the throttle flags are missing.
+    // Jetson reports [N/A] for those flags and keeps the real value in sysfs.
+    if (condition.thermalLimited == 1 || condition.temperatureC >= 83) return 4u;
+    if (condition.temperatureC >= 0) return condition.temperatureC >= 70 ? 3u : 2u;
+    return 0u;
+}
+
+// Loss is part of the tier even though a TCP probe cannot observe it: a caller
+// that does know the loss can set probesLost and get the top tier.
+inline unsigned networkRisk(const DeviceCondition &condition) {
+    if (condition.probesSent == 0u || condition.rttMeanMs < 0.0) return 0u;
+    const double jitter = condition.rttJitterMs < 0.0 ? 0.0 : condition.rttJitterMs;
+    if (condition.probesLost == 0u && condition.rttMeanMs < 20.0 && jitter < 5.0) return 2u;
+    if (condition.probesLost == 0u && condition.rttMeanMs < 80.0 && jitter < 20.0) return 3u;
+    return 4u;
+}
+
+inline unsigned powerRisk(const DeviceCondition &condition) {
+    if (condition.onExternalPower < 0) return 0u;
+    return condition.onExternalPower == 0 ? 4u : 2u;
+}
+
+// The worst known tier wins, because a device only has to be bad in one way to
+// slow the pipeline. With no evidence at all the device lands in the middle
+// tier, since unknown is not the same as healthy.
+inline unsigned combineDeviceRiskWeight(const DeviceCondition &condition) {
+    const unsigned thermal = thermalRisk(condition);
+    const unsigned network = networkRisk(condition);
+    const unsigned power = powerRisk(condition);
+    unsigned weight = thermal > network ? thermal : network;
+    if (power > weight) weight = power;
+    return weight > 0u ? weight : 3u;
+}
+
+// One `nvidia-smi --format=csv,noheader` line: the temperature followed by the
+// hw thermal, sw thermal, and hw power brake slowdown reasons. Fewer than four
+// fields is a malformed line and returns false. A field that does not parse
+// leaves its own value unknown instead of failing the whole line.
+inline bool parseNvidiaTemperatureCsv(const char *line, int *tempC, int *thermalLimited) {
+    if (tempC != nullptr) *tempC = -1;
+    if (thermalLimited != nullptr) *thermalLimited = -1;
+    if (line == nullptr || tempC == nullptr || thermalLimited == nullptr) return false;
+    std::vector<std::string> fields;
+    std::string field;
+    for (const char *cursor = line; ; ++cursor) {
+        const bool atEnd = *cursor == '\0';
+        if (!atEnd && *cursor != ',') {
+            field.push_back(*cursor);
+            continue;
+        }
+        const std::size_t first = field.find_first_not_of(" \t\r\n\v\f");
+        const std::size_t last = field.find_last_not_of(" \t\r\n\v\f");
+        fields.push_back(first == std::string::npos ? std::string() : field.substr(first, last - first + 1u));
+        field.clear();
+        if (atEnd) break;
+    }
+    if (fields.size() < 4u) return false;
+    char *stop = nullptr;
+    const long parsed = std::strtol(fields[0].c_str(), &stop, 10);
+    if (stop != fields[0].c_str() && *stop == '\0') *tempC = (int)parsed;
+    unsigned active = 0u;
+    unsigned notActive = 0u;
+    for (std::size_t i = 1u; i < 4u; ++i) {
+        if (fields[i] == "Active") ++active;
+        else if (fields[i] == "Not Active") ++notActive;
+    }
+    if (active > 0u) *thermalLimited = 1;
+    else if (notActive == 3u) *thermalLimited = 0;
+    return true;
+}
+
+// sysfs reports supplies one line at a time, so the caller does the scanning and
+// this decides the single state. Discharging wins over an online main: a laptop
+// on a weak charger is still spending battery.
+inline int externalPowerFromSupplies(bool sawSupply, bool batteryDischarging, bool externalOnline) {
+    if (!sawSupply) return -1;
+    if (batteryDischarging) return 0;
+    if (externalOnline) return 1;
+    return -1;
+}
+
+// Fills the thermal and power fields from this machine. The network fields stay
+// unknown: only the caller knows the peer it wants to measure.
+DeviceCondition measureLocalCondition();
+
+// Parses a shadow priority file: one stage per line, "<stage> <priority>
+// [reason]". Blank lines and lines whose first non-space character is '#'
+// are skipped, so config/shadow_priorities.example reads as written. The
+// priority token is case-insensitive: low=2, mid and medium=3, high=4. A later
+// line for the same stage wins, and a stage that never appears keeps mid, so
+// an empty file means the equal split. On a bad stage index or an unknown
+// token the reason lands in error and parsing stops; weights keep whatever was
+// already written.
+inline bool parseShadowPriorityText(
+    const std::string &text,
+    unsigned nStages,
+    std::vector<unsigned> *weights,
+    std::string *error) {
+    if (weights == nullptr) return false;
+    weights->assign(nStages, 3u);
+    std::size_t pos = 0u;
+    unsigned lineNumber = 0u;
+    while (pos < text.size()) {
+        const std::size_t newline = text.find('\n', pos);
+        const std::size_t lineEnd = newline == std::string::npos ? text.size() : newline;
+        std::string line = text.substr(pos, lineEnd - pos);
+        pos = newline == std::string::npos ? text.size() : newline + 1u;
+        ++lineNumber;
+        const std::size_t first = line.find_first_not_of(" \t\r\v\f");
+        if (first == std::string::npos) continue;
+        if (line[first] == '#') continue;
+        std::istringstream fields(line.substr(first));
+        std::string indexToken;
+        if (!(fields >> indexToken)) continue;
+        char *stop = nullptr;
+        const unsigned long index = std::strtoul(indexToken.c_str(), &stop, 10);
+        if (stop == indexToken.c_str() || *stop != '\0') {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": stage '" + indexToken + "' is not a number";
+            }
+            return false;
+        }
+        if (index >= (unsigned long)nStages) {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": stage " + indexToken
+                    + " is outside " + std::to_string(nStages) + " stages";
+            }
+            return false;
+        }
+        std::string priorityToken;
+        if (!(fields >> priorityToken)) {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": stage " + indexToken + " has no priority";
+            }
+            return false;
+        }
+        std::string token = priorityToken;
+        for (std::size_t i = 0u; i < token.size(); ++i) {
+            if (token[i] >= 'A' && token[i] <= 'Z') token[i] = (char)(token[i] - 'A' + 'a');
+        }
+        unsigned weight = 0u;
+        if (token == "low") weight = 2u;
+        else if (token == "mid" || token == "medium") weight = 3u;
+        else if (token == "high") weight = 4u;
+        else {
+            if (error != nullptr) {
+                *error = "line " + std::to_string(lineNumber) + ": unknown priority '" + priorityToken + "'";
+            }
+            return false;
+        }
+        // A later line for the same stage wins.
+        (*weights)[index] = weight;
+    }
+    return true;
+}
+
+// Low and high trade places. Reversed mode reads the same file as priority
+// mode but asks the opposite question: whether the experiment holds up when
+// the quiet neighbors get the shadow instead.
+inline void reverseShadowPriorityWeights(std::vector<unsigned> *weights) {
+    if (weights == nullptr) return;
+    for (std::size_t i = 0u; i < weights->size(); ++i) {
+        if ((*weights)[i] == 2u) (*weights)[i] = 4u;
+        else if ((*weights)[i] == 4u) (*weights)[i] = 2u;
+    }
+}
+
+// Exchange the allocation weight of one lowest-risk stage with one
+// highest-risk stage. The multiset of weights is unchanged. Returns false
+// when every stage has the same weight, which is not a mismatch control.
+inline bool permuteExtremeDeviceWeights(
+    std::vector<unsigned> *weights,
+    unsigned *lowStage,
+    unsigned *highStage) {
+    if (weights == nullptr || weights->size() < 2u) return false;
+    unsigned lo = 0u;
+    unsigned hi = 0u;
+    for (unsigned i = 1u; i < (unsigned)weights->size(); ++i) {
+        if ((*weights)[i] < (*weights)[lo]) lo = i;
+        if ((*weights)[i] > (*weights)[hi]) hi = i;
+    }
+    if ((*weights)[lo] == (*weights)[hi]) return false;
+    const unsigned lowWeight = (*weights)[lo];
+    (*weights)[lo] = (*weights)[hi];
+    (*weights)[hi] = lowWeight;
+    if (lowStage != nullptr) *lowStage = lo;
+    if (highStage != nullptr) *highStage = hi;
+    return true;
+}
+
+// After the primary split, each stage may keep extra layers up to the tighter
+// of two caps: leftover memory (70% of free memory, one layer of headroom)
+// and the bubble depth from bubbleShadowLayerCap. A null bubble cap means
+// "memory only", which is what the older callers asked for. A stage with two
+// neighbors divides its spare between both boundaries with
+// splitDeviceShadowBudget. A stage is never emptied, so a neighbor with N
+// primary layers can take at most N-1 from this stage.
+//
+// priorityWeight scores the neighbor being protected, not the stage holding
+// the copy: a high-priority neighbor pulls more shadow onto both of its peers.
+// A null vector, or a vector shorter than the pipeline, means mid weights
+// everywhere, which reproduces the equal split the older callers relied on.
+//
+// linkPriority is per boundary, same order as the returned overlaps. It raises
+// only that boundary: the weight used on a side is the larger of the neighbor's
+// device priority and that boundary's link priority. Zero means the link was
+// not measured, and an unmeasured link does not change the device priority.
+inline unsigned stageShadowBudget(
+    unsigned primary,
+    unsigned memoryCap,
+    bool bubbleKnown,
+    unsigned bubbleCap,
+    int experimentCap) {
+    const unsigned memSpare = memoryCap > primary ? memoryCap - primary : 0u;
+    unsigned limit = memSpare;
+    if (bubbleKnown) limit = std::min(limit, bubbleCap);
+    if (experimentCap >= 0) limit = std::min(limit, (unsigned)experimentCap);
+    return limit;
+}
+
 inline std::vector<BoundaryOverlap> assignBoundaryOverlap(
     const std::vector<unsigned> &primary,
-    const std::vector<unsigned> &memoryCap) {
+    const std::vector<unsigned> &memoryCap,
+    const std::vector<unsigned> *bubbleCap = nullptr,
+    const std::vector<unsigned> *priorityWeight = nullptr,
+    const std::vector<unsigned> *linkPriority = nullptr,
+    int experimentBudgetCap = -1) {
     const unsigned n = (unsigned)std::min(primary.size(), memoryCap.size());
     std::vector<unsigned> spare(n, 0u);
     for (unsigned i = 0; i < n; ++i) {
-        spare[i] = memoryCap[i] > primary[i] ? memoryCap[i] - primary[i] : 0u;
+        const bool bubbleKnown = bubbleCap != nullptr && i < bubbleCap->size() && (*bubbleCap)[i] != 0xffffffffu;
+        const unsigned bubble = bubbleKnown ? (*bubbleCap)[i] : 0u;
+        spare[i] = stageShadowBudget(primary[i], memoryCap[i], bubbleKnown, bubble, experimentBudgetCap);
     }
     std::vector<BoundaryOverlap> overlaps(n < 2u ? 0u : n - 1u);
-    bool grew = true;
-    while (grew) {
-        grew = false;
-        for (unsigned boundary = 0u; boundary + 1u < n; ++boundary) {
-            const unsigned left = boundary;
-            const unsigned right = boundary + 1u;
-            const unsigned maxLeftHolds = primary[right] > 0u ? primary[right] - 1u : 0u;
-            const unsigned maxRightHolds = primary[left] > 0u ? primary[left] - 1u : 0u;
-            if (spare[left] > 0u && overlaps[boundary].leftHolds < maxLeftHolds) {
-                overlaps[boundary].leftHolds += 1u;
-                spare[left] -= 1u;
-                grew = true;
-            }
-            if (spare[right] > 0u && overlaps[boundary].rightHolds < maxRightHolds) {
-                overlaps[boundary].rightHolds += 1u;
-                spare[right] -= 1u;
-                grew = true;
-            }
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned leftCap = i > 0u && primary[i - 1u] > 0u ? primary[i - 1u] - 1u : 0u;
+        const unsigned rightCap = i + 1u < n && primary[i + 1u] > 0u ? primary[i + 1u] - 1u : 0u;
+        unsigned leftWeight = i > 0u && priorityWeight != nullptr
+            && i - 1u < priorityWeight->size() ? (*priorityWeight)[i - 1u] : 3u;
+        unsigned rightWeight = i + 1u < n && priorityWeight != nullptr
+            && i + 1u < priorityWeight->size() ? (*priorityWeight)[i + 1u] : 3u;
+        if (linkPriority != nullptr && i > 0u && (i - 1u) < linkPriority->size()
+            && (*linkPriority)[i - 1u] > leftWeight) {
+            leftWeight = (*linkPriority)[i - 1u];
         }
+        if (linkPriority != nullptr && i + 1u < n && i < linkPriority->size()
+            && (*linkPriority)[i] > rightWeight) {
+            rightWeight = (*linkPriority)[i];
+        }
+        unsigned xLeft = 0u;
+        unsigned xRight = 0u;
+        splitDeviceShadowBudget(spare[i], leftCap, rightCap, leftWeight, rightWeight, &xLeft, &xRight);
+        if (i > 0u) overlaps[i - 1u].rightHolds = xLeft;
+        if (i + 1u < n) overlaps[i].leftHolds = xRight;
     }
     return overlaps;
 }
@@ -322,6 +787,36 @@ inline std::string formatBoundaryOverlap(const std::vector<BoundaryOverlap> &ove
     for (size_t i = 0u; i < overlaps.size(); ++i) {
         if (i > 0u) out << ';';
         out << overlaps[i].leftHolds << ',' << overlaps[i].rightHolds;
+    }
+    return out.str();
+}
+
+// Layer intervals actually placed. A middle stage is placement-complete only
+// when the previous stage's prefix and the next stage's suffix meet or
+// overlap. The sum of the two counts is not that check. This does not mean a
+// takeover ran, and a first or last stage is not a takeover target.
+inline std::string formatShadowPlacement(
+    const std::vector<unsigned> &primary,
+    const std::vector<BoundaryOverlap> &overlaps) {
+    std::ostringstream out;
+    unsigned cursor = 0u;
+    for (unsigned s = 0u; s < (unsigned)primary.size(); ++s) {
+        const unsigned begin = cursor;
+        const unsigned end = cursor + primary[s];
+        cursor = end;
+        if (s > 0u) out << ' ';
+        out << "stage" << s << "=[" << begin << "," << end << ")";
+        if (s == 0u || s + 1u == (unsigned)primary.size()) {
+            out << " edge";
+            continue;
+        }
+        const unsigned prefix = (s - 1u) < overlaps.size() ? overlaps[s - 1u].leftHolds : 0u;
+        const unsigned suffix = s < overlaps.size() ? overlaps[s].rightHolds : 0u;
+        const unsigned prefixEnd = begin + std::min(prefix, end - begin);
+        const unsigned suffixBegin = end - std::min(suffix, end - begin);
+        out << " prefix=[" << begin << "," << prefixEnd << ")";
+        out << " suffix=[" << suffixBegin << "," << end << ")";
+        out << (prefixEnd >= suffixBegin ? " placement-cover=complete" : " placement-cover=gap");
     }
     return out.str();
 }

@@ -126,7 +126,7 @@ else
     DELETE_CMD = rm -fv
 endif
 
-DEPS += io-profile.o product-log.o device-profile.o
+DEPS += io-profile.o product-log.o device-profile.o sustained-profile.o
 
 .PHONY: clean dllama
 
@@ -147,6 +147,8 @@ io-profile.o: src/nn/io-profile.cpp
 product-log.o: src/product_log.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 device-profile.o: src/device_profile.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+sustained-profile.o: src/sustained_profile.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 nn-network-local.o: src/nn/nn-network-local.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -211,6 +213,8 @@ dynamic-layer.o: src/dynamic/dynamic_layer.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 tpot-algorithm.o: src/dynamic/tpot_algorithm.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+algo2.o: src/dynamic/algo2.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 dynamic-tpot.o: src/dynamic/dynamic_tpot.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 kv-collector.o: src/dynamic/kv_collector.cpp
@@ -223,6 +227,9 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
 dynamic-tpot-test: src/test/test_dynamic_tpot_algorithm.cpp tpot-algorithm.o
+	$(CXX) $(CXXFLAGS) $(filter-out %.hpp %.h, $^) -o $@ $(LIBS)
+
+algo2-test: src/test/test_algo2.cpp algo2.o tpot-algorithm.o
 	$(CXX) $(CXXFLAGS) $(filter-out %.hpp %.h, $^) -o $@ $(LIBS)
 
 failover-gate-test: src/test/test_failover_gate.cpp
@@ -240,14 +247,14 @@ mmap-range-test: src/test/test_mmap_range.cpp
 weight-chunking-test: src/test/test_weight_chunking.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
-app-cli-test: src/test/test_app_cli.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+app-cli-test: src/test/test_app_cli.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 # --- (您的新测试目标) ---
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 
-worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o ablation.o ${DEPS}
@@ -256,32 +263,32 @@ Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-netwo
 pointer-swizzling-microbench: src/test/pointer_swizzling_microbench.cpp nn-quants.o nn-core.o nn-executor.o nn-cpu.o nn-cpu-ops.o llamafile-sgemm.o plan-command.o ablation.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-dllama: src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+dllama: src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-dllama-api: src/dllama-api.cpp terminal-ui.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+dllama-api: src/dllama-api.cpp terminal-ui.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp terminal-ui.o nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp terminal-ui.o nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 # Include auto-generated dependency files (created by -MMD).
 -include $(wildcard *.d)
 
-pp-failover-network-test: src/test/test_pp_failover_network.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+pp-failover-network-test: src/test/test_pp_failover_network.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -o $@ $(LIBS)
 
 # Optional model-backed test; controller synchronization is confined to this
 # executable. Build in CI, run on devices with user-prepared model files.
-reserved-join-test: src/test/test_reserved_join.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+reserved-join-test: src/test/test_reserved_join.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) src/test/test_reserved_join.cpp $(filter %.o,$^) -o $@ $(LIBS)
 
-delayed-sample-worker-test: src/test/test_delayed_sample.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o dynamic-tpot.o kv-collector.o ${DEPS}
+delayed-sample-worker-test: src/test/test_delayed_sample.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -Wl,--wrap=send -o $@ $(LIBS)
 
 # Model-free Linux acceptance gate. GPU builds run the same host-side tests.
 CHECK_TESTS := nn-cpu-test nn-cpu-ops-test tokenizer-test app-cli-test \
- dynamic-tpot-test failover-gate-test token-timing-test device-profile-test \
+ dynamic-tpot-test algo2-test failover-gate-test token-timing-test device-profile-test \
  pp-failover-network-test
 .PHONY: check
 check: $(CHECK_TESTS) reserved-join-test delayed-sample-worker-test

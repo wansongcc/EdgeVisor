@@ -10,6 +10,7 @@
 #include "app.hpp"
 #include "product_log.hpp"
 #include "token_timing.hpp"
+#include "dynamic/algo2.hpp"
 #include "terminal_ui.hpp"
 #include <stdexcept>
 #include <cmath>
@@ -864,7 +865,9 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         try {
             context->inference->forward();
         } catch (const NnPeerOfflineException &e) {
-            armSessionRestart(e.peerNodeIndex);
+            std::printf("inference stopped peer=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
+            std::fflush(stdout);
+            throw std::runtime_error(std::string("inference stopped: ") + e.what());
         } catch (const NnPeerTimeoutException &e) {
             armSessionRestart(e.peerNodeIndex, true);
         }
@@ -1129,9 +1132,32 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     // forward(), worker/profile waits, sampling/decoding, and token output/flush.
     if (context->args->showTerminalUi) edgeVisorUiOpen();
     const auto predWallStart = std::chrono::steady_clock::now();
+    dllama::dynamic_tpot::algo2ResetTokenClock();
+    // Anchor timestamps for every position a degradation can start at. The
+    // matrix injects several faults in one episode, so one mark is not enough.
+    std::vector<NnUint> markPositions;
+    if (const char *mark = std::getenv("DLLAMA_MARK_POS")) {
+        std::stringstream ss{std::string(mark)};
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (item.empty()) continue;
+            try { markPositions.push_back((NnUint)std::stoul(item)); } catch (...) {}
+        }
+    }
+    std::vector<NnUint> markedPositions;
     for (; pos < maxPos; pos++) {
         const auto tokenWallStart = std::chrono::steady_clock::now();
+        for (NnUint markPos : markPositions) {
+            if (pos != markPos) continue;
+            if (std::find(markedPositions.begin(), markedPositions.end(), pos) != markedPositions.end()) continue;
+            markedPositions.push_back(pos);
+            const unsigned long long monoNs = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::printf("[e1-mark] pos=%u t_mono_ns=%llu\n", (unsigned)pos, monoNs);
+            std::fflush(stdout);
+        }
         maybeJoinReservedDevice(context, pos);
+        maybeRejoinDroppedDevice(context, pos);
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
         forwardOrRestart();
@@ -1145,7 +1171,9 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 context->network != nullptr &&
                 context->inference->tryReceiveLastStageSampledToken(lastStageToken, nullptr);
         } catch (const NnPeerOfflineException &e) {
-            armSessionRestart(e.peerNodeIndex);
+            std::printf("inference stopped peer=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
+            std::fflush(stdout);
+            throw std::runtime_error(std::string("inference stopped: ") + e.what());
         } catch (const NnPeerTimeoutException &e) {
             armSessionRestart(e.peerNodeIndex, true);
         }
@@ -1493,6 +1521,21 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
 #endif
         token = haveLastStageToken ? (int)lastStageToken : context->sampler->sample(context->inference->logitsPipe);
+        dllama::dynamic_tpot::algo2NoteTokenComplete((NnUint)pos, pos + 1u, true);
+        context->inference->pollRevisedSwitchReconcile();
+        // Per-token completion timestamps. The matrix measures "trigger to the
+        // first token emitted on the new route", which needs the emission time
+        // of individual tokens, not just the episode total.
+        if (markPositions.size() > 0u) {
+            const unsigned long long tokenMonoNs =
+                (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::printf("[e1-token] pos=%u t_mono_ns=%llu\n", (unsigned)pos, tokenMonoNs);
+            std::fflush(stdout);
+        }
+        // KV for this position is already written. Copy a chunk now and leave
+        // the residual for the migration trigger.
+        context->inference->runPipeLivePatch(pos);
 
         char *piece = context->tokenizer->decode(token);
         EosDetectorType eosType = eosDetector.append(token, piece);
@@ -1542,11 +1585,20 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
         predTotalTime += predTime + syncTime + predBubbleTime;
         if (eosType == EOS) {
-            pos++;
-            break;
+            const char *ignoreEos = std::getenv("DLLAMA_IGNORE_EOS");
+            if (ignoreEos == nullptr || ignoreEos[0] != '1') {
+                pos++;
+                break;
+            }
         }
     }
     const auto predWallEnd = std::chrono::steady_clock::now();
+    {
+        const unsigned long long monoNs = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            predWallEnd.time_since_epoch()).count();
+        std::printf("[e1-end] pos=%u t_mono_ns=%llu\n", (unsigned)pos, monoNs);
+        std::fflush(stdout);
+    }
 
     NnUint nEvalTokens = nInputTokens - 1;
     NnUint nPredTokens = pos - nEvalTokens;
@@ -1855,6 +1907,29 @@ static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int
             std::printf("%s\n", nodeLine.c_str());
         }
     }
+    // Occupancy line: per node, how much of this token's wall time went to
+    // compute versus how long the device was free. Emitted for every episode
+    // token regardless of the general timing flag, because the bubble-coverage
+    // study needs the full series and nothing else.
+    //
+    // Two idle figures, because they answer different questions:
+    //   idle_avail = wall - exec
+    //       Everything the stage does not spend computing. A PP stage finishes
+    //       its slice and then waits for the rest of the ring to come round,
+    //       so most of this is real slack that a shadow pass could fill.
+    //   idle_strict = wall - exec - sync
+    //       The subset where the stage is not even waiting on a peer. Smaller,
+    //       and the conservative number when arguing that shadow work hides.
+    for (const LlmPerfPacket &packet : perf) {
+        const double execMs = (double)packet.execUs / 1000.0;
+        const double syncMs = (double)packet.syncUs / 1000.0;
+        const double idleAvail = wallMs > execMs ? wallMs - execMs : 0.0;
+        const double idleStrict = wallMs > execMs + syncMs ? wallMs - execMs - syncMs : 0.0;
+        std::printf("[occupancy] pos=%u node=%u stage=%u wall_ms=%.2f exec_ms=%.2f "
+                    "sync_ms=%.2f idle_avail_ms=%.2f idle_strict_ms=%.2f\n",
+            (unsigned)pos, (unsigned)packet.nodeIndex, (unsigned)packet.stageIndex,
+            wallMs, execMs, syncMs, idleAvail, idleStrict);
+    }
     std::fflush(stdout);
     appendEpisodeTokenCommit(phase, round, pos, inputToken, sampledToken);
     return sampledToken;
@@ -1904,8 +1979,11 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
     if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
         throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
     }
-    if (rounds.size() != 5u) {
-        throw std::runtime_error("Formal E1 episode requires exactly five ROUND records");
+    // The round count used to be pinned to five because every formal run had
+    // five. Different agent workloads have different tool-call cadences, so the
+    // count is now whatever the script declares.
+    if (rounds.empty()) {
+        throw std::runtime_error("Episode script declares no ROUND records");
     }
     NnUint pos = 0u;
     int currentToken = 0;
@@ -1927,7 +2005,9 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
             appendEpisodeEvent("tool_shadow_run", roundNumber, pos, 0u, toolShadowUs);
         }
         if (std::getenv("DLLAMA_BACKGROUND_PRECOPY") != nullptr) {
-            const unsigned long long bgUs = context->inference->runBackgroundPreCopy(pos);
+            // Hold ownership until the migration trigger. The copy is the
+            // prefix; the trigger sends the delta and switches.
+            const unsigned long long bgUs = context->inference->runBackgroundPreCopy(pos, true);
             if (bgUs > 0u) {
                 appendEpisodeEvent("bg_precopy_run", roundNumber, pos, 0u, bgUs);
             }
@@ -2235,8 +2315,8 @@ static void inferenceRunMultiSessionEpisode(AppInferenceContext *context, const 
     if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
         throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
     }
-    if (rounds.size() != 5u) {
-        throw std::runtime_error("Formal E3 episode requires exactly five ROUND records");
+    if (rounds.empty()) {
+        throw std::runtime_error("Episode script declares no ROUND records");
     }
     if (sessionCount < 1u || sessionCount > 64u) {
         throw std::runtime_error("DLLAMA_MULTI_SESSION_COUNT must be within 1..64");

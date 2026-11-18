@@ -1,4 +1,5 @@
 runtime_logs/
+shadow_profile/
 __pycache__/
 *.py[cod]
 *.log

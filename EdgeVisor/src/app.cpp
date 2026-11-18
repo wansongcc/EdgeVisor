@@ -6901,8 +6901,9 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     std::fflush(stdout);
     if (myNodeIndex == 0u) {
         char uiEvent[96];
-        std::snprintf(uiEvent, sizeof(uiEvent), "node %u offline", (unsigned)deadNodeIndex);
-        edgeVisorUiMarkOffline(stageIndex, uiEvent);
+        std::snprintf(uiEvent, sizeof(uiEvent), "node %u offline, layers moved", (unsigned)deadNodeIndex);
+        edgeVisorUiNoteTakeover(stageIndex, prev, split.frontBegin, split.frontEnd,
+            next, split.backBegin, split.backEnd, uiEvent);
         commitDroppedDevice(dropoutSlot);
     }
     return true;
@@ -7773,6 +7774,9 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     // Controllers from the previous context have been destroyed. A cached
     // migration describes that context's ownership and cannot cross restart.
     planCommandCache().clear();
+    // A rebuilt session does not share the previous plan. The ratio-relax
+    // retry skips probeDevicePool, which is otherwise the only clear of this slot.
+    g_dropped = DroppedDevice();
     if (args != nullptr && args->showTerminalUi) edgeVisorUiEnable(true);
     resolveAutoBackend(args);
     setNnPpFailoverHook(failoverBypassDeadNode);
@@ -8113,6 +8117,8 @@ static void sendJoinPacket(NnNetwork *network, NnUint socketIndex, const LlmDevi
     network->readAck(socketIndex);
 }
 
+static bool waitForJoiningWorkerWeights(NnNetwork *network, NnUint workerIndex, const char *host, int port);
+
 void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
     if (!g_reserved.armed || g_reserved.joined || context == nullptr || context->network == nullptr) return;
     if (context->args == nullptr || g_joinNet == nullptr || position == 0u) return;
@@ -8182,6 +8188,9 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
     NnRootConfigWriter configWriter(network);
     configWriter.writeNet(workerIndex, &g_joinNet->netConfig);
     configWriter.writeNode(workerIndex, &g_joinNet->nodeConfigs[g_reserved.stageIndex]);
+    if (!waitForJoiningWorkerWeights(network, workerIndex,
+            context->args->workerHosts[workerIndex], (int)context->args->workerPorts[workerIndex]))
+        return;
 
     const NnUint kvDim = context->header->kvDim;
     const NnUint endPos = position - 1u;
@@ -8430,6 +8439,21 @@ static void sendKvHistoryToWorker(
     }
 }
 
+static bool waitForJoiningWorkerWeights(NnNetwork *network, NnUint workerIndex, const char *host, int port) {
+    std::printf("🧩 [pool] waiting for %s:%d to finish loading weights\n",
+        host != nullptr ? host : "?", port);
+    std::fflush(stdout);
+    try {
+        network->readAckWithTimeout(workerIndex, 180000ul);
+        return true;
+    } catch (const std::exception &err) {
+        std::printf("⚠️  [pool] worker %s:%d did not finish loading weights: %s\n",
+            host != nullptr ? host : "?", port, err.what());
+        std::fflush(stdout);
+        return false;
+    }
+}
+
 void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
     if (!g_dropped.armed || g_dropped.joined || context == nullptr || context->network == nullptr) return;
     if (context->args == nullptr || g_joinNet == nullptr || position == 0u) return;
@@ -8505,106 +8529,113 @@ void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
     // The config index is the dead node, not the stage slot: a stage can in
     // principle hold more than one node.
     configWriter.writeNode(workerIndex, &g_joinNet->nodeConfigs[g_dropped.deadNode]);
+    if (!waitForJoiningWorkerWeights(network, workerIndex, host, port)) return;
 
-    const NnUint targetNode = g_dropped.deadNode;
-    std::vector<LlmKvTransferHeader> headers;
-    std::vector<std::vector<float>> ks;
-    std::vector<std::vector<float>> vs;
-    // The returning machine lost its memory, so every row comes from the
-    // neighbours that were covering these layers: the front run from the
-    // previous stage, the back run from the next stage. They meet at
-    // frontEnd/backBegin, so together they cover the original stage range.
-    collectKvHistoryForRange(context, g_dropped.prevOwnerNode, g_dropped.layerBegin, g_dropped.frontEnd,
-        targetNode, position, headers, ks, vs);
-    collectKvHistoryForRange(context, g_dropped.nextOwnerNode, g_dropped.backBegin, g_dropped.layerEnd,
-        targetNode, position, headers, ks, vs);
+    try {
+        const NnUint targetNode = g_dropped.deadNode;
+        std::vector<LlmKvTransferHeader> headers;
+        std::vector<std::vector<float>> ks;
+        std::vector<std::vector<float>> vs;
+        // The returning machine lost its memory, so every row comes from the
+        // neighbours that were covering these layers: the front run from the
+        // previous stage, the back run from the next stage. They meet at
+        // frontEnd/backBegin, so together they cover the original stage range.
+        collectKvHistoryForRange(context, g_dropped.prevOwnerNode, g_dropped.layerBegin, g_dropped.frontEnd,
+            targetNode, position, headers, ks, vs);
+        collectKvHistoryForRange(context, g_dropped.nextOwnerNode, g_dropped.backBegin, g_dropped.layerEnd,
+            targetNode, position, headers, ks, vs);
 
-    const size_t expectedRows = (size_t)(g_dropped.layerEnd - g_dropped.layerBegin) * (size_t)position;
-    if (headers.size() != expectedRows)
-        throw std::runtime_error("Rejoined worker KV history is incomplete");
-    sendKvHistoryToWorker(network, workerIndex, targetNode, headers, ks, vs);
+        const size_t expectedRows = (size_t)(g_dropped.layerEnd - g_dropped.layerBegin) * (size_t)position;
+        if (headers.size() != expectedRows)
+            throw std::runtime_error("Rejoined worker KV history is incomplete");
+        sendKvHistoryToWorker(network, workerIndex, targetNode, headers, ks, vs);
 
-    LlmDeviceJoinPacket insert{};
-    insert.magic = LLM_DEVICE_JOIN_MAGIC;
-    insert.version = LLM_DEVICE_JOIN_VERSION;
-    insert.op = LLM_DEVICE_JOIN_INSERT;
-    insert.stageIndex = g_dropped.stageIndex;
-    insert.donorStage = g_dropped.prevStage;
-    // Each neighbour gives back only the extra layers it took during takeover.
-    LlmDeviceJoinPacket disableFront = insert;
-    disableFront.op = LLM_DEVICE_JOIN_DISABLE;
-    disableFront.workerIndex = g_dropped.prevOwnerNode;
-    disableFront.layerBegin = g_dropped.frontBegin;
-    disableFront.layerEnd = g_dropped.frontEnd;
-    LlmDeviceJoinPacket disableBack = disableFront;
-    disableBack.workerIndex = g_dropped.nextOwnerNode;
-    disableBack.layerBegin = g_dropped.backBegin;
-    disableBack.layerEnd = g_dropped.backEnd;
-    // Restore every stage's primary range to what it was before the takeover.
-    LlmDeviceJoinPacket restorePrev{};
-    restorePrev.magic = LLM_DEVICE_JOIN_MAGIC;
-    restorePrev.version = LLM_DEVICE_JOIN_VERSION;
-    restorePrev.op = LLM_DEVICE_JOIN_RESTORE;
-    restorePrev.stageIndex = g_dropped.prevStage;
-    restorePrev.layerBegin = g_dropped.prevStageStartLayer;
-    restorePrev.layerEnd = g_dropped.prevStageEndLayer;
-    LlmDeviceJoinPacket restoreNext = restorePrev;
-    restoreNext.stageIndex = g_dropped.nextStage;
-    restoreNext.layerBegin = g_dropped.nextStageStartLayer;
-    restoreNext.layerEnd = g_dropped.nextStageEndLayer;
-    LlmDeviceJoinPacket restoreSelf = restorePrev;
-    restoreSelf.stageIndex = g_dropped.stageIndex;
-    restoreSelf.layerBegin = g_dropped.layerBegin;
-    restoreSelf.layerEnd = g_dropped.layerEnd;
-    for (NnUint i = 0; i < nWorkers; ++i) {
-        if (i == workerIndex || !network->isSocketActive(i)) continue;
-        sendJoinPacket(network, i, insert);
-        sendJoinPacket(network, i, restorePrev);
-        sendJoinPacket(network, i, restoreNext);
-        sendJoinPacket(network, i, restoreSelf);
-        if (i + 1u == g_dropped.prevOwnerNode) sendJoinPacket(network, i, disableFront);
-        if (i + 1u == g_dropped.nextOwnerNode) sendJoinPacket(network, i, disableBack);
-    }
-    NnUnevenPartitionPlan *livePlan = const_cast<NnUnevenPartitionPlan *>(context->inference->getPartitionPlan());
-    if (livePlan == nullptr) throw std::runtime_error("Rejoined worker has no live partition plan");
-    // The root applies the same restore the workers just applied.
-    for (NnUint s = 0u; s < livePlan->nStages; ++s) {
-        NnStageConfig &stage = livePlan->stages[s];
-        if (stage.stageIndex == g_dropped.prevStage) {
-            stage.endLayer = g_dropped.prevStageEndLayer;
-            stage.nLayers = stage.endLayer - stage.startLayer;
-        } else if (stage.stageIndex == g_dropped.nextStage) {
-            stage.startLayer = g_dropped.nextStageStartLayer;
-            stage.nLayers = stage.endLayer - stage.startLayer;
-        } else if (stage.stageIndex == g_dropped.stageIndex) {
-            stage.startLayer = g_dropped.layerBegin;
-            stage.endLayer = g_dropped.layerEnd;
-            stage.nLayers = g_dropped.layerEnd - g_dropped.layerBegin;
+        LlmDeviceJoinPacket insert{};
+        insert.magic = LLM_DEVICE_JOIN_MAGIC;
+        insert.version = LLM_DEVICE_JOIN_VERSION;
+        insert.op = LLM_DEVICE_JOIN_INSERT;
+        insert.stageIndex = g_dropped.stageIndex;
+        insert.donorStage = g_dropped.prevStage;
+        // Each neighbour gives back only the extra layers it took during takeover.
+        LlmDeviceJoinPacket disableFront = insert;
+        disableFront.op = LLM_DEVICE_JOIN_DISABLE;
+        disableFront.workerIndex = g_dropped.prevOwnerNode;
+        disableFront.layerBegin = g_dropped.frontBegin;
+        disableFront.layerEnd = g_dropped.frontEnd;
+        LlmDeviceJoinPacket disableBack = disableFront;
+        disableBack.workerIndex = g_dropped.nextOwnerNode;
+        disableBack.layerBegin = g_dropped.backBegin;
+        disableBack.layerEnd = g_dropped.backEnd;
+        // Restore every stage's primary range to what it was before the takeover.
+        LlmDeviceJoinPacket restorePrev{};
+        restorePrev.magic = LLM_DEVICE_JOIN_MAGIC;
+        restorePrev.version = LLM_DEVICE_JOIN_VERSION;
+        restorePrev.op = LLM_DEVICE_JOIN_RESTORE;
+        restorePrev.stageIndex = g_dropped.prevStage;
+        restorePrev.layerBegin = g_dropped.prevStageStartLayer;
+        restorePrev.layerEnd = g_dropped.prevStageEndLayer;
+        LlmDeviceJoinPacket restoreNext = restorePrev;
+        restoreNext.stageIndex = g_dropped.nextStage;
+        restoreNext.layerBegin = g_dropped.nextStageStartLayer;
+        restoreNext.layerEnd = g_dropped.nextStageEndLayer;
+        LlmDeviceJoinPacket restoreSelf = restorePrev;
+        restoreSelf.stageIndex = g_dropped.stageIndex;
+        restoreSelf.layerBegin = g_dropped.layerBegin;
+        restoreSelf.layerEnd = g_dropped.layerEnd;
+        for (NnUint i = 0; i < nWorkers; ++i) {
+            if (i == workerIndex || !network->isSocketActive(i)) continue;
+            sendJoinPacket(network, i, insert);
+            sendJoinPacket(network, i, restorePrev);
+            sendJoinPacket(network, i, restoreNext);
+            sendJoinPacket(network, i, restoreSelf);
+            if (i + 1u == g_dropped.prevOwnerNode) sendJoinPacket(network, i, disableFront);
+            if (i + 1u == g_dropped.nextOwnerNode) sendJoinPacket(network, i, disableBack);
         }
+        NnUnevenPartitionPlan *livePlan = const_cast<NnUnevenPartitionPlan *>(context->inference->getPartitionPlan());
+        if (livePlan == nullptr) throw std::runtime_error("Rejoined worker has no live partition plan");
+        // The root applies the same restore the workers just applied.
+        for (NnUint s = 0u; s < livePlan->nStages; ++s) {
+            NnStageConfig &stage = livePlan->stages[s];
+            if (stage.stageIndex == g_dropped.prevStage) {
+                stage.endLayer = g_dropped.prevStageEndLayer;
+                stage.nLayers = stage.endLayer - stage.startLayer;
+            } else if (stage.stageIndex == g_dropped.nextStage) {
+                stage.startLayer = g_dropped.nextStageStartLayer;
+                stage.nLayers = stage.endLayer - stage.startLayer;
+            } else if (stage.stageIndex == g_dropped.stageIndex) {
+                stage.startLayer = g_dropped.layerBegin;
+                stage.endLayer = g_dropped.layerEnd;
+                stage.nLayers = g_dropped.layerEnd - g_dropped.layerBegin;
+            }
+        }
+        if (context->executor != nullptr) {
+            for (NnUint layer = g_dropped.frontBegin; layer < g_dropped.frontEnd; ++layer)
+                context->executor->setPrimaryLayerEnabled(layer, false);
+            for (NnUint layer = g_dropped.backBegin; layer < g_dropped.backEnd; ++layer)
+                context->executor->setPrimaryLayerEnabled(layer, false);
+        }
+        // Put the stage back between its original neighbours.
+        if (!applyPpStageInsert(livePlan, g_dropped.stageIndex, g_dropped.prevStage))
+            throw std::runtime_error("Rejoined worker could not be relinked into the pipeline");
+        // Runtime primary ownership is not modified here: the takeover never moved
+        // it either, so the original assignment (the dropped stage owns its own
+        // layers) is exactly right again now that the stage is live.
+        // g_poolLive is indexed by node, not by stage slot.
+        if (g_dropped.deadNode < g_poolLive.size()) g_poolLive[g_dropped.deadNode] = 1;
+        g_dropped.joined = true;
+        if (context->startDynamicControllers) context->startDynamicControllers();
+        std::printf("✅ [pool] node=%u rejoined stage=%u layers=[%u,%u) with %u kv rows\n",
+            (unsigned)targetNode, (unsigned)g_dropped.stageIndex,
+            (unsigned)g_dropped.layerBegin, (unsigned)g_dropped.layerEnd,
+            (unsigned)headers.size());
+        std::fflush(stdout);
+        refreshTerminalUi(context->args, livePlan, context->header != nullptr ? context->header->nLayers : 0u,
+            "device joined the pipeline");
+    } catch (const std::exception &err) {
+        std::printf("⚠️  [pool] rejoin did not finish: %s\n", err.what());
+        std::fflush(stdout);
+        return;
     }
-    if (context->executor != nullptr) {
-        for (NnUint layer = g_dropped.frontBegin; layer < g_dropped.frontEnd; ++layer)
-            context->executor->setPrimaryLayerEnabled(layer, false);
-        for (NnUint layer = g_dropped.backBegin; layer < g_dropped.backEnd; ++layer)
-            context->executor->setPrimaryLayerEnabled(layer, false);
-    }
-    // Put the stage back between its original neighbours.
-    if (!applyPpStageInsert(livePlan, g_dropped.stageIndex, g_dropped.prevStage))
-        throw std::runtime_error("Rejoined worker could not be relinked into the pipeline");
-    // Runtime primary ownership is not modified here: the takeover never moved
-    // it either, so the original assignment (the dropped stage owns its own
-    // layers) is exactly right again now that the stage is live.
-    // g_poolLive is indexed by node, not by stage slot.
-    if (g_dropped.deadNode < g_poolLive.size()) g_poolLive[g_dropped.deadNode] = 1;
-    g_dropped.joined = true;
-    if (context->startDynamicControllers) context->startDynamicControllers();
-    std::printf("✅ [pool] node=%u rejoined stage=%u layers=[%u,%u) with %u kv rows\n",
-        (unsigned)targetNode, (unsigned)g_dropped.stageIndex,
-        (unsigned)g_dropped.layerBegin, (unsigned)g_dropped.layerEnd,
-        (unsigned)headers.size());
-    std::fflush(stdout);
-    refreshTerminalUi(context->args, livePlan, context->header != nullptr ? context->header->nLayers : 0u,
-        "device joined the pipeline");
 }
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
@@ -8867,6 +8898,15 @@ void runWorkerApp(AppCliArgs *args) {
             printf("📡 Worker %d: Waiting for weights from Root...\n", nodeConfig.nodeIndex);
             NnWorkerWeightReader weightReader(&executor, network);
             weightReader.read();
+        }
+
+        // A joining worker loads its model after the root handshake. The root
+        // must not stream the KV history until this load is done, or the unread
+        // send dies on a short TCP user timeout.
+        if (boot.joinStageIndex != 0xFFFFFFFFu) {
+            std::printf("🧩 [pool] worker weights loaded, ready to join\n");
+            std::fflush(stdout);
+            network->writeAck(ROOT_SOCKET_INDEX);
         }
 
         const NnUint logitsPipeIndex = findPipeIndexByName(&netConfig, "LG");

@@ -221,7 +221,7 @@ std::vector<Line> layout(int cols) {
         else if (g_stages[i].degraded || (int)i == g_moveFrom) name += " SLOW";
         else if ((int)i == g_moveTo) name += " IN";
         add(names, "|" + fit(name, inner) + "|", color);
-        std::string label = " waiting";
+        std::string label = g_stages[i].offline ? " moved" : " waiting";
         if ((on || g_stages[i].offline) && g_stages[i].layerEnd > g_stages[i].layerBegin) {
             std::ostringstream lab;
             lab << " L" << g_stages[i].layerBegin << "-" << (g_stages[i].layerEnd - 1u);
@@ -339,6 +339,56 @@ void edgeVisorUiMarkOffline(unsigned stageIndex, const char *event) {
         }
         if (event == nullptr || event[0] == '\0') g_event = stage.name + " offline";
     }
+    if (event != nullptr && event[0] != '\0') g_event = event;
+    redrawLocked();
+}
+
+void edgeVisorUiNoteTakeover(
+    unsigned deadStage,
+    unsigned prevStage,
+    unsigned frontBegin,
+    unsigned frontEnd,
+    unsigned nextStage,
+    unsigned backBegin,
+    unsigned backEnd,
+    const char *event) {
+    if (!g_enabled) return;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (deadStage >= g_stages.size()) {
+        if (event != nullptr && event[0] != '\0') g_event = event;
+        g_moveFrom = -1;
+        g_moveTo = -1;
+        redrawLocked();
+        return;
+    }
+    EdgeVisorUiStage &dead = g_stages[deadStage];
+    if (prevStage < g_stages.size() && frontEnd > frontBegin) {
+        EdgeVisorUiStage &prev = g_stages[prevStage];
+        if (frontEnd > prev.layerEnd) prev.layerEnd = frontEnd;
+        prev.computing = prev.layerEnd > prev.layerBegin;
+        prev.shadow.clear();
+        if (frontEnd >= dead.layerBegin && frontEnd <= dead.layerEnd) dead.layerBegin = frontEnd;
+    }
+    if (nextStage < g_stages.size() && backEnd > backBegin) {
+        EdgeVisorUiStage &next = g_stages[nextStage];
+        if (backBegin < next.layerBegin) next.layerBegin = backBegin;
+        next.computing = next.layerEnd > next.layerBegin;
+        next.shadow.clear();
+        if (backBegin >= dead.layerBegin && backBegin <= dead.layerEnd) dead.layerEnd = backBegin;
+    }
+    dead.offline = true;
+    dead.computing = false;
+    dead.degraded = false;
+    dead.shadow.clear();
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        if (g_devices[i].name == dead.name) {
+            g_devices[i].offline = true;
+            g_devices[i].live = false;
+            g_devices[i].inPipeline = false;
+        }
+    }
+    g_moveFrom = -1;
+    g_moveTo = -1;
     if (event != nullptr && event[0] != '\0') g_event = event;
     redrawLocked();
 }

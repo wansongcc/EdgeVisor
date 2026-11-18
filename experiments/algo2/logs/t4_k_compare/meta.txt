@@ -1,0 +1,10 @@
+code=82bc5e888fb892db23b1fd0c4b7808af49f395da
+steps=80
+delay_us=15000 node=2 after_decode_tokens=24 decode_only=1
+ratios=1@7*1@7*1@7*1@7 split_order=gpu0,gpu1,gpu2,gpu3
+verify_tokens=8 settle_tokens=4 max_issues=1
+k1=force from 2 to 3 k=1; k6=unforced, previously selected k=6
+0, Tesla T4, GPU-7f68ab30-52b2-7d89-537f-a57bdf6ec9b8, 15360 MiB
+1, Tesla T4, GPU-ffc54436-7dea-6bae-f384-7d11a714072f, 15360 MiB
+2, Tesla T4, GPU-6b3393e8-f16a-15be-00aa-53ce15a2805a, 15360 MiB
+3, Tesla T4, GPU-8c29bb83-69f9-4e0b-4d61-ee0abc759877, 15360 MiB

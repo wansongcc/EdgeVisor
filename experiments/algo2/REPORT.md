@@ -104,6 +104,24 @@ No other step was executed. The table shows the program selected the highest pas
 
 An earlier pair on the previous build, `logs/t4_pair/`, refused every boundary with `fixed_overhead_not_separated` because the decision snapshot did not yet receive the boundary-layer timers.
 
+## k=1 against k=6
+
+Build `82bc5e8`, same injection and the same 80-step window as the paired diagnostic. Each revised run could issue only one move. k=1 was forced on the stage-2 to stage-3 boundary. k=6 is the step the search selects there. Three repeats, logs in `logs/t4_k_compare/`. Command: `experiments/algo2/t4_k_compare.sh`.
+
+All nine runs exited 0. The move was issued at token 50, 51, or 52. Each keep used 8 verify samples. Medians over tokens 70–78, ms/token:
+
+| Arm | End-to-end | Full-chain compute sum | Stage 2 compute | Stage 3 compute | Predicted gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| static | 557.0 | 538.8 | 471.7 | 28.0 | — |
+| k=1 | 496.3 | 478.4 | 408.6 | 30.7 | 28.8 |
+| k=6 | 178.9 | 176.6 | 93.4 | 44.1 | 415.0 |
+
+Against static, k=1 lowers the token interval by 60.6 ms and the compute sum by 60.4 ms. k=6 lowers the interval by 378.1 ms and the compute sum by 362.2 ms. On the machine, 6 layers is better than 1 layer by about 317 ms/token. The predicted order is the same, and the gap is large.
+
+For k=6, stage 2's compute falls by 378.3 ms and stage 3's rises by 16.1 ms. The token interval falls by 378.1 ms, the same amount as stage 2. The 16 ms added on the receiver does not stack onto the interval. The cost table's 415 ms is 37 ms above that stage-2 drop. That is the whole of the earlier 36.8 ms gap: the table overstates how much timed compute leaves the slow stage. It is not a separate communication term in the token interval.
+
+For k=1, stage 2 falls by 63.0 ms and the interval falls by 60.6 ms. The boundary-layer estimate only predicted 28.8 ms, so one measured boundary layer does not capture the whole stage-time change of moving that layer.
+
 ## Not run
 
 - The 512-token, four-strategy matrix
@@ -122,6 +140,7 @@ make algo2-test dynamic-tpot-test dllama
 ./dynamic-tpot-test
 bash ../experiments/algo2/t4_smoke.sh
 OUT=../experiments/algo2/logs/t4_pair_b bash ../experiments/algo2/t4_pair.sh
+bash ../experiments/algo2/t4_k_compare.sh
 ```
 
 `algo2-test` and `dynamic-tpot-test` passed after the controller was linked. `dllama` was built with `DLLAMA_CUDA` and arch 75.

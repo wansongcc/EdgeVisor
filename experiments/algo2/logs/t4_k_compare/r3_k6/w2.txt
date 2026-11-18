@@ -1,0 +1,71 @@
+device: backend=cuda threads=1 CUDA Device[2]: Tesla T4 cc 7.5 sm_75, globalMem=14912 MB, multiProcessorCount=40, warpSize=32, maxThreadsPerBlock=1024, integrated=0, driver=13020, runtime=13020
+Listening on 0.0.0.0:29142...
+loading weights
+   [PP] Node 2: Stage full-weight loading ENABLED
+📨 [Worker] Recv Control: Batch=9, Pos=0
+📨 [Worker] Recv Control: Batch=1, Pos=9
+📨 [Worker] Recv Control: Batch=1, Pos=10
+📨 [Worker] Recv Control: Batch=1, Pos=11
+📨 [Worker] Recv Control: Batch=1, Pos=12
+📨 [Worker] Recv Control: Batch=1, Pos=13
+📨 [Worker] Recv Control: Batch=1, Pos=14
+📨 [Worker] Recv Control: Batch=1, Pos=15
+📨 [Worker] Recv Control: Batch=1, Pos=16
+📨 [Worker] Recv Control: Batch=1, Pos=17
+📨 [Worker] Recv Control: Batch=1, Pos=18
+📨 [Worker] Recv Control: Batch=1, Pos=19
+📨 [Worker] Recv Control: Batch=1, Pos=20
+📨 [Worker] Recv Control: Batch=1, Pos=21
+📨 [Worker] Recv Control: Batch=1, Pos=22
+📨 [Worker] Recv Control: Batch=1, Pos=23
+📨 [Worker] Recv Control: Batch=1, Pos=24
+📨 [Worker] Recv Control: Batch=1, Pos=25
+📨 [Worker] Recv Control: Batch=1, Pos=26
+📨 [Worker] Recv Control: Batch=1, Pos=27
+📨 [Worker] Recv Control: Batch=1, Pos=28
+📨 [Worker] Recv Control: Batch=1, Pos=29
+📨 [Worker] Recv Control: Batch=1, Pos=30
+📨 [Worker] Recv Control: Batch=1, Pos=31
+📨 [Worker] Recv Control: Batch=1, Pos=32
+📨 [Worker] Recv Control: Batch=1, Pos=33
+📨 [Worker] Recv Control: Batch=1, Pos=34
+📨 [Worker] Recv Control: Batch=1, Pos=35
+📨 [Worker] Recv Control: Batch=1, Pos=36
+📨 [Worker] Recv Control: Batch=1, Pos=37
+📨 [Worker] Recv Control: Batch=1, Pos=38
+📨 [Worker] Recv Control: Batch=1, Pos=39
+📨 [Worker] Recv Control: Batch=1, Pos=40
+📨 [Worker] Recv Control: Batch=1, Pos=41
+📨 [Worker] Recv Control: Batch=1, Pos=42
+📨 [Worker] Recv Control: Batch=1, Pos=43
+📨 [Worker] Recv Control: Batch=1, Pos=44
+📨 [Worker] Recv Control: Batch=1, Pos=45
+📨 [Worker] Recv Control: Batch=1, Pos=46
+📨 [Worker] Recv Control: Batch=1, Pos=47
+📨 [Worker] Recv Control: Batch=1, Pos=48
+📨 [Worker] Recv Control: Batch=1, Pos=49
+📨 [Worker] Recv Control: Batch=1, Pos=50
+📨 [Worker] Recv Control: Batch=1, Pos=51
+📨 [Worker] Recv Control: Batch=1, Pos=52
+📨 [Worker] Recv Control: Batch=1, Pos=53
+📨 [Worker] Recv Control: Batch=1, Pos=54
+📨 [Worker] Recv Control: Batch=1, Pos=55
+📨 [Worker] Recv Control: Batch=1, Pos=55
+🛂 [layer-gate] node=2 role=primary layer=15 enabled=0 matchedSegs=4
+🛂 [layer-gate] node=2 role=redundant layer=15 enabled=0 matchedSegs=0
+🔁 [worker-switch] node=2 sleep primary layer=15 (source-stage)
+🛂 [layer-gate] node=2 role=primary layer=16 enabled=0 matchedSegs=4
+🛂 [layer-gate] node=2 role=redundant layer=16 enabled=0 matchedSegs=0
+🔁 [worker-switch] node=2 sleep primary layer=16 (source-stage)
+🛂 [layer-gate] node=2 role=primary layer=17 enabled=0 matchedSegs=4
+🛂 [layer-gate] node=2 role=redundant layer=17 enabled=0 matchedSegs=0
+🔁 [worker-switch] node=2 sleep primary layer=17 (source-stage)
+🛂 [layer-gate] node=2 role=primary layer=18 enabled=0 matchedSegs=4
+🛂 [layer-gate] node=2 role=redundant layer=18 enabled=0 matchedSegs=0
+🔁 [worker-switch] node=2 sleep primary layer=18 (source-stage)
+🛂 [layer-gate] node=2 role=primary layer=19 enabled=0 matchedSegs=4
+🛂 [layer-gate] node=2 role=redundant layer=19 enabled=0 matchedSegs=0
+🔁 [worker-switch] node=2 sleep primary layer=19 (source-stage)
+🛂 [layer-gate] node=2 role=primary layer=20 enabled=0 matchedSegs=4
+🛂 [layer-gate] node=2 role=redundant layer=20 enabled=0 matchedSegs=0
+🔁 [worker-switch] node=2 sleep primary layer=20 (source-stage)

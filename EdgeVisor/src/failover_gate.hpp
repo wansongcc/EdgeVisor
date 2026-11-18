@@ -18,9 +18,11 @@ inline bool shadowHistoryCovers(const unsigned *filledThrough, unsigned nLayers,
 
 // Offline takeover splits one stage across its two neighbors. The previous
 // stage holds a prefix of the dead stage, the next stage holds a suffix, and
-// the two runs must meet. An overlap stays with the previous stage; the next
-// stage runs only the remainder, which is inside its own suffix. A gap, or a
-// missing neighbor that leaves one side at zero, is not a takeover.
+// the two runs must meet. A gap, or a missing neighbor that leaves one side
+// at zero, is not a takeover. Layers only one neighbor covers stay with that
+// neighbor. The overlap is split by execution time when both times are known:
+// the faster device (smaller milliseconds) takes more of it. Unknown or zero
+// times keep the overlap with the previous stage.
 struct ShadowTakeoverSplit {
     bool complete = false;
     unsigned frontBegin = 0u;
@@ -44,6 +46,86 @@ inline ShadowTakeoverSplit bidirectionalShadowTakeover(
     split.backEnd = end;
     return split;
 }
+
+// prevExecMs / nextExecMs are the neighbors' last stage execution times.
+// Zero means the time is unknown, so the overlap stays with the previous stage.
+inline ShadowTakeoverSplit bidirectionalShadowTakeover(
+    unsigned start, unsigned end, unsigned prefixLayers, unsigned suffixLayers,
+    unsigned prevExecMs, unsigned nextExecMs) {
+    if (prevExecMs == 0u || nextExecMs == 0u)
+        return bidirectionalShadowTakeover(start, end, prefixLayers, suffixLayers);
+    ShadowTakeoverSplit split;
+    if (start >= end) return split;
+    const unsigned width = end - start;
+    if (prefixLayers > width) prefixLayers = width;
+    if (suffixLayers > width) suffixLayers = width;
+    if (prefixLayers + suffixLayers < width) return split;
+    const unsigned exclusiveFront = width - suffixLayers;
+    const unsigned overlap = prefixLayers + suffixLayers - width;
+    const unsigned long long den =
+        (unsigned long long)prevExecMs + (unsigned long long)nextExecMs;
+    const unsigned long long num = (unsigned long long)overlap * (unsigned long long)nextExecMs;
+    unsigned toPrev = (unsigned)(num / den);
+    const unsigned long long twiceRem = 2ull * (num % den);
+    // Exact halves go to the faster side, and to the previous stage when the
+    // two times are equal, so the cut is stable across every process.
+    if (toPrev < overlap && (twiceRem > den || (twiceRem == den && prevExecMs <= nextExecMs)))
+        toPrev += 1u;
+    split.complete = true;
+    split.frontBegin = start;
+    split.frontEnd = start + exclusiveFront + toPrev;
+    split.backBegin = split.frontEnd;
+    split.backEnd = end;
+    return split;
+}
+
+// A down device is probed once per stride tokens, not on every token.
+inline bool offlineProbeDue(unsigned position, unsigned stride) {
+    return position > 0u && stride > 0u && (position % stride) == 0u;
+}
+
+// While the returning device is more than `threshold` tokens behind, copy at
+// most `chunk` positions and keep decoding. The copy stops short of the
+// threshold so the pipeline is not paused for the whole backlog. Once the gap
+// is within the threshold (or one token past it, which cannot shrink without
+// crossing it), copy the tail and insert.
+struct RejoinCatchupStep {
+    unsigned sendEnd = 0u;
+    bool seal = false;
+};
+
+inline RejoinCatchupStep planRejoinCatchup(
+    unsigned filled, unsigned position, unsigned threshold, unsigned chunk) {
+    RejoinCatchupStep step;
+    step.sendEnd = filled;
+    if (position < filled) return step;
+    if (position == filled) {
+        step.seal = true;
+        return step;
+    }
+    if (chunk < 2u) chunk = 2u;
+    const unsigned gap = position - filled;
+    if (gap <= threshold) {
+        step.sendEnd = position;
+        step.seal = true;
+        return step;
+    }
+    unsigned send = chunk;
+    if (send > gap - threshold) send = gap - threshold;
+    // A one-position copy loses to the token the pipeline is about to run.
+    if (send < 2u) {
+        step.sendEnd = position;
+        step.seal = true;
+        return step;
+    }
+    step.sendEnd = filled + send;
+    step.seal = false;
+    return step;
+}
+
+constexpr unsigned kRejoinProbeStride = 10u;
+constexpr unsigned kRejoinCatchupTokens = 10u;
+constexpr unsigned kRejoinCatchupChunk = 16u;
 
 // Join connect/accept must fail closed instead of blocking the decode loop.
 constexpr int kJoinConnectTimeoutMs = 5000;

@@ -2231,6 +2231,11 @@ bool NnNetwork::isSocketActive(NnUint socketIndex) const {
     return socketIndex < nSockets && socketActive[socketIndex];
 }
 
+void NnNetwork::setSocketBroadcast(NnUint socketIndex, bool enabled) {
+    if (socketIndex >= nSockets || socketActive == nullptr) return;
+    socketActive[socketIndex] = enabled;
+}
+
 static int connectSocketWithin(const char *host, int port, int timeoutMs) {
     if (host == nullptr || timeoutMs < 0) return -1;
     char mutableHost[256];

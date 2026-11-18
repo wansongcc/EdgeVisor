@@ -315,6 +315,9 @@ public:
     int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex, bool includeInactive = false) const;
     NnUint getPeerNodeIndex(NnUint socketIndex) const;
     bool isSocketActive(NnUint socketIndex) const;
+    // Leave the fd open but drop the socket from writeAll. A device that is
+    // loading weights must not receive the next decode control.
+    void setSocketBroadcast(NnUint socketIndex, bool enabled);
     bool deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex);
     void resetStats();
     // Listen socket kept open so a reserved pool member can connect later.

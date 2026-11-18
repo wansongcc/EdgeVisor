@@ -94,6 +94,51 @@ bool queryWorkerCondition(const char *host, int port, DeviceCondition *out);
 // not run those layers on the previous token.
 typedef bool (*NnPpFailoverFn)(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex, bool replayActivation);
 void setNnPpFailoverHook(NnPpFailoverFn fn);
+
+// Worker-frame kinds shared with app.hpp. They live here so the PP transport can
+// write and recognise a delivery probe without depending on the app layer.
+static constexpr NnUint NN_WORKER_FRAME_MAGIC = 0x4d465756u;   // 'VWFM'
+static constexpr NnUint NN_WORKER_FRAME_VERSION = 1u;
+static constexpr NnUint NN_WORKER_FRAME_DELIVERY_NEED = 5u;
+static constexpr NnUint NN_PP_DELIVERY_NEED_MAGIC = 0x444E4550u; // 'PEND'
+
+// The stage after a dead one answers the delivery question with this frame on
+// the socket of the stage that now precedes it. That is the root socket only
+// when the root itself is the previous stage. Three NnUint words.
+typedef struct {
+    NnUint magic;
+    NnUint position;
+    NnUint deadNode;
+} NnPpDeliveryNeedPacket;
+
+// Same 4-word header as the app's worker frames. Defined here so the PP
+// transport can write a delivery probe without depending on the app layer;
+// app.hpp aliases it to LlmWorkerFrameHeader.
+typedef struct {
+    NnUint magic;
+    NnUint version;
+    NnUint kind;
+    NnUint payloadBytes;
+} NnWorkerFrameHeader;
+
+// The one worker-frame writer: header then payload on the root socket. Both the
+// app and the PP transport use it so the framing cannot drift. Declared at the
+// bottom of this header, after NnNetwork.
+
+// How long the root waits for the stage after a dead one to say it still needs
+// the in-flight token. A reset peer wakes a blocked recv immediately, so
+// silence means that stage is already computing the token.
+static constexpr long long NN_PP_DELIVERY_ASK_TIMEOUT_MS = 500ll;
+
+// True when a normal worker frame for this position is already queued from the
+// downstream stage (a HAVE answer; the token reached it before the hop died).
+typedef bool (*NnPpDeliveryHaveFn)(void *context, NnUint downstreamNodeIndex, NnUint position);
+
+// Reads the token position out of a worker frame that is readable but not yet
+// consumed. The layouts live in the app layer, so the app answers this. Returns
+// false when the frame carries no position this probe can use.
+typedef bool (*NnPpFramePositionFn)(void *context, NnUint socketIndex, NnUint kind,
+    const void *payload, NnSize payloadBytes, NnUint *position);
 void nnSetAcceptTimeoutMs(int timeoutMs);
 bool probeWorkerReachable(const char *host, int port, int timeoutMs);
 // Bit i set means worker i is online. Default is every worker.
@@ -160,6 +205,35 @@ private:
     std::atomic<std::uint64_t> commReadManyCalls{0};
     std::atomic<std::uint64_t> commSyncSteps{0};
 
+    // Delivery probe state. The dead stage's successor answers the question on
+    // its own stream; the root records that answer instead of guessing.
+    NnUint currentPosition_ = 0u;
+    const NnUnevenPartitionPlan *ppPlan_ = nullptr;
+    std::vector<NnByte> lastPpActivation_;
+    // The send pipe the copy was taken from. A front-slice splice writes the
+    // post-takeover activation back into this pipe; the vector stays the
+    // pre-takeover bytes.
+    const void *lastPpLive_ = nullptr;
+    NnSize lastPpLiveBytes_ = 0u;
+    struct PpDeliveryNeedNote {
+        NnUint position = 0u;
+        NnUint deadNode = 0u;
+        NnUint sourceNode = 0u;
+    };
+    std::vector<PpDeliveryNeedNote> ppDeliveryNeedNotes_;
+    NnPpDeliveryHaveFn ppDeliveryHaveFn_ = nullptr;
+    void *ppDeliveryHaveContext_ = nullptr;
+    NnPpFramePositionFn ppFramePositionFn_ = nullptr;
+    void *ppFramePositionContext_ = nullptr;
+    // Answers the delivery question for one dead peer. Returns:
+    //   1 = HAVE, 2 = NEED, 0 = no answer.
+    int askPpDeliveryState(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNode);
+    // Resolves a dead next hop after a buffered PP send or a result wait.
+    // Returns true when the plan was relinked and the token's delivery is
+    // settled; false means "no answer" and the caller must stop the session.
+    bool ppResolveDeadNextHop(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNode);
+    bool takePpDeliveryNeedNote(NnUint position, NnUint deadNode);
+
     void recordCommSend(NnSize size);
     void recordCommRecv(NnSize size);
     void recordCommSendEagain();
@@ -204,9 +278,35 @@ public:
     void sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size);
     // True when the live socket to targetNodeIndex has already been reset.
     bool peerLooksOffline(NnUint targetNodeIndex) const;
-    // A dead next hop while waiting for results makes buffered delivery
-    // ambiguous. Throw for session restart; do not replay the activation.
+    // A dead next hop while waiting for results is answered by an explicit
+    // delivery probe on the hop after it. HAVE means the stage that follows the
+    // dead one already has this token, so later tokens just skip the dead stage.
+    // NEED replays the saved activation once. Silence after the wait is the
+    // same as HAVE: the next stage is computing, so only later tokens skip
+    // the dead one. A missing shadow still stops the session.
     void checkPpNextWhileWaiting(const NnUnevenPartitionPlan *plan, NnUint myNodeIndex);
+    // The stage root calls this before its PP send so a delivery probe can name
+    // the position it is asking about.
+    void setCurrentPosition(NnUint position) { currentPosition_ = position; }
+    NnUint getCurrentPosition() const { return currentPosition_; }
+    // The pipeline plan the PP probes reason about. Set once by the network
+    // synchronizer, so sendToNode can find the stage after a dead peer.
+    void setPpPlan(const NnUnevenPartitionPlan *plan) { ppPlan_ = plan; }
+    // The activation bytes the PP send just handed to the network. A NEED
+    // answer replays exactly these bytes to the new next stage.
+    void saveLastPpActivation(const void *data, NnSize size);
+    void noteLastPpActivation(const void *data, NnSize size) { saveLastPpActivation(data, size); }
+    bool hasLastPpActivation() const { return !lastPpActivation_.empty(); }
+    // A downstream stage says it lacks this position. Recorded by the worker
+    // frame pump on the root, consumed by the next delivery probe.
+    void notePpDeliveryNeed(NnUint position, NnUint deadNode, NnUint sourceNode);
+    void setPpDeliveryHaveHook(NnPpDeliveryHaveFn fn, void *context);
+    // Lets the app decode a queued frame's position without consuming it, so a
+    // stale frame from an earlier token is not mistaken for HAVE.
+    void setPpFramePositionHook(NnPpFramePositionFn fn, void *context) {
+        ppFramePositionFn_ = fn;
+        ppFramePositionContext_ = context;
+    }
     bool isCommProfileEnabled() const;
     void recordSyncStepComplete();
     void recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size);
@@ -383,5 +483,9 @@ public:
 private:
     void allocate(NnUint size);
 };
+
+// The one worker-frame writer: header then payload on the root socket. Both the
+// app and the PP transport use it so the framing cannot drift.
+void nnWriteWorkerFrame(NnNetwork *network, NnUint kind, const void *payload, NnSize payloadBytes);
 
 #endif

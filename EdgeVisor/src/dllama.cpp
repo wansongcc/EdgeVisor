@@ -1157,6 +1157,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             std::fflush(stdout);
         }
         maybeJoinReservedDevice(context, pos);
+        maybeRejoinDroppedDevice(context, pos);
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
         forwardOrRestart();

@@ -210,6 +210,134 @@ __device__ static inline float cudaHalfBitsToFloat(uint16_t h) {
     return sign * ldexpf((float)(1024 + mant), exp - 25);
 }
 
+/* __dp4a is a sm_61+ instruction. Host-side compilation passes and any device
+ * build below sm_61 keep the scalar accumulation path. */
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610
+#define NN_CUDA_HAS_DP4A 1
+#else
+#define NN_CUDA_HAS_DP4A 0
+#endif
+
+/* Largest aBlocks that still fits the packed x cache in the default 48KB
+ * shared-memory budget: 1024 blocks needs 40KB. K of 32768 covers every
+ * dimension the model uses; anything wider reads x from global memory while
+ * staying on the warp dp4a path. */
+#define NN_CUDA_MATMUL_SHARED_MAX_BLOCKS 1024u
+
+/* NnBlockQ40 (18 bytes) and NnBlockQ80 (34 bytes) only guarantee 2-byte
+ * alignment, so ->qs must never be reinterpreted as an int pointer. Two uint16
+ * loads are always legal and assemble the same four packed int8 lanes. */
+__device__ static inline int cudaLoadInt8x4(const int8_t *p) {
+    const uint16_t *w = (const uint16_t *)p;
+    return (int)((unsigned int)w[0] | ((unsigned int)w[1] << 16));
+}
+
+__device__ static inline int cudaSumInt8x4(int packed) {
+#if NN_CUDA_HAS_DP4A
+    return __dp4a(packed, 0x01010101, 0);
+#else
+    const unsigned int u = (unsigned int)packed;
+    int sum = 0;
+    #pragma unroll
+    for (NnUint i = 0u; i < 4u; ++i) {
+        sum += (int)(int8_t)((u >> (8u * i)) & 0xffu);
+    }
+    return sum;
+#endif
+}
+
+/* Q80 x Q40 block dot product as a raw integer accumulator.
+ * The q40 nibbles are kept in 0..15 so __dp4a can consume them directly (all
+ * values stay inside the signed int8 range); the +8 bias this introduces is
+ * removed once per block by subtracting 8 * sum(x). That is integer-identical
+ * to the (w - 8) * x form while keeping the inner loop subtraction-free. */
+__device__ static inline int cudaQ80Q40DotPacked(const int *xWords, int xSum, const uint8_t *wq) {
+#if NN_CUDA_HAS_DP4A
+    int acc = 0;
+    #pragma unroll
+    for (NnUint g = 0u; g < 4u; ++g) {
+        const int w32 = cudaLoadInt8x4((const int8_t *)(wq + 4u * g));
+        acc = __dp4a(xWords[g], w32 & 0x0f0f0f0f, acc);
+        acc = __dp4a(xWords[4u + g], (w32 >> 4) & 0x0f0f0f0f, acc);
+    }
+    return acc - 8 * xSum;
+#else
+    const int8_t *xq = (const int8_t *)xWords;
+    int acc = 0;
+    for (NnUint k = 0u; k < Q40_BLOCK_SIZE / 2u; ++k) {
+        const int w0 = (int)(wq[k] & 0x0fu) - 8;
+        const int w1 = (int)(wq[k] >> 4) - 8;
+        acc += w0 * (int)xq[k] + w1 * (int)xq[k + Q80_BLOCK_SIZE / 2u];
+    }
+    (void)xSum;
+    return acc;
+#endif
+}
+
+/* Same product straight out of global memory. The input block is packed once so
+ * the dp4a path and the scalar fallback share a single read of x. */
+__device__ static inline int cudaQ80Q40DotGlobal(const NnBlockQ80 *xb, const NnBlockQ40 *wb) {
+    int xWords[8];
+    int xSum = 0;
+    #pragma unroll
+    for (NnUint w = 0u; w < 8u; ++w) {
+        xWords[w] = cudaLoadInt8x4(xb->qs + 4u * w);
+        xSum += cudaSumInt8x4(xWords[w]);
+    }
+    return cudaQ80Q40DotPacked(xWords, xSum, wb->qs);
+}
+
+__device__ static inline float cudaWarpReduceMax(float v) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    return v;
+}
+
+__device__ static inline float cudaWarpReduceSum(float v) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+/* Block-wide max over a 32-slot staging array. Two barriers; the result is
+ * re-read from the staging slot so a follow-up reduction on its own slot cannot
+ * race this one. blockDim.x is always a power of two >= 32. */
+__device__ static inline float cudaBlockReduceMax(float v, float *shared) {
+    const NnUint nWarps = (blockDim.x + 31u) >> 5u;
+    const NnUint lane = threadIdx.x & 31u;
+    const NnUint wid = threadIdx.x >> 5u;
+    v = cudaWarpReduceMax(v);
+    if (lane == 0u) shared[wid] = v;
+    __syncthreads();
+    if (wid == 0u) {
+        float w = lane < nWarps ? shared[lane] : -3.4028234663852886e38f;
+        w = cudaWarpReduceMax(w);
+        if (lane == 0u) shared[0] = w;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
+__device__ static inline float cudaBlockReduceSum(float v, float *shared) {
+    const NnUint nWarps = (blockDim.x + 31u) >> 5u;
+    const NnUint lane = threadIdx.x & 31u;
+    const NnUint wid = threadIdx.x >> 5u;
+    v = cudaWarpReduceSum(v);
+    if (lane == 0u) shared[wid] = v;
+    __syncthreads();
+    if (wid == 0u) {
+        float w = lane < nWarps ? shared[lane] : 0.0f;
+        w = cudaWarpReduceSum(w);
+        if (lane == 0u) shared[0] = w;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
 __device__ static inline NnByte *cudaRowBase(NnByte *base, NnPointerLayout layout, NnUint z, NnUint y) {
     return base + z * layout.zStrideBytes + y * layout.batchStrideBytes + layout.byteOffset;
 }
@@ -642,28 +770,30 @@ __global__ static void q80QuantizeKernel(
     NnUint batchSize) {
     const NnUint blocksPerRow = len / Q80_BLOCK_SIZE;
     const NnSize totalBlocks = (NnSize)input.logicalSize.z * batchSize * blocksPerRow;
-    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= totalBlocks) return;
-    const NnUint b = (NnUint)(tid % blocksPerRow);
-    NnSize t = tid / blocksPerRow;
+    /* One warp per 32-element block: each lane owns exactly one element. The
+     * block-per-thread form left the GPU with len/32 threads for the whole
+     * tensor (96 for dim=3072), far too few to fill a T4. */
+    const NnUint lane = threadIdx.x & 31u;
+    const NnSize blockIndex = ((NnSize)blockIdx.x * blockDim.x + threadIdx.x) >> 5u;
+    if (blockIndex >= totalBlocks) return;
+    const NnUint b = (NnUint)(blockIndex % blocksPerRow);
+    NnSize t = blockIndex / blocksPerRow;
     const NnUint y = (NnUint)(t % batchSize);
     const NnUint z = (NnUint)(t / batchSize);
     const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, z, y) + offset + b * Q80_BLOCK_SIZE;
     NnBlockQ80 *out = (NnBlockQ80 *)cudaRowBase(outputBase, output, z, y) + (offset / Q80_BLOCK_SIZE) + b;
-    float amax = 0.0f;
-    for (NnUint j = 0u; j < Q80_BLOCK_SIZE; ++j) {
-        const float av = fabsf(in[j]);
-        amax = amax > av ? amax : av;
-    }
+
+    const float v = in[lane];
+    float amax = cudaWarpReduceMax(fabsf(v));
     const float d = amax / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    out->d = cudaFloatToHalfBits(d);
-    for (NnUint j = 0u; j < Q80_BLOCK_SIZE; ++j) {
-        int q = (int)nearbyintf(in[j] * id);
-        if (q > 127) q = 127;
-        if (q < -128) q = -128;
-        out->qs[j] = (int8_t)q;
-    }
+    /* d is uniform across the warp, so one lane publishes it and the rest read
+     * it back through the broadcast instead of racing the same half store. */
+    if (lane == 0u) out->d = cudaFloatToHalfBits(d);
+    int q = (int)nearbyintf(v * id);
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    out->qs[lane] = (int8_t)q;
 }
 
 __global__ static void repeatZCopyQ80Kernel(
@@ -758,17 +888,24 @@ __global__ static void invRmsF32Kernel(
     float epsilon,
     NnUint nColumns,
     NnUint batchSize) {
-    const NnSize total = (NnSize)batchSize * nColumns;
-    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
-    const NnUint col = (NnUint)(tid % nColumns);
-    const NnUint y = (NnUint)(tid / nColumns);
+    /* One block per (y, col). The previous form gave each thread the whole
+     * colSize (3072 element) accumulation; now the block splits it and folds it
+     * with warp shuffles, leaving only the cross-warp step in shared memory. */
+    __shared__ float shared[32];
+    const NnUint col = blockIdx.x;
+    const NnUint y = blockIdx.y;
+    if (col >= nColumns || y >= batchSize) return;
     const NnUint colSize = input.logicalSize.x / nColumns;
     const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y) + (NnSize)col * colSize;
     float ss = 0.0f;
-    for (NnUint i = 0u; i < colSize; ++i) ss += in[i] * in[i];
-    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
-    out[col] = rsqrtf(ss / (float)colSize + epsilon);
+    for (NnUint i = threadIdx.x; i < colSize; i += blockDim.x) {
+        ss += in[i] * in[i];
+    }
+    ss = cudaBlockReduceSum(ss, shared);
+    if (threadIdx.x == 0u) {
+        float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+        out[col] = rsqrtf(ss / (float)colSize + epsilon);
+    }
 }
 
 __global__ static void rmsNormF32Kernel(
@@ -1010,6 +1147,8 @@ __device__ static inline void cudaMhaOffsets(
     *attOffset = y * config.nHeads0 * config.seqLen + h * config.seqLen;
 }
 
+#define NN_CUDA_MHA_SHARED_QUERY_DIM 256u
+
 __global__ static void multiheadAttScoreF32Kernel(
     const float *positions,
     const float *slots,
@@ -1018,6 +1157,10 @@ __global__ static void multiheadAttScoreF32Kernel(
     float *att,
     NnMultiHeadAttOpConfig config,
     NnUint batchSize) {
+    /* The query slice is re-read once per key position. It is small (headDim,
+     * typically 64 or 128) and identical for every p, so stage it in shared
+     * memory when it fits and keep the dot product fed from there. */
+    __shared__ float sQuery[NN_CUDA_MHA_SHARED_QUERY_DIM];
     const NnUint h = blockIdx.x;
     const NnUint y = blockIdx.y;
     if (h >= config.nHeads0 || y >= batchSize) return;
@@ -1029,11 +1172,25 @@ __global__ static void multiheadAttScoreF32Kernel(
     NnUint attOffset = 0u;
     cudaMhaOffsets(config, h, y, &qOffset, &kvOffset, &attOffset);
     const float invHeadDimRoot = rsqrtf((float)config.headDim);
+    const bool sharedQuery = config.headDim <= NN_CUDA_MHA_SHARED_QUERY_DIM;
+    if (sharedQuery) {
+        for (NnUint i = threadIdx.x; i < config.headDim; i += blockDim.x) {
+            sQuery[i] = query[qOffset + i];
+        }
+        __syncthreads();
+    }
     for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         float score = 0.0f;
         const NnSize kOffset = slotBase + (NnSize)p * config.kvStride + kvOffset;
-        for (NnUint i = 0u; i < config.headDim; ++i) {
-            score += query[qOffset + i] * keyCache[kOffset + i];
+        if (sharedQuery) {
+            #pragma unroll 4
+            for (NnUint i = 0u; i < config.headDim; ++i) {
+                score += sQuery[i] * keyCache[kOffset + i];
+            }
+        } else {
+            for (NnUint i = 0u; i < config.headDim; ++i) {
+                score += query[qOffset + i] * keyCache[kOffset + i];
+            }
         }
         att[attOffset + p] = score * invHeadDimRoot;
     }
@@ -1044,24 +1201,31 @@ __global__ static void multiheadAttSoftmaxSerialF32Kernel(
     float *att,
     NnMultiHeadAttOpConfig config,
     NnUint batchSize) {
+    /* Parallel softmax over the same [0, pos] range the serial version walked:
+     * both passes reduce with warp shuffles plus one shared stage, then every
+     * thread rescales its own slots. attOffset and the numeric treatment of the
+     * scores are unchanged, so results match the serial form up to the
+     * reduction order. */
+    __shared__ float shared[32];
     const NnUint h = blockIdx.x;
     const NnUint y = blockIdx.y;
     if (h >= config.nHeads0 || y >= batchSize) return;
     const NnUint pos = (NnUint)positions[y];
     const NnUint attOffset = y * config.nHeads0 * config.seqLen + h * config.seqLen;
     float maxScore = -3.4028234663852886e38f;
-    for (NnUint p = 0u; p <= pos; ++p) {
+    for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         const float v = att[attOffset + p];
         maxScore = maxScore > v ? maxScore : v;
     }
+    maxScore = cudaBlockReduceMax(maxScore, shared);
     float sum = 0.0f;
-    for (NnUint p = 0u; p <= pos; ++p) {
+    for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         const float v = expf(att[attOffset + p] - maxScore);
         att[attOffset + p] = v;
         sum += v;
     }
-    const float invSum = 1.0f / sum;
-    for (NnUint p = 0u; p <= pos; ++p) {
+    const float invSum = 1.0f / cudaBlockReduceSum(sum, shared);
+    for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         att[attOffset + p] *= invSum;
     }
 }
@@ -1098,15 +1262,7 @@ __global__ static void multiheadAttValueF32Kernel(
 }
 
 __device__ static inline float q80q40BlockDot(const NnBlockQ80 *xb, const NnBlockQ40 *wb) {
-    int acc = 0;
-    for (NnUint k = 0u; k < Q40_BLOCK_SIZE / 2u; ++k) {
-        const int w0 = (int)(wb->qs[k] & 0x0fu) - 8;
-        const int w1 = (int)(wb->qs[k] >> 4) - 8;
-        const int x0 = (int)xb->qs[k];
-        const int x1 = (int)xb->qs[k + Q80_BLOCK_SIZE / 2u];
-        acc += w0 * x0 + w1 * x1;
-    }
-    return (float)acc * cudaHalfBitsToFloat(xb->d) * cudaHalfBitsToFloat(wb->d);
+    return (float)cudaQ80Q40DotGlobal(xb, wb) * cudaHalfBitsToFloat(xb->d) * cudaHalfBitsToFloat(wb->d);
 }
 
 __global__ static void matmulQ80Q40SmallKKernel(
@@ -1173,34 +1329,77 @@ __global__ static void matmulQ80Q40LargeKKernel(
     NnUint inStartBlocks,
     NnUint outStart,
     NnUint batchSize) {
-    __shared__ float partial[256];
-    const NnSize oid = blockIdx.x;
-    const NnUint outLocal = (NnUint)(oid % cLen);
-    NnSize t = oid / cLen;
-    const NnUint e = (NnUint)(t % nActiveExpertsOr1);
-    const NnUint y = (NnUint)(t / nActiveExpertsOr1);
-    if (y >= batchSize) return;
+    /* One warp per output row: every warp of the block works on rows from the
+     * same (y, e) group, so a single shared copy of x feeds all of them and
+     * global x traffic drops by the warp count (8 on a 256-thread block).
+     * Grid is (row groups, batchSize * nActiveExpertsOr1). */
+    extern __shared__ int smem[];
+    const NnUint lane = threadIdx.x & 31u;
+    const NnUint wid = threadIdx.x >> 5u;
+    const NnUint nWarps = blockDim.x >> 5u;
+
+    const NnUint y = (NnUint)(blockIdx.y % batchSize);
+    const NnUint e = (NnUint)(blockIdx.y / batchSize);
     const NnUint activeExpert = nActiveExperts == 0u ? 0u : (NnUint)activeExpertIndexes[(NnSize)y * activeExpertRowStride + e];
-    float sum = 0.0f;
-    if (activeExpert < weightExperts) {
-        const NnBlockQ80 *x = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, e, y) + aOffsetBlocks;
-        const NnUint row = view == 0u ? outLocal : outStart + outLocal;
-        const NnUint inBlock = view == 2u ? inStartBlocks : 0u;
-        const NnBlockQ40 *w = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
+    /* Uniform across the block, so this return cannot strand a barrier. */
+    if (activeExpert >= weightExperts) return;
+
+    const NnUint outLocal = blockIdx.x * nWarps + wid;
+    const NnBlockQ80 *x = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, e, y) + aOffsetBlocks;
+
+    /* cachedBlocks is a compile-time shared-memory budget; beyond it we read x
+     * straight from global memory and stay on the warp dp4a path. */
+    const bool cached = aBlocks <= NN_CUDA_MATMUL_SHARED_MAX_BLOCKS;
+    int *xs = smem;
+    float *xd = (float *)(xs + (cached ? aBlocks * 8u : 0u));
+    int *xSum = (int *)(xd + (cached ? aBlocks : 0u));
+    if (cached) {
+        /* One thread per 32-element block: pack the block into eight int words
+         * and fold its int8 sum once, so the dp4a inner loop needs no per-lane
+         * pre-pass and no subtraction. */
         for (NnUint b = threadIdx.x; b < aBlocks; b += blockDim.x) {
-            sum += q80q40BlockDot(x + b, w + b);
+            int s = 0;
+            #pragma unroll
+            for (NnUint g = 0u; g < 8u; ++g) {
+                const int v = cudaLoadInt8x4(x[b].qs + 4u * g);
+                xs[b * 8u + g] = v;
+                s += cudaSumInt8x4(v);
+            }
+            xSum[b] = s;
+            xd[b] = cudaHalfBitsToFloat(x[b].d);
         }
-    }
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (NnUint stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0u && activeExpert < weightExperts) {
-        float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
-        out[outLocal] = partial[0];
+    /* Rows past cLen leave after the barrier; nothing below syncs. */
+    if (outLocal >= cLen) return;
+
+    const NnUint row = view == 0u ? outLocal : outStart + outLocal;
+    const NnUint inBlock = view == 2u ? inStartBlocks : 0u;
+    const NnBlockQ40 *w = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
+
+    float sum = 0.0f;
+    if (cached) {
+        for (NnUint b = lane; b < aBlocks; b += 32u) {
+            const int ip = cudaQ80Q40DotPacked(xs + b * 8u, xSum[b], w[b].qs);
+            sum += (float)ip * xd[b] * cudaHalfBitsToFloat(w[b].d);
+        }
+    } else {
+        for (NnUint b = lane; b < aBlocks; b += 32u) {
+            const int ip = cudaQ80Q40DotGlobal(x + b, w + b);
+            sum += (float)ip * cudaHalfBitsToFloat(x[b].d) * cudaHalfBitsToFloat(w[b].d);
+        }
     }
+    sum = cudaWarpReduceSum(sum);
+    if (lane == 0u) {
+        float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
+        out[outLocal] = sum;
+    }
+}
+
+/* Shared bytes for a cached-x Large-K block: packed int words, the per-block
+ * f16 scales, and the per-block int8 sums. */
+static NnSize cudaQ80Q40LargeKSharedBytes(NnUint aBlocks) {
+    return (NnSize)aBlocks * (NnSize)(8u * sizeof(int) + sizeof(float) + sizeof(int));
 }
 
 int nnCudaDeviceCount() {
@@ -2094,7 +2293,10 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnSize total = (NnSize)batchSize * config->nColumns;
             if (total != 0u) {
-                invRmsF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
+                /* One block per (y, col): the block splits the colSize
+                 * accumulation instead of one thread walking all of it. */
+                dim3 invRmsGrid(config->nColumns, batchSize, 1u);
+                invRmsF32Kernel<<<invRmsGrid, (unsigned int)launch.reductionBlockSize, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     config->epsilon,
@@ -2205,7 +2407,17 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                         batchSize);
                     NN_CUDA_CHECK(cudaGetLastError());
                 } else {
-                    matmulQ80Q40LargeKKernel<<<(unsigned int)totalOutputs, q80q40LargeKBlock, 0, stream>>>(
+                    /* Warp-per-row blocks: 8 rows per block, one block per
+                     * (row group, y, e) with the whole x group cached in
+                     * shared memory when it fits. */
+                    const unsigned int largeKBlock = q80q40LargeKBlock;
+                    const unsigned int warpsPerBlock = largeKBlock >> 5u;
+                    const NnSize rowGroups = ((NnSize)cLen + warpsPerBlock - 1u) / warpsPerBlock;
+                    const NnSize sharedBytes = aBlocks <= NN_CUDA_MATMUL_SHARED_MAX_BLOCKS
+                        ? cudaQ80Q40LargeKSharedBytes(aBlocks)
+                        : 0u;
+                    dim3 largeKGrid((unsigned int)rowGroups, (unsigned int)((NnSize)batchSize * nActiveExpertsOr1), 1u);
+                    matmulQ80Q40LargeKKernel<<<largeKGrid, largeKBlock, (size_t)sharedBytes, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
@@ -2426,7 +2638,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                     config,
                     batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
-                multiheadAttSoftmaxSerialF32Kernel<<<grid, 1, 0, stream>>>(
+                multiheadAttSoftmaxSerialF32Kernel<<<grid, softmaxBlock, 0, stream>>>(
                     (const float *)positionPipe->data(),
                     (float *)attBuffer->data(),
                     config,
@@ -2462,7 +2674,8 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 validateQ80View("CAST F32->Q80", view);
                 const NnSize totalBlocks = (NnSize)in.layout.logicalSize.z * batchSize * (view.sizeX / Q80_BLOCK_SIZE);
                 if (totalBlocks != 0u) {
-                    q80QuantizeKernel<<<cudaBlocks(totalBlocks, elementwiseBlock), elementwiseBlock, 0, stream>>>(
+                    /* One warp per 32-element block, so one thread per element. */
+                    q80QuantizeKernel<<<cudaBlocks(totalBlocks * 32u, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         (NnUint)view.offset, (NnUint)view.sizeX, batchSize);
@@ -2596,7 +2809,8 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnSize quantBlocks = (NnSize)batchSize * (out.layout.logicalSize.x / Q80_BLOCK_SIZE);
             if (quantBlocks != 0u) {
-                q80QuantizeKernel<<<cudaBlocks(quantBlocks, elementwiseBlock), elementwiseBlock, 0, stream>>>(
+                /* One warp per block here too, so scale the grid by 32. */
+                q80QuantizeKernel<<<cudaBlocks(quantBlocks * 32u, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     0u, out.layout.logicalSize.x,

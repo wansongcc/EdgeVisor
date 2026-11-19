@@ -8249,7 +8249,7 @@ static void sendRejoinNotice(NnNetwork *network, NnUint socketIndex, const LlmDe
     skipWorkerFrames(network, socketIndex);
     writeJoinPacket(network, socketIndex, pkt);
     bool acked = false;
-    for (int spin = 0; spin < 100 && !acked; ++spin) {
+    for (int spin = 0; spin < 1500 && !acked; ++spin) {
         skipWorkerFrames(network, socketIndex);
         try {
             acked = network->tryConsumeAck(socketIndex);
@@ -8871,10 +8871,14 @@ void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
             }
         }
         if (context->executor != nullptr) {
-            for (NnUint layer = g_dropped.frontBegin; layer < g_dropped.frontEnd; ++layer)
+            for (NnUint layer = g_dropped.frontBegin; layer < g_dropped.frontEnd; ++layer) {
                 context->executor->setPrimaryLayerEnabled(layer, false);
-            for (NnUint layer = g_dropped.backBegin; layer < g_dropped.backEnd; ++layer)
+                context->executor->setRedundantLayerEnabled(layer, false);
+            }
+            for (NnUint layer = g_dropped.backBegin; layer < g_dropped.backEnd; ++layer) {
                 context->executor->setPrimaryLayerEnabled(layer, false);
+                context->executor->setRedundantLayerEnabled(layer, false);
+            }
         }
         if (!applyPpStageInsert(livePlan, g_dropped.stageIndex, g_dropped.prevStage))
             throw std::runtime_error("Rejoined worker could not be relinked into the pipeline");
@@ -9260,6 +9264,7 @@ void runWorkerApp(AppCliArgs *args) {
                         } else if (pkt.op == LLM_DEVICE_JOIN_DISABLE && pkt.workerIndex == nodeConfig.nodeIndex) {
                             for (NnUint layer = pkt.layerBegin; layer < pkt.layerEnd; ++layer) {
                                 executor.setPrimaryLayerEnabled(layer, false);
+                                executor.setRedundantLayerEnabled(layer, false);
                             }
                             std::printf("🧩 [pool] node=%u dropped layers=[%u,%u)\n",
                                 (unsigned)nodeConfig.nodeIndex, (unsigned)pkt.layerBegin, (unsigned)pkt.layerEnd);

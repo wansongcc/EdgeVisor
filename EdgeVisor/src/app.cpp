@@ -4840,6 +4840,9 @@ void RootLlmInference::pumpWorkerFrames(NnUint socketIndex, int timeoutMs) {
         LlmWorkerFrameHeader peek{};
         if (!network->tryPeekWithMaxAttempts(socketIndex, &peek, sizeof(peek), 1ul)) return;
         if (peek.magic != LLM_WORKER_FRAME_MAGIC || peek.version != LLM_WORKER_FRAME_VERSION) {
+            // A join ack shares this socket with sampled tokens. Drop it and
+            // keep the token frame that follows aligned.
+            if (network->tryConsumeAck(socketIndex)) continue;
             throw std::runtime_error("Invalid worker frame magic or version");
         }
         if (peek.payloadBytes > 1024u * 1024u)
@@ -6938,7 +6941,22 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     // Previous stage stores the dead stage's prefix. Next stage stores its
     // suffix. Takeover needs those two runs to cover every dead layer.
     const unsigned prefix = neighborCoverRun(roles, prevStage, dead.startLayer, dead.endLayer, true);
-    const unsigned suffix = neighborCoverRun(roles, nextStage, dead.startLayer, dead.endLayer, false);
+    unsigned suffix = neighborCoverRun(roles, nextStage, dead.startLayer, dead.endLayer, false);
+    // The next stage's copy of a layer was shadowed from the activation it
+    // received, which is that layer's output. The previous stage replayed the
+    // same layer from its own output, so that copy is the one to run.
+    if (prevStage != nullptr && suffix > 0u && dead.endLayer >= suffix) {
+        const NnUint suffixBegin = dead.endLayer - suffix;
+        unsigned drop = 0u;
+        for (NnUint layer = suffixBegin; layer < dead.endLayer; ++layer) {
+            const bool prevOwns = layer >= prevStage->startLayer && layer < prevStage->endLayer;
+            const bool prevRight = layer >= prevStage->endLayer &&
+                roles.getRole(prevStage->stageIndex, layer) == RUNTIME_LAYER_REDUNDANT;
+            if (!prevOwns && !prevRight) break;
+            drop += 1u;
+        }
+        suffix -= drop;
+    }
     const NnUint prevMs = (prev != (NnUint)-1 && prev < LLM_STAGE_SPEED_SLOTS) ? g_stageExecMs[prev] : 0u;
     const NnUint nextMs = (next != (NnUint)-1 && next < LLM_STAGE_SPEED_SLOTS) ? g_stageExecMs[next] : 0u;
     // DLLAMA_TAKEOVER_PREV_WINS keeps the overlap on the previous stage. It is

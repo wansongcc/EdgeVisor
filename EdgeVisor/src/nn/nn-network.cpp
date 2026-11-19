@@ -2245,6 +2245,27 @@ bool NnNetwork::tryConsumeAck(NnUint socketIndex) {
     return true;
 }
 
+void NnNetwork::discardBufferedAck(NnUint socketIndex) {
+    if (socketIndex >= nSockets) return;
+    const int fd = sockets[socketIndex];
+    if (fd < 0) return;
+    // Block until the peer's next word is available. A join ack is written
+    // before that peer's logit tensor; leaving it here shifts every sample.
+    for (int n = 0; n < 8; ++n) {
+        NnUint word = 0u;
+        ssize_t got = 0;
+        do {
+            got = ::recv(fd, &word, sizeof(word), MSG_PEEK | MSG_WAITALL);
+        } while (got < 0 && errno == EINTR);
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!tryConsumeAck(socketIndex)) return;
+            continue;
+        }
+        if (got != (ssize_t)sizeof(word) || word != (NnUint)ACK) return;
+        readAck(socketIndex);
+    }
+}
+
 static int connectSocketWithin(const char *host, int port, int timeoutMs) {
     if (host == nullptr || timeoutMs < 0) return -1;
     char mutableHost[256];
@@ -2513,7 +2534,18 @@ int NnNetwork::askPpDeliveryState(const NnUnevenPartitionPlan *plan, NnUint myNo
     if (socketIndex < 0) return 0;
 
     const NnUint position = currentPosition_;
-    const long long deadlineMs = nowMsSteady() + NN_PP_DELIVERY_ASK_TIMEOUT_MS;
+    // A blocked recv notices the dead peer only when that read fails, which is
+    // bounded by TCP_USER_TIMEOUT (4s in the tests, 20s by default). Returning
+    // silence at 500ms skips the replay, and the next activation is then read
+    // as this token.
+    const int userMs = envIntOr("DLLAMA_TCP_USER_TIMEOUT_MS", 20000);
+    long long askMs = NN_PP_DELIVERY_ASK_TIMEOUT_MS;
+    if (userMs > 0) {
+        const long long bound = (long long)userMs + 1000ll;
+        if (bound > askMs) askMs = bound;
+    }
+    if (askMs > 30000ll) askMs = 30000ll;
+    const long long deadlineMs = nowMsSteady() + askMs;
     for (;;) {
         // The worker-frame pump may already have stored the answer.
         if (takePpDeliveryNeedNote(position, deadNode)) return 2;
@@ -2552,15 +2584,21 @@ int NnNetwork::askPpDeliveryState(const NnUnevenPartitionPlan *plan, NnUint myNo
                                 notePpDeliveryNeed(need.position, need.deadNode, downstream);
                             }
                         }
+                    } else if (header.kind == NN_WORKER_FRAME_STAGE_SPEED) {
+                        // A speed report carries no position and says nothing
+                        // about delivery. Consume it so the reader that owns
+                        // this stream never sees it, then keep waiting.
+                        read((NnUint)socketIndex, frame.data(), frameBytes);
+                        continue;
                     } else {
-                        // Any other worker frame is a HAVE answer, but only if
-                        // it belongs to this position. A profile/sample left
-                        // over from an earlier token proves nothing either way.
+                        // Any other worker frame can be a HAVE answer, but only
+                        // when it belongs to this position. A profile/sample
+                        // left over from an earlier token proves nothing.
                         NnUint framePos = 0u;
                         const bool havePos = ppFramePositionFn_ != nullptr &&
                             ppFramePositionFn_(ppFramePositionContext_, (NnUint)socketIndex, header.kind,
                                 frame.data() + sizeof(header), (NnSize)header.payloadBytes, &framePos);
-                        if (!havePos || framePos == position) return 1;
+                        if (havePos && framePos == position) return 1;
                     }
                 }
             }
@@ -3028,6 +3066,10 @@ static void syncNodeSlices(
                     io.size = sliceSizes[targetNode];
                     batchIos.push_back(io);
                 }
+            }
+            if (amIRoot && isLogitsGather) {
+                for (NnUint i = 0; i < nSocketsPerThread; i++)
+                    network->discardBufferedAck((NnUint)targetSockets[startIdx + i]);
             }
             network->readMany((NnUint)batchIos.size(), batchIos.data(), onWait);
         }

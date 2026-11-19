@@ -1464,6 +1464,7 @@ static NnNodeConfig buildLlmNodeInternal(
     }
     addSegmentLogged(start, "start", 0u);
 
+    NnUint ppRecvHoldBufferIndex = 0u;
     if (!isFirstStage) {
         // 创建一个专门的 Segment 来处理接收
         NnSegmentConfigBuilder ppRecvSeg;
@@ -1481,9 +1482,21 @@ static NnNodeConfig buildLlmNodeInternal(
         ppRecvSeg.addSync(n->xPipeIndex, SYNC_WITH_ROOT); 
 
         addSegmentLogged(ppRecvSeg, "pp_recv", startLayer);
+
+        // pp_cast_out reuses the X pipe for the outgoing activation. Left-boundary
+        // shadow runs after that send, so it must read the activation that arrived
+        // this token, not the one this stage is about to forward.
+        ppRecvHoldBufferIndex = nodeBuilder.addBuffer(
+            "pp_recv_hold", size2D(F_32, nBatches, h->dim));
+        NnSegmentConfigBuilder ppRecvHoldSeg;
+        ppRecvHoldSeg.addOp(OP_CAST, "pp_recv_hold", startLayer,
+            pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
+            pointerBatchConfig(SRC_BUFFER, ppRecvHoldBufferIndex),
+            size0(), NnCastOpCodeConfig{});
+        addSegmentLogged(ppRecvHoldSeg, "pp_recv_hold", startLayer);
     }
 
-    auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromXPipe, bool writeBackToXPipe, bool readFromStageCache) {
+    auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromXPipe, bool writeBackToXPipe, bool readFromStageCache, bool useRecvHold) {
         const NnUint redundantKBufferIndex = nodeBuilder.addBuffer(
             "red_k",
             fullAttBuffers ? size2D(F_32, h->seqLen * kvSlotCount, h->kvDim) : kvCacheSlice.keySize);
@@ -1508,7 +1521,8 @@ static NnNodeConfig buildLlmNodeInternal(
                 size0(), NnCastOpCodeConfig{});
         } else if (readFromXPipe) {
             redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_left", layerIndex,
-                pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
+                useRecvHold ? pointerBatchConfig(SRC_BUFFER, ppRecvHoldBufferIndex)
+                            : pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, xBufferIndex),
                 size0(), NnCastOpCodeConfig{});
         } else {
@@ -1594,7 +1608,8 @@ static NnNodeConfig buildLlmNodeInternal(
                 size0(), NnCastOpCodeConfig{});
         } else if (readFromXPipe) {
             takeoverAtt.addOp(OP_CAST, "runtime_redundant_att_in_left", layerIndex,
-                pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
+                useRecvHold ? pointerBatchConfig(SRC_BUFFER, ppRecvHoldBufferIndex)
+                            : pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, xBufferIndex),
                 size0(), NnCastOpCodeConfig{});
         } else {
@@ -1869,13 +1884,19 @@ static NnNodeConfig buildLlmNodeInternal(
     };
 
     // Place left-boundary redundant layers before active range.
+    NnUint firstLeftLayer = startLayer;
+    for (NnUint i = 0; i < redundantLayers.size(); ++i) {
+        if (redundantLayers[i] < firstLeftLayer) firstLeftLayer = redundantLayers[i];
+    }
     for (NnUint i = 0; i < redundantLayers.size(); ++i) {
         const NnUint layerIndex = redundantLayers[i];
         if (layerIndex < startLayer) {
             // Runtime migration may enable any suffix of the built redundant
             // boundary set. Keep each takeover layer self-contained through
             // X so both single-layer and consecutive-layer takeover work.
-            addRedundantWeightHolderForLayer(layerIndex, true, true, false);
+            // Only the first layer's input is the received activation. Replay
+            // writes X, and the following layer reads that.
+            addRedundantWeightHolderForLayer(layerIndex, true, true, false, layerIndex == firstLeftLayer);
             if (productLogLevel() >= 1)
                 printf("redundant weight holder for layer %u before startLayer %u\n", layerIndex, startLayer);
         }
@@ -2285,7 +2306,7 @@ static NnNodeConfig buildLlmNodeInternal(
         for (NnUint i = 0; i < redundantLayers.size(); ++i) {
             const NnUint layerIndex = redundantLayers[i];
             if (layerIndex >= endLayer) {
-                addRedundantWeightHolderForLayer(layerIndex, false, false, true);
+                addRedundantWeightHolderForLayer(layerIndex, false, false, true, false);
             }
         }
 
@@ -2651,6 +2672,31 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
                     first = false;
                 }
         printf("\n");
+    }
+
+    // A left-boundary copy is filled from the activation that stage already
+    // received, so its KV is not that layer's real history. The previous
+    // stage's right-boundary replay walks forward from its own output.
+    // Continue that chain through every later redundant copy. Stopping at
+    // the next stage's last layer leaves the takeover activation wrong;
+    // the copies after that stage have to be on this chain too.
+    for (NnUint s = 0; s + 1u < plan->nStages; ++s) {
+        const NnStageConfig &left = plan->stages[s];
+        NnUint layer = std::min(left.endLayer, nLayers);
+        while (layer < nLayers && out.getRole(left.stageIndex, layer) == RUNTIME_LAYER_REDUNDANT)
+            layer += 1u;
+        while (layer < nLayers) {
+            bool heldLater = false;
+            for (NnUint t = s + 1u; t < plan->nStages; ++t) {
+                if (out.getRole(plan->stages[t].stageIndex, layer) == RUNTIME_LAYER_REDUNDANT) {
+                    heldLater = true;
+                    break;
+                }
+            }
+            if (!heldLater) break;
+            admit(left.stageIndex, layer);
+            layer += 1u;
+        }
     }
 
     if (policyStr != nullptr) {

@@ -28,79 +28,83 @@
 
 ## 可变交接
 
-更新时间：2026-11-09 17:44 CST（机器时间 09:44 UTC）。分支 `exp/multifault-weights`，已推到 GitHub `wansongcc/EdgeVisor`。
+更新时间：2026-11-19 15:45 CST。分支 `main`，已与 `origin/main` 对齐，HEAD `4756d18`（Merge pull request #7）。工作状态：接管乱码已修并合进 `main`。机器上没有正在跑的实验。
 
 ### 现在在做哪件事
 
-跑 8B 的 E1 主矩阵（机制级对比，六臂）。**正在跑，不要停，也不要再开一份。**
-
-- 驱动脚本：`/tmp/ev_matrix_v2/run_8b.sh`，pid `3057489`，启动命令 `setsid -f bash run_8b.sh`
-- 实验进程：pid `3113960`，`python3 -u /home/byh/B01/baseline/_harness/e1_v2.py --model-key 8b ...`
-- 日志：`/tmp/ev_matrix_v2/matrix.log`
-- 进度：8b 4× 已完成触发点 1024 / 2048 / 4096；`8b_s4_t8192` 正在跑（bounded 已完成，transfer 进行中，还剩 pipelive / ev_hit / ev_miss）
-- 队列剩余：8192、16384、再两档 6×（1024、8192），最后单独补 replay 六个组
-- 队列里的组是按 `run_8b.sh` 顺序自动跑的，不需要人介入
+算法 2 的流水线接管。死掉一台之后，句子不再掉进 `!'-39?EKQW]ciou`。做到：T4 上杀掉中间那台、不杀、以及整段交给后一台再重新加入，这三种都保持英文。还没做完的是：机器重新回到计算路径之后，句子会离开原来那句，另起一段。
 
 ### 已经定下来的结论
 
-讨论方向和结论比代码更重要，先读这一段。
+- 根节点自己算被抢走的第 8 层时，这一层的结果和它本来就由根节点计算时一致。坏的是后一台机器左边的副本：那些层的 KV 是用本机已经算完、准备发出去的激活填的。
+- 修法在三处。收到的激活另存一份，左边影子层读这份。上一台机器右边的影子链继续接到后面各台已经持有的连续副本；这次死掉的是第 8 到 11 层，链要接到第 14 层，只接到 11、12 或 13 层时乱码还在。接管时，后一台机器上与这条链重复的层不再分给它。
+- 不杀进程时，同一提示、temperature 0，句子是 “Is there something on your mind that you'd like to talk about…”。杀掉第 8 到 11 层那一台之后，前半句与此相同。日志在 `/tmp/ev_textfix_nokill/root.log` 和 `/tmp/ev_textfix_rejoin/root.log`。
+- 重新加入之后乱码没有出现，但原文停住，模型另起 “I'd be happy to help you with any questions…”。这不是已经修好的那串乱码。
+- 整段交给后一台（depths `0,0;0,4;1,1`，不要再加 `--runtime-redundant-boundary-layers`）时，接管和重新加入都能跑完，句子是英文。日志 `/tmp/ev_textfix_ack2/root.log`。
+- 用 `kill` 记下的 PID 停掉进程，不能写成物理断电的结果。
+- 2026-11-09 那份交接里的 8B 矩阵已经跑完。`/tmp/ev_matrix_v2/matrix.log` 末行是 `2026-11-10T05:01:20+00:00 === 8B matrix done ===`。当时的 pid 3057489、3113960 已经不在。不要再开那一轮。
 
-**1. 之前那一整批 E1 数据作废**，原因有三个，都已修：权重没算进迁移时间；`state_transfer_bytes` 双计（`sourceBytes + targetBytes` 是同一次拷贝，报 270 MB 实际过线 135 MB）；故障只注入一次、只迁一层。旧结果在 `/tmp/ev_e1_deprecated/`。
+### 两套设备
 
-**2. bounded 没有「恢复时间」。** 它不做任何恢复动作，只有 episode 完成时间可比。主指标分两个数报：触发到新路径第一个 token（含在飞 token），以及其中迁移占的 `stall_ms`。用 bounded 的「下个 token 间隔」当恢复时间是概念错误。
+#### 这台机器上的四张 T4
 
-**3. 故障必须持续到 episode 结束，且按重平衡搬够层。** 短窗口 + 只搬 1 层时，六臂 tok/s 全都一样（约 3.6），迁移付了成本却拿不到吞吐回报。现在用 `pos-pos:slowdown@persist+rebalance`，层数按 `S*(s-1)/(s+1)` 自动算（8B 4×→6 层，6×→7 层）。
+控制机就是这台，四张 Tesla T4，当前空闲（每张 0 MiB）。GPU 0 当根，1、2、3 当 worker。本机编译：
 
-**4. 降速惩罚必须按 primary 层数缩放，不能按节点固定加时。** 固定加时的话搬走 6 层后仍付满额惩罚，稳态只从 485→454 ms；按层缩放后 485→187 ms。`countExecutedLayers()` 只数 `SEG_ROLE_PRIMARY`，冗余段不能算进去，否则 EV 的准备会把自己拖慢。
+`make -C /home/byh/B01/EdgeVisor-wansongcc/EdgeVisor -j dllama`
 
-**5. EV 的预留在气泡路径上，不在内联路径上。** 这是最容易踩的坑：`--runtime-redundant-seg-enabled` 把冗余段编进 forward，每 token 多 20 ms，会得出「EV 亏本 22 倍」的错误结论；`DLLAMA_BUBBLE_SHADOW_KV=1` 才是把冗余计算放进空隙的做法。用气泡后 3B 单线程 EV 从 8.63 回到 10.90 前置 tok/s。
+二进制是 `/home/byh/B01/EdgeVisor-wansongcc/EdgeVisor/dllama`，CUDA 架构 75。模型用 `/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m`。分词器没有 llama3.2 那份，用 `/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t`。
 
-**6. 这套 PP 拓扑下单线程更快。** 一 stage 一节点，多余线程只增加同步开销。所有臂统一 `--threads 1`，否则对比不公平。旧的多线程 8B/3B 数据与新数据不可比。
+现成脚本：`/home/byh/B01/EdgeVisor-wansongcc/experiments/algo2/t4_rejoin.sh`。它用 `--ratios '1@8*1@4*1@8*1@8'`、`--runtime-redundant-boundary-layers 3`、`--workers 127.0.0.1:29241` 起三台、`--nthreads 1`、`--buffer-float-type q80`、`--enable-pp-migration`。影子 KV 必须 `--nthreads 1`，否则直接拒绝启动。层段用 `--ratios` 钉死；不钉的话速度装箱可能排出 29 层然后中止。对比句子时用 `--temperature 0 --seed 1`。停进程用脚本记下来的 PID，`kill` 那个 PID。不要用 `pkill -f`，那会把远程 shell 一起杀掉。
 
-**7. EV 的预留是预算约束下的预测，不是全量铺。** 全铺 48 层时前置慢 2.09 倍。现在 `--ev-budget-boundaries 1`、深度=重平衡层数，并让先验 `DLLAMA_SCENARIO_PROBABILITIES` 指向故障真正发生的边界（stage 2→1 是边界 1）。`ev_hit` 与 `ev_miss` 的区别就是预测对错，两者的图结构都要 provision，否则迁移命令会被 `target stage lacks provisioned layer` 拒掉。
+#### 边缘五台：rog、nx1、nx2、nano1、nano2
 
-**8. ReMP / DynaPipe / Llumnix 不进主表。** 这四个目录里只有 `.gitkeep`，从没复现过；现有六臂是机制移植，不是系统复现。ReMP 在固定 2→1 路线上与已有两臂重叠（影子关=transfer，影子开=ev_hit）。`dynapipe_ab.py` 依赖的 `DLLAMA_TPOT_ACCOUNT_TAIL_SAMPLE` 在源码里不存在，跑不通。
+从这台控制机用 SSH 别名 `rog`、`nx1`、`nx2`、`nano1`、`nano2`。推理走有线 `192.168.137.0/24`，不要走 WiFi。
 
-### 已出的结果（8B，4×，单线程，触发点 1024/2048/4096）
+| 别名 | 有线 | 角色 |
+| --- | --- | --- |
+| rog | 192.168.137.20 | 流水线两头的主控，Vulkan/CPU 都在这台起 inference |
+| nx1 | 192.168.137.13 | 第一台 Jetson，也是 aarch64 的编译机 |
+| nx2 | 192.168.137.15 | 中间那台，演示里拔的是它 |
+| nano1 | 192.168.137.18 | Jetson |
+| nano2 | 192.168.137.16 | 流水线另一头 |
 
-episode 完成时间，从触发起算：
+跳板：Jetson 不从控制机直连。先 `ssh rog`，再由 rog 用 `~/.ssh/id_ed25519_lab` 登 `jetson@192.168.137.x`。脚本里的写法在 `/home/byh/B01/EdgeVisor-wansongcc/scripts/demo_dropout_rejoin.sh` 和 `scripts/demo_power_cycle.sh`。
 
-| 触发点 | bounded | transfer | pipelive | ev_hit | ev_miss | replay |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1024 | 325.9 s | 250.5 s | 248.5 s | **199.1 s** | 248.4 s | 477.9 s |
-| 2048 | 568.0 s | 484.5 s | 484.4 s | **441.1 s** | 487.5 s | 未跑 |
-| 4096 | 1163.3 s | 1063.2 s | 1056.9 s | **926.7 s** | 1056.7 s | 未跑 |
+WiFi `192.168.8.46` 和 `192.168.8.23` 在速度表里算 NX，`192.168.8.45` 和 `192.168.8.53` 算 Nano（`EdgeVisor/src/device_profile.hpp` 的 `knownSpeedProfile`）。源码没有把每个 WiFi 地址再绑到某一台别名上。这些地址探得通，但撑不住一次完整的模型加载。重新加入和正式推理都用上面的有线地址，`--workers` 也填有线地址。
 
-`stall_ms`：EV 0–1 ms，transfer 1509 / 2426 / 4247 ms。KV：101 / 202 / 405 MB。
+模型：rog 用 `/home/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m` 和 `/home/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t`。四台 Jetson 用 `/home/jetson/cc/models/` 下的同名文件。没有 llama3.2 的分词器。
 
-未解释现象：EV 的前置吞吐稳定高 15–30%（6.92 / 5.37 / 4.77 vs 其他臂 5.26 / 4.84 / 4.14）。怀疑是气泡填充利用了 stage 间空隙，但也可能是其他臂单线程没跑满。**这个差异要么在论文里解释清楚，要么归一化掉，不能当作 EV 的收益直接报。**
+两条演示：
+
+- 杀进程再拉起：`bash /home/byh/B01/EdgeVisor-wansongcc/scripts/demo_dropout_rejoin.sh`。二进制在各机 `/tmp/ev_demo1/EdgeVisor/dllama`，重启机器会丢。`--rebuild` 才重编。
+- 人手断电：`bash /home/byh/B01/EdgeVisor-wansongcc/scripts/demo_power_cycle.sh`。必须在真实终端里跑，面板要 100 列以上。二进制放在掉电也不丢的目录：rog 是 `/home/cc/ev_demo2`，Jetson 是 `/home/jetson/ev_demo2`。脚本自己不拔电。出 token 之后人手拔 nx2。不要拔 rog，也不要拔 nano2，它们在流水线两头。nx2 上电并能 ping 通 `192.168.137.15` 之后，再跑脚本写到 `/tmp/ev_demo2_next.txt` 的那条重新加入命令。
+
+边缘上的二进制经常比 `main` 旧。`source_rev` 和当前 HEAD 不一致时，演示脚本会重编：rog 上 `DLLAMA_VULKAN=0 DLLAMA_CUDA=0 make dllama`，nx1 上编 aarch64，再拷到另外三台。合进 `4756d18` 之后还没在五台上重编，下一次边缘实验先让脚本按 `source_rev` 重编，不要拿旧二进制报结果。
+
+rog 若改跑 Vulkan，工作目录必须能打开 `./src/nn/vulkan/`。加载函数按这个相对路径找文件（`EdgeVisor/src/nn/nn-vulkan.cpp` 的 `readShader`）。文件名是 `matmul-forward-q80-q40-f32.spv` 这一类，没有 `matmul.spv`。现在这两条演示脚本编的是 CPU 版，工作目录是持久目录，里面没有这些 shader。
+
+停边缘进程用 `pkill -x dllama`（演示脚本就是这样），不要用 `pkill -f`。
 
 ### 机器上还留着什么
 
-- GPU 0–3 被当前实验占用（7281 / 9881 / 9881 / 7207 MiB），四张都在用
-- 端口 9992–9994 在实验结束后会释放
-- 不要动 `/tmp/ev_e1_deprecated/`（作废数据，留对照）
-- 已归档的可复用数据：`/tmp/ev_st3b/`（3B 单线程六臂，触发点 600，已验证）、`/tmp/ev_matrix_v2/8b_s4_t1024`（含 replay）
+- 没有 `dllama` 进程。四张 T4 都是 0 MiB。端口 9992–9994、294xx 都没有在听。
+- 未跟踪、不要提交：`/home/byh/B01/EdgeVisor-wansongcc/experiments/algo2/logs/t4_rejoin/`。
+- 8B 矩阵结果还在 `/tmp/ev_matrix_v2/`，作废对照在 `/tmp/ev_e1_deprecated/`，3B 单线程六臂在 `/tmp/ev_st3b/`。都不要删，也不要提交。
+- `/home/byh/B01/baseline` 在分支 `feat/remp-pp`，另有未跟踪的 `_harness/dynapipe_ab.py` 和 `_harness/dynapipe_sampling.py`。那个仓库的 remote 不是这份 EdgeVisor。不要从这边顺手提交。
 
 ### 下一步
 
-用户说「继续」时：
-
-1. 先确认 `run_8b.sh` 是否还在跑（`ps -eo pid,cmd | grep run_8b`），跑着就别动。
-2. 跑完后汇总 8B 完整表，然后问用户 3B 是否按新配置（单线程 + 气泡 EV）全量重跑，14B 是否开。
-3. 之后才是命中率扫描（`--ev-budget-boundaries` × `DLLAMA_SCENARIO_PROBABILITIES` 组合），横轴预算、纵轴加权恢复时间。
-
-没说继续不要开 3B/14B 长实验。
+用户说「继续」时：先看 `/tmp/ev_textfix_rejoin/root.log` 里 `rejoined stage` 之后的句子。重新加入本身已经成功（KV 追到 pos 46，乱码没有出现），但句子离开了 “something on your mind…”。先查交还时 worker 用的是不是刚拷过去的那份 KV，再决定要不要改 `EdgeVisor/src/app.cpp` 的重新加入路径。没说继续就不要重跑 T4，也不要上五台边缘机。
 
 ### 约束
 
-- 不要合到 `main`，不要强推
-- 不要提交 `/tmp` 下的结果目录、论文 PDF、`baseline/` 仓库的东西（那个仓库单独的 remote 是 `BianYanhui/EdgeVisor_baseline_reproduc`）
-- 不要提交 `._*`
-- `baseline/_harness/e1_v2.py` 改动在 `/home/byh/B01/baseline` 仓库里，目前**未提交**（`E1v2-report.md` 与五个 harness 脚本都是 untracked）。这次的 `handsoff.md` 只提交到 EdgeVisor 仓库，不要顺手把 baseline 仓库的东西带上，除非用户要求
+- PR 用 `gh --repo BianYanhui/EdgeVisor_fork`。不带 `--repo` 会打到 `wansongcc/EdgeVisor`。
+- 不要提交 `*.log`、`experiments/algo2/logs/`、`/tmp` 下的结果、论文 PDF、`._*`。
+- 引擎是 C++11，编译带 `-Werror`。
+- 影子 KV 开着时线程数必须是 1。
 
 ### 相关 commit
 
-- `ed7e695` Charge weight residency and make faults repeatable —— 本次代码改动，7 个文件：`app.cpp`（权重下发、按所有权选层、影子接管语义）、`app.hpp`（`weightResidencyPreallocated`、`sendWeightLoadRequest`）、`dllama.cpp`（多锚点 mark、逐 token 时间戳）、`llm.cpp`/`llm.hpp`（按层权重加载、`predictLlmLayerWeightBytes`）、`nn-executor.cpp`/`.hpp`（故障调度、按 primary 层校准、`countExecutedLayers`）
-- 前一个提交 `13c7e5e`，其上四个基提交都已在 origin
-- 关键文件：`EdgeVisor/src/nn/nn-executor.cpp`（`faultScheduleConfig`、`countExecutedLayers`、`forward` 里的惩罚施加点）、`EdgeVisor/src/llm.cpp`（`buildRuntimeStageLayerPlan` 的准入与预算）、`EdgeVisor/src/app.cpp`（`sendWeightLoadRequest`、`resolvePpMigrationLayersByOwnership`、`sendPendingLayerSwitchControlOnly`）
+- `4756d18` 把 `algorithm_2_ver.2` 合进 `main`。其中 `8ccdcc2` 是接管句子这次的修改：`EdgeVisor/src/llm.cpp`（收到的激活另存、右边界链往后接）、`EdgeVisor/src/app.cpp`（后一台重复的层不再算进后缀，并丢掉插在 logit 前面的加入确认）、`EdgeVisor/src/nn/nn-network.cpp` 与 `nn-network.hpp`（丢掉缓冲的确认字，速度帧不挡交付询问）。
+- 同一条分支上已包含：`1456269` 按邻居耗时切重叠层，`2594a19` 追赶中的设备先不进解码，`5fa2491` 设备回来后关掉邻居已经接管的冗余层。
+- 这次交接没有改这些源码。

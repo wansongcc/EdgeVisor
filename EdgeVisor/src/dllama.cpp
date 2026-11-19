@@ -428,6 +428,19 @@ static void debugSyncTopkTrace(const float* logits, NnUint vocabSize, const char
 #define DLLAMA_DEBUG_TOPK_LOGITS 0
 #endif
 
+/* computeLogitsStats walks the whole vocabulary (128K floats on llama3) and its
+ * output only feeds debug printing: the TOPK block when that is compiled in,
+ * the productLogLevel() >= 1 report, and the root-logits split dump. Normal
+ * inference runs at level 0 with TOPK compiled out, so the scan is pure
+ * per-token overhead there and must not run. */
+static bool logitsStatsNeeded() {
+#if DLLAMA_DEBUG_TOPK_LOGITS
+    return true;
+#else
+    return productLogLevel() >= 1 || debugRootLogitsSplitEnabled();
+#endif
+}
+
 #if DLLAMA_DEBUG_TOPK_LOGITS
 static int debugLogitsBatchSelect() {
     const char *v = std::getenv("DLLAMA_DEBUG_LOGITS_BATCH");
@@ -1049,13 +1062,16 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         float minLogit = 1e9f;
         int maxIndex = -1;
 
-        // Always compute basic logits stats (even when TOPK debug isn't compiled).
+        // The stats below are only consumed by the TOPK debug block and by the
+        // productLogLevel()>=1 report, so the vocab-wide scan is skipped when
+        // both are off (normal inference). Both readers recompute their own
+        // numbers when they are active.
         // In eval stage logits pipe is [batch][vocab]. Use the latest row of this window.
         // Non-final chunks skip the logits compute; their pipe rows are stale.
         const NnUint statBatch = (batchSize > 0u) ? (batchSize - 1u) : 0u;
         const float* logitsRow = logits + (size_t)statBatch * (size_t)vocabSize;
         NnUint zeroCount = 0u;
-        if (isFinalChunk) {
+        if (isFinalChunk && logitsStatsNeeded()) {
             computeLogitsStats(logitsRow, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
         }
 
@@ -1178,8 +1194,10 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             armSessionRestart(e.peerNodeIndex, true);
         }
 
-        // In pred stage batchSize==1. Always compute logits stats for debugging.
-        if (!haveLastStageToken) {
+        // In pred stage batchSize==1. The stats exist only for the level>=1
+        // report just below, so the vocab-wide scan runs inside that gate and
+        // normal inference (level 0) skips it entirely.
+        if (!haveLastStageToken && productLogLevel() >= 1) {
             bool hasNaN = false;
             bool hasInf = false;
             float maxLogit = -1e9f;
@@ -1188,15 +1206,13 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             NnUint zeroCount = 0u;
             computeLogitsStats(context->inference->logitsPipe, context->header->vocabSize,
                                hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
-            if (productLogLevel() >= 1) {
-                const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && context->header->vocabSize > 0u);
-                printf("logits pred valid=%s range=[%.2f, %.2f] maxIdx=%d zero=%u/%u\n",
-                    statsOk ? "ok" : "fail",
-                    minLogit, maxLogit, maxIndex,
-                    (unsigned)zeroCount, (unsigned)context->header->vocabSize);
-                printRootLogitsSplitStats("pred", pos, context->inference->logitsPipe, context->header->vocabSize);
-                debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
-            }
+            const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && context->header->vocabSize > 0u);
+            printf("logits pred valid=%s range=[%.2f, %.2f] maxIdx=%d zero=%u/%u\n",
+                statsOk ? "ok" : "fail",
+                minLogit, maxLogit, maxIndex,
+                (unsigned)zeroCount, (unsigned)context->header->vocabSize);
+            printRootLogitsSplitStats("pred", pos, context->inference->logitsPipe, context->header->vocabSize);
+            debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
         }
 
         NnUint predBubbleTime = 0;

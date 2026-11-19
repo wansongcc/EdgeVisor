@@ -1329,9 +1329,14 @@ __global__ static void matmulQ80Q40LargeKKernel(
     NnUint inStartBlocks,
     NnUint outStart,
     NnUint batchSize) {
-    /* One warp per output row: every warp of the block works on rows from the
+    /* Four output rows per warp: every warp of the block works on rows from the
      * same (y, e) group, so a single shared copy of x feeds all of them and
      * global x traffic drops by the warp count (8 on a 256-thread block).
+     * Each warp reuses the x blocks it already pulled for row r on rows r+1..3,
+     * which amortises the x side of the inner loop 4x; the weight rows stay
+     * separate coalesced streams. Every row keeps its own accumulator and its
+     * own b = lane, lane+32, ... walk, so each output is bit-identical to the
+     * one-row-per-warp version.
      * Grid is (row groups, batchSize * nActiveExpertsOr1). */
     extern __shared__ int smem[];
     const NnUint lane = threadIdx.x & 31u;
@@ -1344,7 +1349,7 @@ __global__ static void matmulQ80Q40LargeKKernel(
     /* Uniform across the block, so this return cannot strand a barrier. */
     if (activeExpert >= weightExperts) return;
 
-    const NnUint outLocal = blockIdx.x * nWarps + wid;
+    const NnUint rowBase = (blockIdx.x * nWarps + wid) * 4u;
     const NnBlockQ80 *x = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, e, y) + aOffsetBlocks;
 
     /* cachedBlocks is a compile-time shared-memory budget; beyond it we read x
@@ -1370,29 +1375,67 @@ __global__ static void matmulQ80Q40LargeKKernel(
         }
         __syncthreads();
     }
-    /* Rows past cLen leave after the barrier; nothing below syncs. */
-    if (outLocal >= cLen) return;
+    /* Rows past cLen leave after the barrier; nothing below syncs. A warp owns
+     * up to 4 consecutive rows, so the tail warp may only have 1..3 of them. */
+    const NnUint rowCount = rowBase >= cLen ? 0u : (cLen - rowBase < 4u ? cLen - rowBase : 4u);
+    if (rowCount == 0u) return;
 
-    const NnUint row = view == 0u ? outLocal : outStart + outLocal;
     const NnUint inBlock = view == 2u ? inStartBlocks : 0u;
-    const NnBlockQ40 *w = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
+    /* All four pointers are always in range: an inactive slot is clamped onto
+     * the warp's last real row and never read, because every use is guarded by
+     * r < rowCount (uniform inside the warp). */
+    const NnBlockQ40 *w[4];
+    #pragma unroll
+    for (NnUint r = 0u; r < 4u; ++r) {
+        const NnUint outLocal = rowBase + r;
+        const NnUint clamped = outLocal < cLen ? outLocal : cLen - 1u;
+        const NnUint row = view == 0u ? clamped : outStart + clamped;
+        w[r] = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
+    }
 
-    float sum = 0.0f;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (cached) {
         for (NnUint b = lane; b < aBlocks; b += 32u) {
-            const int ip = cudaQ80Q40DotPacked(xs + b * 8u, xSum[b], w[b].qs);
-            sum += (float)ip * xd[b] * cudaHalfBitsToFloat(w[b].d);
+            const int *xWords = xs + b * 8u;
+            const int xSumB = xSum[b];
+            const float xdB = xd[b];
+            #pragma unroll
+            for (NnUint r = 0u; r < 4u; ++r) {
+                if (r < rowCount) {
+                    const int ip = cudaQ80Q40DotPacked(xWords, xSumB, w[r][b].qs);
+                    sum[r] += (float)ip * xdB * cudaHalfBitsToFloat(w[r][b].d);
+                }
+            }
         }
     } else {
+        /* Wider K than the shared budget: pack x once per block and run the
+         * same dp4a body against global weights, exactly as
+         * cudaQ80Q40DotGlobal does for a single row. */
         for (NnUint b = lane; b < aBlocks; b += 32u) {
-            const int ip = cudaQ80Q40DotGlobal(x + b, w + b);
-            sum += (float)ip * cudaHalfBitsToFloat(x[b].d) * cudaHalfBitsToFloat(w[b].d);
+            int xWords[8];
+            int xSumB = 0;
+            #pragma unroll
+            for (NnUint g = 0u; g < 8u; ++g) {
+                xWords[g] = cudaLoadInt8x4(x[b].qs + 4u * g);
+                xSumB += cudaSumInt8x4(xWords[g]);
+            }
+            const float xdB = cudaHalfBitsToFloat(x[b].d);
+            #pragma unroll
+            for (NnUint r = 0u; r < 4u; ++r) {
+                if (r < rowCount) {
+                    const int ip = cudaQ80Q40DotPacked(xWords, xSumB, w[r][b].qs);
+                    sum[r] += (float)ip * xdB * cudaHalfBitsToFloat(w[r][b].d);
+                }
+            }
         }
     }
-    sum = cudaWarpReduceSum(sum);
-    if (lane == 0u) {
-        float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
-        out[outLocal] = sum;
+    float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
+    #pragma unroll
+    for (NnUint r = 0u; r < 4u; ++r) {
+        if (r < rowCount) {
+            sum[r] = cudaWarpReduceSum(sum[r]);
+            if (lane == 0u) out[rowBase + r] = sum[r];
+        }
     }
 }
 
@@ -2407,12 +2450,13 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                         batchSize);
                     NN_CUDA_CHECK(cudaGetLastError());
                 } else {
-                    /* Warp-per-row blocks: 8 rows per block, one block per
-                     * (row group, y, e) with the whole x group cached in
-                     * shared memory when it fits. */
+                    /* Four rows per warp, eight warps: 32 output rows per
+                     * block, one block per (row group, y, e) with the whole x
+                     * group cached in shared memory when it fits. */
                     const unsigned int largeKBlock = q80q40LargeKBlock;
                     const unsigned int warpsPerBlock = largeKBlock >> 5u;
-                    const NnSize rowGroups = ((NnSize)cLen + warpsPerBlock - 1u) / warpsPerBlock;
+                    const NnSize rowsPerBlock = (NnSize)warpsPerBlock * 4u;
+                    const NnSize rowGroups = ((NnSize)cLen + rowsPerBlock - 1u) / rowsPerBlock;
                     const NnSize sharedBytes = aBlocks <= NN_CUDA_MATMUL_SHARED_MAX_BLOCKS
                         ? cudaQ80Q40LargeKSharedBytes(aBlocks)
                         : 0u;

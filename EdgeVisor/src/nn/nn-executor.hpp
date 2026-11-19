@@ -11,9 +11,27 @@
 #include "pthread.h"
 
 class NnExecutor;
+class NnNetExecution;
 
-class NnDeviceSegment {
-public:
+// Segment kind codes for per-layer compute profiling. The executor fills
+// LayerPerfState from these, and the CUDA backend uses the same codes to know
+// which slot a per-segment GPU timing sample belongs to.
+enum NnSegmentKindCode {
+    NN_SEG_KIND_OTHER = 0,
+    NN_SEG_KIND_ATTN  = 1,
+    NN_SEG_KIND_FFN   = 2
+};
+
+// Per-layer GPU timing target: which segment feeds which (layer, kind) slot of
+// NnNetExecution::LayerPerfState. Derived from the same ATTN/FFN segment
+// classification the executor uses for its CPU-side accounting.
+struct NnLayerPerfSegmentBinding {
+    NnUint segmentIndex;
+    NnUint layerIndex;
+    NnByte kind;
+};
+
+class NnDeviceSegment {public:
     virtual ~NnDeviceSegment() {};
     virtual void loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) = 0;
     virtual void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) = 0;
@@ -41,6 +59,25 @@ public:
     virtual NnUint maxNThreads() = 0;
     virtual ~NnDevice() {}
     virtual NnDeviceSegment *createSegment(NnUint segmentIndex) = 0;
+
+    // Single-device forward residency hooks. A device that keeps its pipes
+    // resident on the GPU across the whole forward() implements these; the
+    // defaults below leave every other backend byte-for-byte unchanged.
+    //
+    // beginForward() is called once before the executor threads start,
+    // endForward() once after the last executor thread has returned (and after
+    // the bubble-shadow drain, so every shadow op on this device is finished).
+    // syncPipeToHost()/invalidatePipeOnDevice() let the executor tell the device
+    // that a sync step is about to read a pipe on the host, or that a sync step
+    // overwrote a pipe on the host and the device copy is therefore stale.
+    virtual void beginForward(NnNetExecution * /*execution*/) {}
+    virtual void endForward(NnNetExecution * /*execution*/) {}
+    virtual void syncPipeToHost(NnUint /*pipeIndex*/, NnUint /*batchSize*/) {}
+    virtual void invalidatePipeOnDevice(NnUint /*pipeIndex*/) {}
+    // Declares which segments carry per-layer GPU timing. Called once by the
+    // executor after it has classified every segment; the device stores the
+    // list and uses it to record per-segment cudaEvents.
+    virtual void setLayerPerfSegments(const std::vector<NnLayerPerfSegmentBinding> & /*bindings*/) {}
 };
 
 class NnNodeSynchronizer {
@@ -153,6 +190,13 @@ typedef struct {
     NnUint nodeIndex;
     NnExecutorSyncProfile *syncProfile;
     const NnByte *segmentSyncProfileKinds;
+    // Set when one device owns every segment on this node (see NnExecutor's
+    // residencyDevice); the executor threads use it to invalidate device pipes
+    // after each sync step. `residencyStage` is this node's stage from the
+    // partition plan (null when it has none).
+    NnDevice *residencyDevice;
+    const NnStageConfig *residencyStage;
+    const NnNodeConfig *nodeConfig;
 } NnExecutorContext;
 
 typedef struct {
@@ -205,6 +249,12 @@ private:
     // Exclusive end position whose shadow KV has been written, per layer.
     std::vector<NnUint> shadowFilledThrough_;
     std::vector<NnByte> segmentSyncProfileKinds;
+    // Single-device pipe residency. Non-null only when this node has exactly one
+    // device entry and it covers every segment, so one device owns the whole
+    // forward and may keep pipes resident between segments. Multi-device nodes
+    // (CUDA + CPU fallback ranges, tests) leave this null and keep the old
+    // per-segment upload/download behaviour.
+    NnDevice *residencyDevice;
     NnBubbleShadowStats runBubbleShadowRedundantInternal(NnUint budgetUs, bool allowWhileRunning);
     NnBubbleShadowStats runBubbleShadowRedundantChunk(NnUint budgetUs, bool allowWhileRunning);
     bool isRedundantLayerActive(NnUint layerIndex) const;

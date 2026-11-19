@@ -95,6 +95,10 @@ public:
     NnCudaBuffer *resolveBuffer(NnUint bufferIndex);
 };
 
+// Per-layer GPU timing target: which segment feeds which (layer, kind) slot of
+// NnNetExecution::LayerPerfState. The struct itself is declared in
+// nn-executor.hpp, next to the NnDevice hooks that carry it.
+
 class NnCudaDevice : public NnDevice {
 private:
     NnUint gpuIndex;
@@ -107,6 +111,33 @@ private:
     std::atomic_uint planEpoch{0u};
     std::atomic_uint lastPlanCmdSeqEmitted{0u};
     NnCudaLaunchConfig launchConfig;
+
+    // --- Single-device pipe residency -------------------------------------
+    // While `residencyActive` a pipe's authoritative bytes sit on the GPU
+    // (`pipeDeviceDirty`) or the host copy is newer (`pipeHostDirty`). Between
+    // forwards both flags are false only for the pipes endForward() just
+    // published, because there the two copies agree.
+    bool residencyActive;
+    bool deviceWorkPending;
+    void *uploadDoneEvent;
+    bool uploadEventPending;
+    std::vector<bool> pipeHostDirty;
+    std::vector<bool> pipeDeviceDirty;
+    // Pipes whose host copy the rest of the process reads after a forward: ZQ
+    // (last layer's attention output, merged by pp_prepare), LG (logits the
+    // sampler reads), KC/VC (aggregated KV rows the migration collector copies).
+    std::vector<NnUint> trailingPipes;
+    // Per-segment cudaEvents for per-layer GPU timing. Indexed by segmentIndex
+    // and only created for segments the executor registered as profile targets.
+    std::vector<void *> segmentStartEvents;
+    std::vector<void *> segmentEndEvents;
+    // Per-forward "this segment actually ran and recorded both events".
+    std::vector<unsigned char> segmentRecorded;
+    std::vector<unsigned char> segmentPerfTarget;
+    std::vector<NnLayerPerfSegmentBinding> perfBindings;
+    bool perfTimingActive;
+    void resolveTrailingPipes();
+    void releaseSegmentEvents();
 public:
     NnCudaPinnedStaging staging;
     // Dedicated pinned buffers for the per-op segment input upload and output
@@ -142,6 +173,46 @@ public:
     void writeBuffer(NnUint bufferIndex, const NnByte *data, NnSize offset, NnSize nBytes);
     void readBuffer(NnUint bufferIndex, NnByte *data, NnSize offset, NnSize nBytes);
     void synchronize();
+
+    // --- Single-device pipe residency API ---------------------------------
+    void beginForward(NnNetExecution *execution) override;
+    void endForward(NnNetExecution *execution) override;
+    void syncPipeToHost(NnUint pipeIndex, NnUint batchSize) override;
+    void invalidatePipeOnDevice(NnUint pipeIndex) override;
+    void setLayerPerfSegments(const std::vector<NnLayerPerfSegmentBinding> &bindings) override;
+
+    bool isResidencyActive() const { return residencyActive; }
+    bool isPipeHostDirty(NnUint pipeIndex) const {
+        return pipeIndex < pipeHostDirty.size() && pipeHostDirty[pipeIndex];
+    }
+    bool isPipeDeviceDirty(NnUint pipeIndex) const {
+        return pipeIndex < pipeDeviceDirty.size() && pipeDeviceDirty[pipeIndex];
+    }
+    // The host copy is authoritative (device copy absent or stale).
+    void markPipeHostOwned(NnUint pipeIndex);
+    // A kernel has just overwritten this pipe on the device. The host copy is
+    // now stale, but it is the destination of a later publish on purpose.
+    void markPipeDeviceOwned(NnUint pipeIndex);
+    // Both copies now hold the same bytes, so neither needs another transfer
+    // until something writes one of them.
+    void markPipeSynchronized(NnUint pipeIndex);
+    void markDeviceWork() { deviceWorkPending = true; }
+    // Wait for the previous segment's H2D batch to stop reading uploadStaging.
+    void waitUploadStagingIdle();
+    void noteUploadBatchIssued();
+    // One batched D2H of `pipes` plus a single stream synchronize. Returns true
+    // when bytes were copied. Both dirty flags end up clear for every pipe it
+    // published, because after the memcpy the two copies agree.
+    bool publishPipesToHost(const std::vector<NnUint> &pipes, NnUint batchSize);
+    // Publish every pipe whose authoritative bytes are still on the device. Used
+    // when residency is off and the host has to be the channel again.
+    bool publishAllDeviceDirtyPipes(NnUint batchSize);
+    // Per-layer GPU timing hooks, all no-ops unless endForward() needs them.
+    bool isLayerPerfSegment(NnUint segmentIndex) const {
+        return segmentIndex < segmentPerfTarget.size() && segmentPerfTarget[segmentIndex] != 0u;
+    }
+    void recordSegmentStart(NnUint segmentIndex);
+    void recordSegmentEnd(NnUint segmentIndex);
 };
 
 // Per-op pointer binding for the CUDA segment: the resolved device buffers and
@@ -168,6 +239,13 @@ private:
     std::vector<NnCudaOpBinding> opBindings;
     std::vector<NnUint> uploadPipeIndices;
     std::vector<NnUint> downloadPipeIndices;
+    // Pipes whose contents this segment writes on the device. Used to flip the
+    // residency dirty flags without a per-op pipe lookup.
+    std::vector<NnUint> writtenPipeIndices;
+    // Pipes this segment's own syncs need to read on the host, precomputed once
+    // per segment from segmentConfig->syncs (see buildPipeIndexSets).
+    std::vector<NnUint> syncReadPipeIndices;
+    bool hasHostVisibleSync;
     unsigned int bindingsEpoch;
     bool bindingsValid;
     bool isHostOnlyPlanSegment;
@@ -176,8 +254,14 @@ private:
     std::string unsupportedOpMessage(NnUint opIndex) const;
     void buildPipeIndexSets();
     void rebuildBindings();
-    void uploadSegmentInputs(NnUint batchSize);
+    // `onlyHostDirty` is the residency path: it uploads only the pipes whose
+    // host copy is newer than the device copy, so a pipe whose authoritative
+    // bytes already sit on the GPU costs nothing.
+    void uploadSegmentInputs(NnUint batchSize, bool onlyHostDirty = false);
     bool downloadSegmentOutputs(NnUint batchSize);
+    // Residency path: publish just the pipes this segment's own syncs read on
+    // the host and leave every other output device-authoritative.
+    void publishResidentOutputs(NnUint batchSize);
     void executeOp(NnUint opIndex, NnUint batchSize);
 public:
     NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);

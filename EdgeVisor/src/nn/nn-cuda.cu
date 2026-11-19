@@ -1833,7 +1833,10 @@ NnCudaBuffer *NnCudaDeviceData::resolveBuffer(NnUint bufferIndex) {
 }
 
 NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan)
-    : gpuIndex(gpuIndex), stream(nullptr), blasHandle(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), launchConfig{}, staging(), data() {
+    : gpuIndex(gpuIndex), stream(nullptr), blasHandle(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), launchConfig{}
+    , residencyActive(false), deviceWorkPending(false), uploadDoneEvent(nullptr), uploadEventPending(false)
+    , pipeHostDirty(), pipeDeviceDirty(), trailingPipes(), segmentStartEvents(), segmentEndEvents(), segmentRecorded(), segmentPerfTarget(), perfBindings(), perfTimingActive(false)
+    , staging(), data() {
     (void)this->netConfig;
     (void)this->netExecution;
     NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
@@ -1856,9 +1859,29 @@ NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig
         nodeConfig->partitionPlan = partitionPlan;
     }
     data = NnCudaDeviceData(netConfig, nodeConfig);
+
+    // Every pipe starts host-authoritative: the app writes its per-token inputs
+    // through the host pipe and a sync step may receive into any of them, so
+    // nothing on the device is authoritative until a kernel writes it.
+    const NnUint nPipes = (netConfig != nullptr) ? netConfig->nPipes : 0u;
+    pipeHostDirty.assign(nPipes, true);
+    pipeDeviceDirty.assign(nPipes, false);
+    resolveTrailingPipes();
+    NN_CUDA_CHECK(cudaEventCreateWithFlags((cudaEvent_t *)&uploadDoneEvent, cudaEventDisableTiming));
+    uploadEventPending = false;
 }
 
 NnCudaDevice::~NnCudaDevice() {
+    if (uploadDoneEvent != nullptr && stream != nullptr) {
+        cudaSetDevice((int)gpuIndex);
+        cudaEventSynchronize((cudaEvent_t)uploadDoneEvent);
+    }
+    releaseSegmentEvents();
+    if (uploadDoneEvent != nullptr) {
+        cudaSetDevice((int)gpuIndex);
+        cudaEventDestroy((cudaEvent_t)uploadDoneEvent);
+        uploadDoneEvent = nullptr;
+    }
     if (stream != nullptr) {
         cudaSetDevice((int)gpuIndex);
         cudaStreamSynchronize((cudaStream_t)stream);
@@ -1931,6 +1954,323 @@ void NnCudaDevice::synchronize() {
     NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
 }
 
+// --- Single-device pipe residency -----------------------------------------
+//
+// The executor calls beginForward() once per forward and endForward() once the
+// last executor thread and the shadow drain are both done. In between, the CUDA
+// segments own the pipes: a pipe's authoritative bytes either sit on the GPU
+// (pipeDeviceDirty) or the host copy is newer (pipeHostDirty). Only the pipes a
+// sync step actually reads on the host, plus the four pipes the rest of the
+// process reads after a forward, ever make the return trip.
+
+void NnCudaDevice::markPipeHostOwned(NnUint pipeIndex) {
+    if (pipeIndex < pipeHostDirty.size()) pipeHostDirty[pipeIndex] = true;
+    if (pipeIndex < pipeDeviceDirty.size()) pipeDeviceDirty[pipeIndex] = false;
+}
+
+void NnCudaDevice::markPipeDeviceOwned(NnUint pipeIndex) {
+    if (pipeIndex < pipeHostDirty.size()) pipeHostDirty[pipeIndex] = false;
+    if (pipeIndex < pipeDeviceDirty.size()) pipeDeviceDirty[pipeIndex] = true;
+}
+
+void NnCudaDevice::markPipeSynchronized(NnUint pipeIndex) {
+    // Both copies now hold the same bytes, so neither needs another transfer
+    // until something writes one of them. Only endForward() and beginForward()
+    // can do that from here, and both set the flag explicitly.
+    if (pipeIndex < pipeHostDirty.size()) pipeHostDirty[pipeIndex] = false;
+    if (pipeIndex < pipeDeviceDirty.size()) pipeDeviceDirty[pipeIndex] = false;
+}
+
+// Which pipes the host reads once a forward is over. ZQ carries the last
+// layer's attention output that pp_stage_merge consumes and that a takeover
+// splice replays; LG is the logits the sampler copies; KC/VC are the aggregated
+// KV rows the migration collector reads. Everything else (X, TOK, POS, SLT,
+// PLN) is either rewritten from the host before its next read or never read on
+// the host at all.
+void NnCudaDevice::resolveTrailingPipes() {
+    trailingPipes.clear();
+    if (netConfig == nullptr) return;
+    for (NnUint p = 0u; p < netConfig->nPipes; ++p) {
+        const char *name = netConfig->pipes[p].name;
+        if (name == nullptr) continue;
+        if (std::strcmp(name, "ZQ") == 0 ||
+            std::strcmp(name, "LG") == 0 ||
+            std::strcmp(name, "KC") == 0 ||
+            std::strcmp(name, "VC") == 0) {
+            trailingPipes.push_back(p);
+        }
+    }
+}
+
+void NnCudaDevice::releaseSegmentEvents() {
+    if (stream != nullptr) cudaSetDevice((int)gpuIndex);
+    for (std::size_t i = 0u; i < segmentStartEvents.size(); ++i) {
+        if (segmentStartEvents[i] != nullptr) {
+            cudaEventDestroy((cudaEvent_t)segmentStartEvents[i]);
+            segmentStartEvents[i] = nullptr;
+        }
+    }
+    for (std::size_t i = 0u; i < segmentEndEvents.size(); ++i) {
+        if (segmentEndEvents[i] != nullptr) {
+            cudaEventDestroy((cudaEvent_t)segmentEndEvents[i]);
+            segmentEndEvents[i] = nullptr;
+        }
+    }
+    segmentStartEvents.clear();
+    segmentEndEvents.clear();
+    segmentRecorded.clear();
+    segmentPerfTarget.clear();
+}
+
+void NnCudaDevice::setLayerPerfSegments(const std::vector<NnLayerPerfSegmentBinding> &bindings) {
+    perfBindings = bindings;
+    perfTimingActive = false;
+    releaseSegmentEvents();
+    if (netExecution == nullptr || netExecution->layerPerf == nullptr || bindings.empty()) return;
+
+    NnUint maxSegment = 0u;
+    for (std::size_t i = 0u; i < bindings.size(); ++i) {
+        if (bindings[i].segmentIndex > maxSegment) maxSegment = bindings[i].segmentIndex;
+    }
+    const std::size_t n = (std::size_t)maxSegment + 1u;
+    segmentPerfTarget.assign(n, 0u);
+    segmentStartEvents.assign(n, nullptr);
+    segmentEndEvents.assign(n, nullptr);
+    segmentRecorded.assign(n, 0u);
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    for (std::size_t i = 0u; i < bindings.size(); ++i) {
+        const NnUint s = bindings[i].segmentIndex;
+        if (s >= n || segmentPerfTarget[s] != 0u) continue;
+        segmentPerfTarget[s] = 1u;
+        NN_CUDA_CHECK(cudaEventCreateWithFlags((cudaEvent_t *)&segmentStartEvents[s], cudaEventDisableTiming));
+        NN_CUDA_CHECK(cudaEventCreateWithFlags((cudaEvent_t *)&segmentEndEvents[s], cudaEventDisableTiming));
+    }
+    perfTimingActive = true;
+}
+
+void NnCudaDevice::recordSegmentStart(NnUint segmentIndex) {
+    if (!perfTimingActive || segmentIndex >= segmentStartEvents.size()) return;
+    if (segmentStartEvents[segmentIndex] == nullptr || segmentEndEvents[segmentIndex] == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventRecord((cudaEvent_t)segmentStartEvents[segmentIndex], (cudaStream_t)stream));
+    segmentRecorded[segmentIndex] = 0u;
+}
+
+void NnCudaDevice::recordSegmentEnd(NnUint segmentIndex) {
+    if (!perfTimingActive || segmentIndex >= segmentEndEvents.size()) return;
+    if (segmentEndEvents[segmentIndex] == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventRecord((cudaEvent_t)segmentEndEvents[segmentIndex], (cudaStream_t)stream));
+    segmentRecorded[segmentIndex] = 1u;
+}
+
+void NnCudaDevice::beginForward(NnNetExecution *execution) {
+    if (execution == nullptr) return;
+    if (pipeHostDirty.size() != (std::size_t)execution->nPipes) {
+        pipeHostDirty.assign(execution->nPipes, true);
+        pipeDeviceDirty.assign(execution->nPipes, false);
+    }
+    // Per-token inputs are rewritten by the app right before every forward (TOK,
+    // POS, SLT) and a sync step may have received new bytes into X, so those are
+    // host-authoritative at the start of a forward. ZQ/LG/KC/VC are always
+    // produced by a GPU op before anything reads them, so pushing their host
+    // copies over the device buffers would be wasted work on the first segment.
+    //
+    // Everything else keeps whatever endForward() left, which is
+    // "synchronized" for the pipes it published and host-authoritative for the
+    // rest. Resetting unconditionally would re-upload the whole pipe set on
+    // every token, which is exactly what residency exists to avoid.
+    for (std::size_t p = 0u; p < pipeHostDirty.size(); ++p) {
+        const char *name = (netConfig != nullptr && p < netConfig->nPipes)
+            ? netConfig->pipes[p].name : nullptr;
+        if (name == nullptr) continue;
+        const bool perTokenHostInput =
+            std::strcmp(name, "TOK") == 0 ||
+            std::strcmp(name, "POS") == 0 ||
+            std::strcmp(name, "SLT") == 0 ||
+            std::strcmp(name, "X") == 0 ||
+            std::strcmp(name, "PLN") == 0;
+        if (perTokenHostInput) {
+            pipeHostDirty[p] = true;
+            pipeDeviceDirty[p] = false;
+        }
+    }
+    if (segmentRecorded.size() > 0u) {
+        std::fill(segmentRecorded.begin(), segmentRecorded.end(), (unsigned char)0u);
+    }
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    residencyActive = true;
+    deviceWorkPending = false;
+    uploadEventPending = false;
+}
+
+void NnCudaDevice::waitUploadStagingIdle() {
+    if (!uploadEventPending || uploadDoneEvent == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)uploadDoneEvent));
+    uploadEventPending = false;
+}
+
+void NnCudaDevice::noteUploadBatchIssued() {
+    if (uploadDoneEvent == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventRecord((cudaEvent_t)uploadDoneEvent, (cudaStream_t)stream));
+    uploadEventPending = true;
+    deviceWorkPending = true;
+}
+
+bool NnCudaDevice::publishPipesToHost(const std::vector<NnUint> &pipes, NnUint batchSize) {
+    if (netConfig == nullptr || netExecution == nullptr || pipes.empty()) return false;
+    NnSize totalBytes = 0u;
+    for (std::size_t i = 0u; i < pipes.size(); ++i) {
+        totalBytes += data.resolvePipe(pipes[i])->calcSliceSize(batchSize, netConfig->nBatches);
+    }
+    if (totalBytes == 0u) return false;
+
+    NnByte *host = (NnByte *)downloadStaging.ensure(totalBytes);
+    if (host == nullptr) throw std::runtime_error("CUDA residency publish staging allocation failed");
+    const bool ioProfile = dllamaIoProbeEnabled();
+    cudaStream_t s = (cudaStream_t)stream;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+
+    std::vector<NnSize> offsets(pipes.size(), 0u);
+    std::vector<NnSize> sizes(pipes.size(), 0u);
+    NnSize cursor = 0u;
+    for (std::size_t i = 0u; i < pipes.size(); ++i) {
+        NnCudaBuffer *pipe = data.resolvePipe(pipes[i]);
+        const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
+        offsets[i] = cursor;
+        sizes[i] = nBytes;
+        cursor += nBytes;
+        if (nBytes == 0u) continue;
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        NN_CUDA_CHECK(cudaMemcpyAsync(host + offsets[i], pipe->data(), nBytes, cudaMemcpyDeviceToHost, s));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+    }
+
+    // One synchronize for the whole publish set. It also retires the pending H2D
+    // batch, so the pinned upload block is free again.
+    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    NN_CUDA_CHECK(cudaStreamSynchronize(s));
+    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+    uploadEventPending = false;
+
+    for (std::size_t i = 0u; i < pipes.size(); ++i) {
+        if (sizes[i] == 0u) continue;
+        NnByte *dst = netExecution->pipes[pipes[i]];
+        if (dst == nullptr) throw std::runtime_error("CUDA residency publish received null host pipe " + std::to_string(pipes[i]));
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        std::memcpy(dst, host + offsets[i], sizes[i]);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+        markPipeSynchronized(pipes[i]);
+    }
+    return true;
+}
+
+void NnCudaDevice::syncPipeToHost(NnUint pipeIndex, NnUint batchSize) {
+    // Only when the device holds the authoritative bytes: a host-owned pipe
+    // already has them, and copying the stale device buffer over it would
+    // destroy the newer host contents a sync step just produced.
+    if (pipeIndex >= pipeDeviceDirty.size() || !pipeDeviceDirty[pipeIndex]) return;
+    std::vector<NnUint> one(1u, pipeIndex);
+    publishPipesToHost(one, batchSize);
+}
+
+void NnCudaDevice::invalidatePipeOnDevice(NnUint pipeIndex) {
+    // A sync step rewrote this pipe through the host, so the device copy is stale.
+    markPipeHostOwned(pipeIndex);
+}
+
+// The non-residency path (nn-cuda-test calling segment->forward() directly, and
+// the takeover splice) reads every input pipe from the host. That only works if
+// the host copies are current, which residency deliberately breaks to save the
+// transfers. Flushing once here is what the pre-residency code did implicitly by
+// downloading every segment output; it costs nothing in the steady state, where
+// no pipe is device-dirty when the window closes.
+bool NnCudaDevice::publishAllDeviceDirtyPipes(NnUint batchSize) {
+    std::vector<NnUint> dirty;
+    for (std::size_t p = 0u; p < pipeDeviceDirty.size(); ++p) {
+        if (pipeDeviceDirty[p]) dirty.push_back((NnUint)p);
+    }
+    if (dirty.empty()) return false;
+    return publishPipesToHost(dirty, batchSize);
+}
+
+void NnCudaDevice::endForward(NnNetExecution *execution) {
+    if (!residencyActive) return;
+    residencyActive = false;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+
+    // Publish the pipes the host reads after this forward. The batched D2H also
+    // drains the stream, which is what makes the per-segment events readable.
+    std::vector<NnUint> publish;
+    publish.reserve(trailingPipes.size());
+    for (std::size_t i = 0u; i < trailingPipes.size(); ++i) {
+        const NnUint p = trailingPipes[i];
+        if (p < pipeDeviceDirty.size() && pipeDeviceDirty[p]) publish.push_back(p);
+    }
+    bool drained = false;
+    if (execution != nullptr && !publish.empty()) {
+        drained = publishPipesToHost(publish, execution->batchSize);
+    }
+    if (!drained && (deviceWorkPending || uploadEventPending || perfTimingActive)) {
+        NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
+        uploadEventPending = false;
+    }
+
+    // Replace the CPU-side per-layer numbers with the exact GPU time the
+    // segments took. The CPU accounting charges each op step's wall time, which
+    // is the same quantity plus launch gaps and the transfer work, so the
+    // boundary-layer numbers Algo2 reads stay positive and become tighter.
+    if (perfTimingActive && execution != nullptr && execution->layerPerf != nullptr) {
+        NnNetExecution::LayerPerfState *perf = execution->layerPerf;
+        // Several segments share one (layer, kind): the primary attention
+        // segment plus any shadow-KV and takeover copies of the same layer. The
+        // CPU accounting sums all of them, so sum the GPU times too.
+        std::vector<unsigned long long> attnUs(perf->nLayers, 0ull);
+        std::vector<unsigned long long> ffnUs(perf->nLayers, 0ull);
+        std::vector<unsigned char> attnRan(perf->nLayers, 0u);
+        std::vector<unsigned char> ffnRan(perf->nLayers, 0u);
+        for (std::size_t i = 0u; i < perfBindings.size(); ++i) {
+            const NnLayerPerfSegmentBinding &b = perfBindings[i];
+            const NnUint s = b.segmentIndex;
+            if (s >= segmentRecorded.size() || segmentRecorded[s] == 0u) continue;
+            if (b.layerIndex >= perf->nLayers) continue;
+            float ms = 0.0f;
+            const cudaError_t err = cudaEventElapsedTime(
+                &ms, (cudaEvent_t)segmentStartEvents[s], (cudaEvent_t)segmentEndEvents[s]);
+            if (err != cudaSuccess) {
+                // An event never completed, which only happens if the segment
+                // aborted mid-way. Keep the CPU-side number.
+                cudaGetLastError();
+                continue;
+            }
+            const unsigned long long us = (ms > 0.0f)
+                ? (unsigned long long)((double)ms * 1000.0 + 0.5) : 0ull;
+            if (b.kind == NN_SEG_KIND_ATTN) {
+                attnUs[b.layerIndex] += us;
+                attnRan[b.layerIndex] = 1u;
+            } else if (b.kind == NN_SEG_KIND_FFN) {
+                ffnUs[b.layerIndex] += us;
+                ffnRan[b.layerIndex] = 1u;
+            }
+        }
+        for (NnUint l = 0u; l < perf->nLayers; ++l) {
+            if (attnRan[l] != 0u) perf->attnUs[l] = attnUs[l];
+            if (ffnRan[l] != 0u) perf->ffnUs[l] = ffnUs[l];
+        }
+    }
+
+    deviceWorkPending = false;
+    uploadEventPending = false;
+    // The dirty flags are deliberately left alone. A pipe the GPU wrote still
+    // holds the authoritative bytes on the device, and every one of them (ZQ,
+    // LG, KC, VC, X) is written by a GPU op again before anything reads it in
+    // the next forward, so re-uploading them here would push stale host bytes
+    // over correct device bytes. beginForward() re-marks exactly the pipes the
+    // host rewrites between tokens.
+}
+
 static void validateCudaQ80Q40MatmulAtCreate(NnCudaDevice *device, const NnOpConfig &op) {
     if (device == nullptr || op.code != OP_MATMUL || op.config == nullptr) return;
     if (op.weightSize.floatType != F_Q40) return;
@@ -1975,7 +2315,7 @@ static void validateCudaQ80Q40MatmulAtCreate(NnCudaDevice *device, const NnOpCon
 
 NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution)
     : device(device), segmentIndex(segmentIndex), segmentConfig(segmentConfig), netExecution(netExecution),
-      bindingsEpoch(0u), bindingsValid(false), isHostOnlyPlanSegment(false), hasControlOps(false) {
+      hasHostVisibleSync(false), bindingsEpoch(0u), bindingsValid(false), isHostOnlyPlanSegment(false), hasControlOps(false) {
     (void)this->netExecution;
     if (device != nullptr) {
         planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
@@ -2022,6 +2362,9 @@ NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentInd
 void NnCudaDeviceSegment::buildPipeIndexSets() {
     uploadPipeIndices.clear();
     downloadPipeIndices.clear();
+    writtenPipeIndices.clear();
+    syncReadPipeIndices.clear();
+    hasHostVisibleSync = false;
     isHostOnlyPlanSegment = false;
     hasControlOps = false;
     if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
@@ -2056,6 +2399,7 @@ void NnCudaDeviceSegment::buildPipeIndexSets() {
         if (downloadSeen[pipeIndex] != 0u) return;
         downloadSeen[pipeIndex] = 1u;
         downloadPipeIndices.push_back(pipeIndex);
+        writtenPipeIndices.push_back(pipeIndex);
     };
 
     for (NnUint i = 0u; i < netConfig->nPreSyncs; ++i) {
@@ -2079,6 +2423,49 @@ void NnCudaDeviceSegment::buildPipeIndexSets() {
             addUpload(config->indexPipeIndex);
             if (config->kvSlotStride != 0u) addUpload(config->slotPipeIndex);
         }
+    }
+
+    // Which of those pipes this segment's own syncs read on the host. A sync
+    // step runs right after the segment and reaches into netExecution->pipes,
+    // so any pipe it reads has to be published before it runs. Everything else
+    // stays on the device.
+    //
+    // A sync receives peer bytes into the host pipe rather than reading what
+    // the kernels wrote, so its pipe is handled by the executor's post-sync
+    // invalidation, not by a publish here.
+    const NnStageConfig *stage = findStageForNodeCuda(device->getPartitionPlan(), device->getNodeIndex());
+    const bool multiNodeStage = (stage == nullptr || stage->nNodes > 1u);
+    for (NnUint i = 0u; i < segmentConfig->nSyncs; ++i) {
+        const NnSyncConfig &sync = segmentConfig->syncs[i];
+        bool readsHostPipe = false;
+        switch (sync.syncType) {
+            case SYNC_PP_SEND:
+            case SYNC_NODE_SLICES_EXCEPT_ROOT:
+            case SYNC_NODE_SLICES_TO_STAGE_ROOT:
+                readsHostPipe = true;
+                break;
+            case SYNC_NODE_SLICES:
+            case SYNC_WITH_ROOT:
+                // On a one-node stage these exchange nothing and return
+                // immediately, so the host copy is never read.
+                readsHostPipe = multiNodeStage;
+                break;
+            case SYNC_PP_RECV:
+                // Reception only reads the local slice slot that is about to be
+                // overwritten, so the device copy is not needed.
+                readsHostPipe = false;
+                break;
+            default:
+                readsHostPipe = true;
+                break;
+        }
+        if (!readsHostPipe) continue;
+        hasHostVisibleSync = true;
+        bool seen = false;
+        for (std::size_t k = 0u; k < syncReadPipeIndices.size(); ++k) {
+            if (syncReadPipeIndices[k] == sync.pipeIndex) { seen = true; break; }
+        }
+        if (!seen) syncReadPipeIndices.push_back(sync.pipeIndex);
     }
 }
 
@@ -2150,7 +2537,7 @@ void NnCudaDeviceSegment::readWeight(NnUint opIndex, NnSize offset, NnSize nByte
     weightBuffers[opIndex]->read(out, offset, nBytes, device->getStream(), &device->staging);
 }
 
-void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
+void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize, bool onlyHostDirty) {
     if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
     NnNetConfig *netConfig = device->getNetConfig();
     if (netConfig == nullptr) return;
@@ -2161,17 +2548,30 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
 
     // Size the transfer set first so the whole segment goes through one pinned
     // block and one round of async copies, with no per-pipe stream sync.
+    // On the residency path a pipe whose authoritative bytes already sit on the
+    // device (a GPU op wrote it earlier in this forward) needs no transfer at
+    // all, so it is skipped before the sizing pass.
+    std::vector<NnUint> toUpload;
+    toUpload.reserve(uploadPipeIndices.size());
     NnSize totalBytes = 0u;
-    std::vector<NnSize> offsets(uploadPipeIndices.size(), 0u);
-    std::vector<NnSize> sizes(uploadPipeIndices.size(), 0u);
+    std::vector<NnSize> offsets;
+    std::vector<NnSize> sizes;
     for (std::size_t i = 0u; i < uploadPipeIndices.size(); ++i) {
-        NnCudaBuffer *pipe = device->data.resolvePipe(uploadPipeIndices[i]);
+        const NnUint pipeIndex = uploadPipeIndices[i];
+        if (onlyHostDirty && !device->isPipeHostDirty(pipeIndex)) continue;
+        NnCudaBuffer *pipe = device->data.resolvePipe(pipeIndex);
         const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
-        offsets[i] = totalBytes;
-        sizes[i] = nBytes;
+        toUpload.push_back(pipeIndex);
+        offsets.push_back(totalBytes);
+        sizes.push_back(nBytes);
         totalBytes += nBytes;
     }
     if (totalBytes == 0u) return;
+
+    // The pinned block is reused by the next segment, so the previous batch of
+    // async copies must be done reading it before it is overwritten. A single
+    // event wait is enough: every copy went into the same stream.
+    device->waitUploadStagingIdle();
 
     NnByte *host = (NnByte *)device->uploadStaging.ensure(totalBytes);
     if (host == nullptr) throw std::runtime_error("CUDA segment upload staging allocation failed");
@@ -2179,8 +2579,8 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
     const bool ioProfile = dllamaIoProbeEnabled();
     cudaStream_t stream = (cudaStream_t)device->getStream();
 
-    for (std::size_t i = 0u; i < uploadPipeIndices.size(); ++i) {
-        const NnUint pipeIndex = uploadPipeIndices[i];
+    for (std::size_t i = 0u; i < toUpload.size(); ++i) {
+        const NnUint pipeIndex = toUpload[i];
         if (sizes[i] == 0u) continue;
         NnByte *src = netExecution->pipes[pipeIndex];
         if (src == nullptr) {
@@ -2194,7 +2594,50 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
         const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync(pipe->data(), host + offsets[i], sizes[i], cudaMemcpyHostToDevice, stream));
         if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
+        if (onlyHostDirty) device->markPipeDeviceOwned(pipeIndex);
     }
+
+    // Record when the pinned block stops being read. The next segment's upload
+    // waits on this instead of the whole stream, so an H2D batch can overlap
+    // with the kernels that consume the batch just issued.
+    device->noteUploadBatchIssued();
+}
+
+// Residency path: this segment's outputs are now the device's, except for the
+// pipes its own syncs read on the host. Publish exactly those and leave the
+// rest on the GPU.
+void NnCudaDeviceSegment::publishResidentOutputs(NnUint batchSize) {
+    if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
+    if (isHostOnlyPlanSegment) return;
+    // Kernels ran into this stream, so endForward() must not assume the device
+    // is idle just because no pipe is dirty.
+    if (segmentConfig->nOps > 0u) device->markDeviceWork();
+    for (std::size_t i = 0u; i < writtenPipeIndices.size(); ++i) {
+        device->markPipeDeviceOwned(writtenPipeIndices[i]);
+    }
+    if (!hasHostVisibleSync || syncReadPipeIndices.empty()) return;
+
+    // A sync reads these on the host right after this segment, so they have to
+    // be there before it runs. This is the only stream synchronize on the
+    // residency path, and it covers just the pipes a sync actually touches.
+    //
+    // Only pipes this segment wrote on the device qualify. A sync can also name
+    // a pipe the segment never touches (the plan barrier broadcasts PLN, which
+    // a host op produced), and downloading the stale device copy there would
+    // overwrite the authoritative host bytes.
+    std::vector<NnUint> publish;
+    publish.reserve(syncReadPipeIndices.size());
+    for (std::size_t i = 0u; i < syncReadPipeIndices.size(); ++i) {
+        const NnUint pipeIndex = syncReadPipeIndices[i];
+        if (!device->isPipeDeviceDirty(pipeIndex)) continue;
+        bool written = false;
+        for (std::size_t k = 0u; k < writtenPipeIndices.size(); ++k) {
+            if (writtenPipeIndices[k] == pipeIndex) { written = true; break; }
+        }
+        if (written) publish.push_back(pipeIndex);
+    }
+    if (publish.empty()) return;
+    device->publishPipesToHost(publish, batchSize);
 }
 
 bool NnCudaDeviceSegment::downloadSegmentOutputs(NnUint batchSize) {
@@ -3149,7 +3592,26 @@ void NnCudaDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thread
         rebuildBindings();
     }
 
-    uploadSegmentInputs(batchSize);
+    // Outside a residency window the host is the only channel between segments
+    // (nn-cuda-test calling forward() directly, the takeover splice after a
+    // forward ended, a forward that aborted). Any pipe whose authoritative bytes
+    // are still on the device has to be published *before* the upload below,
+    // otherwise the upload would read a stale host copy.
+    const bool resident = (device != nullptr && device->isResidencyActive());
+    if (device != nullptr && !resident) {
+        device->publishAllDeviceDirtyPipes(batchSize);
+    }
+
+    uploadSegmentInputs(batchSize, resident);
+    // cudaEvent window for this segment's per-layer GPU time. Recorded only when
+    // the executor registered the segment as an ATTN/FFN profile target, and
+    // only inside a residency window (outside one, segment->forward() is called
+    // directly by tests and the takeover splice, where nothing consumes it).
+    // The window covers exactly the kernels: the upload is issued before it and
+    // any publish/sync happens after it, so the number is GPU execution time and
+    // not PCIe traffic or a host stall.
+    const bool timing = resident && device->isLayerPerfSegment(segmentIndex);
+    if (timing) device->recordSegmentStart(segmentIndex);
     for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
         executeOp(i, batchSize);
         // OP_PLAN_APPLY mutates the plan (and bumps the device epoch) from the
@@ -3170,6 +3632,16 @@ void NnCudaDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thread
             }
         }
     }
+    if (timing) device->recordSegmentEnd(segmentIndex);
+
+    if (resident) {
+        // The device already holds this segment's outputs. Publish only the
+        // pipes a sync step is about to read on the host; everything else stays
+        // resident and is never seen by the CPU.
+        publishResidentOutputs(batchSize);
+        return;
+    }
+
     const bool synced = downloadSegmentOutputs(batchSize);
     if (!synced && !isHostOnlyPlanSegment && device != nullptr) {
         device->synchronize();

@@ -666,6 +666,7 @@ NnExecutorException::NnExecutorException(const std::string message)
 NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *devices, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark)
     : netExecution(netExecution), nodeConfig(nodeConfig), segments(nodeConfig->nSegments), steps(), segmentKinds(), segmentRuntimeRoles(), segmentLayerIndex(), segmentHasExecOps(), segmentEnabled(nullptr), threads(nullptr)
     , bubbleShadowMutex(), lastBubbleShadowStats{}, lastSyncProfile{}, bubbleShadowComplete(false), bubbleShadowCursor(0u), bubbleShadowDrainUs(0u), bubbleShadowStepIndices(), shadowFilledThrough_(), segmentSyncProfileKinds()
+    , residencyDevice(nullptr)
 {
     if (isBubbleShadowKvEnabledForExecutor() && netExecution->nThreads != 1u)
         throw std::invalid_argument("Shadow KV requires one executor thread");
@@ -813,6 +814,9 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.nodeIndex = (this->nodeConfig != nullptr) ? this->nodeConfig->nodeIndex : 0u;
     context.syncProfile = &lastSyncProfile;
     context.segmentSyncProfileKinds = segmentSyncProfileKinds.empty() ? nullptr : segmentSyncProfileKinds.data();
+    context.residencyDevice = nullptr;
+    context.residencyStage = nullptr;
+    context.nodeConfig = nodeConfig;
     context.currentStepIndex.store(0u);
     context.doneThreadCount.store(0u);
     context.isAlive.store(false);
@@ -830,6 +834,65 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
         NnExecutorThread *thread = &threads[threadIndex];
         thread->threadIndex = threadIndex;
         thread->context = &context;
+    }
+
+    // --- Single-device pipe residency -------------------------------------
+    // Residency is worth having only when one device owns every segment of this
+    // node: then no other backend has to see a pipe between two of its ops, and
+    // the device can keep the pipes on the GPU for the whole forward. Any
+    // multi-device layout (CUDA plus a CPU fallback range, as in the mixed
+    // nn-cuda-test case) keeps the old per-segment upload/download path, so the
+    // cross-device pipe semantics stay exactly as they are.
+    if (devices->size() == 1u && !devices->empty()) {
+        NnExecutorDevice &only = (*devices)[0];
+        const bool coversAll =
+            (only.segmentFrom == -1 && only.segmentTo == -1) ||
+            (only.segmentFrom == 0 && only.segmentTo >= (int)nodeConfig->nSegments - 1);
+        if (coversAll && only.device) residencyDevice = only.device.get();
+    }
+    if (residencyDevice != nullptr) {
+        context.residencyDevice = residencyDevice;
+        // The plan is the only source of stage membership here: nodeConfig has
+        // no stage pointer, and the sync semantics depend on the stage's node
+        // count. A node without a stage keeps residencyStage == nullptr, which
+        // makes every conditional sync treat itself as multi-node (the safe
+        // direction: an extra re-upload instead of a stale read).
+        context.residencyStage = nullptr;
+        if (nodeConfig->partitionPlan != nullptr) {
+            const NnUnevenPartitionPlan *plan = nodeConfig->partitionPlan;
+            for (NnUint s = 0u; s < plan->nStages && context.residencyStage == nullptr; ++s) {
+                const NnStageConfig &st = plan->stages[s];
+                for (NnUint i = 0u; i < st.nNodes; ++i) {
+                    if (st.nodeIndices[i] != nodeConfig->nodeIndex) continue;
+                    context.residencyStage = &st;
+                    break;
+                }
+            }
+        }
+        // Tell the device which segments carry per-layer GPU timing so it can
+        // record cudaEvents at the segment boundaries.
+        //
+        // Every ATTN/FFN segment that the main executor loop can run is
+        // registered, so the sum matches the CPU-side accounting exactly: a
+        // disabled takeover segment never records an event and contributes
+        // nothing, while an enabled one contributes, just as executeStep charges
+        // its op steps. Shadow-KV segments are excluded: they run in the drain
+        // after every thread returned, and the CPU accounting does not charge
+        // that work to a layer either.
+        std::vector<NnLayerPerfSegmentBinding> bindings;
+        for (NnUint s = 0u; s < nodeConfig->nSegments; ++s) {
+            const NnByte kind = segmentKinds[s];
+            if (kind != NN_SEG_KIND_ATTN && kind != NN_SEG_KIND_FFN) continue;
+            if (segmentHasExecOps.size() <= s || segmentHasExecOps[s] == 0u) continue;
+            if (s < segmentRuntimeRoles.size() && segmentRuntimeRoles[s] == SEG_ROLE_SHADOW_KV) continue;
+            if (segmentLayerIndex[s] < 0) continue;
+            NnLayerPerfSegmentBinding b;
+            b.segmentIndex = s;
+            b.layerIndex = (NnUint)segmentLayerIndex[s];
+            b.kind = kind;
+            bindings.push_back(b);
+        }
+        residencyDevice->setLayerPerfSegments(bindings);
     }
 }
 
@@ -909,6 +972,93 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
 static std::exception_ptr g_executorError;
 static std::atomic_flag g_executorErrorClaim = ATOMIC_FLAG_INIT;
 
+// Which pipes a sync step leaves host-authoritative. Every sync writes through
+// `execution->pipes[]`, so a pipe whose payload a sync can receive from a peer
+// ends up with bytes the device copy does not have.
+//
+// Pipes a sync only *reads* must stay device-authoritative: SYNC_PP_SEND just
+// puts X on the wire, and invalidating it would force a pointless re-upload of
+// the very buffer the kernels just produced.
+//
+// SYNC_WITH_ROOT / SYNC_NODE_SLICES are conditional: they exchange bytes only
+// when the stage has peers. On the 4xT4 pipeline every stage holds exactly one
+// node, so those calls return immediately and the device copy is still the one
+// the kernels wrote.
+static bool syncWritesHostPipe(NnSyncType syncType, const NnStageConfig *stage) {
+    const bool multiNodeStage = (stage == nullptr || stage->nNodes > 1u);
+    switch (syncType) {
+        case SYNC_PP_RECV:
+            // The received activation lands in the host pipe.
+            return true;
+        case SYNC_WITH_ROOT:
+        case SYNC_NODE_SLICES:
+            return multiNodeStage;
+        case SYNC_PP_SEND:
+            // Read-only: the pipe is read here and the peer's copy is its own.
+            return false;
+        case SYNC_NODE_SLICES_EXCEPT_ROOT:
+        case SYNC_NODE_SLICES_TO_STAGE_ROOT:
+            // Senders read the pipe, receivers write it, and the role is not
+            // visible from here. Marking it dirty on both sides is the safe
+            // direction: a needless re-upload, never a stale read.
+            return true;
+        default:
+            return true;
+    }
+}
+
+// After a sync step: tell the single resident device which of the pipes that
+// sync touched it must re-read from the host before a kernel uses them again.
+// A disabled segment's steps are skipped entirely by executeStep, so its sync
+// never ran and its pipes must keep whatever state they had.
+static void invalidatePipesAfterSync(NnExecutorContext *context, NnUint segmentIndex) {
+    if (context == nullptr || context->residencyDevice == nullptr) return;
+    if (context->segmentEnabled != nullptr && segmentIndex < context->nSegments &&
+        context->segmentEnabled[segmentIndex].load(std::memory_order_relaxed) == 0u) {
+        return;
+    }
+    const NnNodeConfig *nodeConfig = context->nodeConfig;
+    if (nodeConfig == nullptr || segmentIndex >= nodeConfig->nSegments) return;
+    const NnSegmentConfig &seg = nodeConfig->segments[segmentIndex];
+    if (seg.syncs == nullptr) return;
+    for (NnUint i = 0; i < seg.nSyncs; ++i) {
+        const NnSyncConfig &sync = seg.syncs[i];
+        if (!syncWritesHostPipe(sync.syncType, context->residencyStage)) continue;
+        context->residencyDevice->invalidatePipeOnDevice(sync.pipeIndex);
+    }
+}
+
+// Opens the single-device residency window for one forward() and closes it on
+// every exit path, including the NnPeerOfflineException a failed sync step
+// throws. Without this, a mid-forward throw would leave the device thinking its
+// pipes are authoritative and the next forward would read stale device bytes.
+struct ForwardResidencyGuard {
+    NnDevice *device;
+    NnNetExecution *execution;
+    bool active;
+    ForwardResidencyGuard(NnDevice *device, NnNetExecution *execution)
+        : device(device), execution(execution), active(false) {
+        if (device != nullptr && execution != nullptr) {
+            device->beginForward(execution);
+            active = true;
+        }
+    }
+    ~ForwardResidencyGuard() {
+        finish();
+    }
+    // Idempotent: forward() calls it explicitly after the shadow drain so the
+    // download happens inside the timed region, and the destructor covers the
+    // throw paths.
+    void finish() {
+        if (!active) return;
+        active = false;
+        device->endForward(execution);
+    }
+private:
+    ForwardResidencyGuard(const ForwardResidencyGuard &);
+    ForwardResidencyGuard &operator=(const ForwardResidencyGuard &);
+};
+
 static inline void *executorThreadHandler(void *arg) {
     NnExecutorThread *thread = (NnExecutorThread *)arg;
     NnExecutorContext *context = thread->context;
@@ -972,6 +1122,14 @@ static inline void *executorThreadHandler(void *arg) {
             // Optional hook after a full sync step (safe: all threads finished sync()).
             if (step->type == STEP_SYNC_NODES && context->synchronizer != nullptr) {
                 context->synchronizer->onSyncStepComplete(step->arg0);
+            }
+
+            // A sync step just rewrote host pipes behind the device's back. Tell
+            // the single device which of them it must re-upload before a kernel
+            // reads them again. The device stays authoritative for pipes the
+            // sync only read (PP send, logits gather).
+            if (step->type == STEP_SYNC_NODES && context->residencyDevice != nullptr) {
+                invalidatePipesAfterSync(context, step->segmentIndex);
             }
 
             context->doneThreadCount.store(0);
@@ -1049,6 +1207,13 @@ void NnExecutor::forward() {
         netExecution->layerPerf->reset();
     }
 
+    // Open the single-device residency window before the first executor thread
+    // runs and close it after the shadow drain. RAII, because a sync step can
+    // throw NnPeerOfflineException in the middle of the forward: the window has
+    // to be closed (and the device copies flushed) on that path too, otherwise
+    // the next forward, or a takeover splice, would read a stale device pipe.
+    ForwardResidencyGuard residencyGuard(residencyDevice, netExecution);
+
     NnUint threadIndex;
     for (threadIndex = 1; threadIndex < nThreads; threadIndex++) {
         int result = pthread_create(&threads[threadIndex].handler, NULL, (PthreadFunc)executorThreadHandler, (void *)&threads[threadIndex]);
@@ -1083,6 +1248,10 @@ void NnExecutor::forward() {
     // Shadow work shares scratch buffers with primary compute. Run it only
     // after every primary executor thread has returned, never during sync.
     drainBubbleShadowKv();
+    // Shadow segments write pipes on the device too, so the residency window
+    // has to outlive the drain: endForward()'s batch download is what publishes
+    // the shadow KV rows and the takeover splice's ZQ back to the host.
+    residencyGuard.finish();
     const bool completed = context.isAlive.load();
     context.isAlive.store(false);
     if (g_executorError) {

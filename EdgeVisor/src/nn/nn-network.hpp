@@ -318,6 +318,9 @@ public:
     // Leave the fd open but drop the socket from writeAll. A device that is
     // loading weights must not receive the next decode control.
     void setSocketBroadcast(NnUint socketIndex, bool enabled);
+    // Consume an ack only when the next word is one. Anything else stays in
+    // the socket so a join attempt cannot eat a token or a speed report.
+    bool tryConsumeAck(NnUint socketIndex);
     bool deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex);
     void resetStats();
     // Listen socket kept open so a reserved pool member can connect later.

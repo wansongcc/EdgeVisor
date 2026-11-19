@@ -2236,6 +2236,15 @@ void NnNetwork::setSocketBroadcast(NnUint socketIndex, bool enabled) {
     socketActive[socketIndex] = enabled;
 }
 
+bool NnNetwork::tryConsumeAck(NnUint socketIndex) {
+    if (socketIndex >= nSockets) return false;
+    NnUint packet = 0u;
+    if (!tryPeekWithMaxAttempts(socketIndex, &packet, sizeof(packet), 1ul)) return false;
+    if (packet != (NnUint)ACK) return false;
+    readAck(socketIndex);
+    return true;
+}
+
 static int connectSocketWithin(const char *host, int port, int timeoutMs) {
     if (host == nullptr || timeoutMs < 0) return -1;
     char mutableHost[256];

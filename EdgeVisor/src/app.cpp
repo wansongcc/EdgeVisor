@@ -431,6 +431,28 @@ static void noteStageSpeedPayload(const void *payload, NnSize payloadBytes) {
     rememberStageExecUs(sp.stageIndex, sp.execUs);
 }
 
+// Drop worker frames that are sitting on one socket. A KV export response is
+// not a frame; leaving a speed or profile frame in front of it makes the
+// response look truncated.
+static void skipWorkerFrames(NnNetwork *network, NnUint socketIndex) {
+    if (network == nullptr) return;
+    for (int n = 0; n < 8; ++n) {
+        LlmWorkerFrameHeader peek{};
+        try {
+            if (!network->tryPeekWithMaxAttempts(socketIndex, &peek, sizeof(peek), 1ul)) return;
+        } catch (const std::exception &) {
+            return;
+        }
+        if (peek.magic != LLM_WORKER_FRAME_MAGIC || peek.version != LLM_WORKER_FRAME_VERSION) return;
+        if (peek.payloadBytes > 1024u * 1024u) return;
+        LlmWorkerFrameHeader frame{};
+        std::vector<char> payload;
+        if (!readWorkerFrame(network, socketIndex, frame, payload, 50)) return;
+        if (frame.kind == LLM_WORKER_FRAME_STAGE_SPEED)
+            noteStageSpeedPayload(payload.data(), payload.size());
+    }
+}
+
 // Pull stage-speed frames off the root sockets without touching any other
 // bytes. Those other frames belong to the sampled-token and profile readers.
 static void drainStageSpeedFrames(NnNetwork *network) {
@@ -6919,8 +6941,12 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     const unsigned suffix = neighborCoverRun(roles, nextStage, dead.startLayer, dead.endLayer, false);
     const NnUint prevMs = (prev != (NnUint)-1 && prev < LLM_STAGE_SPEED_SLOTS) ? g_stageExecMs[prev] : 0u;
     const NnUint nextMs = (next != (NnUint)-1 && next < LLM_STAGE_SPEED_SLOTS) ? g_stageExecMs[next] : 0u;
+    // DLLAMA_TAKEOVER_PREV_WINS keeps the overlap on the previous stage. It is
+    // the control for the speed split: same shadow, different cut.
+    const bool prevWins = std::getenv("DLLAMA_TAKEOVER_PREV_WINS") != nullptr;
     const ShadowTakeoverSplit split = bidirectionalShadowTakeover(
-        dead.startLayer, dead.endLayer, prefix, suffix, prevMs, nextMs);
+        dead.startLayer, dead.endLayer, prefix, suffix,
+        prevWins ? 0u : prevMs, prevWins ? 0u : nextMs);
     if (prev == (NnUint)-1 || next == (NnUint)-1 || !split.complete) {
         const char *reason = !split.complete ? "partial-cover"
             : (next == (NnUint)-1 ? "last-stage" : "first-stage");
@@ -8216,6 +8242,28 @@ static void sendJoinPacket(NnNetwork *network, NnUint socketIndex, const LlmDevi
     network->readAck(socketIndex);
 }
 
+// Rejoin runs while other stages are still decoding, so their root sockets
+// can hold a speed frame in front of the join ack. Never block on readAck:
+// a missing ack must not freeze the decode loop.
+static void sendRejoinNotice(NnNetwork *network, NnUint socketIndex, const LlmDeviceJoinPacket &pkt) {
+    skipWorkerFrames(network, socketIndex);
+    writeJoinPacket(network, socketIndex, pkt);
+    bool acked = false;
+    for (int spin = 0; spin < 100 && !acked; ++spin) {
+        skipWorkerFrames(network, socketIndex);
+        try {
+            acked = network->tryConsumeAck(socketIndex);
+        } catch (const std::exception &) {
+            break;
+        }
+        if (!acked) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (!acked) {
+        std::printf("⚠️  [pool] join notice socket=%u was not acked\n", (unsigned)socketIndex);
+        std::fflush(stdout);
+    }
+}
+
 static bool waitForJoiningWorkerWeights(NnNetwork *network, NnUint workerIndex, const char *host, int port);
 
 void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
@@ -8228,12 +8276,16 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
     if (!probeWorkerReachable(host, port, 200)) return;
     // The probe is a real TCP accept. Give the worker time to listen again.
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    drainStageSpeedFrames(context->network);
 
     NnNetwork *network = context->network;
     const NnUint nWorkers = context->args->nWorkers;
     NnUint onlineMask = (workerIndex < 32u) ? (1u << workerIndex) : 0u;
     for (NnUint i = 0; i < nWorkers && i < 32u; ++i) {
-        if (i < g_poolLive.size() - 1u && g_poolLive[i + 1u] != 0) onlineMask |= (1u << i);
+        // size()-1 underflows when the pool was never probed (explicit ratios).
+        // An untracked worker is live: the root is already decoding with it.
+        const bool tracked = i + 1u < g_poolLive.size();
+        if (!tracked || g_poolLive[i + 1u] != 0) onlineMask |= (1u << i);
     }
     std::printf("🧩 [pool] joining %s:%d at pos=%u layers=[%u,%u)\n",
         host, port, (unsigned)position, (unsigned)g_reserved.layerBegin, (unsigned)g_reserved.layerEnd);
@@ -8485,9 +8537,30 @@ static void collectKvHistoryForRange(
     for (NnUint layer = layerBegin; layer < layerEnd; ++layer) {
         network->write(ownerSocket, &layer, sizeof(layer));
     }
+    // The socket may still hold a worker frame and the ack from the join
+    // packet. Peek before reading the response so a frame is not sliced in half.
+    for (int skip = 0; skip < 8; ++skip) {
+        NnUint magic = 0u;
+        bool saw = false;
+        try {
+            saw = network->tryPeekWithMaxAttempts(ownerSocket, &magic, sizeof(magic), 1ul);
+        } catch (const std::exception &) {
+            break;
+        }
+        if (!saw) break;
+        if (magic == LLM_WORKER_FRAME_MAGIC) {
+            skipWorkerFrames(network, ownerSocket);
+            continue;
+        }
+        if (!network->tryConsumeAck(ownerSocket)) break;
+    }
     LlmKvExportResponseHeader resp{};
     network->read(ownerSocket, &resp, sizeof(resp));
-    if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC) return;
+    if (resp.magic != LLM_KV_EXPORT_RESPONSE_MAGIC) {
+        std::printf("⚠️  [pool] kv export response magic=0x%08x rows=%u\n", resp.magic, resp.rowCount);
+        std::fflush(stdout);
+        return;
+    }
     for (NnUint i = 0u; i < resp.rowCount; ++i) {
         LlmKvTransferHeader hdr{};
         network->read(ownerSocket, &hdr, sizeof(hdr));
@@ -8580,14 +8653,25 @@ static void transferDroppedKvSlice(AppInferenceContext *context, NnUint startPos
     std::vector<LlmKvTransferHeader> headers;
     std::vector<std::vector<float>> ks;
     std::vector<std::vector<float>> vs;
+    const size_t before = headers.size();
     collectKvHistoryForRange(context, g_dropped.prevOwnerNode, g_dropped.layerBegin, g_dropped.frontEnd,
         targetNode, endExclusive, headers, ks, vs, startPos);
+    const size_t mid = headers.size();
     collectKvHistoryForRange(context, g_dropped.nextOwnerNode, g_dropped.backBegin, g_dropped.layerEnd,
         targetNode, endExclusive, headers, ks, vs, startPos);
     const size_t expectedRows =
         (size_t)(g_dropped.layerEnd - g_dropped.layerBegin) * (size_t)(endExclusive - startPos);
-    if (headers.size() != expectedRows)
+    if (headers.size() != expectedRows) {
+        std::printf("⚠️  [pool] kv slice [%u,%u) front=%lu back=%lu expected=%lu owners=%u/%u ranges=[%u,%u)+[%u,%u)\n",
+            (unsigned)startPos, (unsigned)endExclusive,
+            (unsigned long)(mid - before), (unsigned long)(headers.size() - mid),
+            (unsigned long)expectedRows,
+            (unsigned)g_dropped.prevOwnerNode, (unsigned)g_dropped.nextOwnerNode,
+            (unsigned)g_dropped.layerBegin, (unsigned)g_dropped.frontEnd,
+            (unsigned)g_dropped.backBegin, (unsigned)g_dropped.layerEnd);
+        std::fflush(stdout);
         throw std::runtime_error("Rejoined worker KV history is incomplete");
+    }
     sendKvHistoryToWorker(network, workerIndex, targetNode, headers, ks, vs);
 }
 
@@ -8619,9 +8703,13 @@ void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
         if (!probeWorkerReachable(host, port, 200)) return;
         // The probe is a real TCP accept. Give the worker time to listen again.
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        // The last token's speed frames are still unread. Join acks share
+        // these sockets, so drain them before reading an acknowledgement.
+        drainStageSpeedFrames(network);
         NnUint onlineMask = (workerIndex < 32u) ? (1u << workerIndex) : 0u;
         for (NnUint i = 0; i < nWorkers && i < 32u; ++i) {
-            if (i < g_poolLive.size() - 1u && g_poolLive[i + 1u] != 0) onlineMask |= (1u << i);
+            const bool tracked = i + 1u < g_poolLive.size();
+            if (!tracked || g_poolLive[i + 1u] != 0) onlineMask |= (1u << i);
         }
         std::printf("🧩 [pool] rejoining %s:%d at pos=%u layers=[%u,%u)\n",
             host, port, (unsigned)position, (unsigned)g_dropped.layerBegin, (unsigned)g_dropped.layerEnd);
@@ -8646,27 +8734,36 @@ void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
                 }
             }
             if (connected) {
-                std::vector<NnUint> acceptSockets;
+                // The slot is live as soon as the handshake returns. Take it
+                // out of writeAll before any later ack read can throw, or the
+                // next decode control is what the worker tries to parse as
+                // its bootstrap.
+                setWorkerBroadcast(network, workerIndex, false);
                 for (NnUint i = 0; i < nWorkers && i < 32u; ++i) {
                     if ((onlineMask & (1u << i)) == 0u || i == workerIndex) continue;
                     if (!network->isSocketActive(i)) continue;
-                    writeJoinPacket(network, i, accept);
-                    acceptSockets.push_back(i);
+                    try {
+                        writeJoinPacket(network, i, accept);
+                        if (!network->tryConsumeAck(i)) {
+                            std::printf("⚠️  [pool] peer %u did not ack the rejoin yet\n", (unsigned)i);
+                            std::fflush(stdout);
+                        }
+                    } catch (const std::exception &err) {
+                        std::printf("⚠️  [pool] peer %u join failed: %s\n", (unsigned)i, err.what());
+                        std::fflush(stdout);
+                    }
                 }
-                for (NnUint socketIndex : acceptSockets) network->readAck(socketIndex);
             }
         } catch (const std::runtime_error &err) {
             std::printf("⚠️  [pool] rejoin aborted: %s\n", err.what());
             std::fflush(stdout);
+            if (connected) setWorkerBroadcast(network, workerIndex, false);
             connected = false;
         }
         if (!connected) {
             noteRejoinConnectFailure();
             return;
         }
-        // Keep this socket out of writeAll until the device is inserted.
-        // Otherwise the next decode control arrives while it is still loading.
-        setWorkerBroadcast(network, workerIndex, false);
         g_writeDroppedJoinFields = true;
         writeBootstrapPacket(network, workerIndex, context->args);
         g_writeDroppedJoinFields = false;
@@ -8750,12 +8847,12 @@ void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
         restoreSelf.layerEnd = g_dropped.layerEnd;
         for (NnUint i = 0; i < nWorkers; ++i) {
             if (i == workerIndex || !network->isSocketActive(i)) continue;
-            sendJoinPacket(network, i, insert);
-            sendJoinPacket(network, i, restorePrev);
-            sendJoinPacket(network, i, restoreNext);
-            sendJoinPacket(network, i, restoreSelf);
-            if (i + 1u == g_dropped.prevOwnerNode) sendJoinPacket(network, i, disableFront);
-            if (i + 1u == g_dropped.nextOwnerNode) sendJoinPacket(network, i, disableBack);
+            sendRejoinNotice(network, i, insert);
+            sendRejoinNotice(network, i, restorePrev);
+            sendRejoinNotice(network, i, restoreNext);
+            sendRejoinNotice(network, i, restoreSelf);
+            if (i + 1u == g_dropped.prevOwnerNode) sendRejoinNotice(network, i, disableFront);
+            if (i + 1u == g_dropped.nextOwnerNode) sendRejoinNotice(network, i, disableBack);
         }
         NnUnevenPartitionPlan *livePlan = const_cast<NnUnevenPartitionPlan *>(context->inference->getPartitionPlan());
         if (livePlan == nullptr) throw std::runtime_error("Rejoined worker has no live partition plan");

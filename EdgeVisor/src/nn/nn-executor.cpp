@@ -819,10 +819,11 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.batchSize = 0u;
     context.position = 0u;
     std::memset(context.totalTime, 0, sizeof(context.totalTime));
-    if (benchmark)
-        context.timer = new Timer();
-    else
-        context.timer = nullptr;
+    // Stage execution time is the takeover split's speed signal, so the timer
+    // stays on even when the benchmark flag is off. The extra read is one
+    // clock sample per step on the last thread.
+    (void)benchmark;
+    context.timer = new Timer();
 
     threads = new NnExecutorThread[netExecution->nThreads];
     for (NnUint threadIndex = 0; threadIndex < netExecution->nThreads; threadIndex++) {

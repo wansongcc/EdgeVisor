@@ -182,11 +182,17 @@ NnUint ppStartLayerSwitchFlag(
     NnUint boundaryLayer,
     const NnUnevenPartitionPlan *activePlan = nullptr);
 
+// Last measured stage execution time, in milliseconds. 0 means unknown.
+// Every control packet carries the same snapshot so a takeover split agrees
+// on the root and on every worker.
+static constexpr NnUint LLM_STAGE_SPEED_SLOTS = 8u;
+
 typedef struct {
     NnUint position;
     NnUint batchSize; // 0 = stop signal
     NnUint flags;     // bit0: enable per-token profiling
     NnUint planCmdSeq; // command seq; valid only when LLM_CTRL_HAS_PLAN_CMD is set
+    NnUint stageExecMs[LLM_STAGE_SPEED_SLOTS];
 } LlmControlPacket;
 
 enum LlmControlFlags : NnUint {
@@ -402,10 +408,18 @@ enum LlmWorkerFrameKind : NnUint {
     // Kind 5 is NN_WORKER_FRAME_DELIVERY_NEED. The takeover reply is a
     // different frame, so it cannot reuse that number.
     LLM_WORKER_FRAME_TAKEOVER_ACK = 6u,
+    // One stage's last execution time. The root drains these between tokens
+    // and broadcasts the snapshot in the next control packet.
+    LLM_WORKER_FRAME_STAGE_SPEED = 7u,
     // A queueable delivery note for the PP transport. Declared in nn-network.hpp
     // because the network writes and recognises it without the app layer.
     LLM_WORKER_FRAME_DELIVERY_NEED = NN_WORKER_FRAME_DELIVERY_NEED,
 };
+
+typedef struct {
+    NnUint stageIndex;
+    NnUint execUs;
+} LlmStageSpeedPacket;
 
 // A receiving stage answers a layer switch with this when its reservation does
 // not cover the range yet. The root then falls back to moving the KV instead.

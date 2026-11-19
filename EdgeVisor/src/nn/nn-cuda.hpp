@@ -109,6 +109,12 @@ private:
     NnCudaLaunchConfig launchConfig;
 public:
     NnCudaPinnedStaging staging;
+    // Dedicated pinned buffers for the per-op segment input upload and output
+    // download. Kept separate from `staging` (which is reused by plan-refresh
+    // and weight loading in the middle of a forward) so that batching a whole
+    // segment's transfers into one pinned block can never alias them.
+    NnCudaPinnedStaging uploadStaging;
+    NnCudaPinnedStaging downloadStaging;
     NnCudaDeviceData data;
     NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan = nullptr);
     ~NnCudaDevice() override;
@@ -138,6 +144,15 @@ public:
     void synchronize();
 };
 
+// Per-op pointer binding for the CUDA segment: the resolved device buffers and
+// the plan-dependent layouts, cached so the hot op loop never re-resolves them.
+struct NnCudaOpBinding {
+    NnCudaBuffer *inBuf;
+    NnCudaBuffer *outBuf;
+    NnPointerLayout inLayout;
+    NnPointerLayout outLayout;
+};
+
 class NnCudaDeviceSegment : public NnDeviceSegment {
 private:
     NnCudaDevice *device;
@@ -148,9 +163,21 @@ private:
     std::vector<std::unique_ptr<NnCudaBuffer>> weightBuffers;
     std::vector<std::unique_ptr<NnCudaBuffer>> configBuffers;
 
+    // Cached per-op bindings and the deduplicated host<->device pipe sets the
+    // segment needs. All three are built once in the constructor.
+    std::vector<NnCudaOpBinding> opBindings;
+    std::vector<NnUint> uploadPipeIndices;
+    std::vector<NnUint> downloadPipeIndices;
+    unsigned int bindingsEpoch;
+    bool bindingsValid;
+    bool isHostOnlyPlanSegment;
+    bool hasControlOps;
+
     std::string unsupportedOpMessage(NnUint opIndex) const;
+    void buildPipeIndexSets();
+    void rebuildBindings();
     void uploadSegmentInputs(NnUint batchSize);
-    void downloadSegmentOutputs(NnUint batchSize);
+    bool downloadSegmentOutputs(NnUint batchSize);
     void executeOp(NnUint opIndex, NnUint batchSize);
 public:
     NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);

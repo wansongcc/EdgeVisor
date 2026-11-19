@@ -2713,6 +2713,8 @@ static void syncWithRoot(
     
     const bool amIActive = isStageNodeSyncActive(plan, stage, myNodeIndex);
     if (!amIActive) return;
+    // A single-node stage has no peers: the broadcast is a no-op.
+    if (stage != nullptr && stage->nNodes <= 1u) return;
 
     if (amIRoot) {
         // --- Root 发送 (Broadcast) ---
@@ -2842,6 +2844,9 @@ static void syncNodeSlices(
         ? (amIRoot || isLogitsGatherWorkerActive(plan, myNodeIndex))
         : isStageNodeSyncActive(plan, stage, myNodeIndex);
     if (!amIActive) return;
+    // A single-node stage has no peers to exchange slices with. `stage == nullptr`
+    // is the logits-gather path, which is never skipped here.
+    if (stage != nullptr && stage->nNodes <= 1u) return;
 
     // 1. 确定参与同步的节点列表 (Peers)
     std::vector<NnUint> activeStageNodes;

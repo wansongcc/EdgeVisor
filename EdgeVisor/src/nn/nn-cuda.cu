@@ -1732,7 +1732,8 @@ static void validateCudaQ80Q40MatmulAtCreate(NnCudaDevice *device, const NnOpCon
 }
 
 NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution)
-    : device(device), segmentIndex(segmentIndex), segmentConfig(segmentConfig), netExecution(netExecution) {
+    : device(device), segmentIndex(segmentIndex), segmentConfig(segmentConfig), netExecution(netExecution),
+      bindingsEpoch(0u), bindingsValid(false), isHostOnlyPlanSegment(false), hasControlOps(false) {
     (void)this->netExecution;
     if (device != nullptr) {
         planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
@@ -1769,6 +1770,100 @@ NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentInd
             device->synchronize();
         }
     }
+    buildPipeIndexSets();
+}
+
+// Collect the pipes this segment really has to move across the PCIe link.
+// OP_PLAN_BARRIER / OP_PLAN_APPLY are pure host ops (they read and write
+// netExecution->pipes directly and never touch device memory), so their inputs
+// and outputs are excluded.
+void NnCudaDeviceSegment::buildPipeIndexSets() {
+    uploadPipeIndices.clear();
+    downloadPipeIndices.clear();
+    isHostOnlyPlanSegment = false;
+    hasControlOps = false;
+    if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
+    NnNetConfig *netConfig = device->getNetConfig();
+    if (netConfig == nullptr) return;
+
+    // Pass 1: classify the segment. A segment made only of barrier/apply ops
+    // runs entirely on the host, so it must not move any bytes at all.
+    bool sawNonControlOp = false;
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        if (isCudaControlOp(segmentConfig->ops[i].code)) hasControlOps = true;
+        else sawNonControlOp = true;
+    }
+    isHostOnlyPlanSegment = hasControlOps && !sawNonControlOp;
+    if (isHostOnlyPlanSegment) return;
+
+    std::vector<unsigned char> uploadSeen(netConfig->nPipes, 0u);
+    std::vector<unsigned char> downloadSeen(netConfig->nPipes, 0u);
+
+    const auto addUpload = [&](NnUint pipeIndex) {
+        if (pipeIndex >= netConfig->nPipes) {
+            throw std::runtime_error("CUDA segment pipe index out of range during upload planning");
+        }
+        if (uploadSeen[pipeIndex] != 0u) return;
+        uploadSeen[pipeIndex] = 1u;
+        uploadPipeIndices.push_back(pipeIndex);
+    };
+    const auto addDownload = [&](NnUint pipeIndex) {
+        if (pipeIndex >= netConfig->nPipes) {
+            throw std::runtime_error("CUDA segment pipe index out of range during download planning");
+        }
+        if (downloadSeen[pipeIndex] != 0u) return;
+        downloadSeen[pipeIndex] = 1u;
+        downloadPipeIndices.push_back(pipeIndex);
+    };
+
+    for (NnUint i = 0u; i < netConfig->nPreSyncs; ++i) {
+        addUpload(netConfig->preSyncs[i].pipeIndex);
+    }
+
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        const NnOpConfig &op = segmentConfig->ops[i];
+        if (isCudaControlOp(op.code)) continue;
+        if (op.input.source == SRC_PIPE) addUpload(op.input.pointerIndex);
+        if (op.output.source == SRC_PIPE) addDownload(op.output.pointerIndex);
+        if (op.code == OP_ROPE && op.config != nullptr) {
+            const NnRopeOpConfig *config = (const NnRopeOpConfig *)op.config;
+            addUpload(config->positionPipeIndex);
+        } else if (op.code == OP_MULTIHEAD_ATT && op.config != nullptr) {
+            const NnMultiHeadAttOpConfig *config = (const NnMultiHeadAttOpConfig *)op.config;
+            addUpload(config->positionPipeIndex);
+            if (config->kvSlotStride != 0u) addUpload(config->slotPipeIndex);
+        } else if (op.code == OP_SHIFT && op.config != nullptr) {
+            const NnShiftOpCodeConfig *config = (const NnShiftOpCodeConfig *)op.config;
+            addUpload(config->indexPipeIndex);
+            if (config->kvSlotStride != 0u) addUpload(config->slotPipeIndex);
+        }
+    }
+}
+
+// Resolve every op's device buffers and plan-dependent layouts once per plan
+// epoch. refreshPointers() has already rewritten the op configs (slices,
+// offsets, column counts) for the current plan, so this must run after it.
+void NnCudaDeviceSegment::rebuildBindings() {
+    opBindings.clear();
+    bindingsValid = false;
+    bindingsEpoch = device != nullptr ? device->getPlanEpoch() : 0u;
+    if (device == nullptr || segmentConfig == nullptr) return;
+    NnNetConfig *netConfig = device->getNetConfig();
+    NnNodeConfig *nodeConfig = device->getNodeConfig();
+    if (netConfig == nullptr || nodeConfig == nullptr) return;
+
+    const NnUnevenPartitionPlan *plan = device->getPartitionPlan();
+    opBindings.resize(segmentConfig->nOps);
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        const NnOpConfig &op = segmentConfig->ops[i];
+        const NnCudaPointerRef in = resolveCudaPointer(device, netConfig, nodeConfig, plan, &op.input);
+        const NnCudaPointerRef out = resolveCudaPointer(device, netConfig, nodeConfig, plan, &op.output);
+        opBindings[i].inBuf = in.buffer;
+        opBindings[i].outBuf = out.buffer;
+        opBindings[i].inLayout = in.layout;
+        opBindings[i].outLayout = out.layout;
+    }
+    bindingsValid = true;
 }
 
 NnCudaDeviceSegment::~NnCudaDeviceSegment() = default;
@@ -1820,56 +1915,97 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
     if (batchSize > netConfig->nBatches) {
         throw std::runtime_error("CUDA segment batchSize exceeds configured nBatches");
     }
+    if (isHostOnlyPlanSegment || uploadPipeIndices.empty()) return;
 
-    std::vector<unsigned char> uploaded(netConfig->nPipes, 0u);
-    const auto uploadPipe = [&](NnUint pipeIndex) {
-        if (pipeIndex >= netConfig->nPipes) {
-            throw std::runtime_error("CUDA segment pipe index out of range during upload");
-        }
-        if (uploaded[pipeIndex] != 0u) return;
-        NnCudaBuffer *pipe = device->data.resolvePipe(pipeIndex);
+    // Size the transfer set first so the whole segment goes through one pinned
+    // block and one round of async copies, with no per-pipe stream sync.
+    NnSize totalBytes = 0u;
+    std::vector<NnSize> offsets(uploadPipeIndices.size(), 0u);
+    std::vector<NnSize> sizes(uploadPipeIndices.size(), 0u);
+    for (std::size_t i = 0u; i < uploadPipeIndices.size(); ++i) {
+        NnCudaBuffer *pipe = device->data.resolvePipe(uploadPipeIndices[i]);
         const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
-        pipe->write(netExecution->pipes[pipeIndex], 0u, nBytes, device->getStream(), &device->staging);
-        uploaded[pipeIndex] = 1u;
-    };
-
-    for (NnUint i = 0u; i < netConfig->nPreSyncs; ++i) {
-        uploadPipe(netConfig->preSyncs[i].pipeIndex);
+        offsets[i] = totalBytes;
+        sizes[i] = nBytes;
+        totalBytes += nBytes;
     }
+    if (totalBytes == 0u) return;
 
-    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
-        const NnOpConfig &op = segmentConfig->ops[i];
-        if (op.input.source == SRC_PIPE) uploadPipe(op.input.pointerIndex);
-        if (op.code == OP_ROPE && op.config != nullptr) {
-            const NnRopeOpConfig *config = (const NnRopeOpConfig *)op.config;
-            uploadPipe(config->positionPipeIndex);
-        } else if (op.code == OP_MULTIHEAD_ATT && op.config != nullptr) {
-            const NnMultiHeadAttOpConfig *config = (const NnMultiHeadAttOpConfig *)op.config;
-            uploadPipe(config->positionPipeIndex);
-            if (config->kvSlotStride != 0u) uploadPipe(config->slotPipeIndex);
-        } else if (op.code == OP_SHIFT && op.config != nullptr) {
-            const NnShiftOpCodeConfig *config = (const NnShiftOpCodeConfig *)op.config;
-            uploadPipe(config->indexPipeIndex);
-            if (config->kvSlotStride != 0u) uploadPipe(config->slotPipeIndex);
+    NnByte *host = (NnByte *)device->uploadStaging.ensure(totalBytes);
+    if (host == nullptr) throw std::runtime_error("CUDA segment upload staging allocation failed");
+
+    const bool ioProfile = dllamaIoProbeEnabled();
+    cudaStream_t stream = (cudaStream_t)device->getStream();
+
+    for (std::size_t i = 0u; i < uploadPipeIndices.size(); ++i) {
+        const NnUint pipeIndex = uploadPipeIndices[i];
+        if (sizes[i] == 0u) continue;
+        NnByte *src = netExecution->pipes[pipeIndex];
+        if (src == nullptr) {
+            throw std::runtime_error("CUDA segment upload received null host pipe " + std::to_string(pipeIndex));
         }
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        std::memcpy(host + offsets[i], src, sizes[i]);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+
+        NnCudaBuffer *pipe = device->data.resolvePipe(pipeIndex);
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        NN_CUDA_CHECK(cudaMemcpyAsync(pipe->data(), host + offsets[i], sizes[i], cudaMemcpyHostToDevice, stream));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
     }
 }
 
-void NnCudaDeviceSegment::downloadSegmentOutputs(NnUint batchSize) {
-    if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
+bool NnCudaDeviceSegment::downloadSegmentOutputs(NnUint batchSize) {
+    if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return false;
     NnNetConfig *netConfig = device->getNetConfig();
-    if (netConfig == nullptr) return;
+    if (netConfig == nullptr) return false;
     if (batchSize > netConfig->nBatches) {
         throw std::runtime_error("CUDA segment batchSize exceeds configured nBatches");
     }
+    if (isHostOnlyPlanSegment || downloadPipeIndices.empty()) return false;
 
-    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
-        const NnOpConfig &op = segmentConfig->ops[i];
-        if (op.output.source != SRC_PIPE) continue;
-        NnCudaBuffer *pipe = device->data.resolvePipe(op.output.pointerIndex);
+    NnSize totalBytes = 0u;
+    std::vector<NnSize> offsets(downloadPipeIndices.size(), 0u);
+    std::vector<NnSize> sizes(downloadPipeIndices.size(), 0u);
+    for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
+        NnCudaBuffer *pipe = device->data.resolvePipe(downloadPipeIndices[i]);
         const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
-        pipe->read(netExecution->pipes[op.output.pointerIndex], 0u, nBytes, device->getStream(), &device->staging);
+        offsets[i] = totalBytes;
+        sizes[i] = nBytes;
+        totalBytes += nBytes;
     }
+    if (totalBytes == 0u) return false;
+
+    NnByte *host = (NnByte *)device->downloadStaging.ensure(totalBytes);
+    if (host == nullptr) throw std::runtime_error("CUDA segment download staging allocation failed");
+
+    const bool ioProfile = dllamaIoProbeEnabled();
+    cudaStream_t stream = (cudaStream_t)device->getStream();
+
+    for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
+        if (sizes[i] == 0u) continue;
+        NnCudaBuffer *pipe = device->data.resolvePipe(downloadPipeIndices[i]);
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        NN_CUDA_CHECK(cudaMemcpyAsync(host + offsets[i], pipe->data(), sizes[i], cudaMemcpyDeviceToHost, stream));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
+    }
+
+    // Exactly one sync for the whole download set.
+    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    NN_CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+
+    for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
+        if (sizes[i] == 0u) continue;
+        NnByte *dst = netExecution->pipes[downloadPipeIndices[i]];
+        if (dst == nullptr) {
+            throw std::runtime_error("CUDA segment download received null host pipe " + std::to_string(downloadPipeIndices[i]));
+        }
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        std::memcpy(dst, host + offsets[i], sizes[i]);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+    }
+    return true;
 }
 
 void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
@@ -1882,8 +2018,15 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
     }
 
     const NnOpConfig &op = segmentConfig->ops[opIndex];
-    NnCudaPointerRef in = resolveCudaPointer(device, netConfig, nodeConfig, device->getPartitionPlan(), &op.input);
-    NnCudaPointerRef out = resolveCudaPointer(device, netConfig, nodeConfig, device->getPartitionPlan(), &op.output);
+    if (!bindingsValid || opIndex >= opBindings.size()) {
+        throw std::runtime_error("CUDA executeOp has no cached binding for op index: " + std::to_string(opIndex));
+    }
+    NnCudaPointerRef in;
+    NnCudaPointerRef out;
+    in.buffer = opBindings[opIndex].inBuf;
+    in.layout = opBindings[opIndex].inLayout;
+    out.buffer = opBindings[opIndex].outBuf;
+    out.layout = opBindings[opIndex].outLayout;
     cudaStream_t stream = (cudaStream_t)device->getStream();
     const NnCudaLaunchConfig &launch = device->getLaunchConfig();
     const unsigned int elementwiseBlock = (unsigned int)launch.elementwiseBlockSize;
@@ -2644,7 +2787,14 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 row[6] = (float)pos;
                 row[7] = (float)ffnMove;
             }
-            if (op.output.pointerIndex < netConfig->nPipes) {
+            // No GPU op in the real graph reads the plan pipe, so its device-side
+            // copy is dead weight: the write below also costs a stream sync. Keep
+            // it only if some non-control op in this segment actually binds this
+            // pipe as an input or output.
+            const bool deviceVisible =
+                std::find(uploadPipeIndices.begin(), uploadPipeIndices.end(), op.output.pointerIndex) != uploadPipeIndices.end() ||
+                std::find(downloadPipeIndices.begin(), downloadPipeIndices.end(), op.output.pointerIndex) != downloadPipeIndices.end();
+            if (deviceVisible && op.output.pointerIndex < netConfig->nPipes) {
                 NnCudaBuffer *pipe = device->data.resolvePipe(op.output.pointerIndex);
                 const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
                 pipe->write((const NnByte *)planPipe, 0u, nBytes, stream, &device->staging);
@@ -2725,21 +2875,45 @@ void NnCudaDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thread
     if (segmentConfig == nullptr) {
         throw std::runtime_error("CUDA backend received null segment config for segment " + std::to_string(segmentIndex));
     }
+    unsigned int deviceEpoch = 0u;
     if (device != nullptr) {
-        const unsigned int deviceEpoch = device->getPlanEpoch();
-        const unsigned int readyEpoch = planEpochReady.load(std::memory_order_acquire);
-        if (readyEpoch != deviceEpoch) {
+        deviceEpoch = device->getPlanEpoch();
+        if (planEpochReady.load(std::memory_order_acquire) != deviceEpoch) {
             refreshPointers();
+            deviceEpoch = device->getPlanEpoch();
             planEpochReady.store(deviceEpoch, std::memory_order_release);
         }
+    }
+    // Bindings are resolved from the op configs refreshPointers() just rewrote,
+    // so they are rebuilt whenever the plan epoch moved. `bindingsValid` covers
+    // the first forward, where readyEpoch == deviceEpoch == 0 and nothing moved.
+    if (!bindingsValid || bindingsEpoch != deviceEpoch) {
+        rebuildBindings();
     }
 
     uploadSegmentInputs(batchSize);
     for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
         executeOp(i, batchSize);
+        // OP_PLAN_APPLY mutates the plan (and bumps the device epoch) from the
+        // host in the middle of a segment, which would leave every later op with
+        // stale cached slices. Re-bind before continuing. Control ops never touch
+        // opBindings themselves, so a barrier/apply-only segment can skip this
+        // and let the next real segment pick the new epoch up. Segments with no
+        // control op skip the check entirely and keep the hot loop free of reads.
+        if (hasControlOps && !isHostOnlyPlanSegment) {
+            const unsigned int epochNow = device != nullptr ? device->getPlanEpoch() : 0u;
+            if (epochNow != bindingsEpoch) {
+                if (device != nullptr && planEpochReady.load(std::memory_order_acquire) != epochNow) {
+                    // Rewrites the op configs and rebuilds the bindings.
+                    refreshPointers();
+                } else {
+                    rebuildBindings();
+                }
+            }
+        }
     }
-    downloadSegmentOutputs(batchSize);
-    if (device != nullptr) {
+    const bool synced = downloadSegmentOutputs(batchSize);
+    if (!synced && !isHostOnlyPlanSegment && device != nullptr) {
         device->synchronize();
     }
 }
@@ -2750,6 +2924,9 @@ void NnCudaDeviceSegment::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
             device->setPartitionPlan(plan);
         }
         planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+        // The cached bindings belong to the previous plan; drop them so the next
+        // forward re-resolves them against the current partition.
+        bindingsValid = false;
     }
 }
 
@@ -2901,6 +3078,10 @@ void NnCudaDeviceSegment::refreshPointers() {
 
     device->synchronize();
     planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+    // This is the one place where op configs (slices, offsets, column counts)
+    // are rewritten, so it is also the point at which the cached per-op
+    // bindings become stale.
+    rebuildBindings();
 }
 
 bool NnCudaDeviceSegment::exportLayerKvRow(

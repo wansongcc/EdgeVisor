@@ -167,6 +167,20 @@ static bool isBubbleShadowKvEnabledForExecutor() {
     return parseEnvBoolOr("DLLAMA_BUBBLE_SHADOW_KV", false);
 }
 
+// Runs the shadow KV pass inside the PP root-wait bubble (a pure sync step with
+// no local compute) instead of draining it after forward(). On by default: the
+// bubble is dead time on the root, and the shadow pass only touches its own
+// scratch buffers, so overlapping it with the wait is free latency.
+static bool bubbleShadowRootWaitAsyncEnabled() {
+    static const char *const keys[] = {"0", "false", "False", "off", "OFF"};
+    const char *v = std::getenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+    if (v == nullptr || v[0] == '\0') return true;
+    for (std::size_t i = 0u; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        if (std::strcmp(v, keys[i]) == 0) return false;
+    }
+    return true;
+}
+
 static long parseEnvLongOr(const char *name, long fallback) {
     const char *v = std::getenv(name);
     if (v == nullptr || v[0] == '\0') return fallback;
@@ -817,6 +831,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.residencyDevice = nullptr;
     context.residencyStage = nullptr;
     context.nodeConfig = nodeConfig;
+    context.executor = this;
     context.currentStepIndex.store(0u);
     context.doneThreadCount.store(0u);
     context.isAlive.store(false);
@@ -963,7 +978,35 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
     if (step->type == STEP_EXECUTE_OP) {
         step->segment->forward(step->arg0, nThreads, thread->threadIndex, context->batchSize);
     } else if (step->type == STEP_SYNC_NODES) {
-        context->synchronizer->sync(step->arg0, nThreads, thread->threadIndex);
+        NnExecutor *executor = context->executor;
+        // The PP root-wait bubble is a sync-only step where this node has no
+        // local compute left to do: everything it needs is on the wire. That is
+        // the one place the shadow KV pass can run concurrently with the wait
+        // instead of being charged to the token after the forward.
+        if (executor != nullptr && executor->shouldRunBubbleShadowDuringSync(step, nThreads, thread->threadIndex)) {
+            std::thread shadowThread([executor]() {
+                // A throw out of a std::thread body is std::terminate, and a
+                // failed shadow pass must not take the whole forward down: its
+                // result is a cache the next token can rebuild. Swallow it and
+                // leave the cursor where it stopped.
+                try {
+                    (void)executor->runBubbleShadowRedundantChunk(0u, true);
+                } catch (...) {
+                }
+            });
+            try {
+                context->synchronizer->sync(step->arg0, nThreads, thread->threadIndex);
+            } catch (...) {
+                // Join before unwinding so the thread never outlives the state
+                // it reads. A failed sync leaves the forward itself failed, but
+                // the shadow pass still has to be reclaimed.
+                if (shadowThread.joinable()) shadowThread.join();
+                throw;
+            }
+            if (shadowThread.joinable()) shadowThread.join();
+        } else {
+            context->synchronizer->sync(step->arg0, nThreads, thread->threadIndex);
+        }
     } else {
         throw std::invalid_argument("Unsupported step type");
     }
@@ -1145,6 +1188,10 @@ static inline void *executorThreadHandler(void *arg) {
 }
 
 void NnExecutor::forward() {
+    forward(false);
+}
+
+void NnExecutor::forward(bool deferBubbleShadow) {
     g_executorError = nullptr;
     g_executorErrorClaim.clear(std::memory_order_release);
     assert(netExecution->batchSize > 0);
@@ -1245,9 +1292,13 @@ void NnExecutor::forward() {
         }
     }
 
-    // Shadow work shares scratch buffers with primary compute. Run it only
-    // after every primary executor thread has returned, never during sync.
-    drainBubbleShadowKv();
+    // The root-wait bubble may already have run the shadow pass concurrently
+    // with sync(), in which case this drain is a no-op. It stays as the
+    // catch-all for nodes without a root-wait step and for the case where the
+    // bubble was shorter than the shadow work.
+    if (!deferBubbleShadow) {
+        drainBubbleShadowKv();
+    }
     // Shadow segments write pipes on the device too, so the residency window
     // has to outlive the drain: endForward()'s batch download is what publishes
     // the shadow KV rows and the takeover splice's ZQ back to the host.
@@ -1524,6 +1575,36 @@ void NnExecutor::drainBubbleShadowKv() {
 NnBubbleShadowStats NnExecutor::getLastBubbleShadowStats() const {
     std::lock_guard<std::mutex> lock(bubbleShadowMutex);
     return lastBubbleShadowStats;
+}
+
+bool NnExecutor::hasPendingBubbleShadow() const {
+    std::lock_guard<std::mutex> lock(bubbleShadowMutex);
+    return !bubbleShadowComplete && bubbleShadowCursor < (NnUint)bubbleShadowStepIndices.size();
+}
+
+bool NnExecutor::shouldRunBubbleShadowDuringSync(const NnExecutorStep *step, NnUint nThreads, NnUint threadIndex) const {
+    if (!isBubbleShadowKvEnabledForExecutor()) return false;
+    if (!bubbleShadowRootWaitAsyncEnabled()) return false;
+    // The chunk runner drives the shadow segments with one thread, and the
+    // extra thread must not race a second executor thread for the same
+    // scratch buffers. Anything but the single-threaded layout keeps the old
+    // post-forward drain.
+    if (nThreads != 1u || threadIndex != 0u) return false;
+    if (step == nullptr || step->type != STEP_SYNC_NODES) return false;
+    if (step->segmentIndex >= segmentSyncProfileKinds.size()) return false;
+    if (segmentSyncProfileKinds[step->segmentIndex] != SEG_SYNC_ROOT_WAIT) return false;
+    return hasPendingBubbleShadow();
+}
+
+void NnExecutor::runDeferredBubbleShadowKv() {
+    if (!isBubbleShadowKvEnabledForExecutor()) return;
+    if (!hasPendingBubbleShadow()) return;
+    // forward(true) closed its own residency window, so this needs its own.
+    // The guard also keeps the device's pipe-ownership bookkeeping consistent
+    // for the shadow segments' device writes.
+    ForwardResidencyGuard residencyGuard(residencyDevice, netExecution);
+    drainBubbleShadowKv();
+    residencyGuard.finish();
 }
 
 NnExecutorSyncProfile NnExecutor::getLastSyncProfile() const {

@@ -197,6 +197,10 @@ typedef struct {
     NnDevice *residencyDevice;
     const NnStageConfig *residencyStage;
     const NnNodeConfig *nodeConfig;
+    // Owner, so the root-wait path can start the shadow KV pass while the
+    // executor threads are blocked in sync(). Null in tests that drive
+    // executeStep without an executor.
+    NnExecutor *executor;
 } NnExecutorContext;
 
 typedef struct {
@@ -266,11 +270,25 @@ private:
     void replayRedundantLayer(NnUint layerIndex);
     void resetBubbleShadowStateForForward();
     void drainBubbleShadowKv();
+    // True when the PP root-wait bubble on this node can host the shadow KV
+    // pass: shadow KV on, async bubble enabled, single executor thread, and the
+    // step really is a pure root-wait sync with work still queued.
+    bool shouldRunBubbleShadowDuringSync(const NnExecutorStep *step, NnUint nThreads, NnUint threadIndex) const;
+    bool hasPendingBubbleShadow() const;
+    friend void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context);
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
     ~NnExecutor();
     void loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight);
+    // deferBubbleShadow=true leaves the shadow KV drain to the caller, which
+    // runs it later with runDeferredBubbleShadowKv(). That is how the root hides
+    // the pass in its PP wait instead of charging it after the forward.
+    void forward(bool deferBubbleShadow);
     void forward();
+    // Drains whatever shadow KV work forward(true) deferred. No-op when shadow
+    // KV is off, when the pass already completed inside forward, or when there
+    // is nothing queued.
+    void runDeferredBubbleShadowKv();
     NnBubbleShadowStats runBubbleShadowRedundant(NnUint budgetUs);
     NnBubbleShadowStats getLastBubbleShadowStats() const;
     NnExecutorSyncProfile getLastSyncProfile() const;

@@ -1165,7 +1165,28 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     // drained only after token N's sample is in hand, by which point they have
     // had a whole token period to arrive, so the worker round-trip leaves the
     // root's per-token critical path.
-    const bool useDeferredProfile = (context->inference->isProfileEnabled() && deferredProfileEnabled());
+    //
+    // This is only safe once every byte the root reads is a framed worker
+    // frame. Without last-stage sampling the tail gathers the logits with
+    // SYNC_NODE_SLICES_EXCEPT_ROOT, which pushes the raw LG float array over
+    // the same socket with no LlmWorkerFrameHeader in front of it. Leaving the
+    // previous token's PROFILE/STAGE_SPEED frames queued would then make the
+    // next token's root_wait read that header as logits and desynchronise the
+    // stream ("Invalid worker frame magic or version"). With last-stage
+    // sampling the tail sends a SAMPLED_TOKEN frame instead, the raw gather is
+    // gone, and a one-token-late drain is safe. So the deferral is gated on
+    // the sampling path that actually removes the raw transfer, not just on
+    // the arg being set.
+    const NnUnevenPartitionPlan *deferredPlan = context->inference->getPartitionPlan();
+    bool lastStageSamplingLive = false;
+    if (context->args->lastStageSampling && context->network != nullptr &&
+            deferredPlan != nullptr && deferredPlan->stages != nullptr && deferredPlan->nStages >= 2u) {
+        const NnStageConfig *tail = pipelineTailStage(deferredPlan);
+        lastStageSamplingLive = tail != nullptr && tail->nNodes > 0u &&
+            tail->rootNodeIndex != 0u && tail->rootNodeIndex < deferredPlan->nNodes;
+    }
+    const bool useDeferredProfile =
+        (context->inference->isProfileEnabled() && deferredProfileEnabled() && lastStageSamplingLive);
     bool hasPendingProfile = false;
     LlmPerfPacket pendingRootPacket{};
     NnUint pendingProfilePos = 0u;

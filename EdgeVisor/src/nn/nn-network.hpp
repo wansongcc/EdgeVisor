@@ -100,6 +100,7 @@ void setNnPpFailoverHook(NnPpFailoverFn fn);
 static constexpr NnUint NN_WORKER_FRAME_MAGIC = 0x4d465756u;   // 'VWFM'
 static constexpr NnUint NN_WORKER_FRAME_VERSION = 1u;
 static constexpr NnUint NN_WORKER_FRAME_DELIVERY_NEED = 5u;
+static constexpr NnUint NN_WORKER_FRAME_STAGE_SPEED = 7u;
 static constexpr NnUint NN_PP_DELIVERY_NEED_MAGIC = 0x444E4550u; // 'PEND'
 
 // The stage after a dead one answers the delivery question with this frame on
@@ -315,6 +316,15 @@ public:
     int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex, bool includeInactive = false) const;
     NnUint getPeerNodeIndex(NnUint socketIndex) const;
     bool isSocketActive(NnUint socketIndex) const;
+    // Leave the fd open but drop the socket from writeAll. A device that is
+    // loading weights must not receive the next decode control.
+    void setSocketBroadcast(NnUint socketIndex, bool enabled);
+    // Consume an ack only when the next word is one. Anything else stays in
+    // the socket so a join attempt cannot eat a token or a speed report.
+    bool tryConsumeAck(NnUint socketIndex);
+    // A join ack is a raw word on the same socket as the logit tensor. Drop a
+    // word that is already buffered so it is not read as the first floats.
+    void discardBufferedAck(NnUint socketIndex);
     bool deactivateNode(NnUint targetNodeIndex, NnUint myNodeIndex);
     void resetStats();
     // Listen socket kept open so a reserved pool member can connect later.

@@ -111,6 +111,14 @@ struct ControllerRuntime {
     std::string logPath;
     bool captureAlgo2 = false;
     std::vector<tpot::Algo2TokenObs> freshTokens;
+    // End-to-end token intervals, keyed by token id, that
+    // algo2DrainTokenCompletes() reported but that have not met their matching
+    // perf observation yet. This has to outlive a single poll: the root notes a
+    // token complete on the same instant it starts the next forward, while the
+    // PROFILE frames that carry the observation are drained a token late, so a
+    // completion can be seen several polls before its observation. Only the
+    // controller thread touches this map.
+    std::map<uint32_t, double> e2eByToken;
     std::unique_ptr<tpot::Algo2Session> algo2;
     tpot::Algo2Mode algo2Mode = tpot::Algo2Mode::LEGACY;
     bool algo2WaitApply = false;
@@ -1086,8 +1094,10 @@ static void stepAlgo2(
     const std::string &socketPath) {
     if (rt.algo2 == nullptr || inference == nullptr) return;
     const std::vector<tpot::Algo2CompletedToken> completed = tpot::algo2DrainTokenCompletes();
-    std::map<uint32_t, double> e2eByToken;
-    for (size_t i = 0u; i < completed.size(); ++i) e2eByToken[completed[i].tokenId] = completed[i].intervalMs;
+    for (size_t i = 0u; i < completed.size(); ++i) rt.e2eByToken[completed[i].tokenId] = completed[i].intervalMs;
+    // Bound the map by dropping the oldest token ids. A completion whose
+    // observation never arrives must not accumulate for the whole run.
+    while (rt.e2eByToken.size() > 1024u) rt.e2eByToken.erase(rt.e2eByToken.begin());
     rt.algo2->setBoundaries(parseAlgo2Boundaries(std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS")));
     rt.algo2->setSerialRequest(true);
 
@@ -1120,10 +1130,11 @@ static void stepAlgo2(
 
     for (size_t n = 0u; n < rt.freshTokens.size(); ++n) {
         tpot::Algo2TokenObs obs = rt.freshTokens[n];
-        std::map<uint32_t, double>::const_iterator e2e = e2eByToken.find(obs.tokenId);
-        if (e2e != e2eByToken.end()) {
+        std::map<uint32_t, double>::iterator e2e = rt.e2eByToken.find(obs.tokenId);
+        if (e2e != rt.e2eByToken.end()) {
             obs.e2eKnown = true;
             obs.e2eMs = e2e->second;
+            rt.e2eByToken.erase(e2e);
         }
         if (rt.algo2WaitApply) {
             PendingAction pending;

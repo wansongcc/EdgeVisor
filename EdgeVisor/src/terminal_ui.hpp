@@ -30,6 +30,15 @@ void edgeVisorUiPublish(
     const char *event);
 void edgeVisorUiMarkDegraded(unsigned stageIndex, bool degraded);
 void edgeVisorUiMarkOffline(unsigned stageIndex, const char *event);
+void edgeVisorUiNoteTakeover(
+    unsigned deadStage,
+    unsigned prevStage,
+    unsigned frontBegin,
+    unsigned frontEnd,
+    unsigned nextStage,
+    unsigned backBegin,
+    unsigned backEnd,
+    const char *event);
 void edgeVisorUiBeginMove(unsigned fromStage, unsigned toStage, const char *event);
 void edgeVisorUiShiftLayers(
     unsigned fromStage,

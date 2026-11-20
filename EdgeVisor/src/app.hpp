@@ -182,11 +182,17 @@ NnUint ppStartLayerSwitchFlag(
     NnUint boundaryLayer,
     const NnUnevenPartitionPlan *activePlan = nullptr);
 
+// Last measured stage execution time, in milliseconds. 0 means unknown.
+// Every control packet carries the same snapshot so a takeover split agrees
+// on the root and on every worker.
+static constexpr NnUint LLM_STAGE_SPEED_SLOTS = 8u;
+
 typedef struct {
     NnUint position;
     NnUint batchSize; // 0 = stop signal
     NnUint flags;     // bit0: enable per-token profiling
     NnUint planCmdSeq; // command seq; valid only when LLM_CTRL_HAS_PLAN_CMD is set
+    NnUint stageExecMs[LLM_STAGE_SPEED_SLOTS];
 } LlmControlPacket;
 
 enum LlmControlFlags : NnUint {
@@ -402,10 +408,18 @@ enum LlmWorkerFrameKind : NnUint {
     // Kind 5 is NN_WORKER_FRAME_DELIVERY_NEED. The takeover reply is a
     // different frame, so it cannot reuse that number.
     LLM_WORKER_FRAME_TAKEOVER_ACK = 6u,
+    // One stage's last execution time. The root drains these between tokens
+    // and broadcasts the snapshot in the next control packet.
+    LLM_WORKER_FRAME_STAGE_SPEED = 7u,
     // A queueable delivery note for the PP transport. Declared in nn-network.hpp
     // because the network writes and recognises it without the app layer.
     LLM_WORKER_FRAME_DELIVERY_NEED = NN_WORKER_FRAME_DELIVERY_NEED,
 };
+
+typedef struct {
+    NnUint stageIndex;
+    NnUint execUs;
+} LlmStageSpeedPacket;
 
 // A receiving stage answers a layer switch with this when its reservation does
 // not cover the range yet. The root then falls back to moving the KV instead.
@@ -684,6 +698,10 @@ private:
     std::vector<LlmPerfPacket> lastPerf;
     std::deque<LlmPerfHistorySample> perfHistory;
     unsigned long long perfHistorySeq = 0ull;
+    // Set by forward() when it really drained this token's profile frames.
+    // A deferred forward leaves it false so the caller knows the frames are
+    // still on the wire.
+    bool lastForwardProfileCollected = false;
     NnUint lastPlanCmdSeqSent = 0u;
     NnBubbleShadowStats lastBubbleShadowStats{};
     int asyncKvCollectLayer = -1;
@@ -822,6 +840,7 @@ private:
         bool selfIsSource,
         bool selfIsTarget);
     void collectProfilePackets();
+    void commitProfilePackets(const std::vector<LlmPerfPacket> &perf);
     bool replayHistoryForMigrationRecompute(NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens, NnUint startPos = 0u);
     bool replayHistoryForHeadMigrationRecompute(const PlanCommand &cmd, NnUint endPos, double *recomputeMs, uint64_t *recomputeTokens);
     bool recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUint triggerPos);
@@ -844,7 +863,16 @@ public:
     void setRuntimeLayerGate(bool enablePrimarySegments, bool enableRedundantSegments);
     void setPrimaryLayerEnabled(NnUint layerIndex, bool enabled);
     void setShiftedPpStartLayerEnabled(NnUint layerIndex, bool enabled);
-    void forward(bool collectProfile = true);
+    // deferProfileCollect: leave this forward's profile packets on the wire
+    // instead of draining them here. The caller finishes the drain with
+    // collectAndCommitDeferredProfile() once the next token is under way.
+    void forward(bool collectProfile = true, bool deferProfileCollect = false);
+    // True when forward() actually drained the profile frames this token, so a
+    // deferred caller knows there is nothing left to collect. False when the
+    // drain was deferred (or profiling is off).
+    bool didLastForwardCollectProfile() const { return lastForwardProfileCollected; }
+    // True when this root is collecting per-forward worker profiles at all.
+    bool isProfileEnabled() const { return profileEnabled; }
     // Returns elapsed microseconds; zero means the operation was not run.
     unsigned long long runToolWindowShadow();
     // deferSwitch: ack completes the copy but does not move layer ownership.
@@ -852,6 +880,11 @@ public:
     unsigned long long runBackgroundPreCopy(NnUint endPos, bool deferSwitch = false);
     unsigned long long runPipeLivePatch(NnUint pos);
     void collectDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out);
+    // Drains the worker profile frames a deferred forward left on the wire and
+    // publishes them exactly like a synchronous collect would, so lastPerf and
+    // perfHistory (Algo2 / DynamicTpotController) stay bit-for-bit equivalent
+    // to the non-deferred path.
+    void collectAndCommitDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out);
     LlmPerfPacket makeRootPerfPacket() const;
     // True when a complete normal worker frame for this position is already
     // cached from that node. The PP delivery probe treats this as HAVE.
@@ -926,6 +959,9 @@ typedef struct {
 } AppInferenceContext;
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
+// True when worker PROFILE frames may be collected one token late. Controlled
+// by DLLAMA_DEFERRED_PROFILE (default on); only takes effect while profiling.
+bool deferredProfileEnabled();
 // Between tokens, connect a reserved pool member and move a slice of the slowest donor onto it.
 void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position);
 // Between tokens, probe a device that dropped mid-session. When its port

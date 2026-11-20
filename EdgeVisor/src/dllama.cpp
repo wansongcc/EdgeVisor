@@ -428,6 +428,19 @@ static void debugSyncTopkTrace(const float* logits, NnUint vocabSize, const char
 #define DLLAMA_DEBUG_TOPK_LOGITS 0
 #endif
 
+/* computeLogitsStats walks the whole vocabulary (128K floats on llama3) and its
+ * output only feeds debug printing: the TOPK block when that is compiled in,
+ * the productLogLevel() >= 1 report, and the root-logits split dump. Normal
+ * inference runs at level 0 with TOPK compiled out, so the scan is pure
+ * per-token overhead there and must not run. */
+static bool logitsStatsNeeded() {
+#if DLLAMA_DEBUG_TOPK_LOGITS
+    return true;
+#else
+    return productLogLevel() >= 1 || debugRootLogitsSplitEnabled();
+#endif
+}
+
 #if DLLAMA_DEBUG_TOPK_LOGITS
 static int debugLogitsBatchSelect() {
     const char *v = std::getenv("DLLAMA_DEBUG_LOGITS_BATCH");
@@ -861,9 +874,9 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         failoverArmSessionRestart(effectivePrompt + generatedText, steps, context->header->nLayers);
         throw NnSessionRestartException();
     };
-    auto forwardOrRestart = [&]() {
+    auto forwardOrRestart = [&](bool deferProfileCollect = false) {
         try {
-            context->inference->forward();
+            context->inference->forward(true, deferProfileCollect);
         } catch (const NnPeerOfflineException &e) {
             std::printf("inference stopped peer=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
             std::fflush(stdout);
@@ -1049,13 +1062,16 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         float minLogit = 1e9f;
         int maxIndex = -1;
 
-        // Always compute basic logits stats (even when TOPK debug isn't compiled).
+        // The stats below are only consumed by the TOPK debug block and by the
+        // productLogLevel()>=1 report, so the vocab-wide scan is skipped when
+        // both are off (normal inference). Both readers recompute their own
+        // numbers when they are active.
         // In eval stage logits pipe is [batch][vocab]. Use the latest row of this window.
         // Non-final chunks skip the logits compute; their pipe rows are stale.
         const NnUint statBatch = (batchSize > 0u) ? (batchSize - 1u) : 0u;
         const float* logitsRow = logits + (size_t)statBatch * (size_t)vocabSize;
         NnUint zeroCount = 0u;
-        if (isFinalChunk) {
+        if (isFinalChunk && logitsStatsNeeded()) {
             computeLogitsStats(logitsRow, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
         }
 
@@ -1145,6 +1161,117 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
     }
     std::vector<NnUint> markedPositions;
+    // Deferred profile collection. The worker PROFILE frames for token N are
+    // drained only after token N's sample is in hand, by which point they have
+    // had a whole token period to arrive, so the worker round-trip leaves the
+    // root's per-token critical path.
+    //
+    // This is only safe once every byte the root reads is a framed worker
+    // frame. Without last-stage sampling the tail gathers the logits with
+    // SYNC_NODE_SLICES_EXCEPT_ROOT, which pushes the raw LG float array over
+    // the same socket with no LlmWorkerFrameHeader in front of it. Leaving the
+    // previous token's PROFILE/STAGE_SPEED frames queued would then make the
+    // next token's root_wait read that header as logits and desynchronise the
+    // stream ("Invalid worker frame magic or version"). With last-stage
+    // sampling the tail sends a SAMPLED_TOKEN frame instead, the raw gather is
+    // gone, and a one-token-late drain is safe. So the deferral is gated on
+    // the sampling path that actually removes the raw transfer, not just on
+    // the arg being set.
+    const NnUnevenPartitionPlan *deferredPlan = context->inference->getPartitionPlan();
+    bool lastStageSamplingLive = false;
+    if (context->args->lastStageSampling && context->network != nullptr &&
+            deferredPlan != nullptr && deferredPlan->stages != nullptr && deferredPlan->nStages >= 2u) {
+        const NnStageConfig *tail = pipelineTailStage(deferredPlan);
+        lastStageSamplingLive = tail != nullptr && tail->nNodes > 0u &&
+            tail->rootNodeIndex != 0u && tail->rootNodeIndex < deferredPlan->nNodes;
+    }
+    const bool useDeferredProfile =
+        (context->inference->isProfileEnabled() && deferredProfileEnabled() && lastStageSamplingLive);
+    bool hasPendingProfile = false;
+    LlmPerfPacket pendingRootPacket{};
+    NnUint pendingProfilePos = 0u;
+    std::vector<LlmPerfPacket> deferredPerf;
+    // The accounting the old inline benchmark block did, hoisted so the exact
+    // same work runs whether the packets arrived synchronously or a token late.
+    // perfAgg, predPerfHistory and the hasMigrationAck probe stay together, as
+    // they were: moving the ack read out would change when the pivot is seen.
+    auto recordProfileForToken = [&](const std::vector<LlmPerfPacket> &perf, NnUint tokenPos) {
+        if (tokenTimingPrint) {
+            for (const LlmPerfPacket& p : perf) {
+                DllamaTokenNodeTiming timing;
+                timing.nodeIndex = p.nodeIndex;
+                timing.stageIndex = p.stageIndex;
+                timing.hasStage = true;
+                timing.execUs = p.execUs;
+                timing.syncUs = p.syncUs;
+                timing.bubbleUs = p.bubbleUs;
+                const std::string nodeLine = formatTokenNodeTimingLine((unsigned int)tokenPos, timing);
+                printf("%s\n", nodeLine.c_str());
+            }
+        }
+        if (!context->args->benchmark) return;
+        for (const LlmPerfPacket& p : perf) {
+            if (p.nodeIndex >= perfAgg.size()) continue;
+            NodePerfAgg& a = perfAgg[p.nodeIndex];
+            a.execUs += p.execUs;
+            a.syncUs += p.syncUs;
+            a.syncPpSendUs += p.syncPpSendUs;
+            a.syncPpRecvUs += p.syncPpRecvUs;
+            a.syncRootWaitUs += p.syncRootWaitUs;
+            a.syncLogitsUs += p.syncLogitsUs;
+            a.syncOtherUs += p.syncOtherUs;
+            a.bubbleUs += p.bubbleUs;
+            a.bubbleSegments += p.bubbleSegments;
+            a.bubbleOps += p.bubbleOps;
+            a.bubbleSkippedSyncs += p.bubbleSkippedSyncs;
+            a.bubbleDrainUs += p.bubbleDrainUs;
+            a.bubbleCompleted += p.bubbleCompleted;
+            a.forwardCount += 1;
+            a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
+            a.stageIndex = p.stageIndex;
+            a.hasStage = true;
+        }
+
+        TokenPerfSample sample;
+        sample.pos = tokenPos;
+        sample.nodePerf.resize(nNodes);
+        for (const LlmPerfPacket& p : perf) {
+            if (p.nodeIndex >= sample.nodePerf.size()) continue;
+            sample.nodePerf[p.nodeIndex].execUs = p.execUs;
+            sample.nodePerf[p.nodeIndex].syncUs = p.syncUs;
+            sample.nodePerf[p.nodeIndex].bubbleUs = p.bubbleUs;
+            sample.nodePerf[p.nodeIndex].stageIndex = p.stageIndex;
+            sample.nodePerf[p.nodeIndex].hasStage = true;
+            sample.nodePerf[p.nodeIndex].hasValue = true;
+        }
+        predPerfHistory.push_back(std::move(sample));
+        while (predPerfHistory.size() > 512u) {
+            predPerfHistory.pop_front();
+        }
+
+        if (!migrationPivotKnown && context->inference->hasMigrationAck()) {
+            const int ackPos = context->inference->getMigrationAckPos();
+            const int ackLayer = context->inference->getMigrationAckLayer();
+            if (ackPos >= 0 && ackLayer >= 0) {
+                migrationPivotKnown = true;
+                migrationPivotPos = (NnUint)ackPos;
+                migrationPivotLayer = (NnUint)ackLayer;
+                std::printf("📍 [migrate-prof] anchor layer=%u pos=%u window=%u-before/%u-after\n",
+                    (unsigned)migrationPivotLayer,
+                    (unsigned)migrationPivotPos,
+                    (unsigned)migrationWindowTokens,
+                    (unsigned)migrationWindowTokens);
+                std::fflush(stdout);
+            }
+        }
+    };
+    // Commits a token whose packets forward() left on the wire.
+    auto flushPendingProfile = [&]() {
+        if (!hasPendingProfile) return;
+        context->inference->collectAndCommitDeferredProfile(pendingRootPacket, deferredPerf);
+        recordProfileForToken(deferredPerf, pendingProfilePos);
+        hasPendingProfile = false;
+    };
     for (; pos < maxPos; pos++) {
         const auto tokenWallStart = std::chrono::steady_clock::now();
         for (NnUint markPos : markPositions) {
@@ -1160,7 +1287,16 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         maybeRejoinDroppedDevice(context, pos);
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
-        forwardOrRestart();
+        // Snapshot the root half of this token's profile before the next
+        // setPosition() overwrites it. In deferred mode the worker frames are
+        // still on the wire, so only the root packet can be taken here.
+        LlmPerfPacket currentRootPacket{};
+        bool deferredThisToken = false;
+        forwardOrRestart(useDeferredProfile);
+        if (useDeferredProfile && !context->inference->didLastForwardCollectProfile()) {
+            currentRootPacket = context->inference->makeRootPerfPacket();
+            deferredThisToken = true;
+        }
         const std::vector<LlmPerfPacket>& tokenPerf = context->inference->getLastPerf();
 
         NnUint lastStageToken = 0u;
@@ -1178,8 +1314,10 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             armSessionRestart(e.peerNodeIndex, true);
         }
 
-        // In pred stage batchSize==1. Always compute logits stats for debugging.
-        if (!haveLastStageToken) {
+        // In pred stage batchSize==1. The stats exist only for the level>=1
+        // report just below, so the vocab-wide scan runs inside that gate and
+        // normal inference (level 0) skips it entirely.
+        if (!haveLastStageToken && productLogLevel() >= 1) {
             bool hasNaN = false;
             bool hasInf = false;
             float maxLogit = -1e9f;
@@ -1188,73 +1326,25 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             NnUint zeroCount = 0u;
             computeLogitsStats(context->inference->logitsPipe, context->header->vocabSize,
                                hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
-            if (productLogLevel() >= 1) {
-                const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && context->header->vocabSize > 0u);
-                printf("logits pred valid=%s range=[%.2f, %.2f] maxIdx=%d zero=%u/%u\n",
-                    statsOk ? "ok" : "fail",
-                    minLogit, maxLogit, maxIndex,
-                    (unsigned)zeroCount, (unsigned)context->header->vocabSize);
-                printRootLogitsSplitStats("pred", pos, context->inference->logitsPipe, context->header->vocabSize);
-                debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
-            }
+            const bool statsOk = (!hasNaN && !hasInf && maxIndex >= 0 && context->header->vocabSize > 0u);
+            printf("logits pred valid=%s range=[%.2f, %.2f] maxIdx=%d zero=%u/%u\n",
+                statsOk ? "ok" : "fail",
+                minLogit, maxLogit, maxIndex,
+                (unsigned)zeroCount, (unsigned)context->header->vocabSize);
+            printRootLogitsSplitStats("pred", pos, context->inference->logitsPipe, context->header->vocabSize);
+            debugSyncTopkTrace(context->inference->logitsPipe, context->header->vocabSize, "pred", pos, 0u);
         }
 
+        // Root bubble time for this token. It used to fall out of the packet sum
+        // in the benchmark block; a deferred token's packets are still on the
+        // wire, so the root snapshot supplies the same number.
         NnUint predBubbleTime = 0;
         if (context->args->benchmark) {
-            const std::vector<LlmPerfPacket>& perf = tokenPerf;
-            for (const LlmPerfPacket& p : perf) {
-                if (p.nodeIndex == 0u) predBubbleTime += p.bubbleUs;
-                if (p.nodeIndex >= perfAgg.size()) continue;
-                NodePerfAgg& a = perfAgg[p.nodeIndex];
-                a.execUs += p.execUs;
-                a.syncUs += p.syncUs;
-                a.syncPpSendUs += p.syncPpSendUs;
-                a.syncPpRecvUs += p.syncPpRecvUs;
-                a.syncRootWaitUs += p.syncRootWaitUs;
-                a.syncLogitsUs += p.syncLogitsUs;
-                a.syncOtherUs += p.syncOtherUs;
-                a.bubbleUs += p.bubbleUs;
-                a.bubbleSegments += p.bubbleSegments;
-                a.bubbleOps += p.bubbleOps;
-                a.bubbleSkippedSyncs += p.bubbleSkippedSyncs;
-                a.bubbleDrainUs += p.bubbleDrainUs;
-                a.bubbleCompleted += p.bubbleCompleted;
-                a.forwardCount += 1;
-                a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
-                a.stageIndex = p.stageIndex;
-                a.hasStage = true;
-            }
-
-            TokenPerfSample sample;
-            sample.pos = pos;
-            sample.nodePerf.resize(nNodes);
-            for (const LlmPerfPacket& p : perf) {
-                if (p.nodeIndex >= sample.nodePerf.size()) continue;
-                sample.nodePerf[p.nodeIndex].execUs = p.execUs;
-                sample.nodePerf[p.nodeIndex].syncUs = p.syncUs;
-                sample.nodePerf[p.nodeIndex].bubbleUs = p.bubbleUs;
-                sample.nodePerf[p.nodeIndex].stageIndex = p.stageIndex;
-                sample.nodePerf[p.nodeIndex].hasStage = true;
-                sample.nodePerf[p.nodeIndex].hasValue = true;
-            }
-            predPerfHistory.push_back(std::move(sample));
-            while (predPerfHistory.size() > 512u) {
-                predPerfHistory.pop_front();
-            }
-
-            if (!migrationPivotKnown && context->inference->hasMigrationAck()) {
-                const int ackPos = context->inference->getMigrationAckPos();
-                const int ackLayer = context->inference->getMigrationAckLayer();
-                if (ackPos >= 0 && ackLayer >= 0) {
-                    migrationPivotKnown = true;
-                    migrationPivotPos = (NnUint)ackPos;
-                    migrationPivotLayer = (NnUint)ackLayer;
-                    std::printf("📍 [migrate-prof] anchor layer=%u pos=%u window=%u-before/%u-after\n",
-                        (unsigned)migrationPivotLayer,
-                        (unsigned)migrationPivotPos,
-                        (unsigned)migrationWindowTokens,
-                        (unsigned)migrationWindowTokens);
-                    std::fflush(stdout);
+            if (deferredThisToken) {
+                predBubbleTime = currentRootPacket.bubbleUs;
+            } else {
+                for (const LlmPerfPacket& p : tokenPerf) {
+                    if (p.nodeIndex == 0u) predBubbleTime += p.bubbleUs;
                 }
             }
 
@@ -1521,6 +1611,36 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
 #endif
         token = haveLastStageToken ? (int)lastStageToken : context->sampler->sample(context->inference->logitsPipe);
+        // Commit the profile accounting here, once this token's sample is
+        // already in hand. In deferred mode the previous token's PROFILE frames
+        // have had a full token period to reach us, so draining them no longer
+        // sits between forward() and the next token's start.
+        try {
+            if (useDeferredProfile) {
+                if (deferredThisToken) {
+                    // Drain the older token before queueing this one so
+                    // predPerfHistory stays in position order.
+                    flushPendingProfile();
+                    pendingRootPacket = currentRootPacket;
+                    pendingProfilePos = pos;
+                    hasPendingProfile = true;
+                } else {
+                    // forward() drained this token itself, e.g. a failover
+                    // rebuilt the session mid-forward. Flush the older token,
+                    // then record this one straight from lastPerf.
+                    flushPendingProfile();
+                    recordProfileForToken(tokenPerf, pos);
+                }
+            } else {
+                recordProfileForToken(tokenPerf, pos);
+            }
+        } catch (const NnPeerOfflineException &e) {
+            std::printf("inference stopped peer=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
+            std::fflush(stdout);
+            throw std::runtime_error(std::string("inference stopped: ") + e.what());
+        } catch (const NnPeerTimeoutException &e) {
+            armSessionRestart(e.peerNodeIndex, true);
+        }
         dllama::dynamic_tpot::algo2NoteTokenComplete((NnUint)pos, pos + 1u, true);
         context->inference->pollRevisedSwitchReconcile();
         // Per-token completion timestamps. The matrix measures "trigger to the
@@ -1567,17 +1687,8 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             const double tokenWallMs = std::chrono::duration<double, std::milli>(tokenWallEnd - tokenWallStart).count();
             const std::string e2eLine = formatTokenE2eTimingLine((unsigned int)pos, token, tokenWallMs);
             printf("%s\n", e2eLine.c_str());
-            for (const LlmPerfPacket& p : tokenPerf) {
-                DllamaTokenNodeTiming timing;
-                timing.nodeIndex = p.nodeIndex;
-                timing.stageIndex = p.stageIndex;
-                timing.hasStage = true;
-                timing.execUs = p.execUs;
-                timing.syncUs = p.syncUs;
-                timing.bubbleUs = p.bubbleUs;
-                const std::string nodeLine = formatTokenNodeTimingLine((unsigned int)pos, timing);
-                printf("%s\n", nodeLine.c_str());
-            }
+            // The per-node lines come from recordProfileForToken, which in
+            // deferred mode runs when this position's packets actually land.
             fflush(stdout);
         }
         if (eosType == NOT_EOS || eosType == EOS) {
@@ -1590,6 +1701,21 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
                 pos++;
                 break;
             }
+        }
+    }
+    // Flush the last token's deferred profile. The loop ends either at maxPos
+    // or on an EOS break; both leave that token's packets on the wire, and
+    // dropping them would lose the final entry of the benchmark summary. The
+    // restart path throws out of the loop, so it never reaches here.
+    if (useDeferredProfile && hasPendingProfile) {
+        try {
+            flushPendingProfile();
+        } catch (const NnPeerOfflineException &e) {
+            std::printf("inference stopped peer=%u %s\n", (unsigned)e.peerNodeIndex, e.what());
+            std::fflush(stdout);
+            throw std::runtime_error(std::string("inference stopped: ") + e.what());
+        } catch (const NnPeerTimeoutException &e) {
+            armSessionRestart(e.peerNodeIndex, true);
         }
     }
     const auto predWallEnd = std::chrono::steady_clock::now();

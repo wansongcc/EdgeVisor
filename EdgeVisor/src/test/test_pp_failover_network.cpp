@@ -584,6 +584,11 @@ static void testDeadHopBeyondNext(bool turbo) {
 }
 int main() {
     setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
+    // The delivery probe sizes its answer window from TCP_USER_TIMEOUT
+    // (userMs + 1s). The 20s production default would blow the ~2s bound the
+    // buffered-send cases assert; keep a short default and let an explicit
+    // external value win.
+    setenv("DLLAMA_TCP_USER_TIMEOUT_MS", "1000", 0);
     setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
     for (unsigned fault = 0u; fault <= 4u; ++fault) {
         testControlAckFrames(false, fault); testControlAckFrames(true, fault);

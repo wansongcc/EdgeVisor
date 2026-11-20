@@ -261,6 +261,14 @@ static bool lastStageSamplingEnabled() {
     return envFlagEnabledDefault("DLLAMA_LAST_STAGE_SAMPLING", false);
 }
 
+// Deferring the worker PROFILE drain by one token keeps the worker frames from
+// sitting between the tail's SAMPLED_TOKEN and the root's next forward: the
+// frames arrive while the root is already sampling, so the wait is off the
+// critical path. On by default when profiling is on.
+bool deferredProfileEnabled() {
+    return envFlagEnabledDefault("DLLAMA_DEFERRED_PROFILE", true);
+}
+
 static bool lastStageSamplingPlanSupported(const NnUnevenPartitionPlan *plan) {
     if (!lastStageSamplingEnabled()) return false;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
@@ -5023,10 +5031,8 @@ std::vector<LlmPerfHistorySample> RootLlmInference::getPerfHistorySince(
     return out;
 }
 
-void RootLlmInference::collectProfilePackets() {
+void RootLlmInference::commitProfilePackets(const std::vector<LlmPerfPacket> &perf) {
     if (!profileEnabled) return;
-    std::vector<LlmPerfPacket> perf;
-    collectDeferredProfile(makeRootPerfPacket(), perf);
     std::lock_guard<std::mutex> lk(lastPerfMutex);
     lastPerf = perf;
     if (!perf.empty()) {
@@ -5037,6 +5043,18 @@ void RootLlmInference::collectProfilePackets() {
         const size_t maxHistory = 512u;
         while (perfHistory.size() > maxHistory) perfHistory.pop_front();
     }
+}
+
+void RootLlmInference::collectProfilePackets() {
+    if (!profileEnabled) return;
+    std::vector<LlmPerfPacket> perf;
+    collectDeferredProfile(makeRootPerfPacket(), perf);
+    commitProfilePackets(perf);
+}
+
+void RootLlmInference::collectAndCommitDeferredProfile(const LlmPerfPacket &rootPacket, std::vector<LlmPerfPacket> &out) {
+    collectDeferredProfile(rootPacket, out);
+    commitProfilePackets(out);
 }
 
 unsigned long long RootLlmInference::runToolWindowShadow() {
@@ -5399,9 +5417,10 @@ bool RootLlmInference::recoverHeadMigrationNoShadow(const PlanCommand &cmd, NnUi
     return applyOk;
 }
 
-void RootLlmInference::forward(bool collectProfile) {
+void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
     pollStageBypassAckFrames();
     lastBubbleShadowStats = {};
+    lastForwardProfileCollected = false;
     bool sendKvTransfer = false;
     bool sendLayerSwitch = false;
     std::vector<PendingKvTransferItem> kvTransfers;
@@ -6061,6 +6080,7 @@ void RootLlmInference::forward(bool collectProfile) {
         if (collectProfile && !profileCollectedBeforeRecovery) {
             collectProfilePackets();
             profileCollectedBeforeRecovery = true;
+            lastForwardProfileCollected = true;
         }
         const NnUint endPos = std::min((NnUint)asyncKvCollectPos, (header->seqLen > 0u) ? (header->seqLen - 1u) : 0u);
         const EdgeVisorAblationConfig &ablationCfg = getEdgeVisorAblationConfig();
@@ -6411,8 +6431,13 @@ void RootLlmInference::forward(bool collectProfile) {
     }
 
     if (collectProfile) {
-        if (!profileCollectedBeforeRecovery) {
+        // A deferred collect leaves the frames on the wire: the caller drains
+        // them one token later, once the tail's SAMPLED_TOKEN is already in.
+        // lastPerf / perfHistory are deliberately left alone here; clearing
+        // them would drop the Algo2 history the deferred commit appends to.
+        if (!profileCollectedBeforeRecovery && !deferProfileCollect) {
             collectProfilePackets();
+            lastForwardProfileCollected = true;
         }
     } else {
         std::lock_guard<std::mutex> lk(lastPerfMutex);
@@ -9607,13 +9632,34 @@ void runWorkerApp(AppCliArgs *args) {
                     }
                 }
 
-                executor.forward();
+                // The pipeline tail can sample as soon as its D2H lands: it does
+                // not need the shadow KV drain or the profile packet. Deferring
+                // the drain keeps SAMPLED_TOKEN off the root's post-forward
+                // critical path, so the root has the token while this stage is
+                // still finishing its own bookkeeping.
+                const NnStageConfig *tailStage = pipelineTailStage(planPtr.get());
+                const bool deferTailShadow =
+                    tailStage != nullptr &&
+                    getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex) == tailStage->stageIndex &&
+                    lastStageSamplingPlanSupported(planPtr.get()) &&
+                    bubbleShadowKvDuringForwardEnabled();
+
+                executor.forward(deferTailShadow);
+                if (deferTailShadow) {
+                    // Sample straight after the logits D2H: everything the token
+                    // needs is already on the host here.
+                    inference.maybeSendLastStageSampledToken(planPtr.get());
+                }
                 if (network != nullptr) {
                     LlmStageSpeedPacket sp{};
                     sp.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
                     sp.execUs = executor.getTotalTime(STEP_EXECUTE_OP);
                     if (sp.execUs > 0u)
                         writeWorkerFrame(network, LLM_WORKER_FRAME_STAGE_SPEED, &sp, sizeof(sp));
+                }
+                if (deferTailShadow) {
+                    // forward(true) left the shadow drain to us.
+                    executor.runDeferredBubbleShadowKv();
                 }
                 NnBubbleShadowStats bubbleStats = maybeRunBubbleShadowKv(&executor, "worker", nodeConfig.nodeIndex, inference.position(), inference.batchSize());
                 inference.flushPendingKvAck();
@@ -9647,7 +9693,7 @@ void runWorkerApp(AppCliArgs *args) {
                     fillBoundaryLayerPerfPacket(p, planPtr.get(), nodeConfig.nodeIndex, &execution);
                     writeWorkerFrame(network, LLM_WORKER_FRAME_PROFILE, &p, sizeof(p));
                 }
-                inference.maybeSendLastStageSampledToken(planPtr.get());
+                if (!deferTailShadow) inference.maybeSendLastStageSampledToken(planPtr.get());
                 isFirstAttempt = true;
             } catch (const NnPeerOfflineException &e) {
                 printf("🚨 Peer offline: node=%u %s\n", (unsigned)e.peerNodeIndex, e.what());

@@ -1496,7 +1496,92 @@ static NnNodeConfig buildLlmNodeInternal(
         addSegmentLogged(ppRecvHoldSeg, "pp_recv_hold", startLayer);
     }
 
+    // Shadow KV / redundant segments used to reuse the primary path's scratch
+    // buffers (x/y/q/att/d/...). That is what forced them to run strictly after
+    // the primary forward returned: sharing a buffer means a later primary op
+    // would overwrite half-finished shadow state (and vice versa). Giving the
+    // shadow path its own node-level scratch makes the two independent, so the
+    // shadow KV pass can fill the PP root-wait bubble concurrently.
+    //
+    // Allocated lazily, on the first redundant layer this node really builds:
+    // a node with no redundant layer pays zero extra memory.
+    struct ShadowScratchBuffers {
+        bool initialized = false;
+        NnUint x = (NnUint)-1;
+        NnUint y = (NnUint)-1;
+        NnUint yq = (NnUint)-1;
+        NnUint mhaOut = (NnUint)-1;
+        NnUint mhaOutQ = (NnUint)-1;
+        NnUint q = (NnUint)-1;
+        NnUint kTemp = (NnUint)-1;
+        NnUint vTemp = (NnUint)-1;
+        NnUint invRms = (NnUint)-1;
+        NnUint att = (NnUint)-1;
+        NnUint d = (NnUint)-1;
+        NnUint dq = (NnUint)-1;
+        NnUint l = (NnUint)-1;
+        // MoE scratch. Only the buffers the redundant branch actually writes
+        // are shadowed. `moeYq`, `moeDQ` and `moeExpertIndexes` are read-only
+        // inputs there (the redundant FF has no OP_REPEAT_Z, no block_cast_d2
+        // and no OP_MOE_GATE of its own), so they keep pointing at whatever the
+        // primary path produced — exactly the pre-existing behaviour, and
+        // deliberately unchanged here.
+        NnUint moeGt = (NnUint)-1;
+        NnUint moeY = (NnUint)-1;
+        NnUint moeD = (NnUint)-1;
+        NnUint moeL = (NnUint)-1;
+    };
+    ShadowScratchBuffers shadowScratch;
+
+    // The shadow path still shares the read-only RoPE tables and the PP
+    // hand-off buffers with the primary path. Those are safe to share: RoPE
+    // caches are never written after build, and the PP stage-output cache /
+    // recv-hold contents are exactly what a boundary shadow layer has to read.
+    auto allocateShadowScratchBuffers = [&]() {
+        if (shadowScratch.initialized) return;
+        shadowScratch.initialized = true;
+        shadowScratch.x = nodeBuilder.addBuffer("shadow_x", size2D(F_32, nBatches, h->dim));
+        shadowScratch.y = nodeBuilder.addBuffer("shadow_y", size2D(F_32, nBatches, h->dim));
+        shadowScratch.yq = (h->syncType == F_32)
+            ? shadowScratch.y
+            : nodeBuilder.addBuffer("shadow_q_y", size2D(h->syncType, nBatches, h->dim));
+        const NnSize3D mhaOutSize = size2D(F_32, nBatches, fullAttBuffers ? h->qDim : qSlice.inLen);
+        shadowScratch.mhaOut = nodeBuilder.addBuffer("shadow_mha_out", mhaOutSize);
+        shadowScratch.mhaOutQ = (h->syncType == F_32)
+            ? shadowScratch.mhaOut
+            : nodeBuilder.addBuffer("shadow_q_mha_out", size2D(h->syncType, mhaOutSize.y, mhaOutSize.x));
+        shadowScratch.q = nodeBuilder.addBuffer(
+            "shadow_q",
+            size2D(F_32, nBatches, fullAttBuffers ? h->qDim : qSlice.inLen));
+        shadowScratch.kTemp = nodeBuilder.addBuffer(
+            "shadow_k_temp",
+            size2D(F_32, nBatches, (fullAttBuffers && enableKvRedundancy) ? kSlice.inLen : (fullAttBuffers ? h->kvDim : kSlice.inLen)));
+        shadowScratch.vTemp = nodeBuilder.addBuffer(
+            "shadow_v_temp",
+            size2D(F_32, nBatches, (fullAttBuffers && enableKvRedundancy) ? vSlice.inLen : (fullAttBuffers ? h->kvDim : vSlice.inLen)));
+        shadowScratch.invRms = nodeBuilder.addBuffer("shadow_inv_rms", size2D(F_32, nBatches, nInvBufferColumns));
+        shadowScratch.att = nodeBuilder.addBuffer("shadow_att", attSize);
+        const NnSize3D dSize = size2D(F_32, nBatches, fullFfnBuffers ? ffDim : w1Slice.inLen);
+        shadowScratch.d = nodeBuilder.addBuffer("shadow_d", dSize);
+        shadowScratch.dq = (h->syncType == F_32)
+            ? shadowScratch.d
+            : nodeBuilder.addBuffer("shadow_q_d", size2D(h->syncType, nBatches, fullFfnBuffers ? ffDim : w1Slice.inLen));
+        shadowScratch.l = nodeBuilder.addBuffer(
+            "shadow_l",
+            size2D(F_32, nBatches, fullFfnBuffers ? ffDim : w3Slice.inLen));
+
+        if (h->nExperts > 0) {
+            shadowScratch.moeGt = nodeBuilder.addBuffer("shadow_moe_gt", size2D(F_32, nBatches, nExpertsOr1));
+            shadowScratch.moeY = nodeBuilder.addBuffer("shadow_moe_y", size3D(F_32, nActiveExpertsOr1, nBatches, h->dim));
+            shadowScratch.moeD = nodeBuilder.addBuffer("shadow_moe_d", size3D(F_32, nActiveExpertsOr1, nBatches, w1Slice.inLen));
+            shadowScratch.moeL = nodeBuilder.addBuffer("shadow_moe_l", size3D(F_32, nActiveExpertsOr1, nBatches, w3Slice.inLen));
+        }
+    };
+
     auto addRedundantWeightHolderForLayer = [&](NnUint layerIndex, bool readFromXPipe, bool writeBackToXPipe, bool readFromStageCache, bool useRecvHold) {
+        assert(!useRecvHold || !isFirstStage);
+        assert(!readFromStageCache || ppStageOutCacheBufferIndex != (NnUint)-1);
+        allocateShadowScratchBuffers();
         const NnUint redundantKBufferIndex = nodeBuilder.addBuffer(
             "red_k",
             fullAttBuffers ? size2D(F_32, h->seqLen * kvSlotCount, h->kvDim) : kvCacheSlice.keySize);
@@ -1517,42 +1602,42 @@ static NnNodeConfig buildLlmNodeInternal(
             // leftover FFN delta again would double-count the residual.
             redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_right", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                 size0(), NnCastOpCodeConfig{});
         } else if (readFromXPipe) {
             redAtt.addOp(OP_CAST, "runtime_shadow_kv_att_in_left", layerIndex,
                 useRecvHold ? pointerBatchConfig(SRC_BUFFER, ppRecvHoldBufferIndex)
                             : pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                 size0(), NnCastOpCodeConfig{});
         } else {
             redAtt.addOp(OP_MERGE_ADD, "runtime_shadow_kv_att_in_right", layerIndex,
                 pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                 size0(), NnMergeAddOpCodeConfig{});
         }
         redAtt.addOp(OP_INV_RMS, "block_norm_pre_0", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.invRms),
             size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
         redAtt.addOp(OP_RMS_NORM, "block_norm_0", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
             n->rmsNormSize,
-            NnRmsNormOpConfig{invRmsBufferIndex, 1});
-        if (yBufferIndex != yqBufferIndex) {
+            NnRmsNormOpConfig{shadowScratch.invRms, 1});
+        if (shadowScratch.y != shadowScratch.yq) {
             redAtt.addOp(OP_CAST, "block_cast_y", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.yq),
                 size0(), NnCastOpCodeConfig{});
         }
 
         const NnPointerConfig kTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, kTempBufferIndex, NN_SLICE_KV_HEAD)
-            : pointerBatchConfig(SRC_BUFFER, kTempBufferIndex);
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.kTemp, NN_SLICE_KV_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, shadowScratch.kTemp);
         const NnPointerConfig vTempSlicePtr = (fullAttBuffers && !enableKvRedundancy)
-            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, vTempBufferIndex, NN_SLICE_KV_HEAD)
-            : pointerBatchConfig(SRC_BUFFER, vTempBufferIndex);
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.vTemp, NN_SLICE_KV_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, shadowScratch.vTemp);
 
         NnMatmulOpConfig kCfg = enableKvRedundancy
             ? makeRowMatmulCfg(kSlice.n, kSlice.inLen, kSlice.inStart, kResidentSlice.inStart, stageFullWeights)
@@ -1565,19 +1650,19 @@ static NnNodeConfig buildLlmNodeInternal(
             vCfg.outStartUnit = h->headDim;
         }
         redAtt.addOp(OP_MATMUL, "block_matmul_k", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), kTempSlicePtr,
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), kTempSlicePtr,
             stageFullWeights ? kResidentSlice.sliceSize : kSlice.sliceSize, kCfg);
         redAtt.addOp(OP_MATMUL, "block_matmul_v", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), vTempSlicePtr,
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), vTempSlicePtr,
             stageFullWeights ? vResidentSlice.sliceSize : vSlice.sliceSize, vCfg);
 
         if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
             redAtt.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex,
-                kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+                kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, shadowScratch.invRms),
                 size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
             redAtt.addOp(OP_RMS_NORM, "block_norm_k", layerIndex,
                 kTempSlicePtr, kTempSlicePtr,
-                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
+                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{shadowScratch.invRms, nKNormColumns});
         }
 
         redAtt.addOp(OP_ROPE, "block_rope_k", layerIndex,
@@ -1604,70 +1689,70 @@ static NnNodeConfig buildLlmNodeInternal(
         if (readFromStageCache) {
             takeoverAtt.addOp(OP_CAST, "runtime_redundant_att_in_right", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                 size0(), NnCastOpCodeConfig{});
         } else if (readFromXPipe) {
             takeoverAtt.addOp(OP_CAST, "runtime_redundant_att_in_left", layerIndex,
                 useRecvHold ? pointerBatchConfig(SRC_BUFFER, ppRecvHoldBufferIndex)
                             : pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                 size0(), NnCastOpCodeConfig{});
         } else {
             takeoverAtt.addOp(OP_MERGE_ADD, "runtime_redundant_att_in_right", layerIndex,
                 pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                 size0(), NnMergeAddOpCodeConfig{});
         }
         takeoverAtt.addOp(OP_INV_RMS, "block_norm_pre_0", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.invRms),
             size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
         takeoverAtt.addOp(OP_RMS_NORM, "block_norm_0", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
             n->rmsNormSize,
-            NnRmsNormOpConfig{invRmsBufferIndex, 1});
-        if (yBufferIndex != yqBufferIndex) {
+            NnRmsNormOpConfig{shadowScratch.invRms, 1});
+        if (shadowScratch.y != shadowScratch.yq) {
             takeoverAtt.addOp(OP_CAST, "block_cast_y", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.yq),
                 size0(), NnCastOpCodeConfig{});
         }
 
         const NnPointerConfig qSlicePtr = fullAttBuffers
-            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, qBufferIndex, NN_SLICE_HEAD)
-            : pointerBatchConfig(SRC_BUFFER, qBufferIndex);
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.q, NN_SLICE_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, shadowScratch.q);
         const NnPointerConfig mhaOutSlicePtr = fullAttBuffers
-            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutBufferIndex, NN_SLICE_HEAD)
-            : pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex);
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.mhaOut, NN_SLICE_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, shadowScratch.mhaOut);
         const NnPointerConfig mhaOutQSlicePtr = fullAttBuffers
-            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, mhaOutQBufferIndex, NN_SLICE_HEAD)
-            : pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex);
+            ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.mhaOutQ, NN_SLICE_HEAD)
+            : pointerBatchConfig(SRC_BUFFER, shadowScratch.mhaOutQ);
 
         takeoverAtt.addOp(OP_MATMUL, "block_matmul_q", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), qSlicePtr,
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), qSlicePtr,
             stageFullWeights ? qResidentSlice.sliceSize : qSlice.sliceSize,
             makeRowMatmulCfgTagged(NN_SLICE_HEAD, h->headDim, qSlice.n, qSlice.inLen, qSlice.inStart, qResidentSlice.inStart, stageFullWeights));
         takeoverAtt.addOp(OP_MATMUL, "block_matmul_k", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), kTempSlicePtr,
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), kTempSlicePtr,
             stageFullWeights ? kResidentSlice.sliceSize : kSlice.sliceSize, kCfg);
         takeoverAtt.addOp(OP_MATMUL, "block_matmul_v", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex), vTempSlicePtr,
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), vTempSlicePtr,
             stageFullWeights ? vResidentSlice.sliceSize : vSlice.sliceSize, vCfg);
 
         if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
             takeoverAtt.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex,
-                qSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+                qSlicePtr, pointerBatchConfig(SRC_BUFFER, shadowScratch.invRms),
                 size0(), NnInvRmsOpConfig{h->normEpsilon, nQNormColumns});
             takeoverAtt.addOp(OP_RMS_NORM, "block_norm_q", layerIndex,
                 qSlicePtr, qSlicePtr,
-                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nQNormColumns});
+                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{shadowScratch.invRms, nQNormColumns});
             takeoverAtt.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex,
-                kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+                kTempSlicePtr, pointerBatchConfig(SRC_BUFFER, shadowScratch.invRms),
                 size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
             takeoverAtt.addOp(OP_RMS_NORM, "block_norm_k", layerIndex,
                 kTempSlicePtr, kTempSlicePtr,
-                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
+                size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{shadowScratch.invRms, nKNormColumns});
         }
 
         takeoverAtt.addOp(OP_ROPE, "block_rope_q", layerIndex,
@@ -1705,14 +1790,14 @@ static NnNodeConfig buildLlmNodeInternal(
                 redKvStart,
                 redKvStride,
                 n->positionPipeIndex,
-                qBufferIndex,
+                shadowScratch.q,
                 redundantKBufferIndex,
                 redundantVBufferIndex,
-                attBufferIndex,
+                shadowScratch.att,
                 n->slotPipeIndex,
                 fullAttBuffers ? fullKvSlotStride : localKvSlotStride});
 
-        if (mhaOutBufferIndex != mhaOutQBufferIndex) {
+        if (shadowScratch.mhaOut != shadowScratch.mhaOutQ) {
             takeoverAtt.addOp(OP_CAST, "block_cast_y2", layerIndex,
                 mhaOutSlicePtr, mhaOutQSlicePtr,
                 size0(), NnCastOpCodeConfig{});
@@ -1720,11 +1805,11 @@ static NnNodeConfig buildLlmNodeInternal(
 
         takeoverAtt.addOp(OP_MATMUL, "block_matmul_wo", layerIndex,
             mhaOutQSlicePtr,
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
             stageFullWeights ? woResidentSlice.sliceSize : woSlice.sliceSize,
             makeColMatmulCfgTagged(NN_SLICE_HEAD, h->headDim, woSlice.n0, woSlice.d, woSlice.outStart, woResidentSlice.outStart, stageFullWeights));
         takeoverAtt.addOp(OP_CAST, "block_cast_d", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
             pointerBatchedSliceConfigTagged(SRC_PIPE, n->zqPipeIndex, NN_SLICE_STACKED_BY_NODE),
             size0(), NnCastOpCodeConfig{});
         takeoverAtt.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
@@ -1733,23 +1818,23 @@ static NnNodeConfig buildLlmNodeInternal(
         NnSegmentConfigBuilder takeoverFf;
         takeoverFf.addOp(OP_MERGE_ADD, "runtime_redundant_ff_in", layerIndex,
             pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
             size0(), NnMergeAddOpCodeConfig{});
         takeoverFf.addOp(OP_INV_RMS, "block_norm_pre_1", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.invRms),
             size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
         takeoverFf.addOp(OP_RMS_NORM, "block_norm_1", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
             n->rmsNormSize,
-            NnRmsNormOpConfig{invRmsBufferIndex, 1});
+            NnRmsNormOpConfig{shadowScratch.invRms, 1});
 
         NnUint ffDim = (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim;
         if (h->nExperts > 0) {
             takeoverFf.addOp(OP_MATMUL, "block_moe_gate", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.moeGt),
                 n->moeGateSize,
                 makeRowMatmulCfg(n->moeGateSize.x, nExpertsOr1, 0u));
 
@@ -1762,7 +1847,7 @@ static NnNodeConfig buildLlmNodeInternal(
             w1Cfg.outStartUnit = 1u;
             takeoverFf.addOp(OP_MATMUL, "block_matmul_w1", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, moeDBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.moeD),
                 w1ExpertSliceSize,
                 w1Cfg);
 
@@ -1771,7 +1856,7 @@ static NnNodeConfig buildLlmNodeInternal(
             w3Cfg.outStartUnit = 1u;
             takeoverFf.addOp(OP_MATMUL, "block_matmul_w3", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, moeLBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.moeL),
                 w3ExpertSliceSize,
                 w3Cfg);
 
@@ -1780,37 +1865,37 @@ static NnNodeConfig buildLlmNodeInternal(
             w2Cfg.inStartUnit = 1u;
             takeoverFf.addOp(OP_MATMUL, "block_matmul_w2", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, moeYBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.moeY),
                 w2ExpertSliceSize,
                 w2Cfg);
         } else {
-            if (yBufferIndex != yqBufferIndex) {
+            if (shadowScratch.y != shadowScratch.yq) {
                 takeoverFf.addOp(OP_CAST, "block_cast_y3", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.yq),
                     size0(), NnCastOpCodeConfig{});
             }
             const NnPointerConfig dSlicePtr = fullFfnBuffers
-                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, dBufferIndex, NN_SLICE_FFN)
-                : pointerBatchConfig(SRC_BUFFER, dBufferIndex);
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.d, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, shadowScratch.d);
             const NnPointerConfig dqSlicePtr = fullFfnBuffers
-                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, dqBufferIndex, NN_SLICE_FFN)
-                : pointerBatchConfig(SRC_BUFFER, dqBufferIndex);
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.dq, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, shadowScratch.dq);
             const NnPointerConfig lSlicePtr = fullFfnBuffers
-                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, lBufferIndex, NN_SLICE_FFN)
-                : pointerBatchConfig(SRC_BUFFER, lBufferIndex);
+                ? pointerBatchedSliceConfigTagged(SRC_BUFFER, shadowScratch.l, NN_SLICE_FFN)
+                : pointerBatchConfig(SRC_BUFFER, shadowScratch.l);
 
             takeoverFf.addOp(OP_MATMUL, "block_matmul_w1", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex), dSlicePtr,
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), dSlicePtr,
                 w1Slice.sliceSize,
                 makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w1Slice.n, w1Slice.inLen, w1Slice.inStart));
             takeoverFf.addOp(OP_MATMUL, "block_matmul_w3", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex), lSlicePtr,
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), lSlicePtr,
                 w3Slice.sliceSize,
                 makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w3Slice.n, w3Slice.inLen, w3Slice.inStart));
             const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
             const NnUint actDim = w1Slice.inLen;
-            NnMulOpCodeConfig mulCfg = NnMulOpCodeConfig{lBufferIndex};
+            NnMulOpCodeConfig mulCfg = NnMulOpCodeConfig{shadowScratch.l};
             if (fullFfnBuffers) {
                 const NnUint ffnStart0 = (plan && plan->ffnSplit.starts) ? plan->ffnSplit.starts[nodeIndex] : 0u;
                 const NnUint ffnLen0 = (plan && plan->ffnSplit.lengths) ? plan->ffnSplit.lengths[nodeIndex] : w1Slice.inLen;
@@ -1827,13 +1912,13 @@ static NnNodeConfig buildLlmNodeInternal(
                     size0(),
                     NnSiluOpCodeConfig{NnTensorView{half, 0u, actDim - half, 0u, 1u}});
                 takeoverFf.addOp(OP_MUL, "block_mul", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.d),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.d),
                     size0(), mulCfg);
             } else if (siluMulFusionEnabled()) {
                 takeoverFf.addOp(OP_SILU_MUL, "block_act_mul", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.d),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.d),
                     size0(), mulCfg);
             } else {
                 takeoverFf.addOp(OP_SILU, "block_act", layerIndex,
@@ -1841,22 +1926,22 @@ static NnNodeConfig buildLlmNodeInternal(
                     size0(),
                     NnSiluOpCodeConfig{NnTensorView{0u, 0u, 0u, 0u, 1u}});
                 takeoverFf.addOp(OP_MUL, "block_mul", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.d),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.d),
                     size0(), mulCfg);
             }
-            if (dBufferIndex != dqBufferIndex) {
+            if (shadowScratch.d != shadowScratch.dq) {
                 takeoverFf.addOp(OP_CAST, "block_cast_d2", layerIndex,
                     dSlicePtr, dqSlicePtr,
                     size0(), NnCastOpCodeConfig{});
             }
             takeoverFf.addOp(OP_MATMUL, "block_matmul_w2", layerIndex,
-                dqSlicePtr, pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                dqSlicePtr, pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
                 w2Slice.sliceSize,
                 makeColMatmulCfgTagged(NN_SLICE_FFN, 1u, w2Slice.n0, w2Slice.d, w2Slice.outStart));
         }
         takeoverFf.addOp(OP_CAST, "block_cast_d3", layerIndex,
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, shadowScratch.y),
             pointerBatchedSliceConfigTagged(SRC_PIPE, n->zqPipeIndex, NN_SLICE_STACKED_BY_NODE),
             size0(), NnCastOpCodeConfig{});
         takeoverFf.addSync(n->zqPipeIndex, SYNC_NODE_SLICES);
@@ -1865,17 +1950,17 @@ static NnNodeConfig buildLlmNodeInternal(
             NnSegmentConfigBuilder takeoverPost;
             takeoverPost.addOp(OP_MERGE_ADD, "runtime_redundant_ff_out_left_merge", layerIndex,
                 pointerBatchConfig(SRC_PIPE, n->zqPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                 size0(), NnMergeAddOpCodeConfig{});
             if (readFromStageCache) {
                 takeoverPost.addOp(OP_CAST, "runtime_redundant_ff_out_cache", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                     pointerBatchConfig(SRC_BUFFER, ppStageOutCacheBufferIndex),
                     size0(), NnCastOpCodeConfig{});
             }
             if (writeBackToXPipe) {
                 takeoverPost.addOp(OP_CAST, "runtime_redundant_ff_out_left_x", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, shadowScratch.x),
                     pointerBatchConfig(SRC_PIPE, n->xPipeIndex),
                     size0(), NnCastOpCodeConfig{});
             }

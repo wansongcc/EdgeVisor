@@ -210,6 +210,134 @@ __device__ static inline float cudaHalfBitsToFloat(uint16_t h) {
     return sign * ldexpf((float)(1024 + mant), exp - 25);
 }
 
+/* __dp4a is a sm_61+ instruction. Host-side compilation passes and any device
+ * build below sm_61 keep the scalar accumulation path. */
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610
+#define NN_CUDA_HAS_DP4A 1
+#else
+#define NN_CUDA_HAS_DP4A 0
+#endif
+
+/* Largest aBlocks that still fits the packed x cache in the default 48KB
+ * shared-memory budget: 1024 blocks needs 40KB. K of 32768 covers every
+ * dimension the model uses; anything wider reads x from global memory while
+ * staying on the warp dp4a path. */
+#define NN_CUDA_MATMUL_SHARED_MAX_BLOCKS 1024u
+
+/* NnBlockQ40 (18 bytes) and NnBlockQ80 (34 bytes) only guarantee 2-byte
+ * alignment, so ->qs must never be reinterpreted as an int pointer. Two uint16
+ * loads are always legal and assemble the same four packed int8 lanes. */
+__device__ static inline int cudaLoadInt8x4(const int8_t *p) {
+    const uint16_t *w = (const uint16_t *)p;
+    return (int)((unsigned int)w[0] | ((unsigned int)w[1] << 16));
+}
+
+__device__ static inline int cudaSumInt8x4(int packed) {
+#if NN_CUDA_HAS_DP4A
+    return __dp4a(packed, 0x01010101, 0);
+#else
+    const unsigned int u = (unsigned int)packed;
+    int sum = 0;
+    #pragma unroll
+    for (NnUint i = 0u; i < 4u; ++i) {
+        sum += (int)(int8_t)((u >> (8u * i)) & 0xffu);
+    }
+    return sum;
+#endif
+}
+
+/* Q80 x Q40 block dot product as a raw integer accumulator.
+ * The q40 nibbles are kept in 0..15 so __dp4a can consume them directly (all
+ * values stay inside the signed int8 range); the +8 bias this introduces is
+ * removed once per block by subtracting 8 * sum(x). That is integer-identical
+ * to the (w - 8) * x form while keeping the inner loop subtraction-free. */
+__device__ static inline int cudaQ80Q40DotPacked(const int *xWords, int xSum, const uint8_t *wq) {
+#if NN_CUDA_HAS_DP4A
+    int acc = 0;
+    #pragma unroll
+    for (NnUint g = 0u; g < 4u; ++g) {
+        const int w32 = cudaLoadInt8x4((const int8_t *)(wq + 4u * g));
+        acc = __dp4a(xWords[g], w32 & 0x0f0f0f0f, acc);
+        acc = __dp4a(xWords[4u + g], (w32 >> 4) & 0x0f0f0f0f, acc);
+    }
+    return acc - 8 * xSum;
+#else
+    const int8_t *xq = (const int8_t *)xWords;
+    int acc = 0;
+    for (NnUint k = 0u; k < Q40_BLOCK_SIZE / 2u; ++k) {
+        const int w0 = (int)(wq[k] & 0x0fu) - 8;
+        const int w1 = (int)(wq[k] >> 4) - 8;
+        acc += w0 * (int)xq[k] + w1 * (int)xq[k + Q80_BLOCK_SIZE / 2u];
+    }
+    (void)xSum;
+    return acc;
+#endif
+}
+
+/* Same product straight out of global memory. The input block is packed once so
+ * the dp4a path and the scalar fallback share a single read of x. */
+__device__ static inline int cudaQ80Q40DotGlobal(const NnBlockQ80 *xb, const NnBlockQ40 *wb) {
+    int xWords[8];
+    int xSum = 0;
+    #pragma unroll
+    for (NnUint w = 0u; w < 8u; ++w) {
+        xWords[w] = cudaLoadInt8x4(xb->qs + 4u * w);
+        xSum += cudaSumInt8x4(xWords[w]);
+    }
+    return cudaQ80Q40DotPacked(xWords, xSum, wb->qs);
+}
+
+__device__ static inline float cudaWarpReduceMax(float v) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    return v;
+}
+
+__device__ static inline float cudaWarpReduceSum(float v) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+/* Block-wide max over a 32-slot staging array. Two barriers; the result is
+ * re-read from the staging slot so a follow-up reduction on its own slot cannot
+ * race this one. blockDim.x is always a power of two >= 32. */
+__device__ static inline float cudaBlockReduceMax(float v, float *shared) {
+    const NnUint nWarps = (blockDim.x + 31u) >> 5u;
+    const NnUint lane = threadIdx.x & 31u;
+    const NnUint wid = threadIdx.x >> 5u;
+    v = cudaWarpReduceMax(v);
+    if (lane == 0u) shared[wid] = v;
+    __syncthreads();
+    if (wid == 0u) {
+        float w = lane < nWarps ? shared[lane] : -3.4028234663852886e38f;
+        w = cudaWarpReduceMax(w);
+        if (lane == 0u) shared[0] = w;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
+__device__ static inline float cudaBlockReduceSum(float v, float *shared) {
+    const NnUint nWarps = (blockDim.x + 31u) >> 5u;
+    const NnUint lane = threadIdx.x & 31u;
+    const NnUint wid = threadIdx.x >> 5u;
+    v = cudaWarpReduceSum(v);
+    if (lane == 0u) shared[wid] = v;
+    __syncthreads();
+    if (wid == 0u) {
+        float w = lane < nWarps ? shared[lane] : 0.0f;
+        w = cudaWarpReduceSum(w);
+        if (lane == 0u) shared[0] = w;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
 __device__ static inline NnByte *cudaRowBase(NnByte *base, NnPointerLayout layout, NnUint z, NnUint y) {
     return base + z * layout.zStrideBytes + y * layout.batchStrideBytes + layout.byteOffset;
 }
@@ -642,28 +770,30 @@ __global__ static void q80QuantizeKernel(
     NnUint batchSize) {
     const NnUint blocksPerRow = len / Q80_BLOCK_SIZE;
     const NnSize totalBlocks = (NnSize)input.logicalSize.z * batchSize * blocksPerRow;
-    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= totalBlocks) return;
-    const NnUint b = (NnUint)(tid % blocksPerRow);
-    NnSize t = tid / blocksPerRow;
+    /* One warp per 32-element block: each lane owns exactly one element. The
+     * block-per-thread form left the GPU with len/32 threads for the whole
+     * tensor (96 for dim=3072), far too few to fill a T4. */
+    const NnUint lane = threadIdx.x & 31u;
+    const NnSize blockIndex = ((NnSize)blockIdx.x * blockDim.x + threadIdx.x) >> 5u;
+    if (blockIndex >= totalBlocks) return;
+    const NnUint b = (NnUint)(blockIndex % blocksPerRow);
+    NnSize t = blockIndex / blocksPerRow;
     const NnUint y = (NnUint)(t % batchSize);
     const NnUint z = (NnUint)(t / batchSize);
     const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, z, y) + offset + b * Q80_BLOCK_SIZE;
     NnBlockQ80 *out = (NnBlockQ80 *)cudaRowBase(outputBase, output, z, y) + (offset / Q80_BLOCK_SIZE) + b;
-    float amax = 0.0f;
-    for (NnUint j = 0u; j < Q80_BLOCK_SIZE; ++j) {
-        const float av = fabsf(in[j]);
-        amax = amax > av ? amax : av;
-    }
+
+    const float v = in[lane];
+    float amax = cudaWarpReduceMax(fabsf(v));
     const float d = amax / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    out->d = cudaFloatToHalfBits(d);
-    for (NnUint j = 0u; j < Q80_BLOCK_SIZE; ++j) {
-        int q = (int)nearbyintf(in[j] * id);
-        if (q > 127) q = 127;
-        if (q < -128) q = -128;
-        out->qs[j] = (int8_t)q;
-    }
+    /* d is uniform across the warp, so one lane publishes it and the rest read
+     * it back through the broadcast instead of racing the same half store. */
+    if (lane == 0u) out->d = cudaFloatToHalfBits(d);
+    int q = (int)nearbyintf(v * id);
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    out->qs[lane] = (int8_t)q;
 }
 
 __global__ static void repeatZCopyQ80Kernel(
@@ -758,17 +888,24 @@ __global__ static void invRmsF32Kernel(
     float epsilon,
     NnUint nColumns,
     NnUint batchSize) {
-    const NnSize total = (NnSize)batchSize * nColumns;
-    const NnSize tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= total) return;
-    const NnUint col = (NnUint)(tid % nColumns);
-    const NnUint y = (NnUint)(tid / nColumns);
+    /* One block per (y, col). The previous form gave each thread the whole
+     * colSize (3072 element) accumulation; now the block splits it and folds it
+     * with warp shuffles, leaving only the cross-warp step in shared memory. */
+    __shared__ float shared[32];
+    const NnUint col = blockIdx.x;
+    const NnUint y = blockIdx.y;
+    if (col >= nColumns || y >= batchSize) return;
     const NnUint colSize = input.logicalSize.x / nColumns;
     const float *in = (const float *)cudaRowBase((NnByte *)inputBase, input, 0u, y) + (NnSize)col * colSize;
     float ss = 0.0f;
-    for (NnUint i = 0u; i < colSize; ++i) ss += in[i] * in[i];
-    float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
-    out[col] = rsqrtf(ss / (float)colSize + epsilon);
+    for (NnUint i = threadIdx.x; i < colSize; i += blockDim.x) {
+        ss += in[i] * in[i];
+    }
+    ss = cudaBlockReduceSum(ss, shared);
+    if (threadIdx.x == 0u) {
+        float *out = (float *)cudaRowBase(outputBase, output, 0u, y);
+        out[col] = rsqrtf(ss / (float)colSize + epsilon);
+    }
 }
 
 __global__ static void rmsNormF32Kernel(
@@ -1010,6 +1147,8 @@ __device__ static inline void cudaMhaOffsets(
     *attOffset = y * config.nHeads0 * config.seqLen + h * config.seqLen;
 }
 
+#define NN_CUDA_MHA_SHARED_QUERY_DIM 256u
+
 __global__ static void multiheadAttScoreF32Kernel(
     const float *positions,
     const float *slots,
@@ -1018,6 +1157,10 @@ __global__ static void multiheadAttScoreF32Kernel(
     float *att,
     NnMultiHeadAttOpConfig config,
     NnUint batchSize) {
+    /* The query slice is re-read once per key position. It is small (headDim,
+     * typically 64 or 128) and identical for every p, so stage it in shared
+     * memory when it fits and keep the dot product fed from there. */
+    __shared__ float sQuery[NN_CUDA_MHA_SHARED_QUERY_DIM];
     const NnUint h = blockIdx.x;
     const NnUint y = blockIdx.y;
     if (h >= config.nHeads0 || y >= batchSize) return;
@@ -1029,11 +1172,25 @@ __global__ static void multiheadAttScoreF32Kernel(
     NnUint attOffset = 0u;
     cudaMhaOffsets(config, h, y, &qOffset, &kvOffset, &attOffset);
     const float invHeadDimRoot = rsqrtf((float)config.headDim);
+    const bool sharedQuery = config.headDim <= NN_CUDA_MHA_SHARED_QUERY_DIM;
+    if (sharedQuery) {
+        for (NnUint i = threadIdx.x; i < config.headDim; i += blockDim.x) {
+            sQuery[i] = query[qOffset + i];
+        }
+        __syncthreads();
+    }
     for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         float score = 0.0f;
         const NnSize kOffset = slotBase + (NnSize)p * config.kvStride + kvOffset;
-        for (NnUint i = 0u; i < config.headDim; ++i) {
-            score += query[qOffset + i] * keyCache[kOffset + i];
+        if (sharedQuery) {
+            #pragma unroll 4
+            for (NnUint i = 0u; i < config.headDim; ++i) {
+                score += sQuery[i] * keyCache[kOffset + i];
+            }
+        } else {
+            for (NnUint i = 0u; i < config.headDim; ++i) {
+                score += query[qOffset + i] * keyCache[kOffset + i];
+            }
         }
         att[attOffset + p] = score * invHeadDimRoot;
     }
@@ -1044,24 +1201,31 @@ __global__ static void multiheadAttSoftmaxSerialF32Kernel(
     float *att,
     NnMultiHeadAttOpConfig config,
     NnUint batchSize) {
+    /* Parallel softmax over the same [0, pos] range the serial version walked:
+     * both passes reduce with warp shuffles plus one shared stage, then every
+     * thread rescales its own slots. attOffset and the numeric treatment of the
+     * scores are unchanged, so results match the serial form up to the
+     * reduction order. */
+    __shared__ float shared[32];
     const NnUint h = blockIdx.x;
     const NnUint y = blockIdx.y;
     if (h >= config.nHeads0 || y >= batchSize) return;
     const NnUint pos = (NnUint)positions[y];
     const NnUint attOffset = y * config.nHeads0 * config.seqLen + h * config.seqLen;
     float maxScore = -3.4028234663852886e38f;
-    for (NnUint p = 0u; p <= pos; ++p) {
+    for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         const float v = att[attOffset + p];
         maxScore = maxScore > v ? maxScore : v;
     }
+    maxScore = cudaBlockReduceMax(maxScore, shared);
     float sum = 0.0f;
-    for (NnUint p = 0u; p <= pos; ++p) {
+    for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         const float v = expf(att[attOffset + p] - maxScore);
         att[attOffset + p] = v;
         sum += v;
     }
-    const float invSum = 1.0f / sum;
-    for (NnUint p = 0u; p <= pos; ++p) {
+    const float invSum = 1.0f / cudaBlockReduceSum(sum, shared);
+    for (NnUint p = threadIdx.x; p <= pos; p += blockDim.x) {
         att[attOffset + p] *= invSum;
     }
 }
@@ -1098,15 +1262,7 @@ __global__ static void multiheadAttValueF32Kernel(
 }
 
 __device__ static inline float q80q40BlockDot(const NnBlockQ80 *xb, const NnBlockQ40 *wb) {
-    int acc = 0;
-    for (NnUint k = 0u; k < Q40_BLOCK_SIZE / 2u; ++k) {
-        const int w0 = (int)(wb->qs[k] & 0x0fu) - 8;
-        const int w1 = (int)(wb->qs[k] >> 4) - 8;
-        const int x0 = (int)xb->qs[k];
-        const int x1 = (int)xb->qs[k + Q80_BLOCK_SIZE / 2u];
-        acc += w0 * x0 + w1 * x1;
-    }
-    return (float)acc * cudaHalfBitsToFloat(xb->d) * cudaHalfBitsToFloat(wb->d);
+    return (float)cudaQ80Q40DotGlobal(xb, wb) * cudaHalfBitsToFloat(xb->d) * cudaHalfBitsToFloat(wb->d);
 }
 
 __global__ static void matmulQ80Q40SmallKKernel(
@@ -1173,34 +1329,120 @@ __global__ static void matmulQ80Q40LargeKKernel(
     NnUint inStartBlocks,
     NnUint outStart,
     NnUint batchSize) {
-    __shared__ float partial[256];
-    const NnSize oid = blockIdx.x;
-    const NnUint outLocal = (NnUint)(oid % cLen);
-    NnSize t = oid / cLen;
-    const NnUint e = (NnUint)(t % nActiveExpertsOr1);
-    const NnUint y = (NnUint)(t / nActiveExpertsOr1);
-    if (y >= batchSize) return;
+    /* Four output rows per warp: every warp of the block works on rows from the
+     * same (y, e) group, so a single shared copy of x feeds all of them and
+     * global x traffic drops by the warp count (8 on a 256-thread block).
+     * Each warp reuses the x blocks it already pulled for row r on rows r+1..3,
+     * which amortises the x side of the inner loop 4x; the weight rows stay
+     * separate coalesced streams. Every row keeps its own accumulator and its
+     * own b = lane, lane+32, ... walk, so each output is bit-identical to the
+     * one-row-per-warp version.
+     * Grid is (row groups, batchSize * nActiveExpertsOr1). */
+    extern __shared__ int smem[];
+    const NnUint lane = threadIdx.x & 31u;
+    const NnUint wid = threadIdx.x >> 5u;
+    const NnUint nWarps = blockDim.x >> 5u;
+
+    const NnUint y = (NnUint)(blockIdx.y % batchSize);
+    const NnUint e = (NnUint)(blockIdx.y / batchSize);
     const NnUint activeExpert = nActiveExperts == 0u ? 0u : (NnUint)activeExpertIndexes[(NnSize)y * activeExpertRowStride + e];
-    float sum = 0.0f;
-    if (activeExpert < weightExperts) {
-        const NnBlockQ80 *x = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, e, y) + aOffsetBlocks;
-        const NnUint row = view == 0u ? outLocal : outStart + outLocal;
-        const NnUint inBlock = view == 2u ? inStartBlocks : 0u;
-        const NnBlockQ40 *w = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
+    /* Uniform across the block, so this return cannot strand a barrier. */
+    if (activeExpert >= weightExperts) return;
+
+    const NnUint rowBase = (blockIdx.x * nWarps + wid) * 4u;
+    const NnBlockQ80 *x = (const NnBlockQ80 *)cudaRowBase((NnByte *)inputBase, input, e, y) + aOffsetBlocks;
+
+    /* cachedBlocks is a compile-time shared-memory budget; beyond it we read x
+     * straight from global memory and stay on the warp dp4a path. */
+    const bool cached = aBlocks <= NN_CUDA_MATMUL_SHARED_MAX_BLOCKS;
+    int *xs = smem;
+    float *xd = (float *)(xs + (cached ? aBlocks * 8u : 0u));
+    int *xSum = (int *)(xd + (cached ? aBlocks : 0u));
+    if (cached) {
+        /* One thread per 32-element block: pack the block into eight int words
+         * and fold its int8 sum once, so the dp4a inner loop needs no per-lane
+         * pre-pass and no subtraction. */
         for (NnUint b = threadIdx.x; b < aBlocks; b += blockDim.x) {
-            sum += q80q40BlockDot(x + b, w + b);
+            int s = 0;
+            #pragma unroll
+            for (NnUint g = 0u; g < 8u; ++g) {
+                const int v = cudaLoadInt8x4(x[b].qs + 4u * g);
+                xs[b * 8u + g] = v;
+                s += cudaSumInt8x4(v);
+            }
+            xSum[b] = s;
+            xd[b] = cudaHalfBitsToFloat(x[b].d);
         }
-    }
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (NnUint stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0u && activeExpert < weightExperts) {
-        float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
-        out[outLocal] = partial[0];
+    /* Rows past cLen leave after the barrier; nothing below syncs. A warp owns
+     * up to 4 consecutive rows, so the tail warp may only have 1..3 of them. */
+    const NnUint rowCount = rowBase >= cLen ? 0u : (cLen - rowBase < 4u ? cLen - rowBase : 4u);
+    if (rowCount == 0u) return;
+
+    const NnUint inBlock = view == 2u ? inStartBlocks : 0u;
+    /* All four pointers are always in range: an inactive slot is clamped onto
+     * the warp's last real row and never read, because every use is guarded by
+     * r < rowCount (uniform inside the warp). */
+    const NnBlockQ40 *w[4];
+    #pragma unroll
+    for (NnUint r = 0u; r < 4u; ++r) {
+        const NnUint outLocal = rowBase + r;
+        const NnUint clamped = outLocal < cLen ? outLocal : cLen - 1u;
+        const NnUint row = view == 0u ? clamped : outStart + clamped;
+        w[r] = weight + ((NnSize)activeExpert * weightRows + row) * weightBlocksPerRow + inBlock;
     }
+
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (cached) {
+        for (NnUint b = lane; b < aBlocks; b += 32u) {
+            const int *xWords = xs + b * 8u;
+            const int xSumB = xSum[b];
+            const float xdB = xd[b];
+            #pragma unroll
+            for (NnUint r = 0u; r < 4u; ++r) {
+                if (r < rowCount) {
+                    const int ip = cudaQ80Q40DotPacked(xWords, xSumB, w[r][b].qs);
+                    sum[r] += (float)ip * xdB * cudaHalfBitsToFloat(w[r][b].d);
+                }
+            }
+        }
+    } else {
+        /* Wider K than the shared budget: pack x once per block and run the
+         * same dp4a body against global weights, exactly as
+         * cudaQ80Q40DotGlobal does for a single row. */
+        for (NnUint b = lane; b < aBlocks; b += 32u) {
+            int xWords[8];
+            int xSumB = 0;
+            #pragma unroll
+            for (NnUint g = 0u; g < 8u; ++g) {
+                xWords[g] = cudaLoadInt8x4(x[b].qs + 4u * g);
+                xSumB += cudaSumInt8x4(xWords[g]);
+            }
+            const float xdB = cudaHalfBitsToFloat(x[b].d);
+            #pragma unroll
+            for (NnUint r = 0u; r < 4u; ++r) {
+                if (r < rowCount) {
+                    const int ip = cudaQ80Q40DotPacked(xWords, xSumB, w[r][b].qs);
+                    sum[r] += (float)ip * xdB * cudaHalfBitsToFloat(w[r][b].d);
+                }
+            }
+        }
+    }
+    float *out = (float *)cudaRowBase(outputBase, output, e, y) + cOffset;
+    #pragma unroll
+    for (NnUint r = 0u; r < 4u; ++r) {
+        if (r < rowCount) {
+            sum[r] = cudaWarpReduceSum(sum[r]);
+            if (lane == 0u) out[rowBase + r] = sum[r];
+        }
+    }
+}
+
+/* Shared bytes for a cached-x Large-K block: packed int words, the per-block
+ * f16 scales, and the per-block int8 sums. */
+static NnSize cudaQ80Q40LargeKSharedBytes(NnUint aBlocks) {
+    return (NnSize)aBlocks * (NnSize)(8u * sizeof(int) + sizeof(float) + sizeof(int));
 }
 
 int nnCudaDeviceCount() {
@@ -1591,7 +1833,10 @@ NnCudaBuffer *NnCudaDeviceData::resolveBuffer(NnUint bufferIndex) {
 }
 
 NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan)
-    : gpuIndex(gpuIndex), stream(nullptr), blasHandle(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), launchConfig{}, staging(), data() {
+    : gpuIndex(gpuIndex), stream(nullptr), blasHandle(nullptr), netConfig(netConfig), nodeConfig(nodeConfig), netExecution(netExecution), partitionPlan(partitionPlan), launchConfig{}
+    , residencyActive(false), deviceWorkPending(false), uploadDoneEvent(nullptr), uploadEventPending(false)
+    , pipeHostDirty(), pipeDeviceDirty(), trailingPipes(), segmentStartEvents(), segmentEndEvents(), segmentRecorded(), segmentPerfTarget(), perfBindings(), perfTimingActive(false)
+    , staging(), data() {
     (void)this->netConfig;
     (void)this->netExecution;
     NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
@@ -1614,9 +1859,29 @@ NnCudaDevice::NnCudaDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig
         nodeConfig->partitionPlan = partitionPlan;
     }
     data = NnCudaDeviceData(netConfig, nodeConfig);
+
+    // Every pipe starts host-authoritative: the app writes its per-token inputs
+    // through the host pipe and a sync step may receive into any of them, so
+    // nothing on the device is authoritative until a kernel writes it.
+    const NnUint nPipes = (netConfig != nullptr) ? netConfig->nPipes : 0u;
+    pipeHostDirty.assign(nPipes, true);
+    pipeDeviceDirty.assign(nPipes, false);
+    resolveTrailingPipes();
+    NN_CUDA_CHECK(cudaEventCreateWithFlags((cudaEvent_t *)&uploadDoneEvent, cudaEventDisableTiming));
+    uploadEventPending = false;
 }
 
 NnCudaDevice::~NnCudaDevice() {
+    if (uploadDoneEvent != nullptr && stream != nullptr) {
+        cudaSetDevice((int)gpuIndex);
+        cudaEventSynchronize((cudaEvent_t)uploadDoneEvent);
+    }
+    releaseSegmentEvents();
+    if (uploadDoneEvent != nullptr) {
+        cudaSetDevice((int)gpuIndex);
+        cudaEventDestroy((cudaEvent_t)uploadDoneEvent);
+        uploadDoneEvent = nullptr;
+    }
     if (stream != nullptr) {
         cudaSetDevice((int)gpuIndex);
         cudaStreamSynchronize((cudaStream_t)stream);
@@ -1689,6 +1954,323 @@ void NnCudaDevice::synchronize() {
     NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
 }
 
+// --- Single-device pipe residency -----------------------------------------
+//
+// The executor calls beginForward() once per forward and endForward() once the
+// last executor thread and the shadow drain are both done. In between, the CUDA
+// segments own the pipes: a pipe's authoritative bytes either sit on the GPU
+// (pipeDeviceDirty) or the host copy is newer (pipeHostDirty). Only the pipes a
+// sync step actually reads on the host, plus the four pipes the rest of the
+// process reads after a forward, ever make the return trip.
+
+void NnCudaDevice::markPipeHostOwned(NnUint pipeIndex) {
+    if (pipeIndex < pipeHostDirty.size()) pipeHostDirty[pipeIndex] = true;
+    if (pipeIndex < pipeDeviceDirty.size()) pipeDeviceDirty[pipeIndex] = false;
+}
+
+void NnCudaDevice::markPipeDeviceOwned(NnUint pipeIndex) {
+    if (pipeIndex < pipeHostDirty.size()) pipeHostDirty[pipeIndex] = false;
+    if (pipeIndex < pipeDeviceDirty.size()) pipeDeviceDirty[pipeIndex] = true;
+}
+
+void NnCudaDevice::markPipeSynchronized(NnUint pipeIndex) {
+    // Both copies now hold the same bytes, so neither needs another transfer
+    // until something writes one of them. Only endForward() and beginForward()
+    // can do that from here, and both set the flag explicitly.
+    if (pipeIndex < pipeHostDirty.size()) pipeHostDirty[pipeIndex] = false;
+    if (pipeIndex < pipeDeviceDirty.size()) pipeDeviceDirty[pipeIndex] = false;
+}
+
+// Which pipes the host reads once a forward is over. ZQ carries the last
+// layer's attention output that pp_stage_merge consumes and that a takeover
+// splice replays; LG is the logits the sampler copies; KC/VC are the aggregated
+// KV rows the migration collector reads. Everything else (X, TOK, POS, SLT,
+// PLN) is either rewritten from the host before its next read or never read on
+// the host at all.
+void NnCudaDevice::resolveTrailingPipes() {
+    trailingPipes.clear();
+    if (netConfig == nullptr) return;
+    for (NnUint p = 0u; p < netConfig->nPipes; ++p) {
+        const char *name = netConfig->pipes[p].name;
+        if (name == nullptr) continue;
+        if (std::strcmp(name, "ZQ") == 0 ||
+            std::strcmp(name, "LG") == 0 ||
+            std::strcmp(name, "KC") == 0 ||
+            std::strcmp(name, "VC") == 0) {
+            trailingPipes.push_back(p);
+        }
+    }
+}
+
+void NnCudaDevice::releaseSegmentEvents() {
+    if (stream != nullptr) cudaSetDevice((int)gpuIndex);
+    for (std::size_t i = 0u; i < segmentStartEvents.size(); ++i) {
+        if (segmentStartEvents[i] != nullptr) {
+            cudaEventDestroy((cudaEvent_t)segmentStartEvents[i]);
+            segmentStartEvents[i] = nullptr;
+        }
+    }
+    for (std::size_t i = 0u; i < segmentEndEvents.size(); ++i) {
+        if (segmentEndEvents[i] != nullptr) {
+            cudaEventDestroy((cudaEvent_t)segmentEndEvents[i]);
+            segmentEndEvents[i] = nullptr;
+        }
+    }
+    segmentStartEvents.clear();
+    segmentEndEvents.clear();
+    segmentRecorded.clear();
+    segmentPerfTarget.clear();
+}
+
+void NnCudaDevice::setLayerPerfSegments(const std::vector<NnLayerPerfSegmentBinding> &bindings) {
+    perfBindings = bindings;
+    perfTimingActive = false;
+    releaseSegmentEvents();
+    if (netExecution == nullptr || netExecution->layerPerf == nullptr || bindings.empty()) return;
+
+    NnUint maxSegment = 0u;
+    for (std::size_t i = 0u; i < bindings.size(); ++i) {
+        if (bindings[i].segmentIndex > maxSegment) maxSegment = bindings[i].segmentIndex;
+    }
+    const std::size_t n = (std::size_t)maxSegment + 1u;
+    segmentPerfTarget.assign(n, 0u);
+    segmentStartEvents.assign(n, nullptr);
+    segmentEndEvents.assign(n, nullptr);
+    segmentRecorded.assign(n, 0u);
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    for (std::size_t i = 0u; i < bindings.size(); ++i) {
+        const NnUint s = bindings[i].segmentIndex;
+        if (s >= n || segmentPerfTarget[s] != 0u) continue;
+        segmentPerfTarget[s] = 1u;
+        NN_CUDA_CHECK(cudaEventCreateWithFlags((cudaEvent_t *)&segmentStartEvents[s], cudaEventDisableTiming));
+        NN_CUDA_CHECK(cudaEventCreateWithFlags((cudaEvent_t *)&segmentEndEvents[s], cudaEventDisableTiming));
+    }
+    perfTimingActive = true;
+}
+
+void NnCudaDevice::recordSegmentStart(NnUint segmentIndex) {
+    if (!perfTimingActive || segmentIndex >= segmentStartEvents.size()) return;
+    if (segmentStartEvents[segmentIndex] == nullptr || segmentEndEvents[segmentIndex] == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventRecord((cudaEvent_t)segmentStartEvents[segmentIndex], (cudaStream_t)stream));
+    segmentRecorded[segmentIndex] = 0u;
+}
+
+void NnCudaDevice::recordSegmentEnd(NnUint segmentIndex) {
+    if (!perfTimingActive || segmentIndex >= segmentEndEvents.size()) return;
+    if (segmentEndEvents[segmentIndex] == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventRecord((cudaEvent_t)segmentEndEvents[segmentIndex], (cudaStream_t)stream));
+    segmentRecorded[segmentIndex] = 1u;
+}
+
+void NnCudaDevice::beginForward(NnNetExecution *execution) {
+    if (execution == nullptr) return;
+    if (pipeHostDirty.size() != (std::size_t)execution->nPipes) {
+        pipeHostDirty.assign(execution->nPipes, true);
+        pipeDeviceDirty.assign(execution->nPipes, false);
+    }
+    // Per-token inputs are rewritten by the app right before every forward (TOK,
+    // POS, SLT) and a sync step may have received new bytes into X, so those are
+    // host-authoritative at the start of a forward. ZQ/LG/KC/VC are always
+    // produced by a GPU op before anything reads them, so pushing their host
+    // copies over the device buffers would be wasted work on the first segment.
+    //
+    // Everything else keeps whatever endForward() left, which is
+    // "synchronized" for the pipes it published and host-authoritative for the
+    // rest. Resetting unconditionally would re-upload the whole pipe set on
+    // every token, which is exactly what residency exists to avoid.
+    for (std::size_t p = 0u; p < pipeHostDirty.size(); ++p) {
+        const char *name = (netConfig != nullptr && p < netConfig->nPipes)
+            ? netConfig->pipes[p].name : nullptr;
+        if (name == nullptr) continue;
+        const bool perTokenHostInput =
+            std::strcmp(name, "TOK") == 0 ||
+            std::strcmp(name, "POS") == 0 ||
+            std::strcmp(name, "SLT") == 0 ||
+            std::strcmp(name, "X") == 0 ||
+            std::strcmp(name, "PLN") == 0;
+        if (perTokenHostInput) {
+            pipeHostDirty[p] = true;
+            pipeDeviceDirty[p] = false;
+        }
+    }
+    if (segmentRecorded.size() > 0u) {
+        std::fill(segmentRecorded.begin(), segmentRecorded.end(), (unsigned char)0u);
+    }
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    residencyActive = true;
+    deviceWorkPending = false;
+    uploadEventPending = false;
+}
+
+void NnCudaDevice::waitUploadStagingIdle() {
+    if (!uploadEventPending || uploadDoneEvent == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)uploadDoneEvent));
+    uploadEventPending = false;
+}
+
+void NnCudaDevice::noteUploadBatchIssued() {
+    if (uploadDoneEvent == nullptr) return;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+    NN_CUDA_CHECK(cudaEventRecord((cudaEvent_t)uploadDoneEvent, (cudaStream_t)stream));
+    uploadEventPending = true;
+    deviceWorkPending = true;
+}
+
+bool NnCudaDevice::publishPipesToHost(const std::vector<NnUint> &pipes, NnUint batchSize) {
+    if (netConfig == nullptr || netExecution == nullptr || pipes.empty()) return false;
+    NnSize totalBytes = 0u;
+    for (std::size_t i = 0u; i < pipes.size(); ++i) {
+        totalBytes += data.resolvePipe(pipes[i])->calcSliceSize(batchSize, netConfig->nBatches);
+    }
+    if (totalBytes == 0u) return false;
+
+    NnByte *host = (NnByte *)downloadStaging.ensure(totalBytes);
+    if (host == nullptr) throw std::runtime_error("CUDA residency publish staging allocation failed");
+    const bool ioProfile = dllamaIoProbeEnabled();
+    cudaStream_t s = (cudaStream_t)stream;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+
+    std::vector<NnSize> offsets(pipes.size(), 0u);
+    std::vector<NnSize> sizes(pipes.size(), 0u);
+    NnSize cursor = 0u;
+    for (std::size_t i = 0u; i < pipes.size(); ++i) {
+        NnCudaBuffer *pipe = data.resolvePipe(pipes[i]);
+        const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
+        offsets[i] = cursor;
+        sizes[i] = nBytes;
+        cursor += nBytes;
+        if (nBytes == 0u) continue;
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        NN_CUDA_CHECK(cudaMemcpyAsync(host + offsets[i], pipe->data(), nBytes, cudaMemcpyDeviceToHost, s));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+    }
+
+    // One synchronize for the whole publish set. It also retires the pending H2D
+    // batch, so the pinned upload block is free again.
+    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    NN_CUDA_CHECK(cudaStreamSynchronize(s));
+    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+    uploadEventPending = false;
+
+    for (std::size_t i = 0u; i < pipes.size(); ++i) {
+        if (sizes[i] == 0u) continue;
+        NnByte *dst = netExecution->pipes[pipes[i]];
+        if (dst == nullptr) throw std::runtime_error("CUDA residency publish received null host pipe " + std::to_string(pipes[i]));
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        std::memcpy(dst, host + offsets[i], sizes[i]);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+        markPipeSynchronized(pipes[i]);
+    }
+    return true;
+}
+
+void NnCudaDevice::syncPipeToHost(NnUint pipeIndex, NnUint batchSize) {
+    // Only when the device holds the authoritative bytes: a host-owned pipe
+    // already has them, and copying the stale device buffer over it would
+    // destroy the newer host contents a sync step just produced.
+    if (pipeIndex >= pipeDeviceDirty.size() || !pipeDeviceDirty[pipeIndex]) return;
+    std::vector<NnUint> one(1u, pipeIndex);
+    publishPipesToHost(one, batchSize);
+}
+
+void NnCudaDevice::invalidatePipeOnDevice(NnUint pipeIndex) {
+    // A sync step rewrote this pipe through the host, so the device copy is stale.
+    markPipeHostOwned(pipeIndex);
+}
+
+// The non-residency path (nn-cuda-test calling segment->forward() directly, and
+// the takeover splice) reads every input pipe from the host. That only works if
+// the host copies are current, which residency deliberately breaks to save the
+// transfers. Flushing once here is what the pre-residency code did implicitly by
+// downloading every segment output; it costs nothing in the steady state, where
+// no pipe is device-dirty when the window closes.
+bool NnCudaDevice::publishAllDeviceDirtyPipes(NnUint batchSize) {
+    std::vector<NnUint> dirty;
+    for (std::size_t p = 0u; p < pipeDeviceDirty.size(); ++p) {
+        if (pipeDeviceDirty[p]) dirty.push_back((NnUint)p);
+    }
+    if (dirty.empty()) return false;
+    return publishPipesToHost(dirty, batchSize);
+}
+
+void NnCudaDevice::endForward(NnNetExecution *execution) {
+    if (!residencyActive) return;
+    residencyActive = false;
+    NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
+
+    // Publish the pipes the host reads after this forward. The batched D2H also
+    // drains the stream, which is what makes the per-segment events readable.
+    std::vector<NnUint> publish;
+    publish.reserve(trailingPipes.size());
+    for (std::size_t i = 0u; i < trailingPipes.size(); ++i) {
+        const NnUint p = trailingPipes[i];
+        if (p < pipeDeviceDirty.size() && pipeDeviceDirty[p]) publish.push_back(p);
+    }
+    bool drained = false;
+    if (execution != nullptr && !publish.empty()) {
+        drained = publishPipesToHost(publish, execution->batchSize);
+    }
+    if (!drained && (deviceWorkPending || uploadEventPending || perfTimingActive)) {
+        NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
+        uploadEventPending = false;
+    }
+
+    // Replace the CPU-side per-layer numbers with the exact GPU time the
+    // segments took. The CPU accounting charges each op step's wall time, which
+    // is the same quantity plus launch gaps and the transfer work, so the
+    // boundary-layer numbers Algo2 reads stay positive and become tighter.
+    if (perfTimingActive && execution != nullptr && execution->layerPerf != nullptr) {
+        NnNetExecution::LayerPerfState *perf = execution->layerPerf;
+        // Several segments share one (layer, kind): the primary attention
+        // segment plus any shadow-KV and takeover copies of the same layer. The
+        // CPU accounting sums all of them, so sum the GPU times too.
+        std::vector<unsigned long long> attnUs(perf->nLayers, 0ull);
+        std::vector<unsigned long long> ffnUs(perf->nLayers, 0ull);
+        std::vector<unsigned char> attnRan(perf->nLayers, 0u);
+        std::vector<unsigned char> ffnRan(perf->nLayers, 0u);
+        for (std::size_t i = 0u; i < perfBindings.size(); ++i) {
+            const NnLayerPerfSegmentBinding &b = perfBindings[i];
+            const NnUint s = b.segmentIndex;
+            if (s >= segmentRecorded.size() || segmentRecorded[s] == 0u) continue;
+            if (b.layerIndex >= perf->nLayers) continue;
+            float ms = 0.0f;
+            const cudaError_t err = cudaEventElapsedTime(
+                &ms, (cudaEvent_t)segmentStartEvents[s], (cudaEvent_t)segmentEndEvents[s]);
+            if (err != cudaSuccess) {
+                // An event never completed, which only happens if the segment
+                // aborted mid-way. Keep the CPU-side number.
+                cudaGetLastError();
+                continue;
+            }
+            const unsigned long long us = (ms > 0.0f)
+                ? (unsigned long long)((double)ms * 1000.0 + 0.5) : 0ull;
+            if (b.kind == NN_SEG_KIND_ATTN) {
+                attnUs[b.layerIndex] += us;
+                attnRan[b.layerIndex] = 1u;
+            } else if (b.kind == NN_SEG_KIND_FFN) {
+                ffnUs[b.layerIndex] += us;
+                ffnRan[b.layerIndex] = 1u;
+            }
+        }
+        for (NnUint l = 0u; l < perf->nLayers; ++l) {
+            if (attnRan[l] != 0u) perf->attnUs[l] = attnUs[l];
+            if (ffnRan[l] != 0u) perf->ffnUs[l] = ffnUs[l];
+        }
+    }
+
+    deviceWorkPending = false;
+    uploadEventPending = false;
+    // The dirty flags are deliberately left alone. A pipe the GPU wrote still
+    // holds the authoritative bytes on the device, and every one of them (ZQ,
+    // LG, KC, VC, X) is written by a GPU op again before anything reads it in
+    // the next forward, so re-uploading them here would push stale host bytes
+    // over correct device bytes. beginForward() re-marks exactly the pipes the
+    // host rewrites between tokens.
+}
+
 static void validateCudaQ80Q40MatmulAtCreate(NnCudaDevice *device, const NnOpConfig &op) {
     if (device == nullptr || op.code != OP_MATMUL || op.config == nullptr) return;
     if (op.weightSize.floatType != F_Q40) return;
@@ -1732,7 +2314,8 @@ static void validateCudaQ80Q40MatmulAtCreate(NnCudaDevice *device, const NnOpCon
 }
 
 NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution)
-    : device(device), segmentIndex(segmentIndex), segmentConfig(segmentConfig), netExecution(netExecution) {
+    : device(device), segmentIndex(segmentIndex), segmentConfig(segmentConfig), netExecution(netExecution),
+      hasHostVisibleSync(false), bindingsEpoch(0u), bindingsValid(false), isHostOnlyPlanSegment(false), hasControlOps(false) {
     (void)this->netExecution;
     if (device != nullptr) {
         planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
@@ -1769,6 +2352,147 @@ NnCudaDeviceSegment::NnCudaDeviceSegment(NnCudaDevice *device, NnUint segmentInd
             device->synchronize();
         }
     }
+    buildPipeIndexSets();
+}
+
+// Collect the pipes this segment really has to move across the PCIe link.
+// OP_PLAN_BARRIER / OP_PLAN_APPLY are pure host ops (they read and write
+// netExecution->pipes directly and never touch device memory), so their inputs
+// and outputs are excluded.
+void NnCudaDeviceSegment::buildPipeIndexSets() {
+    uploadPipeIndices.clear();
+    downloadPipeIndices.clear();
+    writtenPipeIndices.clear();
+    syncReadPipeIndices.clear();
+    hasHostVisibleSync = false;
+    isHostOnlyPlanSegment = false;
+    hasControlOps = false;
+    if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
+    NnNetConfig *netConfig = device->getNetConfig();
+    if (netConfig == nullptr) return;
+
+    // Pass 1: classify the segment. A segment made only of barrier/apply ops
+    // runs entirely on the host, so it must not move any bytes at all.
+    bool sawNonControlOp = false;
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        if (isCudaControlOp(segmentConfig->ops[i].code)) hasControlOps = true;
+        else sawNonControlOp = true;
+    }
+    isHostOnlyPlanSegment = hasControlOps && !sawNonControlOp;
+    if (isHostOnlyPlanSegment) return;
+
+    std::vector<unsigned char> uploadSeen(netConfig->nPipes, 0u);
+    std::vector<unsigned char> downloadSeen(netConfig->nPipes, 0u);
+
+    const auto addUpload = [&](NnUint pipeIndex) {
+        if (pipeIndex >= netConfig->nPipes) {
+            throw std::runtime_error("CUDA segment pipe index out of range during upload planning");
+        }
+        if (uploadSeen[pipeIndex] != 0u) return;
+        uploadSeen[pipeIndex] = 1u;
+        uploadPipeIndices.push_back(pipeIndex);
+    };
+    const auto addDownload = [&](NnUint pipeIndex) {
+        if (pipeIndex >= netConfig->nPipes) {
+            throw std::runtime_error("CUDA segment pipe index out of range during download planning");
+        }
+        if (downloadSeen[pipeIndex] != 0u) return;
+        downloadSeen[pipeIndex] = 1u;
+        downloadPipeIndices.push_back(pipeIndex);
+        writtenPipeIndices.push_back(pipeIndex);
+    };
+
+    for (NnUint i = 0u; i < netConfig->nPreSyncs; ++i) {
+        addUpload(netConfig->preSyncs[i].pipeIndex);
+    }
+
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        const NnOpConfig &op = segmentConfig->ops[i];
+        if (isCudaControlOp(op.code)) continue;
+        if (op.input.source == SRC_PIPE) addUpload(op.input.pointerIndex);
+        if (op.output.source == SRC_PIPE) addDownload(op.output.pointerIndex);
+        if (op.code == OP_ROPE && op.config != nullptr) {
+            const NnRopeOpConfig *config = (const NnRopeOpConfig *)op.config;
+            addUpload(config->positionPipeIndex);
+        } else if (op.code == OP_MULTIHEAD_ATT && op.config != nullptr) {
+            const NnMultiHeadAttOpConfig *config = (const NnMultiHeadAttOpConfig *)op.config;
+            addUpload(config->positionPipeIndex);
+            if (config->kvSlotStride != 0u) addUpload(config->slotPipeIndex);
+        } else if (op.code == OP_SHIFT && op.config != nullptr) {
+            const NnShiftOpCodeConfig *config = (const NnShiftOpCodeConfig *)op.config;
+            addUpload(config->indexPipeIndex);
+            if (config->kvSlotStride != 0u) addUpload(config->slotPipeIndex);
+        }
+    }
+
+    // Which of those pipes this segment's own syncs read on the host. A sync
+    // step runs right after the segment and reaches into netExecution->pipes,
+    // so any pipe it reads has to be published before it runs. Everything else
+    // stays on the device.
+    //
+    // A sync receives peer bytes into the host pipe rather than reading what
+    // the kernels wrote, so its pipe is handled by the executor's post-sync
+    // invalidation, not by a publish here.
+    const NnStageConfig *stage = findStageForNodeCuda(device->getPartitionPlan(), device->getNodeIndex());
+    const bool multiNodeStage = (stage == nullptr || stage->nNodes > 1u);
+    for (NnUint i = 0u; i < segmentConfig->nSyncs; ++i) {
+        const NnSyncConfig &sync = segmentConfig->syncs[i];
+        bool readsHostPipe = false;
+        switch (sync.syncType) {
+            case SYNC_PP_SEND:
+            case SYNC_NODE_SLICES_EXCEPT_ROOT:
+            case SYNC_NODE_SLICES_TO_STAGE_ROOT:
+                readsHostPipe = true;
+                break;
+            case SYNC_NODE_SLICES:
+            case SYNC_WITH_ROOT:
+                // On a one-node stage these exchange nothing and return
+                // immediately, so the host copy is never read.
+                readsHostPipe = multiNodeStage;
+                break;
+            case SYNC_PP_RECV:
+                // Reception only reads the local slice slot that is about to be
+                // overwritten, so the device copy is not needed.
+                readsHostPipe = false;
+                break;
+            default:
+                readsHostPipe = true;
+                break;
+        }
+        if (!readsHostPipe) continue;
+        hasHostVisibleSync = true;
+        bool seen = false;
+        for (std::size_t k = 0u; k < syncReadPipeIndices.size(); ++k) {
+            if (syncReadPipeIndices[k] == sync.pipeIndex) { seen = true; break; }
+        }
+        if (!seen) syncReadPipeIndices.push_back(sync.pipeIndex);
+    }
+}
+
+// Resolve every op's device buffers and plan-dependent layouts once per plan
+// epoch. refreshPointers() has already rewritten the op configs (slices,
+// offsets, column counts) for the current plan, so this must run after it.
+void NnCudaDeviceSegment::rebuildBindings() {
+    opBindings.clear();
+    bindingsValid = false;
+    bindingsEpoch = device != nullptr ? device->getPlanEpoch() : 0u;
+    if (device == nullptr || segmentConfig == nullptr) return;
+    NnNetConfig *netConfig = device->getNetConfig();
+    NnNodeConfig *nodeConfig = device->getNodeConfig();
+    if (netConfig == nullptr || nodeConfig == nullptr) return;
+
+    const NnUnevenPartitionPlan *plan = device->getPartitionPlan();
+    opBindings.resize(segmentConfig->nOps);
+    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
+        const NnOpConfig &op = segmentConfig->ops[i];
+        const NnCudaPointerRef in = resolveCudaPointer(device, netConfig, nodeConfig, plan, &op.input);
+        const NnCudaPointerRef out = resolveCudaPointer(device, netConfig, nodeConfig, plan, &op.output);
+        opBindings[i].inBuf = in.buffer;
+        opBindings[i].outBuf = out.buffer;
+        opBindings[i].inLayout = in.layout;
+        opBindings[i].outLayout = out.layout;
+    }
+    bindingsValid = true;
 }
 
 NnCudaDeviceSegment::~NnCudaDeviceSegment() = default;
@@ -1813,63 +2537,160 @@ void NnCudaDeviceSegment::readWeight(NnUint opIndex, NnSize offset, NnSize nByte
     weightBuffers[opIndex]->read(out, offset, nBytes, device->getStream(), &device->staging);
 }
 
-void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize) {
+void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize, bool onlyHostDirty) {
     if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
     NnNetConfig *netConfig = device->getNetConfig();
     if (netConfig == nullptr) return;
     if (batchSize > netConfig->nBatches) {
         throw std::runtime_error("CUDA segment batchSize exceeds configured nBatches");
     }
+    if (isHostOnlyPlanSegment || uploadPipeIndices.empty()) return;
 
-    std::vector<unsigned char> uploaded(netConfig->nPipes, 0u);
-    const auto uploadPipe = [&](NnUint pipeIndex) {
-        if (pipeIndex >= netConfig->nPipes) {
-            throw std::runtime_error("CUDA segment pipe index out of range during upload");
-        }
-        if (uploaded[pipeIndex] != 0u) return;
+    // Size the transfer set first so the whole segment goes through one pinned
+    // block and one round of async copies, with no per-pipe stream sync.
+    // On the residency path a pipe whose authoritative bytes already sit on the
+    // device (a GPU op wrote it earlier in this forward) needs no transfer at
+    // all, so it is skipped before the sizing pass.
+    std::vector<NnUint> toUpload;
+    toUpload.reserve(uploadPipeIndices.size());
+    NnSize totalBytes = 0u;
+    std::vector<NnSize> offsets;
+    std::vector<NnSize> sizes;
+    for (std::size_t i = 0u; i < uploadPipeIndices.size(); ++i) {
+        const NnUint pipeIndex = uploadPipeIndices[i];
+        if (onlyHostDirty && !device->isPipeHostDirty(pipeIndex)) continue;
         NnCudaBuffer *pipe = device->data.resolvePipe(pipeIndex);
         const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
-        pipe->write(netExecution->pipes[pipeIndex], 0u, nBytes, device->getStream(), &device->staging);
-        uploaded[pipeIndex] = 1u;
-    };
-
-    for (NnUint i = 0u; i < netConfig->nPreSyncs; ++i) {
-        uploadPipe(netConfig->preSyncs[i].pipeIndex);
+        toUpload.push_back(pipeIndex);
+        offsets.push_back(totalBytes);
+        sizes.push_back(nBytes);
+        totalBytes += nBytes;
     }
+    if (totalBytes == 0u) return;
 
-    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
-        const NnOpConfig &op = segmentConfig->ops[i];
-        if (op.input.source == SRC_PIPE) uploadPipe(op.input.pointerIndex);
-        if (op.code == OP_ROPE && op.config != nullptr) {
-            const NnRopeOpConfig *config = (const NnRopeOpConfig *)op.config;
-            uploadPipe(config->positionPipeIndex);
-        } else if (op.code == OP_MULTIHEAD_ATT && op.config != nullptr) {
-            const NnMultiHeadAttOpConfig *config = (const NnMultiHeadAttOpConfig *)op.config;
-            uploadPipe(config->positionPipeIndex);
-            if (config->kvSlotStride != 0u) uploadPipe(config->slotPipeIndex);
-        } else if (op.code == OP_SHIFT && op.config != nullptr) {
-            const NnShiftOpCodeConfig *config = (const NnShiftOpCodeConfig *)op.config;
-            uploadPipe(config->indexPipeIndex);
-            if (config->kvSlotStride != 0u) uploadPipe(config->slotPipeIndex);
+    // The pinned block is reused by the next segment, so the previous batch of
+    // async copies must be done reading it before it is overwritten. A single
+    // event wait is enough: every copy went into the same stream.
+    device->waitUploadStagingIdle();
+
+    NnByte *host = (NnByte *)device->uploadStaging.ensure(totalBytes);
+    if (host == nullptr) throw std::runtime_error("CUDA segment upload staging allocation failed");
+
+    const bool ioProfile = dllamaIoProbeEnabled();
+    cudaStream_t stream = (cudaStream_t)device->getStream();
+
+    for (std::size_t i = 0u; i < toUpload.size(); ++i) {
+        const NnUint pipeIndex = toUpload[i];
+        if (sizes[i] == 0u) continue;
+        NnByte *src = netExecution->pipes[pipeIndex];
+        if (src == nullptr) {
+            throw std::runtime_error("CUDA segment upload received null host pipe " + std::to_string(pipeIndex));
         }
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        std::memcpy(host + offsets[i], src, sizes[i]);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+
+        NnCudaBuffer *pipe = device->data.resolvePipe(pipeIndex);
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        NN_CUDA_CHECK(cudaMemcpyAsync(pipe->data(), host + offsets[i], sizes[i], cudaMemcpyHostToDevice, stream));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
+        if (onlyHostDirty) device->markPipeDeviceOwned(pipeIndex);
     }
+
+    // Record when the pinned block stops being read. The next segment's upload
+    // waits on this instead of the whole stream, so an H2D batch can overlap
+    // with the kernels that consume the batch just issued.
+    device->noteUploadBatchIssued();
 }
 
-void NnCudaDeviceSegment::downloadSegmentOutputs(NnUint batchSize) {
+// Residency path: this segment's outputs are now the device's, except for the
+// pipes its own syncs read on the host. Publish exactly those and leave the
+// rest on the GPU.
+void NnCudaDeviceSegment::publishResidentOutputs(NnUint batchSize) {
     if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return;
+    if (isHostOnlyPlanSegment) return;
+    // Kernels ran into this stream, so endForward() must not assume the device
+    // is idle just because no pipe is dirty.
+    if (segmentConfig->nOps > 0u) device->markDeviceWork();
+    for (std::size_t i = 0u; i < writtenPipeIndices.size(); ++i) {
+        device->markPipeDeviceOwned(writtenPipeIndices[i]);
+    }
+    if (!hasHostVisibleSync || syncReadPipeIndices.empty()) return;
+
+    // A sync reads these on the host right after this segment, so they have to
+    // be there before it runs. This is the only stream synchronize on the
+    // residency path, and it covers just the pipes a sync actually touches.
+    //
+    // Only pipes this segment wrote on the device qualify. A sync can also name
+    // a pipe the segment never touches (the plan barrier broadcasts PLN, which
+    // a host op produced), and downloading the stale device copy there would
+    // overwrite the authoritative host bytes.
+    std::vector<NnUint> publish;
+    publish.reserve(syncReadPipeIndices.size());
+    for (std::size_t i = 0u; i < syncReadPipeIndices.size(); ++i) {
+        const NnUint pipeIndex = syncReadPipeIndices[i];
+        if (!device->isPipeDeviceDirty(pipeIndex)) continue;
+        bool written = false;
+        for (std::size_t k = 0u; k < writtenPipeIndices.size(); ++k) {
+            if (writtenPipeIndices[k] == pipeIndex) { written = true; break; }
+        }
+        if (written) publish.push_back(pipeIndex);
+    }
+    if (publish.empty()) return;
+    device->publishPipesToHost(publish, batchSize);
+}
+
+bool NnCudaDeviceSegment::downloadSegmentOutputs(NnUint batchSize) {
+    if (device == nullptr || segmentConfig == nullptr || netExecution == nullptr) return false;
     NnNetConfig *netConfig = device->getNetConfig();
-    if (netConfig == nullptr) return;
+    if (netConfig == nullptr) return false;
     if (batchSize > netConfig->nBatches) {
         throw std::runtime_error("CUDA segment batchSize exceeds configured nBatches");
     }
+    if (isHostOnlyPlanSegment || downloadPipeIndices.empty()) return false;
 
-    for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
-        const NnOpConfig &op = segmentConfig->ops[i];
-        if (op.output.source != SRC_PIPE) continue;
-        NnCudaBuffer *pipe = device->data.resolvePipe(op.output.pointerIndex);
+    NnSize totalBytes = 0u;
+    std::vector<NnSize> offsets(downloadPipeIndices.size(), 0u);
+    std::vector<NnSize> sizes(downloadPipeIndices.size(), 0u);
+    for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
+        NnCudaBuffer *pipe = device->data.resolvePipe(downloadPipeIndices[i]);
         const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
-        pipe->read(netExecution->pipes[op.output.pointerIndex], 0u, nBytes, device->getStream(), &device->staging);
+        offsets[i] = totalBytes;
+        sizes[i] = nBytes;
+        totalBytes += nBytes;
     }
+    if (totalBytes == 0u) return false;
+
+    NnByte *host = (NnByte *)device->downloadStaging.ensure(totalBytes);
+    if (host == nullptr) throw std::runtime_error("CUDA segment download staging allocation failed");
+
+    const bool ioProfile = dllamaIoProbeEnabled();
+    cudaStream_t stream = (cudaStream_t)device->getStream();
+
+    for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
+        if (sizes[i] == 0u) continue;
+        NnCudaBuffer *pipe = device->data.resolvePipe(downloadPipeIndices[i]);
+        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        NN_CUDA_CHECK(cudaMemcpyAsync(host + offsets[i], pipe->data(), sizes[i], cudaMemcpyDeviceToHost, stream));
+        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
+    }
+
+    // Exactly one sync for the whole download set.
+    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    NN_CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+
+    for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
+        if (sizes[i] == 0u) continue;
+        NnByte *dst = netExecution->pipes[downloadPipeIndices[i]];
+        if (dst == nullptr) {
+            throw std::runtime_error("CUDA segment download received null host pipe " + std::to_string(downloadPipeIndices[i]));
+        }
+        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        std::memcpy(dst, host + offsets[i], sizes[i]);
+        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+    }
+    return true;
 }
 
 void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
@@ -1882,8 +2703,15 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
     }
 
     const NnOpConfig &op = segmentConfig->ops[opIndex];
-    NnCudaPointerRef in = resolveCudaPointer(device, netConfig, nodeConfig, device->getPartitionPlan(), &op.input);
-    NnCudaPointerRef out = resolveCudaPointer(device, netConfig, nodeConfig, device->getPartitionPlan(), &op.output);
+    if (!bindingsValid || opIndex >= opBindings.size()) {
+        throw std::runtime_error("CUDA executeOp has no cached binding for op index: " + std::to_string(opIndex));
+    }
+    NnCudaPointerRef in;
+    NnCudaPointerRef out;
+    in.buffer = opBindings[opIndex].inBuf;
+    in.layout = opBindings[opIndex].inLayout;
+    out.buffer = opBindings[opIndex].outBuf;
+    out.layout = opBindings[opIndex].outLayout;
     cudaStream_t stream = (cudaStream_t)device->getStream();
     const NnCudaLaunchConfig &launch = device->getLaunchConfig();
     const unsigned int elementwiseBlock = (unsigned int)launch.elementwiseBlockSize;
@@ -1951,7 +2779,10 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnSize total = (NnSize)batchSize * config->nColumns;
             if (total != 0u) {
-                invRmsF32Kernel<<<cudaBlocks(total, elementwiseBlock), elementwiseBlock, 0, stream>>>(
+                /* One block per (y, col): the block splits the colSize
+                 * accumulation instead of one thread walking all of it. */
+                dim3 invRmsGrid(config->nColumns, batchSize, 1u);
+                invRmsF32Kernel<<<invRmsGrid, (unsigned int)launch.reductionBlockSize, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     config->epsilon,
@@ -2062,7 +2893,18 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                         batchSize);
                     NN_CUDA_CHECK(cudaGetLastError());
                 } else {
-                    matmulQ80Q40LargeKKernel<<<(unsigned int)totalOutputs, q80q40LargeKBlock, 0, stream>>>(
+                    /* Four rows per warp, eight warps: 32 output rows per
+                     * block, one block per (row group, y, e) with the whole x
+                     * group cached in shared memory when it fits. */
+                    const unsigned int largeKBlock = q80q40LargeKBlock;
+                    const unsigned int warpsPerBlock = largeKBlock >> 5u;
+                    const NnSize rowsPerBlock = (NnSize)warpsPerBlock * 4u;
+                    const NnSize rowGroups = ((NnSize)cLen + rowsPerBlock - 1u) / rowsPerBlock;
+                    const NnSize sharedBytes = aBlocks <= NN_CUDA_MATMUL_SHARED_MAX_BLOCKS
+                        ? cudaQ80Q40LargeKSharedBytes(aBlocks)
+                        : 0u;
+                    dim3 largeKGrid((unsigned int)rowGroups, (unsigned int)((NnSize)batchSize * nActiveExpertsOr1), 1u);
+                    matmulQ80Q40LargeKKernel<<<largeKGrid, largeKBlock, (size_t)sharedBytes, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         (const NnBlockQ40 *)weightBuffers[opIndex]->data(),
@@ -2283,7 +3125,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                     config,
                     batchSize);
                 NN_CUDA_CHECK(cudaGetLastError());
-                multiheadAttSoftmaxSerialF32Kernel<<<grid, 1, 0, stream>>>(
+                multiheadAttSoftmaxSerialF32Kernel<<<grid, softmaxBlock, 0, stream>>>(
                     (const float *)positionPipe->data(),
                     (float *)attBuffer->data(),
                     config,
@@ -2319,7 +3161,8 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 validateQ80View("CAST F32->Q80", view);
                 const NnSize totalBlocks = (NnSize)in.layout.logicalSize.z * batchSize * (view.sizeX / Q80_BLOCK_SIZE);
                 if (totalBlocks != 0u) {
-                    q80QuantizeKernel<<<cudaBlocks(totalBlocks, elementwiseBlock), elementwiseBlock, 0, stream>>>(
+                    /* One warp per 32-element block, so one thread per element. */
+                    q80QuantizeKernel<<<cudaBlocks(totalBlocks * 32u, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                         (const NnByte *)in.buffer->data(), in.layout,
                         (NnByte *)out.buffer->data(), out.layout,
                         (NnUint)view.offset, (NnUint)view.sizeX, batchSize);
@@ -2453,7 +3296,8 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             const NnSize quantBlocks = (NnSize)batchSize * (out.layout.logicalSize.x / Q80_BLOCK_SIZE);
             if (quantBlocks != 0u) {
-                q80QuantizeKernel<<<cudaBlocks(quantBlocks, elementwiseBlock), elementwiseBlock, 0, stream>>>(
+                /* One warp per block here too, so scale the grid by 32. */
+                q80QuantizeKernel<<<cudaBlocks(quantBlocks * 32u, elementwiseBlock), elementwiseBlock, 0, stream>>>(
                     (const NnByte *)in.buffer->data(), in.layout,
                     (NnByte *)out.buffer->data(), out.layout,
                     0u, out.layout.logicalSize.x,
@@ -2644,7 +3488,14 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 row[6] = (float)pos;
                 row[7] = (float)ffnMove;
             }
-            if (op.output.pointerIndex < netConfig->nPipes) {
+            // No GPU op in the real graph reads the plan pipe, so its device-side
+            // copy is dead weight: the write below also costs a stream sync. Keep
+            // it only if some non-control op in this segment actually binds this
+            // pipe as an input or output.
+            const bool deviceVisible =
+                std::find(uploadPipeIndices.begin(), uploadPipeIndices.end(), op.output.pointerIndex) != uploadPipeIndices.end() ||
+                std::find(downloadPipeIndices.begin(), downloadPipeIndices.end(), op.output.pointerIndex) != downloadPipeIndices.end();
+            if (deviceVisible && op.output.pointerIndex < netConfig->nPipes) {
                 NnCudaBuffer *pipe = device->data.resolvePipe(op.output.pointerIndex);
                 const NnSize nBytes = pipe->calcSliceSize(batchSize, netConfig->nBatches);
                 pipe->write((const NnByte *)planPipe, 0u, nBytes, stream, &device->staging);
@@ -2725,21 +3576,74 @@ void NnCudaDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thread
     if (segmentConfig == nullptr) {
         throw std::runtime_error("CUDA backend received null segment config for segment " + std::to_string(segmentIndex));
     }
+    unsigned int deviceEpoch = 0u;
     if (device != nullptr) {
-        const unsigned int deviceEpoch = device->getPlanEpoch();
-        const unsigned int readyEpoch = planEpochReady.load(std::memory_order_acquire);
-        if (readyEpoch != deviceEpoch) {
+        deviceEpoch = device->getPlanEpoch();
+        if (planEpochReady.load(std::memory_order_acquire) != deviceEpoch) {
             refreshPointers();
+            deviceEpoch = device->getPlanEpoch();
             planEpochReady.store(deviceEpoch, std::memory_order_release);
         }
     }
+    // Bindings are resolved from the op configs refreshPointers() just rewrote,
+    // so they are rebuilt whenever the plan epoch moved. `bindingsValid` covers
+    // the first forward, where readyEpoch == deviceEpoch == 0 and nothing moved.
+    if (!bindingsValid || bindingsEpoch != deviceEpoch) {
+        rebuildBindings();
+    }
 
-    uploadSegmentInputs(batchSize);
+    // Outside a residency window the host is the only channel between segments
+    // (nn-cuda-test calling forward() directly, the takeover splice after a
+    // forward ended, a forward that aborted). Any pipe whose authoritative bytes
+    // are still on the device has to be published *before* the upload below,
+    // otherwise the upload would read a stale host copy.
+    const bool resident = (device != nullptr && device->isResidencyActive());
+    if (device != nullptr && !resident) {
+        device->publishAllDeviceDirtyPipes(batchSize);
+    }
+
+    uploadSegmentInputs(batchSize, resident);
+    // cudaEvent window for this segment's per-layer GPU time. Recorded only when
+    // the executor registered the segment as an ATTN/FFN profile target, and
+    // only inside a residency window (outside one, segment->forward() is called
+    // directly by tests and the takeover splice, where nothing consumes it).
+    // The window covers exactly the kernels: the upload is issued before it and
+    // any publish/sync happens after it, so the number is GPU execution time and
+    // not PCIe traffic or a host stall.
+    const bool timing = resident && device->isLayerPerfSegment(segmentIndex);
+    if (timing) device->recordSegmentStart(segmentIndex);
     for (NnUint i = 0u; i < segmentConfig->nOps; ++i) {
         executeOp(i, batchSize);
+        // OP_PLAN_APPLY mutates the plan (and bumps the device epoch) from the
+        // host in the middle of a segment, which would leave every later op with
+        // stale cached slices. Re-bind before continuing. Control ops never touch
+        // opBindings themselves, so a barrier/apply-only segment can skip this
+        // and let the next real segment pick the new epoch up. Segments with no
+        // control op skip the check entirely and keep the hot loop free of reads.
+        if (hasControlOps && !isHostOnlyPlanSegment) {
+            const unsigned int epochNow = device != nullptr ? device->getPlanEpoch() : 0u;
+            if (epochNow != bindingsEpoch) {
+                if (device != nullptr && planEpochReady.load(std::memory_order_acquire) != epochNow) {
+                    // Rewrites the op configs and rebuilds the bindings.
+                    refreshPointers();
+                } else {
+                    rebuildBindings();
+                }
+            }
+        }
     }
-    downloadSegmentOutputs(batchSize);
-    if (device != nullptr) {
+    if (timing) device->recordSegmentEnd(segmentIndex);
+
+    if (resident) {
+        // The device already holds this segment's outputs. Publish only the
+        // pipes a sync step is about to read on the host; everything else stays
+        // resident and is never seen by the CPU.
+        publishResidentOutputs(batchSize);
+        return;
+    }
+
+    const bool synced = downloadSegmentOutputs(batchSize);
+    if (!synced && !isHostOnlyPlanSegment && device != nullptr) {
         device->synchronize();
     }
 }
@@ -2750,6 +3654,9 @@ void NnCudaDeviceSegment::setPartitionPlan(const NnUnevenPartitionPlan *plan) {
             device->setPartitionPlan(plan);
         }
         planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+        // The cached bindings belong to the previous plan; drop them so the next
+        // forward re-resolves them against the current partition.
+        bindingsValid = false;
     }
 }
 
@@ -2901,6 +3808,10 @@ void NnCudaDeviceSegment::refreshPointers() {
 
     device->synchronize();
     planEpochReady.store(device->getPlanEpoch(), std::memory_order_release);
+    // This is the one place where op configs (slices, offsets, column counts)
+    // are rewritten, so it is also the point at which the cached per-op
+    // bindings become stale.
+    rebuildBindings();
 }
 
 bool NnCudaDeviceSegment::exportLayerKvRow(

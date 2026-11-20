@@ -106,6 +106,13 @@ $(info CUDA_ARCHS=$(CUDA_ARCHS_EFFECTIVE) requested=$(CUDA_ARCHS))
 	CXXFLAGS += -DDLLAMA_CUDA -I$(CUDA_HOME)/include
 	LIBS += -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 	NVCCFLAGS += -std=c++11 -Isrc -DDLLAMA_CUDA
+	# Device-code optimization. -DNDEBUG is deliberately NOT added globally so
+	# the unit tests keep their assert() checks. --use_fast_math is deliberately
+	# NOT added either: it flips rounding in the RMSNorm/softmax/SiLU device
+	# kernels and changes the generated tokens (verified on 4xT4: the final
+	# segment diverges while -O3 alone reproduces the baseline text exactly),
+	# and it measured no faster than plain -O3.
+	NVCCFLAGS += -O3
 	# nvcc's ARM device front-end cannot parse GCC's arm_neon.h built-ins.
 	# The CUDA translation unit does not execute the CPU NEON paths; keep NEON
 	# enabled for normal C++ objects, but hide it while compiling .cu files.

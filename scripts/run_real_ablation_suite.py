@@ -20,9 +20,9 @@ DEFAULT_ROOT = Path(os.environ.get("B01_ROOT", "/home/byh/B01"))
 DEFAULT_PYTHON = DEFAULT_ROOT / "agent_langgraph_venv/bin/python"
 DEFAULT_EPISODE = PROJECT_ROOT / "agent_bench/episodes/agentic_ablation_episode.json"
 EDGE_ENGINE = PROJECT_ROOT / "EdgeVisor"
-DLLAMA = EDGE_ENGINE / "dllama"
-MODEL = DEFAULT_ROOT / "models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m"
-TOKENIZER = DEFAULT_ROOT / "models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
+EDGEVISOR = EDGE_ENGINE / "edgevisor"
+MODEL = DEFAULT_ROOT / "models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m"
+TOKENIZER = DEFAULT_ROOT / "models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t"
 
 VARIANTS: Dict[str, Dict[str, str]] = {
     "full": {"shadow": "enabled", "pointer": "enabled", "jit": "enabled", "vg": "enabled"},
@@ -252,15 +252,15 @@ def start_compute_stress(
     model: Path,
     tokenizer: Path,
 ) -> subprocess.Popen[str]:
-    if not DLLAMA.exists():
-        raise PerturbationError(f"missing dllama binary: {DLLAMA}")
+    if not EDGEVISOR.exists():
+        raise PerturbationError(f"missing edgevisor binary: {EDGEVISOR}")
     for path in [model, tokenizer]:
         if not path.exists():
             raise PerturbationError(f"missing model/tokenizer file: {path}")
     log_path = run_root / f"compute_stress_gpu{target_gpu}.log"
     log_f = open(log_path, "w", encoding="utf-8", errors="replace")
     inner = [
-        str(DLLAMA),
+        str(EDGEVISOR),
         "inference",
         "--prompt",
         "background compute stress for EdgeVisor ablation",
@@ -951,7 +951,7 @@ def main() -> int:
             "kv_ack_timeout_ms": int(args.kv_ack_timeout_ms),
         },
         "perturbation": {
-            "compute": "background dllama inference on target GPU",
+            "compute": "background edgevisor inference on target GPU",
             "compute_target_gpu": effective_compute_gpu,
             "network": "user-space TCP rate proxy on selected root-worker TCP links; actual bytes are throttled, no simulated stalls",
             "network_proxy_scope": args.network_proxy_scope,
@@ -1004,7 +1004,7 @@ def main() -> int:
                                 "enabled": True,
                                 "target_gpu": effective_compute_gpu,
                                 "pid": stress_proc.pid,
-                                "method": "background_dllama_inference",
+                                "method": "background_edgevisor_inference",
                             }
                             time.sleep(2.0)
                         rate = network_proxy_rate(fluctuation, args)

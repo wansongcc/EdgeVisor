@@ -2,7 +2,7 @@
 
 本文面向以下目标：
 
-1. 在 x86_64 服务器上完成 `dllama` / `dllama-api` 交叉编译。
+1. 在 x86_64 服务器上完成 `edgevisor` / `edgevisor-api` 交叉编译。
 2. 将二进制直接分发到实验设备（Jetson、树莓派）运行。
 3. 明确后端算子是否依赖特定 CPU 指令优化，以及编译时如何开启。
 
@@ -97,10 +97,10 @@ rsync -a --delete pi@<rpi-ip>:/usr/ /opt/sysroots/rpi/usr/
 
 ## 4. 服务器交叉编译命令
 
-先进入仓库根目录：
+先进入引擎目录（仓库根目录下的 `EdgeVisor/` 子目录）：
 
 ```bash
-cd distributed-llama
+cd EdgeVisor
 ```
 
 > 关键点：当前 `Makefile` 在 `ifndef TERMUX_VERSION` 中会加 `-march=native -mtune=native`。交叉编译时可通过 `TERMUX_VERSION=1` 避免该行为。
@@ -111,7 +111,7 @@ cd distributed-llama
 make clean
 make TERMUX_VERSION=1 \
   CXX="aarch64-linux-gnu-g++ --sysroot=/opt/sysroots/jetson -O3" \
-  dllama dllama-api
+  edgevisor edgevisor-api
 ```
 
 说明：
@@ -124,7 +124,7 @@ make TERMUX_VERSION=1 \
 make clean
 make TERMUX_VERSION=1 \
   CXX="aarch64-linux-gnu-g++ --sysroot=/opt/sysroots/jetson -O3 -mcpu=<your-jetson-cpu>" \
-  dllama dllama-api
+  edgevisor edgevisor-api
 ```
 
 可选：如果你确定目标 CPU 与工具链支持，也可用 `-march=armv8.2-a+dotprod` 之类参数。
@@ -139,7 +139,7 @@ make TERMUX_VERSION=1 \
 make clean
 make TERMUX_VERSION=1 \
   CXX="aarch64-linux-gnu-g++ --sysroot=/opt/sysroots/rpi -O3" \
-  dllama dllama-api
+  edgevisor edgevisor-api
 ```
 
 > 若树莓派系统不是 64 位，请不要使用上述 aarch64 目标。
@@ -152,10 +152,10 @@ make TERMUX_VERSION=1 \
 
 ```bash
 mkdir -p out/jetson-cpu
-cp dllama dllama-api out/jetson-cpu/
+cp edgevisor edgevisor-api out/jetson-cpu/
 tar czf out/jetson-cpu.tgz -C out/jetson-cpu .
 
-scp out/jetson-cpu.tgz nvidia@<jetson-ip>:/opt/dllama/
+scp out/jetson-cpu.tgz nvidia@<jetson-ip>:/opt/edgevisor/
 ```
 
 树莓派同理，只需替换目标地址。
@@ -163,11 +163,11 @@ scp out/jetson-cpu.tgz nvidia@<jetson-ip>:/opt/dllama/
 ### 5.2 目标机解包并验证
 
 ```bash
-mkdir -p /opt/dllama && cd /opt/dllama
+mkdir -p /opt/edgevisor && cd /opt/edgevisor
 tar xzf jetson-cpu.tgz
 
-file ./dllama
-ldd ./dllama
+file ./edgevisor
+ldd ./edgevisor
 ```
 
 确认：
@@ -183,17 +183,17 @@ ldd ./dllama
 ### 6.1 启动 worker
 
 ```bash
-./dllama worker --port 9999 --nthreads 4
+./edgevisor worker --port 9999 --nthreads 4
 ```
 
 ### 6.2 root 节点做推理
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   --prompt "Hello world" \
   --steps 32 \
-  --model models/<your-model>/dllama_model_<your-model>.m \
-  --tokenizer models/<your-model>/dllama_tokenizer_<your-model>.t \
+  --model models/<your-model>/edgevisor_model_<your-model>.m \
+  --tokenizer models/<your-model>/edgevisor_tokenizer_<your-model>.t \
   --buffer-float-type q80 \
   --nthreads 4 \
   --max-seq-len 4096 \
@@ -203,10 +203,10 @@ ldd ./dllama
 ### 6.3 启动 API
 
 ```bash
-./dllama-api \
+./edgevisor-api \
   --port 9999 \
-  --model models/<your-model>/dllama_model_<your-model>.m \
-  --tokenizer models/<your-model>/dllama_tokenizer_<your-model>.t \
+  --model models/<your-model>/edgevisor_model_<your-model>.m \
+  --tokenizer models/<your-model>/edgevisor_tokenizer_<your-model>.t \
   --buffer-float-type q80 \
   --nthreads 4 \
   --max-seq-len 4096 \
@@ -238,7 +238,7 @@ ldd ./dllama
 
 ## 8. 常见问题排查
 
-1. **设备上 `./dllama: not found`**
+1. **设备上 `./edgevisor: not found`**
    - 可能是动态链接器/依赖不匹配，不一定是文件不存在。
    - 用 `file` + `ldd` 检查架构和依赖。
 
@@ -256,9 +256,9 @@ ldd ./dllama
 
 建议在 CI 或脚本中同时产出：
 
-- `dllama-jetson-cpu-compatible.tgz`
-- `dllama-jetson-cpu-optimized.tgz`
-- `dllama-rpi-cpu-compatible.tgz`
+- `edgevisor-jetson-cpu-compatible.tgz`
+- `edgevisor-jetson-cpu-optimized.tgz`
+- `edgevisor-rpi-cpu-compatible.tgz`
 
 并在包名中标注：
 

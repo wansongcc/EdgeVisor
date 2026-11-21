@@ -30,18 +30,18 @@ What this script does (one command):
 Examples:
   scripts/collect_debug_logs.sh \
     --mode root \
-    --root-cmd "./dllama inference --interactive --prompt 'The capital of France is' --steps 256 --model /workspace/dllama/distributed-llama/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m --tokenizer /workspace/dllama/distributed-llama/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 2048 --enable-plan-barrier --enable-stage-full-weights --benchmark --workers rpi-trixie5:9999 --ratios 1:1"
+    --root-cmd "./edgevisor inference --interactive --prompt 'The capital of France is' --steps 256 --model /workspace/EdgeVisor/EdgeVisor/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m --tokenizer /workspace/EdgeVisor/EdgeVisor/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t --buffer-float-type q80 --nthreads 2 --max-seq-len 2048 --enable-plan-barrier --enable-stage-full-weights --benchmark --workers rpi-trixie5:9999 --ratios 1:1"
 
   scripts/collect_debug_logs.sh \
     --mode both \
-    --root-cmd "./dllama inference ..." \
-    --worker-cmd "./dllama worker --port 9999 --model ... --ratios 1:1"
+    --root-cmd "./edgevisor inference ..." \
+    --worker-cmd "./edgevisor worker --port 9999 --model ... --ratios 1:1"
 
   # Two containers sharing the same mounted workspace/log directory
   # Container A (worker):
-  scripts/collect_debug_logs.sh --mode worker --run-id 20260309_090000 --worker-cmd "./dllama worker --port 9999"
+  scripts/collect_debug_logs.sh --mode worker --run-id 20260309_090000 --worker-cmd "./edgevisor worker --port 9999"
   # Container B (root):
-  scripts/collect_debug_logs.sh --mode root --run-id 20260309_090000 --root-cmd "./dllama inference ..."
+  scripts/collect_debug_logs.sh --mode root --run-id 20260309_090000 --root-cmd "./edgevisor inference ..."
 EOF
 }
 
@@ -159,24 +159,24 @@ write_meta() {
 
 build_env_prefix() {
   cat <<EOF
-export DLLAMA_MIGRATION_OP_TRACE=1;
-export DLLAMA_MIGRATION_OP_TRACE_LIMIT=0;
-export DLLAMA_DEBUG_LAYER_OUT_TRACE=1;
-export DLLAMA_DEBUG_LAYER_OUT_TRACE_POS=$POS_FILTER;
-export DLLAMA_DEBUG_LAYER_OUT_TRACE_LIMIT=500;
-export DLLAMA_DEBUG_LAYER_OUT_COMPARE=$COMPARE_VALUE;
-export DLLAMA_DEBUG_ROOT_LOGITS_SPLIT=1;
-export DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE="${DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE:-1}";
-export DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_POS="${DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_POS:-$POS_FILTER}";
-export DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_LIMIT="${DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_LIMIT:-500}";
-export DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_SLICES="${DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_SLICES:-2}";
-export DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_SAMPLES="${DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_SAMPLES:-4}";
-unset DLLAMA_DEBUG_ATT;
-unset DLLAMA_DEBUG_ATT_QK;
-unset DLLAMA_DEBUG_ATT_SCORES;
-unset DLLAMA_DEBUG_KVCACHE_PER_HEAD;
-unset DLLAMA_DEBUG_FINAL_NORM_INPUT;
-unset DLLAMA_DEBUG_FINAL_LOGITS_SLICE;
+export EDGEVISOR_MIGRATION_OP_TRACE=1;
+export EDGEVISOR_MIGRATION_OP_TRACE_LIMIT=0;
+export EDGEVISOR_DEBUG_LAYER_OUT_TRACE=1;
+export EDGEVISOR_DEBUG_LAYER_OUT_TRACE_POS=$POS_FILTER;
+export EDGEVISOR_DEBUG_LAYER_OUT_TRACE_LIMIT=500;
+export EDGEVISOR_DEBUG_LAYER_OUT_COMPARE=$COMPARE_VALUE;
+export EDGEVISOR_DEBUG_ROOT_LOGITS_SPLIT=1;
+export EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE="${EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE:-1}";
+export EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_POS="${EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_POS:-$POS_FILTER}";
+export EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_LIMIT="${EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_LIMIT:-500}";
+export EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_SLICES="${EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_SLICES:-2}";
+export EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_SAMPLES="${EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_SAMPLES:-4}";
+unset EDGEVISOR_DEBUG_ATT;
+unset EDGEVISOR_DEBUG_ATT_QK;
+unset EDGEVISOR_DEBUG_ATT_SCORES;
+unset EDGEVISOR_DEBUG_KVCACHE_PER_HEAD;
+unset EDGEVISOR_DEBUG_FINAL_NORM_INPUT;
+unset EDGEVISOR_DEBUG_FINAL_LOGITS_SLICE;
 EOF
 }
 

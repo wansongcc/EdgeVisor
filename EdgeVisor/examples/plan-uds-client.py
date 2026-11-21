@@ -131,8 +131,8 @@ def pick_min_max_nodes(nodes: Any) -> Any:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="dllama plan UDS controller client (JSON line protocol)")
-    p.add_argument("socket", help="UDS path, e.g. /tmp/dllama_plan.sock")
+    p = argparse.ArgumentParser(description="edgevisor plan UDS controller client (JSON line protocol)")
+    p.add_argument("socket", help="UDS path, e.g. /tmp/edgevisor_plan.sock")
 
     sub = p.add_subparsers(dest="op", required=True)
 

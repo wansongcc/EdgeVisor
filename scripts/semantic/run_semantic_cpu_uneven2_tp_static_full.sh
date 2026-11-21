@@ -21,11 +21,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-./dllama worker --port "${PORT1}" --nthreads 2 >"${LOG_DIR}/worker1.log" 2>&1 &
+./edgevisor worker --port "${PORT1}" --nthreads 2 >"${LOG_DIR}/worker1.log" 2>&1 &
 P1=$!
 sleep 4
 
-./dllama inference \
+./edgevisor inference \
   --prompt "What is 2+2? Answer with only the number." \
   --steps 32 \
   --model "${MODEL3}" \

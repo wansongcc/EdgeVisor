@@ -15,7 +15,7 @@ cd "${BASE}" || exit 2
 
 PORT1=19301
 PORT2=19302
-SOCK=/tmp/dllama_gpu_pp_migration.sock
+SOCK=/tmp/edgevisor_gpu_pp_migration.sock
 
 cleanup() {
   if [[ -n "${P1:-}" ]]; then kill "${P1}" 2>/dev/null || true; fi
@@ -28,13 +28,13 @@ trap cleanup EXIT
 
 rm -f "${SOCK}"
 
-./dllama worker --port "${PORT1}" --nthreads 1 --gpu-index 1 >"${LOG_DIR}/worker_gpu1.log" 2>&1 &
+./edgevisor worker --port "${PORT1}" --nthreads 1 --gpu-index 1 >"${LOG_DIR}/worker_gpu1.log" 2>&1 &
 P1=$!
-./dllama worker --port "${PORT2}" --nthreads 1 --gpu-index 2 >"${LOG_DIR}/worker_gpu2.log" 2>&1 &
+./edgevisor worker --port "${PORT2}" --nthreads 1 --gpu-index 2 >"${LOG_DIR}/worker_gpu2.log" 2>&1 &
 P2=$!
 sleep 4
 
-DLLAMA_PLAN_CTRL_SOCKET="${SOCK}" ./dllama inference \
+EDGEVISOR_PLAN_CTRL_SOCKET="${SOCK}" ./edgevisor inference \
   --prompt "Hi" \
   --steps 32 \
   --model "${MODEL3}" \

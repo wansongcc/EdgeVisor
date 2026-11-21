@@ -247,7 +247,7 @@ def main():
             suite.IMAGE,
             "bash",
             "-lc",
-            "make -j$(nproc) dllama",
+            "make -j$(nproc) edgevisor",
         ],
         check=False,
         timeout=900,

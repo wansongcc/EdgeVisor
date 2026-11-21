@@ -57,7 +57,7 @@ run_gpu_distributed_inference() {
   local prompt="$5"
   local steps="$6"
   shift 6
-  DLLAMA_LAYER_PROF_PATH="${log_file}.layer_prof.bin" ./dllama inference \
+  EDGEVISOR_LAYER_PROF_PATH="${log_file}.layer_prof.bin" ./edgevisor inference \
     --prompt "${prompt}" \
     --steps "${steps}" \
     --model "${EDGEVISOR_MODEL3}" \
@@ -102,8 +102,8 @@ select_gpu_ratios() {
     local p1=$((19800 + i * 10 + 1))
     local p2=$((19800 + i * 10 + 2))
     local log_file="${log_dir}/ratio_${i}_$(printf '%s' "${ratios}" | tr ':,*@' '____').log"
-    ./dllama worker --port "${p1}" --nthreads 1 --gpu-index 1 >"${log_file}.worker1" 2>&1 & local w1=$!
-    ./dllama worker --port "${p2}" --nthreads 1 --gpu-index 2 >"${log_file}.worker2" 2>&1 & local w2=$!
+    ./edgevisor worker --port "${p1}" --nthreads 1 --gpu-index 1 >"${log_file}.worker1" 2>&1 & local w1=$!
+    ./edgevisor worker --port "${p2}" --nthreads 1 --gpu-index 2 >"${log_file}.worker2" 2>&1 & local w2=$!
     cleanup_pids+=("${w1}" "${w2}")
     sleep 4
     set +e
@@ -163,7 +163,7 @@ wait_for_socket() {
 run_cpu_single() {
   local log_dir="${OUT_BASE}/01_cpu_single"
   mkdir -p "${log_dir}"
-  DLLAMA_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./dllama inference \
+  EDGEVISOR_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./edgevisor inference \
     --prompt "What is 2+2? Answer with only the number." \
     --steps 32 \
     --model "${EDGEVISOR_MODEL3}" \
@@ -181,7 +181,7 @@ run_cpu_single() {
 run_gpu_single() {
   local log_dir="${OUT_BASE}/02_gpu_single"
   mkdir -p "${log_dir}"
-  DLLAMA_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./dllama inference \
+  EDGEVISOR_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./edgevisor inference \
     --prompt "What is 2+2? Answer with only the number." \
     --steps 32 \
     --model "${EDGEVISOR_MODEL3}" \
@@ -202,12 +202,12 @@ run_cpu_static() {
   local p1="${EDGEVISOR_CPU_STATIC_PORT1:-19601}"
   local p2="${EDGEVISOR_CPU_STATIC_PORT2:-19602}"
   mkdir -p "${log_dir}"
-  ./dllama worker --port "${p1}" --nthreads 2 >"${log_dir}/worker1.log" 2>&1 & local w1=$!
-  ./dllama worker --port "${p2}" --nthreads 2 >"${log_dir}/worker2.log" 2>&1 & local w2=$!
+  ./edgevisor worker --port "${p1}" --nthreads 2 >"${log_dir}/worker1.log" 2>&1 & local w1=$!
+  ./edgevisor worker --port "${p2}" --nthreads 2 >"${log_dir}/worker2.log" 2>&1 & local w2=$!
   cleanup_pids+=("${w1}" "${w2}")
   sleep 4
   set +e
-  DLLAMA_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./dllama inference \
+  EDGEVISOR_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./edgevisor inference \
     --prompt "What is 2+2? Answer with only the number." \
     --steps 32 \
     --model "${EDGEVISOR_MODEL3}" \
@@ -238,7 +238,7 @@ run_gpu_static() {
 
   if [[ "${EDGEVISOR_FORCE_DISTRIBUTED}" != "1" ]] && gpu_model_fits_single; then
     echo "04_GPU_STATIC_MODE=single_gpu model_fits_gpu0 force_distributed=${EDGEVISOR_FORCE_DISTRIBUTED}" | tee "${log_dir}/selection.txt"
-    DLLAMA_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./dllama inference \
+    EDGEVISOR_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" ./edgevisor inference \
       --prompt "Write a comma-separated list of the numbers from 1 to 80." \
       --steps 96 \
       --model "${EDGEVISOR_MODEL3}" \
@@ -258,8 +258,8 @@ run_gpu_static() {
   local ratios
   ratios="$(select_gpu_ratios)"
   echo "04_GPU_STATIC_MODE=distributed ratios=${ratios} force_distributed=${EDGEVISOR_FORCE_DISTRIBUTED}" | tee "${log_dir}/selection.txt"
-  ./dllama worker --port "${p1}" --nthreads 1 --gpu-index 1 >"${log_dir}/worker1.log" 2>&1 & local w1=$!
-  ./dllama worker --port "${p2}" --nthreads 1 --gpu-index 2 >"${log_dir}/worker2.log" 2>&1 & local w2=$!
+  ./edgevisor worker --port "${p1}" --nthreads 1 --gpu-index 1 >"${log_dir}/worker1.log" 2>&1 & local w1=$!
+  ./edgevisor worker --port "${p2}" --nthreads 1 --gpu-index 2 >"${log_dir}/worker2.log" 2>&1 & local w2=$!
   cleanup_pids+=("${w1}" "${w2}")
   sleep 4
   set +e
@@ -280,14 +280,14 @@ run_cpu_dynamic() {
   local log_dir="${OUT_BASE}/05_cpu_uneven_dynamic"
   local p1="${EDGEVISOR_CPU_DYNAMIC_PORT1:-19711}"
   local p2="${EDGEVISOR_CPU_DYNAMIC_PORT2:-19712}"
-  local sock="${EDGEVISOR_CPU_DYNAMIC_SOCKET:-/tmp/dllama_bench_cpu_heads.sock}"
+  local sock="${EDGEVISOR_CPU_DYNAMIC_SOCKET:-/tmp/edgevisor_bench_cpu_heads.sock}"
   mkdir -p "${log_dir}"
   rm -f "${sock}"
-  ./dllama worker --port "${p1}" --nthreads 1 >"${log_dir}/worker_cpu1.log" 2>&1 & local w1=$!
-  ./dllama worker --port "${p2}" --nthreads 1 >"${log_dir}/worker_cpu2.log" 2>&1 & local w2=$!
+  ./edgevisor worker --port "${p1}" --nthreads 1 >"${log_dir}/worker_cpu1.log" 2>&1 & local w1=$!
+  ./edgevisor worker --port "${p2}" --nthreads 1 >"${log_dir}/worker_cpu2.log" 2>&1 & local w2=$!
   cleanup_pids+=("${w1}" "${w2}")
   sleep 4
-  DLLAMA_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" DLLAMA_PLAN_CTRL_SOCKET="${sock}" ./dllama inference \
+  EDGEVISOR_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" EDGEVISOR_PLAN_CTRL_SOCKET="${sock}" ./edgevisor inference \
     --prompt "Write a comma-separated list of the numbers from 1 to 20." \
     --steps 64 \
     --model "${EDGEVISOR_MODEL3}" \
@@ -333,17 +333,17 @@ run_gpu_dynamic() {
   local log_dir="${OUT_BASE}/06_gpu_uneven_dynamic"
   local p1="${EDGEVISOR_GPU_DYNAMIC_PORT1:-19701}"
   local p2="${EDGEVISOR_GPU_DYNAMIC_PORT2:-19702}"
-  local sock="${EDGEVISOR_GPU_DYNAMIC_SOCKET:-/tmp/dllama_bench_gpu_heads.sock}"
+  local sock="${EDGEVISOR_GPU_DYNAMIC_SOCKET:-/tmp/edgevisor_bench_gpu_heads.sock}"
   mkdir -p "${log_dir}"
   rm -f "${sock}"
   local ratios
   ratios="$(select_gpu_ratios)"
   echo "06_GPU_DYNAMIC_RATIOS=${ratios}" | tee "${log_dir}/selection.txt"
-  ./dllama worker --port "${p1}" --nthreads 1 --gpu-index 1 >"${log_dir}/worker_gpu1.log" 2>&1 & local w1=$!
-  ./dllama worker --port "${p2}" --nthreads 1 --gpu-index 2 >"${log_dir}/worker_gpu2.log" 2>&1 & local w2=$!
+  ./edgevisor worker --port "${p1}" --nthreads 1 --gpu-index 1 >"${log_dir}/worker_gpu1.log" 2>&1 & local w1=$!
+  ./edgevisor worker --port "${p2}" --nthreads 1 --gpu-index 2 >"${log_dir}/worker_gpu2.log" 2>&1 & local w2=$!
   cleanup_pids+=("${w1}" "${w2}")
   sleep 4
-  DLLAMA_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" DLLAMA_PLAN_CTRL_SOCKET="${sock}" ./dllama inference \
+  EDGEVISOR_LAYER_PROF_PATH="${log_dir}/layer_prof.bin" EDGEVISOR_PLAN_CTRL_SOCKET="${sock}" ./edgevisor inference \
     --prompt "Write a comma-separated list of the numbers from 1 to 20." \
     --steps 96 \
     --model "${EDGEVISOR_MODEL3}" \

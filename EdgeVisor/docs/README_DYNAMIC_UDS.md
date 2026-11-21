@@ -16,16 +16,16 @@
 当前推荐用 root 启动参数启用 UDS：
 
 ```bash
---plan-ctrl-socket /tmp/dllama_plan.sock
+--plan-ctrl-socket /tmp/edgevisor_plan.sock
 ```
 
 兼容写法仍然可用：
 
 ```bash
-export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
+export EDGEVISOR_PLAN_CTRL_SOCKET=/tmp/edgevisor_plan.sock
 ```
 
-Root 进程启动后会监听该 Unix Domain Socket。自动 TPOT 调度使用同一个 UDS；如果启动时加入 `--enable-dynamic-tpot` 且没有指定 socket，代码会默认使用 `/tmp/dllama_plan.sock`。
+Root 进程启动后会监听该 Unix Domain Socket。自动 TPOT 调度使用同一个 UDS；如果启动时加入 `--enable-dynamic-tpot` 且没有指定 socket，代码会默认使用 `/tmp/edgevisor_plan.sock`。
 
 ### 1.2 启用推理侧 plan barrier（决定“是否真的会迁移”）
 
@@ -148,7 +148,7 @@ Root 进程启动后会监听该 Unix Domain Socket。自动 TPOT 调度使用�
 也可指定 snapshot 文件路径：
 
 ```json
-{"op":"layer_prof","path":"/tmp/dllama_layer_prof_stage0_root0.bin","layerIndex":0}
+{"op":"layer_prof","path":"/tmp/edgevisor_layer_prof_stage0_root0.bin","layerIndex":0}
 ```
 
 响应（示例，结构简化）：
@@ -269,19 +269,19 @@ Plan 指令写入一个共享的 PlanCommand cache。
 手动 UDS 迁移：
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   <model/prompt/workers/ratios args> \
-  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --plan-ctrl-socket /tmp/edgevisor_plan.sock \
   --enable-plan-barrier
 ```
 
 自动 TPOT 迁移：
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   <model/prompt/workers/ratios args> \
   --enable-dynamic-tpot \
-  --plan-ctrl-socket /tmp/dllama_plan.sock
+  --plan-ctrl-socket /tmp/edgevisor_plan.sock
 ```
 
 `--enable-dynamic-tpot` 会自动开启 `--enable-plan-barrier` 和 `--enable-pp-migration`，并设置 PP KV ACK timeout 与 collector 默认行为。
@@ -289,9 +289,9 @@ Plan 指令写入一个共享的 PlanCommand cache。
 ### 5.2 查询状态/耗时
 
 ```bash
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock perf
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock layer_prof --layer 0 --stage 0 --root 0
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock status
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock perf
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock layer_prof --layer 0 --stage 0 --root 0
 ```
 
 ### 5.3 watch + 自动触发 set_plan（差值阈值）
@@ -299,8 +299,8 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock layer_prof --layer 0 -
 推荐使用差值阈值（慢-快差距）避免整体负载漂移影响：
 
 ```bash
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock watch_layer_prof \
-  --path /tmp/dllama_layer_prof_stage0_root0.bin \
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock watch_layer_prof \
+  --path /tmp/edgevisor_layer_prof_stage0_root0.bin \
   --layer 0 \
   --delta-threshold-us 8000 \
   --interval-ms 200 \

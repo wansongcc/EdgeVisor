@@ -25,12 +25,12 @@ def main() -> int:
     require("qwen3_8b_q40" in text, "script should include the 8B disturbance workload")
     require("setsid bash -lc" in text, "script should launch disturbance loops in process groups")
     require('kill -- "-${pgid}"' in text, "script should stop only recorded disturbance process groups")
-    require("pkill" not in text, "script must not globally kill dllama processes")
+    require("pkill" not in text, "script must not globally kill edgevisor processes")
 
     docs = GPU_DOC.read_text(encoding="utf-8") + "\n" + MIGRATION_DOC.read_text(encoding="utf-8")
     require("gpu_compute_disturbance.sh" in docs, "docs should mention the disturbance script")
     require("1xQwen3-14B + 1xQwen3-8B" in docs, "docs should document the recommended workload")
-    require("Do not use `pkill -x dllama` after workers are running" in docs,
+    require("Do not use `pkill -x edgevisor` after workers are running" in docs,
             "docs should warn against killing worker processes")
     return 0
 

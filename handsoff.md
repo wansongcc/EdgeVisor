@@ -37,16 +37,16 @@
 ### 已经定下来的结论和约束
 
 - 单请求 PP 气泡和 Shadow KV 的语义都要保留。这几轮只动 GPU 侧执行、搬运和采样时序，没有改调度协议、没有改 PP 语义。`--ratios '1@7*1@7*1@7*1@7'`、`--nthreads 1`（影子 KV 要求单线程），以及 Arm B 的 `--enable-pp-migration --runtime-redundant-boundary-layers 3`，都是验证基线，不要为了刷分改掉。
-- 不盲目强上 `ppInflight > 1` 去挤干气泡。`EdgeVisor/src/dllama.cpp` 第 701–706 行：只有 remote sampling 可用时 `ppInflight` 才允许多于 1，否则强制回到 1，并打印 “remote last-stage sampling is unavailable; using ppInflight=1 to keep logits sampling correct”。调大会破坏 logits 采样正确性。气泡留着，靠 Shadow KV 藏。
+- 不盲目强上 `ppInflight > 1` 去挤干气泡。`EdgeVisor/src/edgevisor.cpp` 第 701–706 行：只有 remote sampling 可用时 `ppInflight` 才允许多于 1，否则强制回到 1，并打印 “remote last-stage sampling is unavailable; using ppInflight=1 to keep logits sampling correct”。调大会破坏 logits 采样正确性。气泡留着，靠 Shadow KV 藏。
 - 不加 `--use_fast_math`。实测它翻转 RMSNorm/softmax/SiLU 的舍入，最后一段的分词就变了；而且并不比纯 `-O3` 快（c1 阶段 nofm 15.11/15.13/15.05 对 fastmath 14.94/14.37/15.02，日志 `/tmp/ev_perf_c1/cmp/c1nofm_A`、`c1fm_A`）。这条已经写进 `EdgeVisor/Makefile` 第 109–115 行的注释，别删。
 - 不全局加 `-DNDEBUG`。全局关掉会让单元测试的 `assert()` 失效，`make check` 就白跑。Makefile 里也是按这个写的。
-- `DLLAMA_DEFERRED_PROFILE` 的延迟收集**必须**按 `c92796e` 那样门控在尾段采样路径上（`args->lastStageSampling` + 有网络 + 尾段落在 worker 上的 ≥2 段 plan）。lss=0 时尾段用 `SYNC_NODE_SLICES_EXCEPT_ROOT` 直接怼原始 LG float 数组，没有 `LlmWorkerFrameHeader`，延迟一个 token 收 profile 会把上一轮的 PROFILE 帧当 header 读，流直接错位成 “Invalid worker frame magic or version”。别把门控拆掉。
+- `EDGEVISOR_DEFERRED_PROFILE` 的延迟收集**必须**按 `c92796e` 那样门控在尾段采样路径上（`args->lastStageSampling` + 有网络 + 尾段落在 worker 上的 ≥2 段 plan）。lss=0 时尾段用 `SYNC_NODE_SLICES_EXCEPT_ROOT` 直接怼原始 LG float 数组，没有 `LlmWorkerFrameHeader`，延迟一个 token 收 profile 会把上一轮的 PROFILE 帧当 header 读，流直接错位成 “Invalid worker frame magic or version”。别把门控拆掉。
 - Algo2 的 `e2eByToken` 必须挂在 `ControllerRuntime` 上（`c92796e`），不能退回 `stepAlgo2()` 里的局部 map。延迟路径下 `algo2NoteTokenComplete(t)` 早于 t 的 PROFILE 帧提交，局部 map 会丢完成事件，决策报 `metric=missing`，实测掉 52% 吞吐。
 - 这轮只做 CUDA 路径。CPU 和 Vulkan 的执行语义没动：`NnDevice` 上新加的 `beginForward/endForward/syncPipeToHost/invalidatePipeOnDevice/setLayerPerfSegments` 都是空默认实现。Vulkan 侧只验证了「还能跑、结果对」，没有为 Vulkan 做专门优化。
-- 边缘集群的冗余覆盖是配置约束不是 bug：`--runtime-redundant-boundary-layers N` 只覆盖 `2N` 层。stage 有 4 层时 N=2 会留 `suffix=0`，掉线按 `partial-cover` 直接中止；要 4/4 全覆盖就钉 `DLLAMA_REDUNDANT_BOUNDARY_DEPTHS=2,2;2,2;2,2;2,2`，**不要**用 `DLLAMA_REDUNDANT_BOUNDARY_BUDGET`（没接进 plan 构造，root 与 worker 会 desync，报 `Cannot locate op name='block_matmul_q'`）。另外显式传 `--runtime-redundant-boundary-layers` 会把 explicit-boundary-layers 打开并清掉已钉的 depths，两者别同时用。
+- 边缘集群的冗余覆盖是配置约束不是 bug：`--runtime-redundant-boundary-layers N` 只覆盖 `2N` 层。stage 有 4 层时 N=2 会留 `suffix=0`，掉线按 `partial-cover` 直接中止；要 4/4 全覆盖就钉 `EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS=2,2;2,2;2,2;2,2`，**不要**用 `EDGEVISOR_REDUNDANT_BOUNDARY_BUDGET`（没接进 plan 构造，root 与 worker 会 desync，报 `Cannot locate op name='block_matmul_q'`）。另外显式传 `--runtime-redundant-boundary-layers` 会把 explicit-boundary-layers 打开并清掉已钉的 depths，两者别同时用。
 - 5 机配比 `--ratios '1@8*1@6*1@4*1@5*1@5'`（合计 28 层）是在 8 个候选里实测最快的（12.00 tok/s，次优 `1@8*1@6*1@6*1@5*1@3` 11.45）。依据是 rog 的 Vulkan stage 0 每层约 2.2 ms 最慢，所以它给 8 层；nano 每层约 2.6 ms，给 4 层。
 - `rog` 上 RTX 3060 的 Vulkan 索引是 **1**，不是 0：`vulkaninfo --summary` 里 GPU0 是 AMD Radeon（RADV RENOIR，核显），GPU1 才是 RTX 3060。核显必须避开。四台 Jetson 的 Tegra GPU 都是索引 0。Vulkan 二进制运行时需要 `EdgeVisor/src/nn/vulkan/*.spv`（24 个 shader），必须在含该目录的 cwd 下执行。
-- 二进制名必须正好叫 `dllama`，因为边缘机上的清理是 `pkill -9 -x dllama`；名字长了 `comm` 会截断，孤儿进程杀不掉。
+- 二进制名必须正好叫 `edgevisor`，因为边缘机上的清理是 `pkill -9 -x edgevisor`；名字长了 `comm` 会截断，孤儿进程杀不掉。
 
 ### 八个提交（都在 `657900f` 之后，按时间顺序）
 
@@ -57,7 +57,7 @@
 2. `b4d0a12` perf(cuda): dp4a warp-tiled Q80xQ40 matmul and parallel reduction kernels
    只改 `EdgeVisor/src/nn/nn-cuda.cu`。主 kernel `matmulQ80Q40LargeK` 改成一次 warp 算一行加 warp shuffle 归约，加 `__dp4a` 快路（q40 的 nibble 保持 0..15，每 block 减一次 `8*sum(x)`，与旧的 `(w-8)*x` 整数等价），x 组整体进 shared memory，grid 按行组乘以 batch 排。`q80Quantize` 改成一 warp 一个 32 元素块，`invRms` 改成一 block 一列，`multiheadAttScore` 把 query 切片缓存进 shared memory。`NnBlockQ40`(18B)/`NnBlockQ80`(34B) 只保证 2 字节对齐，所以 `qs` 按 uint16 读再拼 uint32，绝不 cast 成 `int*`。
 3. `6e21fa8` perf(cuda): four rows per warp in Q80xQ40 Large-K and gate logits stats
-   `EdgeVisor/src/nn/nn-cuda.cu`、`EdgeVisor/src/dllama.cpp`。同一个 kernel 改成每 warp 四行（block 32 行，grid 行维缩 4×），x 侧一份 shared memory 被四行复用，每行保留独立累加器，结果与一行一版逐位相同；尾部 warp 用 `rowCount` 收口，非活跃行的权重指针夹到本 warp 最后一行，避免越界。`dllama.cpp` 新增 `logitsStatsNeeded()`，128256 个 logits 的扫描只在 `DLLAMA_DEBUG_TOPK_LOGITS`、`productLogLevel() >= 1`、或 root logits 分片导出时才做。
+   `EdgeVisor/src/nn/nn-cuda.cu`、`EdgeVisor/src/edgevisor.cpp`。同一个 kernel 改成每 warp 四行（block 32 行，grid 行维缩 4×），x 侧一份 shared memory 被四行复用，每行保留独立累加器，结果与一行一版逐位相同；尾部 warp 用 `rowCount` 收口，非活跃行的权重指针夹到本 warp 最后一行，避免越界。`edgevisor.cpp` 新增 `logitsStatsNeeded()`，128256 个 logits 的扫描只在 `EDGEVISOR_DEBUG_TOPK_LOGITS`、`productLogLevel() >= 1`、或 root logits 分片导出时才做。
 4. `1a66663` perf(cuda): keep pipes resident on the GPU for the whole single-device forward
    `EdgeVisor/src/nn/nn-cuda.cu`、`EdgeVisor/src/nn/nn-cuda.hpp`、`EdgeVisor/src/nn/nn-executor.cpp`、`EdgeVisor/src/nn/nn-executor.hpp`。单设备（一台顶一个 stage）时，整段前向的 pipe 留在显存：段之间不再下到 host 再上传；只有 PP 发送、logits 汇聚、多节点 slice 交换这几处会 `syncPipeToHost`，其余 pipe 标成 device-dirty；每个 sync 之后只失效它可能写过的 pipe。中间段因此省掉整条 PCIe 往返和每段一次的 `cudaStreamSynchronize`。这一条也是边缘 5 机拿到 2.7–3.0× 的主因。
 
@@ -66,18 +66,18 @@
 5. `5288900` perf: isolate shadow KV scratch buffers and run root_wait shadow async
    `EdgeVisor/src/llm.cpp`、`EdgeVisor/src/nn/nn-executor.cpp`、`EdgeVisor/src/nn/nn-executor.hpp`。影子 KV 原来和主计算共用 scratch，只能等所有 executor 线程返回后才跑。现在给冗余 pass 独立 buffer，再交给 helper 线程在 PP `root_wait` 那段死时间里跑；没有 root-wait 步的节点仍走 forward 后的 drain 兜底，`forward(deferBubbleShadow)` 让尾段在 logits D2H 已发布后自己收尾 drain。
 6. `dd5eb16` perf: split last-stage sampling and defer profile collection
-   `EdgeVisor/src/app.cpp`、`EdgeVisor/src/app.hpp`、`EdgeVisor/src/dllama.cpp`。尾段原来要跑完整个 forward 才采样；root 原来在 `forward()` 之后立刻排空每个 worker 的 PROFILE 帧，两处都在每 token 的关键路径上。现在尾段在 logits D2H 一落地就采样并先发 `SAMPLED_TOKEN`，再跑 `runDeferredBubbleShadowKv()` 和 profile 包；root 侧 profile 排空延迟一个 token（`DLLAMA_DEFERRED_PROFILE`，默认开），`forward()` 收 `deferProfileCollect` 并用 `didLastForwardCollectProfile()` 回报本 token 有没有真排空，保证 failover 路径正确；计账搬进 `recordProfileForToken()`，循环末尾有 flush，最后一个 token 不会丢。
+   `EdgeVisor/src/app.cpp`、`EdgeVisor/src/app.hpp`、`EdgeVisor/src/edgevisor.cpp`。尾段原来要跑完整个 forward 才采样；root 原来在 `forward()` 之后立刻排空每个 worker 的 PROFILE 帧，两处都在每 token 的关键路径上。现在尾段在 logits D2H 一落地就采样并先发 `SAMPLED_TOKEN`，再跑 `runDeferredBubbleShadowKv()` 和 profile 包；root 侧 profile 排空延迟一个 token（`EDGEVISOR_DEFERRED_PROFILE`，默认开），`forward()` 收 `deferProfileCollect` 并用 `didLastForwardCollectProfile()` 回报本 token 有没有真排空，保证 failover 路径正确；计账搬进 `recordProfileForToken()`，循环末尾有 flush，最后一个 token 不会丢。
 7. `c92796e` fix: gate deferred profile on last-stage sampling and persist Algo2 e2e map
-   `EdgeVisor/src/dllama.cpp`、`EdgeVisor/src/dynamic/dynamic_tpot.cpp`。修 `dd5eb16` 带出的两个回归：(a) lss=0 时延迟排空会让上一 token 的 PROFILE/STAGE_SPEED 帧顶着原始 logits 传输，root 把帧头当 logits 读，流错位；现在延迟只在 `args->lastStageSampling` + 有网络 + 尾段在 worker 上的 ≥2 段 plan 下生效，Arm A/B（lss=0）从 3/3 崩变成全清。(b) `stepAlgo2()` 的 token→interval map 是局部变量，延迟路径下完成事件先于 PROFILE 提交，观测找不到 interval 就报 `metric=missing`；现在挂到 `ControllerRuntime::e2eByToken`，消费即删、按 1024 条最旧优先裁剪，只有 controller 线程碰它。
+   `EdgeVisor/src/edgevisor.cpp`、`EdgeVisor/src/dynamic/dynamic_tpot.cpp`。修 `dd5eb16` 带出的两个回归：(a) lss=0 时延迟排空会让上一 token 的 PROFILE/STAGE_SPEED 帧顶着原始 logits 传输，root 把帧头当 logits 读，流错位；现在延迟只在 `args->lastStageSampling` + 有网络 + 尾段在 worker 上的 ≥2 段 plan 下生效，Arm A/B（lss=0）从 3/3 崩变成全清。(b) `stepAlgo2()` 的 token→interval map 是局部变量，延迟路径下完成事件先于 PROFILE 提交，观测找不到 interval 就报 `metric=missing`；现在挂到 `ControllerRuntime::e2eByToken`，消费即删、按 1024 条最旧优先裁剪，只有 controller 线程碰它。
 8. `919e4df` Update handsoff for 4xT4 CUDA inference speedups — 只改 `handsoff.md`，第 4 轮收尾时的交接文档。
 
 ### 实测结果（4×T4，同机交替跑）
 
-- 第 5 轮定稿脚本 `/tmp/ev_r5_fix1_arms.sh <rounds>`（Arm A/B/C）与 `/tmp/ev_r5_fix1_bmore.sh`（B 臂补测），日志 `/tmp/ev_r5_t4_verify/fix1/summary.txt`、`fix1_Bmore/summary.txt`。公共配置：`--ratios '1@7*1@7*1@7*1@7'`、`--nthreads 1`、`--steps 64`、`--temperature 0 --seed 1`、`--benchmark --buffer-float-type q80 --max-seq-len 512`、`--prompt "What is 2+2? Answer briefly."`。A = 纯 PP；B = Shadow KV + migration + `--runtime-redundant-boundary-layers 3`（lss=0）；C = B + `DLLAMA_LAST_STAGE_SAMPLING=1`。
+- 第 5 轮定稿脚本 `/tmp/ev_r5_fix1_arms.sh <rounds>`（Arm A/B/C）与 `/tmp/ev_r5_fix1_bmore.sh`（B 臂补测），日志 `/tmp/ev_r5_t4_verify/fix1/summary.txt`、`fix1_Bmore/summary.txt`。公共配置：`--ratios '1@7*1@7*1@7*1@7'`、`--nthreads 1`、`--steps 64`、`--temperature 0 --seed 1`、`--benchmark --buffer-float-type q80 --max-seq-len 512`、`--prompt "What is 2+2? Answer briefly."`。A = 纯 PP；B = Shadow KV + migration + `--runtime-redundant-boundary-layers 3`（lss=0）；C = B + `EDGEVISOR_LAST_STAGE_SAMPLING=1`。
 - 数值（tok/s）：A 49.72 / 52.39，B 53.15 / 52.13，C 53.39 / 50.94；B 臂另补 4 次 51.26 / 53.76 / 47.34 / 53.87。对照第 4 轮的 c4（A 51.73、B 49.81），第 5 轮在 4×T4 上不掉速、B 臂略有上升。**4×T4 不是第 5 轮的主战场**，第 5 轮的收益主要在 5 机边缘集群上体现（见下一节）。
 - 文本一致性：上面全部 run 的 `txt.md5` 都是 `fa945fe6b651db1da18c55e91978bd24`，与本轮 base 逐字节相同。第 5 轮改动没有动采样分布。
 - `nn-cuda-test`：133/133 全 `ok`，rc=0（`/tmp/ev_r5_t4_verify/nn-cuda-test.log`，本次又在 HEAD 上复跑到同一结果 `/tmp/ev_r5_nnct_final.log`）。绝大多数 `max_abs_error=0`，少数归约项是 2.98e-08 / 5.96e-08 / 1.19e-07 的浮点噪声。
-- `make check`：`CHECK_TESTS` 共 10 项，其中 9 项常规项全过（`algo2 checks passed`、`dynamic_tpot_algorithm PASS`、`device profile checks passed`、`failover gate checks passed` 等）；第 10 项 `pp-failover-network-test` 不能跟着默认跑，默认 TCP 超时下它会挂在 `testBufferedSendNoAnswer` 的 `assert(elapsed >= 400 && elapsed < 2500)`（`/tmp/ev_make_check.log` 就是这次失败），要带 `DLLAMA_TCP_USER_TIMEOUT_MS=1000 ./pp-failover-network-test` 单独跑，末尾是 `PP recovery, buffered tail frames, bounded timeouts, protocol rejection and shadow KV passed`。带该环境变量时整个 `make check`（含 `reserved-join-test`、`delayed-sample-worker-test`）一次通过，日志 `/tmp/ev_r5_check_final.log`。
+- `make check`：`CHECK_TESTS` 共 10 项，其中 9 项常规项全过（`algo2 checks passed`、`dynamic_tpot_algorithm PASS`、`device profile checks passed`、`failover gate checks passed` 等）；第 10 项 `pp-failover-network-test` 不能跟着默认跑，默认 TCP 超时下它会挂在 `testBufferedSendNoAnswer` 的 `assert(elapsed >= 400 && elapsed < 2500)`（`/tmp/ev_make_check.log` 就是这次失败），要带 `EDGEVISOR_TCP_USER_TIMEOUT_MS=1000 ./pp-failover-network-test` 单独跑，末尾是 `PP recovery, buffered tail frames, bounded timeouts, protocol rejection and shadow KV passed`。带该环境变量时整个 `make check`（含 `reserved-join-test`、`delayed-sample-worker-test`）一次通过，日志 `/tmp/ev_r5_check_final.log`。
 - Algo2 恢复：`/tmp/ev_r5_algo2_fix.log`。`DEFERRED_PROFILE=1` 下 `5.85 tok/s (170.84 ms/tok)`、`metric_missing=0`、`migration_issued=1`、`lss_auto=1`；修复前是 `2.60 tok/s`、`metric_missing=105`（`/tmp/ev_r5_t4_verify/algo2_def/def1_a/tpot.log`）。另一轮 `def1_b` 5.84、`def0_a` 5.94，三条都是 rc=0。即延迟 profile 现在不再饿死控制器。
 - 4×T4 掉线重入：`/tmp/ev_r5_t4_verify/rejoin_out.txt`。杀 w1 再拉起，`[failover] split deadNode=1 layers=[8,12) prefix=4 suffix=0`、`[pool] rejoining ... at pos=40`、`catch-up ... seal=1`、`node=1 rejoined stage=1 layers=[8,12) kv through 50`，跑到 `[e1-end] pos=500`，`5.34 tok/s (187.12 ms/tok)`，root 退出码 0。输出仍是英文，没有回到乱码。
 
@@ -105,7 +105,7 @@
   ```
 
   两个邻居都确认接管（`nx1` myNode=1 拿 `[14,16)`，`nano1` myNode=3 拿 `[16,18)`）。8 s 停机期间推理继续解码，没有 stall、没有重启、root 没退出。重新拉起后 `[pool] rejoining ... at pos=120`，KV 按 16 位置一块追平到 `kv=[0,138) seal=1`，`node=2 rejoined stage=2 layers=[14,18) kv through 138`，最后 `[e1-end] pos=200`、`tokens/s: 9.23 (108.30 ms/tok)`、root exit=0，驱动记 `took_over=1`。
-- 5 机 CPU 校验（c92796e）：`DLLAMA_CUDA=0 DLLAMA_VULKAN=0` 在 nx1 上编好发给其余 Jetson，rog + 4 Jetson 全 `--backend cpu`、64 步，`tokens/s: 1.87 (534.36 ms/tok)`，rc=0（`/tmp/ev_r5_edge_verify/gpu_5dev/cpu1.out`）。约比 GPU 混跑慢 7×，但它证明同一套 plan 和重入管线在没有任何加速器时也成立。
+- 5 机 CPU 校验（c92796e）：`EDGEVISOR_CUDA=0 EDGEVISOR_VULKAN=0` 在 nx1 上编好发给其余 Jetson，rog + 4 Jetson 全 `--backend cpu`、64 步，`tokens/s: 1.87 (534.36 ms/tok)`，rc=0（`/tmp/ev_r5_edge_verify/gpu_5dev/cpu1.out`）。约比 GPU 混跑慢 7×，但它证明同一套 plan 和重入管线在没有任何加速器时也成立。
 
 ### 实测结果（4×Jetson CUDA，无 rog）
 
@@ -121,9 +121,9 @@
 
 ### 机器上还留着什么
 
-- 全部空闲，本轮已确认：`yhs1` 四张 T4 都是 0 MiB / 0%，`nvidia-smi --query-compute-apps` 为空。`rog`、`nx1`、`nx2`、`nano1`、`nano2` 上 `pgrep -x dllama` 全空。
-- 五台边缘机上唯一在听的是 `:9993`，那是 `zerotier-one.service`（`ss -ltne` 显示 `cgroup:/system.slice/zerotier-one.service`），不是 dllama，别去杀。
-- `EdgeVisor/dllama` 还在（2.6 MB，md5 `a8f527b968e62e5514302d70f560a1bc`），是 HEAD 编出来的 CUDA 版；被 `EdgeVisor/.gitignore:17` 的 `/dllama` 忽略，不会进提交。
+- 全部空闲，本轮已确认：`yhs1` 四张 T4 都是 0 MiB / 0%，`nvidia-smi --query-compute-apps` 为空。`rog`、`nx1`、`nx2`、`nano1`、`nano2` 上 `pgrep -x edgevisor` 全空。
+- 五台边缘机上唯一在听的是 `:9993`，那是 `zerotier-one.service`（`ss -ltne` 显示 `cgroup:/system.slice/zerotier-one.service`），不是 edgevisor，别去杀。
+- `EdgeVisor/edgevisor` 还在（2.6 MB，md5 `a8f527b968e62e5514302d70f560a1bc`），是 HEAD 编出来的 CUDA 版；被 `EdgeVisor/.gitignore:17` 的 `/edgevisor` 忽略，不会进提交。
 - **未跟踪、绝对不要动**：`experiments/algo2/logs/t4_rejoin/`。`git status --short` 至今只有这一行。
 - `/tmp` 下不要删的产物：`/tmp/ev_r5_edge_verify/`（5.5 MB，含 `SUMMARY.md`、`REPORT.md`、`gpu_5dev/`、`gpu_5dev_rejoin/`、`logs/5node/`、`logs/ev_cmp_out/`、`src/` 里两版源码 tar）、`/tmp/ev_r5_t4_verify/`（4.4 MB，第 5 轮 4×T4 全部 run）、`/tmp/ev_perf_base`、`/tmp/ev_perf_c1`（17M，含 fast-math 对照）、`/tmp/ev_perf_c2`、`/tmp/ev_perf_c3`、`/tmp/ev_perf_c4`（9.1 MB，第 4 轮全部日志）。脚本：`/tmp/ev_c4_cmp.sh`、`/tmp/ev_r5_fix1_arms.sh`、`/tmp/ev_r5_fix1_bmore.sh`、`/tmp/ev_r5_algo2_fix.sh`、`/tmp/ev_r5_bench.sh`、`/tmp/ev_r5_cmp.sh`、`/tmp/ev_r5_dropout.sh`、`/tmp/ev_r5_summary.py`、`/tmp/ev_final_table.py`、`/tmp/ev_md5.py`、`/tmp/ev_textcmp.py`。
 - 原有的还在：`/tmp/ev_matrix_v2/`（1.2G，8B 矩阵，已跑完，别重开）、`/tmp/ev_e1_deprecated/`（74M）、`/tmp/ev_st3b/`（7.3M）。以及 `/home/byh/B01/baseline`（分支 `feat/remp-pp`，带未跟踪的 `_harness/dynapipe_ab.py`、`_harness/dynapipe_sampling.py`）。都不要删，也不要从这边顺手提交。
@@ -145,7 +145,7 @@
 - 引擎是 C++11，编译带 `-Werror`。
 - 影子 KV 开着时线程数必须是 1，否则直接拒绝启动。
 - 这台机器上的对比一律交替跑：同一个脚本里 base/r5 轮转，不要单跑一遍就报倍速。T4 有 clock drift，单次对比会差 10% 以上。边缘 5 机同样要交替，且每个 run 都要过有效性门（rc=0、跑到 `[e1-end] pos=64`、四个 worker 都加载权重、日志里没有 `deactivated`/`peer offline`）。
-- 5 机上有别的会话在并行作业（`nx2` 上的 `ev_r5_w_covchk_*`、`ev_r5_selfkill_rejoin{1..4}.log` 等），它的清理按名字杀 `dllama` 不管端口，会把别人的 run 打断（rc=137 或 worker 半路消失）。看到诡异失败先怀疑这个，重跑前把失败目录清掉，别把废数据留在表里。
+- 5 机上有别的会话在并行作业（`nx2` 上的 `ev_r5_w_covchk_*`、`ev_r5_selfkill_rejoin{1..4}.log` 等），它的清理按名字杀 `edgevisor` 不管端口，会把别人的 run 打断（rc=137 或 worker 半路消失）。看到诡异失败先怀疑这个，重跑前把失败目录清掉，别把废数据留在表里。
 
 ### 相关 commit
 
@@ -154,7 +154,7 @@
 - 第 5 轮：`5288900`、`dd5eb16`、`c92796e`（当前 HEAD）。
 - 文档：`919e4df`（第 4 轮 handsoff）。
 - 8 个 commit 全在 `perf/t4-cuda-speed` 上，都没推送。
-- 改动面（不含 `handsoff.md`）：11 个文件，+1941/−299。即 `EdgeVisor/Makefile`、`EdgeVisor/src/app.cpp`、`EdgeVisor/src/app.hpp`、`EdgeVisor/src/dllama.cpp`、`EdgeVisor/src/dynamic/dynamic_tpot.cpp`、`EdgeVisor/src/llm.cpp`、`EdgeVisor/src/nn/nn-cuda.cu`、`EdgeVisor/src/nn/nn-cuda.hpp`、`EdgeVisor/src/nn/nn-executor.cpp`、`EdgeVisor/src/nn/nn-executor.hpp`、`EdgeVisor/src/nn/nn-network.cpp`。其中第 5 轮新增/改动的是 `app.cpp`、`app.hpp`、`dllama.cpp`、`dynamic/dynamic_tpot.cpp`、`llm.cpp`、`nn/nn-executor.cpp`、`nn/nn-executor.hpp` 这 7 个。
+- 改动面（不含 `handsoff.md`）：11 个文件，+1941/−299。即 `EdgeVisor/Makefile`、`EdgeVisor/src/app.cpp`、`EdgeVisor/src/app.hpp`、`EdgeVisor/src/edgevisor.cpp`、`EdgeVisor/src/dynamic/dynamic_tpot.cpp`、`EdgeVisor/src/llm.cpp`、`EdgeVisor/src/nn/nn-cuda.cu`、`EdgeVisor/src/nn/nn-cuda.hpp`、`EdgeVisor/src/nn/nn-executor.cpp`、`EdgeVisor/src/nn/nn-executor.hpp`、`EdgeVisor/src/nn/nn-network.cpp`。其中第 5 轮新增/改动的是 `app.cpp`、`app.hpp`、`edgevisor.cpp`、`dynamic/dynamic_tpot.cpp`、`llm.cpp`、`nn/nn-executor.cpp`、`nn/nn-executor.hpp` 这 7 个。
 - 这次交接只改 `handsoff.md`，源码没有新改动。
 
 # 附录：纯推理速度对比复现指南（T4 单机 / 5 机边缘）
@@ -168,7 +168,7 @@
 | `base` | `657900f` | 优化前 `main`（`Record the merged takeover fix...`） |
 | `r5` | `6699276` | 优化后当前 `main`。相对 `c92796e` 只多改了 `EdgeVisor/src/test/test_pp_failover_network.cpp` 和 `handsoff.md`，**推理路径逐字节一致**，因此正文里所有 `c92796e` 的实测数值可以直接对照 |
 
-目录约定：二进制统一放 `…/bins/<rev>/dllama`，**文件名必须正好是 `dllama`**（`comm` 只有 15 字符，名字长了 `pkill -9 -x dllama` 会漏杀，留下孤儿 worker 占显存）。两版靠**目录**区分，不靠文件名区分。
+目录约定：二进制统一放 `…/bins/<rev>/edgevisor`，**文件名必须正好是 `edgevisor`**（`comm` 只有 15 字符，名字长了 `pkill -9 -x edgevisor` 会漏杀，留下孤儿 worker 占显存）。两版靠**目录**区分，不靠文件名区分。
 
 ---
 
@@ -192,13 +192,13 @@ for rev in 657900f 6699276; do
   git worktree prune
   git worktree add --detach "/tmp/ev_speed_build/$rev" "$rev"
   # T4 是 sm_75；CUDA_ARCHS 留默认 auto 就会自动探测到 sm_75
-  make -C "/tmp/ev_speed_build/$rev/EdgeVisor" -j 12 dllama \
-       DLLAMA_CUDA=1 DLLAMA_VULKAN=0 > "/tmp/ev_speed_build/$rev.build.log" 2>&1 \
+  make -C "/tmp/ev_speed_build/$rev/EdgeVisor" -j 12 edgevisor \
+       EDGEVISOR_CUDA=1 EDGEVISOR_VULKAN=0 > "/tmp/ev_speed_build/$rev.build.log" 2>&1 \
     || { echo "BUILD FAIL $rev"; tail -20 "/tmp/ev_speed_build/$rev.build.log"; break; }
   mkdir -p "/tmp/ev_speed_bins/$tag"
-  cp -f "/tmp/ev_speed_build/$rev/EdgeVisor/dllama" "/tmp/ev_speed_bins/$tag/dllama"
-  chmod +x "/tmp/ev_speed_bins/$tag/dllama"
-  md5sum "/tmp/ev_speed_bins/$tag/dllama"
+  cp -f "/tmp/ev_speed_build/$rev/EdgeVisor/edgevisor" "/tmp/ev_speed_bins/$tag/edgevisor"
+  chmod +x "/tmp/ev_speed_bins/$tag/edgevisor"
+  md5sum "/tmp/ev_speed_bins/$tag/edgevisor"
 done
 
 # 清掉 worktree（编译树 ~几百 MB，别留在 /home）
@@ -210,23 +210,23 @@ for rev in 657900f 6699276; do git worktree remove --force "/tmp/ev_speed_build/
 ```bash
 git archive --format=tar.gz -o /tmp/ev_speed_build/base.tar.gz 657900f
 git archive --format=tar.gz -o /tmp/ev_speed_build/r5.tar.gz   6699276
-# 解包后同样 make -C <dir>/EdgeVisor -j 12 dllama DLLAMA_CUDA=1 DLLAMA_VULKAN=0
+# 解包后同样 make -C <dir>/EdgeVisor -j 12 edgevisor EDGEVISOR_CUDA=1 EDGEVISOR_VULKAN=0
 ```
 
 CUDA 版不依赖 `src/nn/vulkan/*.spv`，随便哪个 cwd 都能跑；只有 Vulkan 版需要（见章节二）。
 
 ## 1.2 单次运行（手工一条命令照抄）
 
-公共环境变量（两个版本都一样，`DLLAMA_IGNORE_EOS=1` 让 64 步不被 EOS 提前截断）：
+公共环境变量（两个版本都一样，`EDGEVISOR_IGNORE_EOS=1` 让 64 步不被 EOS 提前截断）：
 
 ```bash
-export DLLAMA_IGNORE_EOS=1
-export DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3
-export DLLAMA_TCP_USER_TIMEOUT_MS=4000
+export EDGEVISOR_IGNORE_EOS=1
+export EDGEVISOR_TCP_KEEPIDLE_S=2 EDGEVISOR_TCP_KEEPINTVL_S=1 EDGEVISOR_TCP_KEEPCNT=3
+export EDGEVISOR_TCP_USER_TIMEOUT_MS=4000
 
-BIN=/tmp/ev_speed_bins/r5/dllama          # base 用 /tmp/ev_speed_bins/base/dllama
-MODEL=/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
-TOK=/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
+BIN=/tmp/ev_speed_bins/r5/edgevisor          # base 用 /tmp/ev_speed_bins/base/edgevisor
+MODEL=/home/byh/B01/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m
+TOK=/home/byh/B01/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t
 PROMPT="What is 2+2? Answer briefly."
 ```
 
@@ -267,7 +267,7 @@ stdbuf -oL -eL "$BIN" inference \
 tokens/s: 49.72 (20.11 ms/tok)
 ```
 
-清理：`pkill -f -- '--port 29611'`（29612 / 29613 同理），或直接 `pkill -9 -x dllama`。
+清理：`pkill -f -- '--port 29611'`（29612 / 29613 同理），或直接 `pkill -9 -x edgevisor`。
 
 ## 1.3 3 轮交错对比脚本（直接跑）
 
@@ -281,15 +281,15 @@ set -u
 ROUNDS="${1:-3}"
 BINS=/tmp/ev_speed_bins
 OUT=/tmp/ev_speed_t4
-MODEL=/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
-TOK=/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
+MODEL=/home/byh/B01/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m
+TOK=/home/byh/B01/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t
 P1=29611; P2=29612; P3=29613
 PROMPT="What is 2+2? Answer briefly."
 mkdir -p "$OUT"; : > "$OUT/summary.txt"
 
-export DLLAMA_IGNORE_EOS=1
-export DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3
-export DLLAMA_TCP_USER_TIMEOUT_MS=4000
+export EDGEVISOR_IGNORE_EOS=1
+export EDGEVISOR_TCP_KEEPIDLE_S=2 EDGEVISOR_TCP_KEEPINTVL_S=1 EDGEVISOR_TCP_KEEPCNT=3
+export EDGEVISOR_TCP_USER_TIMEOUT_MS=4000
 
 cleanup() {
   for p in "$P1" "$P2" "$P3"; do pkill -f -- "--port $p" >/dev/null 2>&1 || true; done
@@ -297,7 +297,7 @@ cleanup() {
 }
 
 run_one() {   # run_one <base|r5> <round>
-  local tag="$1" r="$2" bin="$BINS/$1/dllama" out="$OUT/${1}_r$2"
+  local tag="$1" r="$2" bin="$BINS/$1/edgevisor" out="$OUT/${1}_r$2"
   rm -rf "$out"; mkdir -p "$out"; cleanup
 
   stdbuf -oL -eL "$bin" worker --backend cuda --port "$P1" --nthreads 1 --gpu-index 1 >"$out/w1.log" 2>&1 &
@@ -353,7 +353,7 @@ echo "median base=${B} tok/s  r5=${R} tok/s  speedup=$(awk -v b="$B" -v r="$R" '
 
 - 优化前基线来自第 4 轮 `/tmp/ev_perf_base/armA`（16.87 / 16.03，中位 16.32）；优化后来自 `/tmp/ev_r5_t4_verify/fix1/A` 两轮 49.72 / 52.39（同为纯 PP、lss=0），另加第 4 轮 c4 的 51.73。
 - **文本一致性**：4×T4 上两版输出逐字节相同，`txt.md5` 都应是 `fa945fe6b651db1da18c55e91978bd24`。这是 T4 侧的强校验——如果 r5 跑出别的 md5，说明编译或参数抄错了，不要当成“优化改变了输出”。
-- 可选追加 `DLLAMA_LAST_STAGE_SAMPLING=1`（尾段采样下沉）后 r5 约 50.9–53.4 tok/s（`/tmp/ev_r5_t4_verify/fix1/C`）。4×T4 上这一项收益很小，正文已说明第 5 轮的主战场在边缘集群。
+- 可选追加 `EDGEVISOR_LAST_STAGE_SAMPLING=1`（尾段采样下沉）后 r5 约 50.9–53.4 tok/s（`/tmp/ev_r5_t4_verify/fix1/C`）。4×T4 上这一项收益很小，正文已说明第 5 轮的主战场在边缘集群。
 
 ---
 
@@ -363,13 +363,13 @@ echo "median base=${B} tok/s  r5=${R} tok/s  speedup=$(awk -v b="$B" -v r="$R" '
 
 | 节点 | 角色 | stage | 硬件 | 后端 | `--gpu-index` | IP | 模型路径 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `rog` | Root | 0 | RTX 3060 Laptop 6 GB + AMD 核显 | Vulkan | **1** | `10.47.72.162`（ssh 别名 `rog`，用户 `cc`） | `/home/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m` |
+| `rog` | Root | 0 | RTX 3060 Laptop 6 GB + AMD 核显 | Vulkan | **1** | `10.47.72.162`（ssh 别名 `rog`，用户 `cc`） | `/home/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m` |
 | `nx1` | Worker | 1 | Jetson Orin 15.6 GB | CUDA sm_87 | 0 | `192.168.137.13` | `/home/jetson/cc/models/…` |
 | `nx2` | Worker | 2 | Jetson Orin 15.6 GB | CUDA sm_87 | 0 | `192.168.137.15` | 同上 |
 | `nano1` | Worker | 3 | Jetson Orin 7.6 GB | CUDA sm_87 | 0 | `192.168.137.18` | 同上 |
 | `nano2` | Worker | 4 | Jetson Orin 7.6 GB | CUDA sm_87 | 0 | `192.168.137.16` | 同上 |
 
-tokenizer（rog 侧）：`/home/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t`，Jetson 侧在同一个 `/home/jetson/cc/models/…` 前缀下。
+tokenizer（rog 侧）：`/home/cc/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t`，Jetson 侧在同一个 `/home/jetson/cc/models/…` 前缀下。
 
 **必须记住的三条硬件约束：**
 
@@ -382,13 +382,13 @@ SSH 通道：`yhs1` 到 `rog` 走 `~/.ssh/config` 里的别名；`yhs1` 到四�
 
 ## 2.2 编译与分发
 
-二进制布局（**文件名必须是 `dllama`，靠目录区分版本**）：
+二进制布局（**文件名必须是 `edgevisor`，靠目录区分版本**）：
 
 ```
-rog:                          /tmp/ev_speed/bins/base/dllama   (Vulkan)
-                              /tmp/ev_speed/bins/r5/dllama     (Vulkan)
-nx1/nx2/nano1/nano2:          /tmp/ev_speed/bins/base/dllama   (CUDA sm_87)
-                              /tmp/ev_speed/bins/r5/dllama     (CUDA sm_87)
+rog:                          /tmp/ev_speed/bins/base/edgevisor   (Vulkan)
+                              /tmp/ev_speed/bins/r5/edgevisor     (Vulkan)
+nx1/nx2/nano1/nano2:          /tmp/ev_speed/bins/base/edgevisor   (CUDA sm_87)
+                              /tmp/ev_speed/bins/r5/edgevisor     (CUDA sm_87)
 rog:                          /tmp/ev_speed/run/src/nn/vulkan/*.spv   (root 的 cwd)
 ```
 
@@ -407,14 +407,14 @@ for rev in 657900f 6699276; do
   ssh rog "set -e
     rm -rf /tmp/ev_speed_build/$rev-vulkan && mkdir -p /tmp/ev_speed_build/$rev-vulkan
     tar xzf /tmp/edge-$rev.tar.gz -C /tmp/ev_speed_build/$rev-vulkan
-    make -C /tmp/ev_speed_build/$rev-vulkan/EdgeVisor dllama -j 8 \
-         DLLAMA_CUDA=0 DLLAMA_VULKAN=1 > /tmp/ev_speed_build/build-$rev-vulkan.log 2>&1
+    make -C /tmp/ev_speed_build/$rev-vulkan/EdgeVisor edgevisor -j 8 \
+         EDGEVISOR_CUDA=0 EDGEVISOR_VULKAN=1 > /tmp/ev_speed_build/build-$rev-vulkan.log 2>&1
     mkdir -p /tmp/ev_speed/bins/$tag
-    cp -f /tmp/ev_speed_build/$rev-vulkan/EdgeVisor/dllama /tmp/ev_speed/bins/$tag/dllama
-    chmod +x /tmp/ev_speed/bins/$tag/dllama
+    cp -f /tmp/ev_speed_build/$rev-vulkan/EdgeVisor/edgevisor /tmp/ev_speed/bins/$tag/edgevisor
+    chmod +x /tmp/ev_speed/bins/$tag/edgevisor
     mkdir -p /tmp/ev_speed/run/src/nn/vulkan
     cp -f /tmp/ev_speed_build/$rev-vulkan/EdgeVisor/src/nn/vulkan/*.spv /tmp/ev_speed/run/src/nn/vulkan/
-    md5sum /tmp/ev_speed/bins/$tag/dllama
+    md5sum /tmp/ev_speed/bins/$tag/edgevisor
     ls /tmp/ev_speed/run/src/nn/vulkan/*.spv | wc -l
     rm -rf /tmp/ev_speed_build/$rev-vulkan"
 done
@@ -433,12 +433,12 @@ for rev in 657900f 6699276; do
     export PATH=/usr/local/cuda/bin:\$PATH
     rm -rf /tmp/ev_speed_build/$rev-cuda && mkdir -p /tmp/ev_speed_build/$rev-cuda
     tar xzf /tmp/edge-$rev.tar.gz -C /tmp/ev_speed_build/$rev-cuda
-    make -C /tmp/ev_speed_build/$rev-cuda/EdgeVisor dllama -j 4 \
-         DLLAMA_CUDA=1 DLLAMA_VULKAN=0 CUDA_ARCHS=87 > /tmp/ev_speed_build/build-$rev-cuda.log 2>&1
+    make -C /tmp/ev_speed_build/$rev-cuda/EdgeVisor edgevisor -j 4 \
+         EDGEVISOR_CUDA=1 EDGEVISOR_VULKAN=0 CUDA_ARCHS=87 > /tmp/ev_speed_build/build-$rev-cuda.log 2>&1
     mkdir -p /tmp/ev_speed/bins/$tag
-    cp -f /tmp/ev_speed_build/$rev-cuda/EdgeVisor/dllama /tmp/ev_speed/bins/$tag/dllama
-    chmod +x /tmp/ev_speed/bins/$tag/dllama
-    md5sum /tmp/ev_speed/bins/$tag/dllama
+    cp -f /tmp/ev_speed_build/$rev-cuda/EdgeVisor/edgevisor /tmp/ev_speed/bins/$tag/edgevisor
+    chmod +x /tmp/ev_speed/bins/$tag/edgevisor
+    md5sum /tmp/ev_speed/bins/$tag/edgevisor
     rm -rf /tmp/ev_speed_build/$rev-cuda"
 done
 ```
@@ -452,16 +452,16 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_lab jetson@192.168.137.13 '
       ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 jetson@$ip \
         "mkdir -p /tmp/ev_speed/bins/$tag"
       scp -q -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
-        /tmp/ev_speed/bins/$tag/dllama "jetson@$ip:/tmp/ev_speed/bins/$tag/dllama"
+        /tmp/ev_speed/bins/$tag/edgevisor "jetson@$ip:/tmp/ev_speed/bins/$tag/edgevisor"
       ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 jetson@$ip \
-        "chmod +x /tmp/ev_speed/bins/$tag/dllama && md5sum /tmp/ev_speed/bins/$tag/dllama"
+        "chmod +x /tmp/ev_speed/bins/$tag/edgevisor && md5sum /tmp/ev_speed/bins/$tag/edgevisor"
     done
   done'
 ```
 
 历史参考 md5：`657900f` CUDA 版 `8e39d7bab462e98e56e010db393028a9`，`c92796e` CUDA 版 `c87a1f68da1340147eab14c470357498`。四台 Jetson 上同名二进制应逐字节相同。
 
-清理时必须 `pkill -9 -x dllama`（短名才能精确匹配）；不要用 `pkill -f dllama_…`，长名在 `comm` 里被截断到 15 字符，匹配不上就留下孤儿进程。
+清理时必须 `pkill -9 -x edgevisor`（短名才能精确匹配）；不要用 `pkill -f edgevisor_…`，长名在 `comm` 里被截断到 15 字符，匹配不上就留下孤儿进程。
 
 ## 2.3 单次运行（手工一条命令照抄）
 
@@ -473,13 +473,13 @@ cat > /tmp/ev_speed/root_bench.sh <<'EOF'
 # argv: <base|r5> <port> [ratios]
 set -u
 REV="$1"; PORT="$2"; RATIOS="${3:-1@8*1@6*1@4*1@5*1@5}"
-export DLLAMA_IGNORE_EOS=1
-export DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3
-export DLLAMA_TCP_USER_TIMEOUT_MS=5000
+export EDGEVISOR_IGNORE_EOS=1
+export EDGEVISOR_TCP_KEEPIDLE_S=2 EDGEVISOR_TCP_KEEPINTVL_S=1 EDGEVISOR_TCP_KEEPCNT=3
+export EDGEVISOR_TCP_USER_TIMEOUT_MS=5000
 cd /tmp/ev_speed/run || exit 4          # 必须是含 ./src/nn/vulkan/ 的目录
-exec stdbuf -oL -eL "/tmp/ev_speed/bins/$REV/dllama" inference \
-  --model /home/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m \
-  --tokenizer /home/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t \
+exec stdbuf -oL -eL "/tmp/ev_speed/bins/$REV/edgevisor" inference \
+  --model /home/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m \
+  --tokenizer /home/cc/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t \
   --prompt "What is 2+2? Answer briefly." \
   --steps 64 --temperature 0 --seed 1 \
   --benchmark --buffer-float-type q80 --max-seq-len 256 --nthreads 1 \
@@ -495,9 +495,9 @@ chmod +x /tmp/ev_speed/root_bench.sh
 ```bash
 for ip in 192.168.137.13 192.168.137.15 192.168.137.18 192.168.137.16; do
   ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_lab jetson@$ip \
-    "setsid nohup stdbuf -oL -eL /tmp/ev_speed/bins/r5/dllama worker \
+    "setsid nohup stdbuf -oL -eL /tmp/ev_speed/bins/r5/edgevisor worker \
        --port 18095 \
-       --model /home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m \
+       --model /home/jetson/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m \
        --nthreads 1 --backend cuda --gpu-index 0 \
        > /tmp/ev_speed/w.log 2>&1 < /dev/null &"
 done
@@ -516,15 +516,15 @@ ssh rog 'bash /tmp/ev_speed/root_bench.sh r5 18095' > /tmp/ev_speed/r5_once.log 
 
 ```bash
 for h in rog nx1 nx2 nano1 nano2; do
-  ssh -o BatchMode=yes "$h" 'pkill -9 -x dllama' >/dev/null 2>&1 || true
+  ssh -o BatchMode=yes "$h" 'pkill -9 -x edgevisor' >/dev/null 2>&1 || true
 done
 ```
 
-（`rog` 和四台 Jetson 的别名都在 `yhs1` 的 `~/.ssh/config` 里、各带自己的 `IdentityFile`，所以不用再写 IP 和 `-i`。如果你是在 `rog` 上手动清：`rog` 本机直接 `pkill -9 -x dllama`，Jetson 在那边的别名是 `lab-nx1` / `lab-nx2` / `lab-nano1` / `lab-nano2`。）
+（`rog` 和四台 Jetson 的别名都在 `yhs1` 的 `~/.ssh/config` 里、各带自己的 `IdentityFile`，所以不用再写 IP 和 `-i`。如果你是在 `rog` 上手动清：`rog` 本机直接 `pkill -9 -x edgevisor`，Jetson 在那边的别名是 `lab-nx1` / `lab-nx2` / `lab-nano1` / `lab-nano2`。）
 
 可选臂（在 root 和四台 worker 上同时加同名环境变量）：
 
-- `DLLAMA_LAST_STAGE_SAMPLING=1` —— 尾段采样下沉，就是正文的 E-C。
+- `EDGEVISOR_LAST_STAGE_SAMPLING=1` —— 尾段采样下沉，就是正文的 E-C。
 - 4×Jetson 纯 CUDA 变体（不用 `rog`）：`nx1` 当 root，ratios 改 `1@9*1@7*1@6*1@6`，root 用 `--backend cuda --gpu-index 0` 且 cwd 无所谓，worker 只留 `nx2/nano1/nano2` 三台。
 
 ## 2.4 3 轮交错对比脚本（直接跑）
@@ -534,7 +534,7 @@ done
 ```bash
 #!/usr/bin/env bash
 # 5 机边缘纯推理交错对比：base(657900f) vs r5(6699276)
-# 前置：5 台机器上已有 /tmp/ev_speed/bins/{base,r5}/dllama，rog 上有 root_bench.sh
+# 前置：5 台机器上已有 /tmp/ev_speed/bins/{base,r5}/edgevisor，rog 上有 root_bench.sh
 # 用法: bash /tmp/ev_speed/bench_edge.sh [rounds] [ratios]
 set -u
 ROUNDS="${1:-3}"
@@ -557,7 +557,7 @@ install_starter() {
 #!/bin/bash
 # argv: <base|r5> <port> <log> [ENV=VAL ...]
 set -u
-BIN="/tmp/ev_speed/bins/$1/dllama"; PORT=$2; LOG=$3; shift 3
+BIN="/tmp/ev_speed/bins/$1/edgevisor"; PORT=$2; LOG=$3; shift 3
 python3 - "$BIN" "$PORT" "$LOG" "$@" <<'PY'
 import os, sys
 b, p, l = sys.argv[1:4]
@@ -571,7 +571,7 @@ nul = os.open("/dev/null", os.O_RDONLY); os.dup2(nul, 0)
 env = dict(os.environ); env.update(extra)
 os.execve("/usr/bin/stdbuf", ["stdbuf", "-oL", "-eL", b, "worker",
     "--port", p,
-    "--model", "/home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m",
+    "--model", "/home/jetson/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m",
     "--nthreads", "1", "--backend", "cuda", "--gpu-index", "0"], env)
 PY
 STARTER
@@ -583,9 +583,9 @@ STARTER
 }
 
 stop_all() {
-  pkill -9 -x dllama >/dev/null 2>&1 || true
+  pkill -9 -x edgevisor >/dev/null 2>&1 || true
   local h
-  for h in $WORKERS; do js "$h" 'pkill -9 -x dllama >/dev/null 2>&1 || true' >/dev/null 2>&1 & done
+  for h in $WORKERS; do js "$h" 'pkill -9 -x edgevisor >/dev/null 2>&1 || true' >/dev/null 2>&1 & done
   wait >/dev/null 2>&1 || true
   sleep 4
 }
@@ -672,7 +672,7 @@ echo "median base=$B tok/s  r5=$R tok/s  speedup=$(awk -v b="$B" -v r="$R" 'BEGI
 
 ```bash
 # E-C：尾段采样下沉
-sed -i 's|for rev in $ORDER; do run_one "$rev" "$r"; done|for rev in $ORDER; do run_one "$rev" "$r" "DLLAMA_LAST_STAGE_SAMPLING=1"; done|' /tmp/ev_speed/bench_edge.sh
+sed -i 's|for rev in $ORDER; do run_one "$rev" "$r"; done|for rev in $ORDER; do run_one "$rev" "$r" "EDGEVISOR_LAST_STAGE_SAMPLING=1"; done|' /tmp/ev_speed/bench_edge.sh
 ```
 
 ## 2.5 启动命令速查（四条参考配置）
@@ -680,7 +680,7 @@ sed -i 's|for rev in $ORDER; do run_one "$rev" "$r"; done|for rev in $ORDER; do 
 | 配置 | ratios | root | 说明 |
 | --- | --- | --- | --- |
 | 5 机 GPU 混合 | `1@8*1@6*1@4*1@5*1@5` | `rog`，`--backend vulkan --gpu-index 1` | 本指南主线；8 个候选里最快 |
-| 5 机 + 尾段采样 | 同上 | 同上 + `DLLAMA_LAST_STAGE_SAMPLING=1` | 正文 E-C |
+| 5 机 + 尾段采样 | 同上 | 同上 + `EDGEVISOR_LAST_STAGE_SAMPLING=1` | 正文 E-C |
 | 4×Jetson 纯 CUDA | `1@9*1@7*1@6*1@6` | `nx1`，`--backend cuda --gpu-index 0` | 无 rog；worker 只有 `nx2/nano1/nano2` |
 | 5 机 CPU 校验 | 同 5 机 | 全 `--backend cpu` | 只证明管线成立，约慢 7× |
 
@@ -688,9 +688,9 @@ sed -i 's|for rev in $ORDER; do run_one "$rev" "$r"; done|for rev in $ORDER; do 
 
 ```bash
 cd /tmp/ev_speed
-stdbuf -oL -eL /tmp/ev_speed/bins/r5/dllama inference \
-  --model /home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m \
-  --tokenizer /home/jetson/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t \
+stdbuf -oL -eL /tmp/ev_speed/bins/r5/edgevisor inference \
+  --model /home/jetson/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m \
+  --tokenizer /home/jetson/cc/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t \
   --prompt "What is 2+2? Answer briefly." \
   --steps 64 --temperature 0 --seed 1 \
   --benchmark --buffer-float-type q80 --max-seq-len 256 --nthreads 1 \
@@ -726,9 +726,9 @@ stdbuf -oL -eL /tmp/ev_speed/bins/r5/dllama inference \
 
 ## 2.7 已知坑（照抄时最容易踩的）
 
-- **别的会话在抢这 5 台机器**。它们的清理按名字杀 `dllama`、不看端口，会把本次 run 打断（表现是 `rc=137` 或 worker 半路消失）。看到诡异失败先怀疑这个；重跑前把失败的 run 目录删掉。
-- 别用 `pkill -f dllama_<rev>_cuda`：`comm` 15 字符截断导致匹配不上，孤儿 worker 占着显存，下一轮 `--gpu-index` 会报分配失败。统一 `pkill -9 -x dllama` + 目录区分版本。
-- `rog` 只有 6 GB 显存，29 个进程就能把它打爆并掉卡（历史事故：`nvidia-smi: Unknown Error`，只能整机重启，`/tmp` 在根分区所以全丢）。跑之前先 `pgrep -x dllama` 确认为空。
+- **别的会话在抢这 5 台机器**。它们的清理按名字杀 `edgevisor`、不看端口，会把本次 run 打断（表现是 `rc=137` 或 worker 半路消失）。看到诡异失败先怀疑这个；重跑前把失败的 run 目录删掉。
+- 别用 `pkill -f edgevisor_<rev>_cuda`：`comm` 15 字符截断导致匹配不上，孤儿 worker 占着显存，下一轮 `--gpu-index` 会报分配失败。统一 `pkill -9 -x edgevisor` + 目录区分版本。
+- `rog` 只有 6 GB 显存，29 个进程就能把它打爆并掉卡（历史事故：`nvidia-smi: Unknown Error`，只能整机重启，`/tmp` 在根分区所以全丢）。跑之前先 `pgrep -x edgevisor` 确认为空。
 - Vulkan root 必须在 `/tmp/ev_speed/run`（含 `./src/nn/vulkan/`）下启动，否则后端初始化失败。
 - `--max-seq-len` 别抄混：T4 用 `512`，边缘 5 机用 `256`。
 - 每轮之间必须 `sleep` 足够（脚本里 `stop_all` 后 4 s、起 worker 后等端口 + 3 s），Jetson 加载权重慢，端口没起来就发 root 会直接失败。

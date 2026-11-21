@@ -44,7 +44,7 @@ This file tracks which documents should be treated as current references and whi
   - Mostly upstream Distributed Llama README retained for compatibility. It now has a status note and should not be treated as authoritative for EdgeVisor migration behavior.
 
 - `agent_bench/README.md`
-  - Current for agent-bench usage. Dynamic migration text has been updated, but backend implementation may need corresponding code changes if it still injects `DLLAMA_PLAN_CTRL_SOCKET` instead of CLI args.
+  - Current for agent-bench usage. Dynamic migration text has been updated, but backend implementation may need corresponding code changes if it still injects `EDGEVISOR_PLAN_CTRL_SOCKET` instead of CLI args.
 
 - `EdgeVisor/docs/CUDA_SUPPORT.md`
   - Current CUDA support matrix. Dynamic migration entry has been updated at a high level.

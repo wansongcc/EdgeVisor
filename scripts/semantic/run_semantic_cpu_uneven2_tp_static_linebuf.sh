@@ -22,11 +22,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-stdbuf -oL -eL ./dllama worker --port "${PORT1}" --nthreads 2 >"${LOG_DIR}/worker1.log" 2>&1 &
+stdbuf -oL -eL ./edgevisor worker --port "${PORT1}" --nthreads 2 >"${LOG_DIR}/worker1.log" 2>&1 &
 P1=$!
 sleep 4
 
-stdbuf -oL -eL ./dllama inference \
+stdbuf -oL -eL ./edgevisor inference \
   --prompt "What is 2+2? Answer with only the number." \
   --steps 24 \
   --model "${MODEL3}" \

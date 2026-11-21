@@ -263,7 +263,7 @@ def main():
     ensure_dirs()
     suite.cleanup_prefix("b01ab_")
     print(f"OUT={OUT}", flush=True)
-    # Reuse the existing built dllama binary; build is intentionally skipped to keep this validation quick.
+    # Reuse the existing built edgevisor binary; build is intentionally skipped to keep this validation quick.
     try:
         for scenario in SCENARIOS:
             print(f"RUN {scenario['scenario']} vg_332", flush=True)

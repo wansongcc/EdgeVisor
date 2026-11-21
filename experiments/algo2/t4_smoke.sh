@@ -2,9 +2,9 @@
 # Host-side T4 smoke for algorithm 2. This is not the 512-token matrix.
 # Docker Hub was unreachable from this machine, so the run uses the host GPUs.
 set -u
-BIN="${BIN:-/home/byh/B01/EdgeVisor-wansongcc/EdgeVisor/dllama}"
-MODEL="${MODEL:-/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m}"
-TOK="${TOK:-/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t}"
+BIN="${BIN:-/home/byh/B01/EdgeVisor-wansongcc/EdgeVisor/edgevisor}"
+MODEL="${MODEL:-/home/byh/B01/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m}"
+TOK="${TOK:-/home/byh/B01/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t}"
 ROOT="${ROOT:-/tmp/ev_algo2_smoke}"
 
 run_one() {
@@ -15,34 +15,34 @@ run_one() {
   local DIR="$ROOT/$name"
   rm -rf "$DIR"
   mkdir -p "$DIR"
-  export DLLAMA_ALGO2_MODE="$mode"
-  export DLLAMA_ALGO2_OUT="$DIR"
-  export DLLAMA_TPOT_LOG="$DIR/tpot.log"
-  export DLLAMA_ALGO2_METRICS_WINDOW=8
-  export DLLAMA_ALGO2_DECISION_WINDOW=8
-  export DLLAMA_ALGO2_DECISION_STRIDE=8
-  export DLLAMA_ALGO2_MIN_DECISION_INTERVAL_MS=0
-  export DLLAMA_ALGO2_SETTLE_TOKENS=4
-  export DLLAMA_ALGO2_VERIFY_TOKENS=8
-  export DLLAMA_ALGO2_VERIFY_MAX_TOKENS=16
-  export DLLAMA_ALGO2_COOLDOWN_TOKENS=4
-  export DLLAMA_ALGO2_COOLDOWN_MIN_MS=0
-  export DLLAMA_IGNORE_EOS=1
+  export EDGEVISOR_ALGO2_MODE="$mode"
+  export EDGEVISOR_ALGO2_OUT="$DIR"
+  export EDGEVISOR_TPOT_LOG="$DIR/tpot.log"
+  export EDGEVISOR_ALGO2_METRICS_WINDOW=8
+  export EDGEVISOR_ALGO2_DECISION_WINDOW=8
+  export EDGEVISOR_ALGO2_DECISION_STRIDE=8
+  export EDGEVISOR_ALGO2_MIN_DECISION_INTERVAL_MS=0
+  export EDGEVISOR_ALGO2_SETTLE_TOKENS=4
+  export EDGEVISOR_ALGO2_VERIFY_TOKENS=8
+  export EDGEVISOR_ALGO2_VERIFY_MAX_TOKENS=16
+  export EDGEVISOR_ALGO2_COOLDOWN_TOKENS=4
+  export EDGEVISOR_ALGO2_COOLDOWN_MIN_MS=0
+  export EDGEVISOR_IGNORE_EOS=1
   export EDGEVISOR_SHADOW_ALLOCATION=equal
   export EDGEVISOR_SHADOW_BUDGET_CAP=6
   export EDGEVISOR_SHADOW_PROFILE_SECONDS=8
   export EDGEVISOR_SHADOW_PROFILE_WARMUP=2
   export EDGEVISOR_SHADOW_PROFILE_DIR="$DIR/profile"
-  export DLLAMA_BUBBLE_SHADOW_KV=1
-  unset DLLAMA_REDUNDANT_BOUNDARY_DEPTHS || true
+  export EDGEVISOR_BUBBLE_SHADOW_KV=1
+  unset EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS || true
   if [[ "$delay" == "1" ]]; then
-    export DLLAMA_TEST_COMPUTE_DELAY_US=15000
-    export DLLAMA_TEST_COMPUTE_DELAY_NODE=2
-    export DLLAMA_TEST_COMPUTE_DELAY_DECODE_ONLY=1
-    export DLLAMA_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS=24
+    export EDGEVISOR_TEST_COMPUTE_DELAY_US=15000
+    export EDGEVISOR_TEST_COMPUTE_DELAY_NODE=2
+    export EDGEVISOR_TEST_COMPUTE_DELAY_DECODE_ONLY=1
+    export EDGEVISOR_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS=24
   else
-    unset DLLAMA_TEST_COMPUTE_DELAY_US || true
-    unset DLLAMA_TEST_COMPUTE_DELAY_NODE || true
+    unset EDGEVISOR_TEST_COMPUTE_DELAY_US || true
+    unset EDGEVISOR_TEST_COMPUTE_DELAY_NODE || true
   fi
   local w1="" w2="" w3=""
   cleanup() {

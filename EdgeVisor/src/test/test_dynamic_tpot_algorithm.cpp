@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace tpot = dllama::dynamic_tpot;
+namespace tpot = edgevisor::dynamic_tpot;
 
 static void require(bool cond, const char *msg) {
     if (!cond) {

@@ -5,8 +5,8 @@
 #include <iomanip>
 #include <sstream>
 
-bool dllamaTokenTimingPrintEnabled() {
-    const char *v = std::getenv("DLLAMA_TOKEN_TIMING_PRINT");
+bool edgevisorTokenTimingPrintEnabled() {
+    const char *v = std::getenv("EDGEVISOR_TOKEN_TIMING_PRINT");
     if (v == nullptr || v[0] == '\0') return false;
     if (std::strcmp(v, "0") == 0 ||
         std::strcmp(v, "false") == 0 ||
@@ -27,7 +27,7 @@ std::string formatTokenE2eTimingLine(unsigned int pos, int token, double wallMs)
     return oss.str();
 }
 
-std::string formatTokenNodeTimingLine(unsigned int pos, const DllamaTokenNodeTiming &timing) {
+std::string formatTokenNodeTimingLine(unsigned int pos, const EdgeVisorTokenNodeTiming &timing) {
     const double execMs = (double)timing.execUs / 1000.0;
     const double syncMs = (double)timing.syncUs / 1000.0;
     const double bubbleMs = (double)timing.bubbleUs / 1000.0;

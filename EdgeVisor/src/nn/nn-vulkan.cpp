@@ -37,12 +37,12 @@ static bool envFlagEnabled(const char *name) {
 
 
 static bool vulkanMatmulSelectDebugEnabled() {
-    static const bool enabled = envFlagEnabled("DLLAMA_DEBUG_VULKAN_MATMUL_SELECT");
+    static const bool enabled = envFlagEnabled("EDGEVISOR_DEBUG_VULKAN_MATMUL_SELECT");
     return enabled;
 }
 
 static bool vulkanSmallKMatmulDisabled() {
-    static const bool disabled = envFlagEnabled("DLLAMA_VULKAN_DISABLE_SMALLK_MATMUL");
+    static const bool disabled = envFlagEnabled("EDGEVISOR_VULKAN_DISABLE_SMALLK_MATMUL");
     return disabled;
 }
 
@@ -152,7 +152,7 @@ NnVulkanContext::NnVulkanContext(const NnUint gpuIndex) {
     deviceExtension.push_back("VK_KHR_16bit_storage");
     deviceExtension.push_back("VK_KHR_maintenance4");
 
-    vk::ApplicationInfo appInfo {"Distributed Llama", 1, nullptr, 0, VK_API_VERSION_1_2 };
+    vk::ApplicationInfo appInfo {"EdgeVisor", 1, nullptr, 0, VK_API_VERSION_1_2 };
     vk::InstanceCreateInfo instanceCreateInfo(createInstanceFlags, &appInfo, instanceLayers, instanceExtensions);
     instance = vk::createInstance(instanceCreateInfo);
 
@@ -621,16 +621,16 @@ void NnVulkanStagingCopier::allocate(const NnSize size) {
 void NnVulkanStagingCopier::copy(NnByte *data, const NnSize size, const NnVulkanStagingCopierDirection direction) {
     assert(size == allocatedSize);
 
-    const bool ioProfile = dllamaIoProbeEnabled();
-    const std::uint64_t startUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const bool ioProfile = edgevisorIoProbeEnabled();
+    const std::uint64_t startUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     switch (direction) {
     case COPY_TO_DEVICE:
         std::memcpy(hostPointer, data, size);
-        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - startUs, (std::uint64_t)size);
+        if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - startUs, (std::uint64_t)size);
         break;
     case COPY_FROM_DEVICE:
         std::memcpy(data, hostPointer, size);
-        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - startUs, (std::uint64_t)size);
+        if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - startUs, (std::uint64_t)size);
         break;
     }
 }
@@ -655,8 +655,8 @@ void NnVulkanStagingCopier::addCopyCommand(vk::CommandBuffer& commandBuffer, vk:
 }
 
 void NnVulkanStagingCopier::executeCopyCommand(vk::Buffer& target, const NnSize offset, const NnSize size, const NnVulkanStagingCopierDirection direction) {
-    const bool ioProfile = dllamaIoProbeEnabled();
-    const std::uint64_t startUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const bool ioProfile = edgevisorIoProbeEnabled();
+    const std::uint64_t startUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     vk::CommandBufferAllocateInfo allocInfo(context->commandPool, vk::CommandBufferLevel::ePrimary, 1);
     const std::vector<vk::CommandBuffer> cmdBuffers = context->device.allocateCommandBuffers(allocInfo);
     vk::CommandBuffer commandBuffer = cmdBuffers.front();
@@ -672,9 +672,9 @@ void NnVulkanStagingCopier::executeCopyCommand(vk::Buffer& target, const NnSize 
     context->device.destroyFence(fence);
     context->device.freeCommandBuffers(context->commandPool, 1, &commandBuffer);
     if (ioProfile) {
-        dllamaIoProbeRecordVulkanCopyCommand(
-            direction == COPY_TO_DEVICE ? DLLAMA_IO_PROBE_H2D : DLLAMA_IO_PROBE_D2H,
-            dllamaIoProbeNowUs() - startUs,
+        edgevisorIoProbeRecordVulkanCopyCommand(
+            direction == COPY_TO_DEVICE ? EDGEVISOR_IO_PROBE_H2D : EDGEVISOR_IO_PROBE_D2H,
+            edgevisorIoProbeNowUs() - startUs,
             (std::uint64_t)size);
     }
 }
@@ -743,13 +743,13 @@ void NnVulkanBuffer::write(const NnByte *data, const NnSize offset, const NnSize
     assert(offset + size <= bufferSize);
 
     if (isHostVisible && hostPointer != nullptr) {
-        const bool ioProfile = dllamaIoProbeEnabled();
-        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const bool ioProfile = edgevisorIoProbeEnabled();
+        const std::uint64_t memcpyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         std::memcpy(&hostPointer[offset], data, size);
-        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)size);
-        const std::uint64_t flushStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - memcpyStartUs, (std::uint64_t)size);
+        const std::uint64_t flushStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         context->device.flushMappedMemoryRanges({ { deviceMemory, offset, (vk::DeviceSize)size } });
-        if (ioProfile) dllamaIoProbeRecordVulkanFlush(dllamaIoProbeNowUs() - flushStartUs, (std::uint64_t)size);
+        if (ioProfile) edgevisorIoProbeRecordVulkanFlush(edgevisorIoProbeNowUs() - flushStartUs, (std::uint64_t)size);
         VULKAN_TRACE("Wrote %zu bytes to host visible buffer", size);
     } else {
         copier->allocate(size);
@@ -767,13 +767,13 @@ void NnVulkanBuffer::read(NnByte *data, const NnSize offset, const NnSize size) 
     assert(offset + size <= bufferSize);
 
     if (isHostVisible && hostPointer != nullptr) {
-        const bool ioProfile = dllamaIoProbeEnabled();
-        const std::uint64_t invalidateStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const bool ioProfile = edgevisorIoProbeEnabled();
+        const std::uint64_t invalidateStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         context->device.invalidateMappedMemoryRanges({ {deviceMemory, offset, (vk::DeviceSize)size} });
-        if (ioProfile) dllamaIoProbeRecordVulkanInvalidate(dllamaIoProbeNowUs() - invalidateStartUs, (std::uint64_t)size);
-        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        if (ioProfile) edgevisorIoProbeRecordVulkanInvalidate(edgevisorIoProbeNowUs() - invalidateStartUs, (std::uint64_t)size);
+        const std::uint64_t memcpyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         std::memcpy(data, &hostPointer[offset], size);
-        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)size);
+        if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - memcpyStartUs, (std::uint64_t)size);
 
         VULKAN_TRACE("Read %zu bytes from host visible buffer", size);
     } else {
@@ -927,10 +927,10 @@ static bool handleVulkanPlanBarrier(
         (pc.cmdKind == PLAN_CMD_KIND_HEAD ||
          pc.cmdKind == PLAN_CMD_KIND_FFN ||
          pc.cmdKind == PLAN_CMD_KIND_BOTH ||
-         (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u));
+         (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u));
     const bool hasCmd =
-        (pc.magic == DLLAMA_PLAN_CMD_MAGIC) &&
-        (pc.version == DLLAMA_PLAN_CMD_VERSION_V1 || pc.version == DLLAMA_PLAN_CMD_VERSION_V2) &&
+        (pc.magic == EDGEVISOR_PLAN_CMD_MAGIC) &&
+        (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V1 || pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2) &&
         (pc.mode == PLAN_CMD_MODE_EXACT || pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) &&
         hasPlanPayload;
 
@@ -973,7 +973,7 @@ static bool handleVulkanPlanBarrier(
 
     if (trigger) {
         emitEpoch = curEpoch + 1u;
-        if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u) {
+        if (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u) {
             const PlanMove &m = pc.moves[0];
             cmd = m.cmdKind;
             headMove = m.headMove;
@@ -991,7 +991,7 @@ static bool handleVulkanPlanBarrier(
                 (unsigned)fromNode,
                 (unsigned)toNode,
                 (unsigned)pc.seq);
-        } else if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u) {
+        } else if (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u) {
             cmd = 4u;
             fromNode = pc.seq;
             printf("🧭 [plan][emit][gpu] node=%u stage=%u layer=%u pos=%u epoch=%u kind=cmdlist seq=%u moves=%u\n",
@@ -1142,7 +1142,7 @@ static bool handleVulkanPlanApply(
             logVulkanPlanApplyAblationEvent(onlyStage, fromNode, toNode, layerIndex, pos, cmd, false, "cmdlist_missing_or_mismatch");
             return true;
         }
-        const uint32_t maxMovesAllowed = std::min<uint32_t>(DLLAMA_PLAN_CMD_MAX_MOVES, (uint32_t)(2u * st->nNodes));
+        const uint32_t maxMovesAllowed = std::min<uint32_t>(EDGEVISOR_PLAN_CMD_MAX_MOVES, (uint32_t)(2u * st->nNodes));
         if (pc2.nMoves > maxMovesAllowed) {
             printf("🧭 [plan][apply][gpu] node=%u stage=%u epoch=%u reject: nMoves=%u > maxAllowed=%u\n",
                 (unsigned)myNode, (unsigned)onlyStage, (unsigned)msgEpoch, (unsigned)pc2.nMoves, (unsigned)maxMovesAllowed);
@@ -2186,7 +2186,7 @@ bool NnVulkanDeviceSegment::exportLayerKvRow(
             buffer->read((NnByte *)(dstRow.data() + dstStart), offset, nBytes);
             readAny = true;
 
-            if (envFlagEnabled("DLLAMA_MIGRATION_VERBOSE_LOG")) {
+            if (envFlagEnabled("EDGEVISOR_MIGRATION_VERBOSE_LOG")) {
                 std::printf("🧩 [kv-export-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                     (unsigned)(data ? data->getNodeIndex() : 0u),
                     (unsigned)segmentIndex,
@@ -2251,7 +2251,7 @@ bool NnVulkanDeviceSegment::applyTransferredKvRow(
             buffer->write((const NnByte *)(srcRow.data() + srcStart), offset, nBytes);
             wroteAny = true;
 
-            if (envFlagEnabled("DLLAMA_MIGRATION_VERBOSE_LOG")) {
+            if (envFlagEnabled("EDGEVISOR_MIGRATION_VERBOSE_LOG")) {
                 std::printf("🧩 [kv-write-gpu] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                     (unsigned)(data ? data->getNodeIndex() : 0u),
                     (unsigned)segmentIndex,

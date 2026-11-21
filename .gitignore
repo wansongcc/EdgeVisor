@@ -14,8 +14,8 @@ run_*.sh
 prima_edgevisor_compare_report_*.md
 
 # Build artifacts
-EdgeVisor/dllama_cpu_*
-EdgeVisor/dllama_gpu_*
+EdgeVisor/edgevisor_cpu_*
+EdgeVisor/edgevisor_gpu_*
 *.patch
 *.o
 *.d

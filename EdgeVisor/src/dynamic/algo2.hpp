@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace dllama {
+namespace edgevisor {
 namespace dynamic_tpot {
 
 // Online discrete local search inside the shadow that is already ready.
@@ -340,4 +340,4 @@ OfflineSearchResult compareLocalSearchToExhaustive(
     uint32_t minLayers);
 
 } // namespace dynamic_tpot
-} // namespace dllama
+} // namespace edgevisor

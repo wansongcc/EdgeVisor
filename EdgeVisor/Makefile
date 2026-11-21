@@ -11,39 +11,39 @@ CUDA_ARCHS_FALLBACK ?= 75
 CXXFLAGS += -MMD -MP
 
 # Optional debug toggles (default OFF)
-DLLAMA_CONTROL_LOG ?= 0
-CXXFLAGS += -DDLLAMA_CONTROL_LOG=$(DLLAMA_CONTROL_LOG)
+EDGEVISOR_CONTROL_LOG ?= 0
+CXXFLAGS += -DEDGEVISOR_CONTROL_LOG=$(EDGEVISOR_CONTROL_LOG)
 
 DEBUG_OP_INPUT_OUTPUT ?= 0
 CXXFLAGS += -DDEBUG_OP_INPUT_OUTPUT=$(DEBUG_OP_INPUT_OUTPUT)
 
 # Compile-time gate for attention debug code blocks in nn-cpu/nn-cpu-ops.
-DLLAMA_DEBUG_ATTN ?= 0
-CXXFLAGS += -DDLLAMA_DEBUG_ATTN=$(DLLAMA_DEBUG_ATTN)
+EDGEVISOR_DEBUG_ATTN ?= 0
+CXXFLAGS += -DEDGEVISOR_DEBUG_ATTN=$(EDGEVISOR_DEBUG_ATTN)
 
 ifndef TERMUX_VERSION
 	CXXFLAGS += -march=native -mtune=native
 endif
 
 # Bare `make` builds the binary. `make clean` still cleans.
-.DEFAULT_GOAL := dllama
+.DEFAULT_GOAL := edgevisor
 
 # 0 or 1 from the command line or environment wins. Otherwise detect.
-ifeq ($(strip $(DLLAMA_CUDA)),)
+ifeq ($(strip $(EDGEVISOR_CUDA)),)
   ifneq ($(shell if [ -x "$(NVCC)" ] || command -v "$(NVCC)" >/dev/null 2>&1; then echo yes; fi),)
-    DLLAMA_CUDA := 1
+    EDGEVISOR_CUDA := 1
   else
-    DLLAMA_CUDA := 0
+    EDGEVISOR_CUDA := 0
   endif
 endif
-ifeq ($(strip $(DLLAMA_VULKAN)),)
+ifeq ($(strip $(EDGEVISOR_VULKAN)),)
   ifneq ($(shell command -v glslc >/dev/null 2>&1 && echo yes || command -v glslangValidator >/dev/null 2>&1 && echo yes),)
-    DLLAMA_VULKAN := 1
+    EDGEVISOR_VULKAN := 1
   else
-    DLLAMA_VULKAN := 0
+    EDGEVISOR_VULKAN := 0
   endif
 endif
-$(info dllama backends: cuda=$(DLLAMA_CUDA) vulkan=$(DLLAMA_VULKAN))
+$(info edgevisor backends: cuda=$(EDGEVISOR_CUDA) vulkan=$(EDGEVISOR_VULKAN))
 
 ifdef DEBUG
 	CXXFLAGS += -g -fsanitize=address
@@ -55,7 +55,7 @@ ifdef WVLA
 	CXXFLAGS += -Wvla-extension
 endif
 
-ifeq ($(DLLAMA_VULKAN),1)
+ifeq ($(EDGEVISOR_VULKAN),1)
 ifeq ($(OS),Windows_NT)
 	CGLSLC ?= glslc
 else
@@ -72,16 +72,16 @@ $(info Vulkan shader compiler: $(CGLSLC_NAME) [$(CGLSLC)])
 
 ifeq ($(OS),Windows_NT)
 	LIBS += -L$(VK_SDK_PATH)\lib -lvulkan-1
-	CXXFLAGS += -DDLLAMA_VULKAN -I$(VK_SDK_PATH)\include
+	CXXFLAGS += -DEDGEVISOR_VULKAN -I$(VK_SDK_PATH)\include
 else
 	LIBS += -lvulkan
-	CXXFLAGS += -DDLLAMA_VULKAN
+	CXXFLAGS += -DEDGEVISOR_VULKAN
 endif
 
 	DEPS += nn-vulkan.o
 endif
 
-ifeq ($(DLLAMA_CUDA),1)
+ifeq ($(EDGEVISOR_CUDA),1)
 CUDA_ARCHS_DETECTED := $(shell \
 	detected="`nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/[^0-9.]//g; s/\.//g' | awk 'NF' | sort -u | tr '\n' ' '`"; \
 	if [ -z "$$detected" ] && [ -r /proc/device-tree/compatible ]; then \
@@ -103,9 +103,9 @@ else
 CUDA_ARCHS_EFFECTIVE := $(CUDA_ARCHS)
 endif
 $(info CUDA_ARCHS=$(CUDA_ARCHS_EFFECTIVE) requested=$(CUDA_ARCHS))
-	CXXFLAGS += -DDLLAMA_CUDA -I$(CUDA_HOME)/include
+	CXXFLAGS += -DEDGEVISOR_CUDA -I$(CUDA_HOME)/include
 	LIBS += -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-	NVCCFLAGS += -std=c++11 -Isrc -DDLLAMA_CUDA
+	NVCCFLAGS += -std=c++11 -Isrc -DEDGEVISOR_CUDA
 	# Device-code optimization. -DNDEBUG is deliberately NOT added globally so
 	# the unit tests keep their assert() checks. --use_fast_math is deliberately
 	# NOT added either: it flips rounding in the RMSNorm/softmax/SiLU device
@@ -122,7 +122,7 @@ $(info CUDA_ARCHS=$(CUDA_ARCHS_EFFECTIVE) requested=$(CUDA_ARCHS))
 endif
 
 ifeq ($(TOPK), 1)
-    CXXFLAGS += -DDLLAMA_DEBUG_TOPK_LOGITS=1
+    CXXFLAGS += -DEDGEVISOR_DEBUG_TOPK_LOGITS=1
 endif
 
 ifeq ($(OS),Windows_NT)
@@ -135,10 +135,10 @@ endif
 
 DEPS += io-profile.o product-log.o device-profile.o sustained-profile.o
 
-.PHONY: clean dllama
+.PHONY: clean edgevisor
 
 clean:
-	$(DELETE_CMD) *.o *.d dllama dllama-* socket-benchmark mmap-buffer-* *-test *.exe src/nn/vulkan/*.spv
+	$(DELETE_CMD) *.o *.d edgevisor edgevisor-* socket-benchmark mmap-buffer-* *-test *.exe src/nn/vulkan/*.spv
 
 # nn
 nn-quants.o: src/nn/nn-quants.cpp
@@ -178,7 +178,7 @@ nn-vulkan.o: src/nn/nn-vulkan.cpp
 nn-cuda.o: src/nn/nn-cuda.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-ifeq ($(DLLAMA_VULKAN),1)
+ifeq ($(EDGEVISOR_VULKAN),1)
 VULKAN_SHADER_SRCS := $(wildcard src/nn/vulkan/*.comp)
 VULKAN_SHADER_BINS := $(VULKAN_SHADER_SRCS:.comp=.spv)
 DEPS += $(VULKAN_SHADER_BINS)
@@ -196,7 +196,7 @@ nn-vulkan-test: src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o ll
 	$(CXX) $(CXXFLAGS) src/nn/nn-vulkan-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-vulkan.o nn-test-runtime-stubs.o plan-command.o ablation.o product-log.o -o $@ $(LIBS)
 endif
 
-ifeq ($(DLLAMA_CUDA),1)
+ifeq ($(EDGEVISOR_CUDA),1)
 nn-cuda-test: src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o product-log.o
 	$(CXX) $(CXXFLAGS) src/nn/nn-cuda-test.cpp nn-cuda.o nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o nn-test-runtime-stubs.o plan-command.o ablation.o io-profile.o product-log.o -o $@ $(LIBS)
 endif
@@ -270,10 +270,10 @@ Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-netwo
 pointer-swizzling-microbench: src/test/pointer_swizzling_microbench.cpp nn-quants.o nn-core.o nn-executor.o nn-cpu.o nn-cpu-ops.o llamafile-sgemm.o plan-command.o ablation.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-dllama: src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
+edgevisor: src/edgevisor.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
-dllama-api: src/dllama-api.cpp terminal-ui.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
+edgevisor-api: src/edgevisor-api.cpp terminal-ui.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv %.hpp %.h, $^) -o $@ $(LIBS)
 
 uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp terminal-ui.o nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
@@ -287,10 +287,10 @@ pp-failover-network-test: src/test/test_pp_failover_network.cpp terminal-ui.o to
 
 # Optional model-backed test; controller synchronization is confined to this
 # executable. Build in CI, run on devices with user-prepared model files.
-reserved-join-test: src/test/test_reserved_join.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
+reserved-join-test: src/test/test_reserved_join.cpp src/edgevisor.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) src/test/test_reserved_join.cpp $(filter %.o,$^) -o $@ $(LIBS)
 
-delayed-sample-worker-test: src/test/test_delayed_sample.cpp src/dllama.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
+delayed-sample-worker-test: src/test/test_delayed_sample.cpp src/edgevisor.cpp terminal-ui.o token-timing.o nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o plan-command.o plan-controller.o tokenizer.o llm.o app.o ablation.o dynamic-layer.o tpot-algorithm.o algo2.o dynamic-tpot.o kv-collector.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter %.cpp %.o,$^) -Wl,--wrap=send -o $@ $(LIBS)
 
 # Model-free Linux acceptance gate. GPU builds run the same host-side tests.

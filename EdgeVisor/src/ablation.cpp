@@ -261,7 +261,7 @@ void edgevisorAblationLogEvent(const EdgeVisorAblationEvent &event) {
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const auto s2Sys = std::chrono::system_clock::now().time_since_epoch();
     const auto s2WallMs = std::chrono::duration_cast<std::chrono::milliseconds>(s2Sys).count();
-    // 与 token 流同域：episodeNowMs() 也用 system_clock（dllama.cpp:1661）
+    // 与 token 流同域：episodeNowMs() 也用 system_clock（edgevisor.cpp:1661）
     const auto s2WallNs = std::chrono::duration_cast<std::chrono::nanoseconds>(s2Sys).count();
     // --- end S2 ---
     const EdgeVisorAblationConfig &cfg = getEdgeVisorAblationConfig();

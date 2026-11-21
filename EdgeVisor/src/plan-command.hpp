@@ -10,13 +10,13 @@
 // - Distributed root->worker via control-plane.
 // - Consumed by OP_PLAN_BARRIER on stage-root, then broadcast via plan pipe.
 
-static constexpr uint32_t DLLAMA_PLAN_CMD_MAGIC = 0x44434e50u; // 'PNCD' little-endian
-static constexpr uint32_t DLLAMA_PLAN_CMD_VERSION_V1 = 1u;
-static constexpr uint32_t DLLAMA_PLAN_CMD_VERSION_V2 = 2u;
+static constexpr uint32_t EDGEVISOR_PLAN_CMD_MAGIC = 0x44434e50u; // 'PNCD' little-endian
+static constexpr uint32_t EDGEVISOR_PLAN_CMD_VERSION_V1 = 1u;
+static constexpr uint32_t EDGEVISOR_PLAN_CMD_VERSION_V2 = 2u;
 
 // Fixed-capacity move list for PlanCommand v2.
 // Runtime validation should still cap to <= 2 * stageNodes.
-static constexpr uint32_t DLLAMA_PLAN_CMD_MAX_MOVES = 64u;
+static constexpr uint32_t EDGEVISOR_PLAN_CMD_MAX_MOVES = 64u;
 
 enum PlanCommandMode : uint32_t {
     PLAN_CMD_MODE_NONE = 0u,
@@ -50,8 +50,8 @@ struct PlanMove {
 };
 
 struct PlanCommand {
-    uint32_t magic;   // DLLAMA_PLAN_CMD_MAGIC
-    uint32_t version; // DLLAMA_PLAN_CMD_VERSION_V1 or _V2
+    uint32_t magic;   // EDGEVISOR_PLAN_CMD_MAGIC
+    uint32_t version; // EDGEVISOR_PLAN_CMD_VERSION_V1 or _V2
 
     uint32_t seq;     // monotonic id assigned by issuer
     uint32_t mode;    // PlanCommandMode
@@ -70,7 +70,7 @@ struct PlanCommand {
     // v2 extension: move list.
     // If version==V2 and nMoves>0, prefer moves[] over the legacy single-edge fields above.
     uint32_t nMoves;
-    PlanMove moves[DLLAMA_PLAN_CMD_MAX_MOVES];
+    PlanMove moves[EDGEVISOR_PLAN_CMD_MAX_MOVES];
 
     uint32_t reserved0;
 };
@@ -79,8 +79,8 @@ struct PlanCommand {
 static inline PlanCommand makeEmptyPlanCommand() {
     PlanCommand c;
     std::memset(&c, 0, sizeof(c));
-    c.magic = DLLAMA_PLAN_CMD_MAGIC;
-    c.version = DLLAMA_PLAN_CMD_VERSION_V2;
+    c.magic = EDGEVISOR_PLAN_CMD_MAGIC;
+    c.version = EDGEVISOR_PLAN_CMD_VERSION_V2;
     c.seq = 0u;
     c.mode = PLAN_CMD_MODE_NONE;
     c.stageIndex = 0xFFFFFFFFu;
@@ -97,13 +97,13 @@ static inline PlanCommand makeEmptyPlanCommand() {
 }
 
 static inline bool isValidPlanCommandHeader(const PlanCommand &pc) {
-    if (pc.magic != DLLAMA_PLAN_CMD_MAGIC) return false;
-    if (pc.version != DLLAMA_PLAN_CMD_VERSION_V1 && pc.version != DLLAMA_PLAN_CMD_VERSION_V2) return false;
+    if (pc.magic != EDGEVISOR_PLAN_CMD_MAGIC) return false;
+    if (pc.version != EDGEVISOR_PLAN_CMD_VERSION_V1 && pc.version != EDGEVISOR_PLAN_CMD_VERSION_V2) return false;
     return true;
 }
 
 static inline bool planCommandHasMoveList(const PlanCommand &pc) {
-    return (pc.version == DLLAMA_PLAN_CMD_VERSION_V2) && (pc.nMoves != 0u);
+    return (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2) && (pc.nMoves != 0u);
 }
 
 struct PlanCommandSnapshot {

@@ -9,7 +9,7 @@
 #include <mutex>
 #include <sstream>
 
-namespace dllama {
+namespace edgevisor {
 namespace dynamic_tpot {
 
 namespace {
@@ -281,47 +281,47 @@ const char *algo2PhaseName(Algo2Phase phase) {
 
 Algo2Config algo2ConfigFromEnvironment() {
     Algo2Config cfg;
-    cfg.metricsWindowTokens = envInt("DLLAMA_ALGO2_METRICS_WINDOW", cfg.metricsWindowTokens, 1);
-    cfg.decisionWindowTokens = envInt("DLLAMA_ALGO2_DECISION_WINDOW", cfg.decisionWindowTokens, 1);
-    cfg.decisionStrideTokens = envInt("DLLAMA_ALGO2_DECISION_STRIDE", cfg.decisionStrideTokens, 1);
-    cfg.minDecisionIntervalMs = envInt("DLLAMA_ALGO2_MIN_DECISION_INTERVAL_MS", cfg.minDecisionIntervalMs, 0);
-    cfg.degradationTriggerRatio = envDouble("DLLAMA_ALGO2_DEGRADATION_TRIGGER", cfg.degradationTriggerRatio);
-    cfg.degradationConfirmations = envInt("DLLAMA_ALGO2_DEGRADATION_CONFIRMATIONS", cfg.degradationConfirmations, 1);
-    cfg.recoveryRatio = envDouble("DLLAMA_ALGO2_RECOVERY_RATIO", cfg.recoveryRatio);
-    cfg.recoveryConfirmations = envInt("DLLAMA_ALGO2_RECOVERY_CONFIRMATIONS", cfg.recoveryConfirmations, 1);
-    cfg.gainAbsMs = envDouble("DLLAMA_ALGO2_GAIN_ABS_MS", cfg.gainAbsMs);
-    cfg.gainRelativePair = envDouble("DLLAMA_ALGO2_GAIN_RELATIVE", cfg.gainRelativePair);
-    if (std::getenv("DLLAMA_ALGO2_PREDICTION_NOISE_MS") != nullptr)
-        cfg.predictionNoiseMs = envDouble("DLLAMA_ALGO2_PREDICTION_NOISE_MS", cfg.predictionNoiseMs);
-    cfg.settleTokens = envInt("DLLAMA_ALGO2_SETTLE_TOKENS", cfg.settleTokens, 0);
-    cfg.verifyTokens = envInt("DLLAMA_ALGO2_VERIFY_TOKENS", cfg.verifyTokens, 1);
-    cfg.verifyMaxTokens = envInt("DLLAMA_ALGO2_VERIFY_MAX_TOKENS", cfg.verifyMaxTokens, cfg.verifyTokens);
-    cfg.cooldownTokens = envInt("DLLAMA_ALGO2_COOLDOWN_TOKENS", cfg.cooldownTokens, 0);
-    cfg.cooldownMinMs = envInt("DLLAMA_ALGO2_COOLDOWN_MIN_MS", cfg.cooldownMinMs, 0);
-    cfg.minLayersPerStage = (uint32_t)envInt("DLLAMA_ALGO2_MIN_LAYERS", (int)cfg.minLayersPerStage, 1);
-    cfg.maxMoveLayers = (uint32_t)envInt("DLLAMA_ALGO2_MAX_MOVE_LAYERS", (int)cfg.maxMoveLayers, 0);
-    cfg.proactiveRebalance = envBool("DLLAMA_ALGO2_PROACTIVE", cfg.proactiveRebalance);
-    cfg.stableBand = envDouble("DLLAMA_ALGO2_STABLE_BAND", cfg.stableBand);
-    cfg.verifyRatio = envDouble("DLLAMA_ALGO2_VERIFY_RATIO", cfg.verifyRatio);
-    cfg.watchdogMs = envInt("DLLAMA_ALGO2_WATCHDOG_MS", cfg.watchdogMs, 1);
-    cfg.watchdogFactor = envDouble("DLLAMA_ALGO2_WATCHDOG_FACTOR", cfg.watchdogFactor);
-    cfg.reverseSuppressDecisions = envInt("DLLAMA_ALGO2_REVERSE_SUPPRESS", cfg.reverseSuppressDecisions, 0);
-    cfg.tailConfirmations = envInt("DLLAMA_ALGO2_TAIL_CONFIRMATIONS", cfg.tailConfirmations, 2);
-    cfg.longReferenceSpanTokens = envInt("DLLAMA_ALGO2_LONG_SPAN", cfg.longReferenceSpanTokens, 1);
-    cfg.rollbackCatchupTokens = envInt("DLLAMA_ALGO2_ROLLBACK_CATCHUP", cfg.rollbackCatchupTokens, 0);
-    if (std::getenv("DLLAMA_ALGO2_FORCE_FROM") != nullptr)
-        cfg.forceFromStage = envInt("DLLAMA_ALGO2_FORCE_FROM", cfg.forceFromStage, -1);
-    if (std::getenv("DLLAMA_ALGO2_FORCE_TO") != nullptr)
-        cfg.forceToStage = envInt("DLLAMA_ALGO2_FORCE_TO", cfg.forceToStage, -1);
-    if (std::getenv("DLLAMA_ALGO2_FORCE_K") != nullptr)
-        cfg.forceK = envInt("DLLAMA_ALGO2_FORCE_K", cfg.forceK, -1);
-    cfg.maxIssues = envInt("DLLAMA_ALGO2_MAX_ISSUES", cfg.maxIssues, 0);
+    cfg.metricsWindowTokens = envInt("EDGEVISOR_ALGO2_METRICS_WINDOW", cfg.metricsWindowTokens, 1);
+    cfg.decisionWindowTokens = envInt("EDGEVISOR_ALGO2_DECISION_WINDOW", cfg.decisionWindowTokens, 1);
+    cfg.decisionStrideTokens = envInt("EDGEVISOR_ALGO2_DECISION_STRIDE", cfg.decisionStrideTokens, 1);
+    cfg.minDecisionIntervalMs = envInt("EDGEVISOR_ALGO2_MIN_DECISION_INTERVAL_MS", cfg.minDecisionIntervalMs, 0);
+    cfg.degradationTriggerRatio = envDouble("EDGEVISOR_ALGO2_DEGRADATION_TRIGGER", cfg.degradationTriggerRatio);
+    cfg.degradationConfirmations = envInt("EDGEVISOR_ALGO2_DEGRADATION_CONFIRMATIONS", cfg.degradationConfirmations, 1);
+    cfg.recoveryRatio = envDouble("EDGEVISOR_ALGO2_RECOVERY_RATIO", cfg.recoveryRatio);
+    cfg.recoveryConfirmations = envInt("EDGEVISOR_ALGO2_RECOVERY_CONFIRMATIONS", cfg.recoveryConfirmations, 1);
+    cfg.gainAbsMs = envDouble("EDGEVISOR_ALGO2_GAIN_ABS_MS", cfg.gainAbsMs);
+    cfg.gainRelativePair = envDouble("EDGEVISOR_ALGO2_GAIN_RELATIVE", cfg.gainRelativePair);
+    if (std::getenv("EDGEVISOR_ALGO2_PREDICTION_NOISE_MS") != nullptr)
+        cfg.predictionNoiseMs = envDouble("EDGEVISOR_ALGO2_PREDICTION_NOISE_MS", cfg.predictionNoiseMs);
+    cfg.settleTokens = envInt("EDGEVISOR_ALGO2_SETTLE_TOKENS", cfg.settleTokens, 0);
+    cfg.verifyTokens = envInt("EDGEVISOR_ALGO2_VERIFY_TOKENS", cfg.verifyTokens, 1);
+    cfg.verifyMaxTokens = envInt("EDGEVISOR_ALGO2_VERIFY_MAX_TOKENS", cfg.verifyMaxTokens, cfg.verifyTokens);
+    cfg.cooldownTokens = envInt("EDGEVISOR_ALGO2_COOLDOWN_TOKENS", cfg.cooldownTokens, 0);
+    cfg.cooldownMinMs = envInt("EDGEVISOR_ALGO2_COOLDOWN_MIN_MS", cfg.cooldownMinMs, 0);
+    cfg.minLayersPerStage = (uint32_t)envInt("EDGEVISOR_ALGO2_MIN_LAYERS", (int)cfg.minLayersPerStage, 1);
+    cfg.maxMoveLayers = (uint32_t)envInt("EDGEVISOR_ALGO2_MAX_MOVE_LAYERS", (int)cfg.maxMoveLayers, 0);
+    cfg.proactiveRebalance = envBool("EDGEVISOR_ALGO2_PROACTIVE", cfg.proactiveRebalance);
+    cfg.stableBand = envDouble("EDGEVISOR_ALGO2_STABLE_BAND", cfg.stableBand);
+    cfg.verifyRatio = envDouble("EDGEVISOR_ALGO2_VERIFY_RATIO", cfg.verifyRatio);
+    cfg.watchdogMs = envInt("EDGEVISOR_ALGO2_WATCHDOG_MS", cfg.watchdogMs, 1);
+    cfg.watchdogFactor = envDouble("EDGEVISOR_ALGO2_WATCHDOG_FACTOR", cfg.watchdogFactor);
+    cfg.reverseSuppressDecisions = envInt("EDGEVISOR_ALGO2_REVERSE_SUPPRESS", cfg.reverseSuppressDecisions, 0);
+    cfg.tailConfirmations = envInt("EDGEVISOR_ALGO2_TAIL_CONFIRMATIONS", cfg.tailConfirmations, 2);
+    cfg.longReferenceSpanTokens = envInt("EDGEVISOR_ALGO2_LONG_SPAN", cfg.longReferenceSpanTokens, 1);
+    cfg.rollbackCatchupTokens = envInt("EDGEVISOR_ALGO2_ROLLBACK_CATCHUP", cfg.rollbackCatchupTokens, 0);
+    if (std::getenv("EDGEVISOR_ALGO2_FORCE_FROM") != nullptr)
+        cfg.forceFromStage = envInt("EDGEVISOR_ALGO2_FORCE_FROM", cfg.forceFromStage, -1);
+    if (std::getenv("EDGEVISOR_ALGO2_FORCE_TO") != nullptr)
+        cfg.forceToStage = envInt("EDGEVISOR_ALGO2_FORCE_TO", cfg.forceToStage, -1);
+    if (std::getenv("EDGEVISOR_ALGO2_FORCE_K") != nullptr)
+        cfg.forceK = envInt("EDGEVISOR_ALGO2_FORCE_K", cfg.forceK, -1);
+    cfg.maxIssues = envInt("EDGEVISOR_ALGO2_MAX_ISSUES", cfg.maxIssues, 0);
     if (cfg.verifyMaxTokens < cfg.verifyTokens) cfg.verifyMaxTokens = cfg.verifyTokens;
     return cfg;
 }
 
 bool algo2ForbidsFullKvFallback() {
-    const Algo2Mode mode = parseAlgo2Mode(std::getenv("DLLAMA_ALGO2_MODE"));
+    const Algo2Mode mode = parseAlgo2Mode(std::getenv("EDGEVISOR_ALGO2_MODE"));
     return mode == Algo2Mode::REVISED_SINGLE || mode == Algo2Mode::REVISED_VARIABLE;
 }
 
@@ -357,7 +357,7 @@ std::vector<Algo2CompletedToken> algo2DrainTokenCompletes() {
 }
 
 Algo2Session::Algo2Session(Algo2Config config) : cfg_(config) {
-    mode_ = parseAlgo2Mode(envOr("DLLAMA_ALGO2_MODE", "legacy"));
+    mode_ = parseAlgo2Mode(envOr("EDGEVISOR_ALGO2_MODE", "legacy"));
 }
 
 void Algo2Session::setMode(Algo2Mode mode) { mode_ = mode; }
@@ -1214,4 +1214,4 @@ OfflineSearchResult compareLocalSearchToExhaustive(
 }
 
 } // namespace dynamic_tpot
-} // namespace dllama
+} // namespace edgevisor

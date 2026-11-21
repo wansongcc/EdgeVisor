@@ -711,11 +711,11 @@ private:
     std::mutex kvTransferMutex;
     std::vector<PendingKvTransferItem> pendingKvTransfers;
     bool waitingKvAck = false;
-    // P2 BackgroundPreCopy baseline state (DLLAMA_BACKGROUND_PRECOPY=1):
+    // P2 BackgroundPreCopy baseline state (EDGEVISOR_BACKGROUND_PRECOPY=1):
     // the candidate migration layers' KV is copied to the destination in the
     // background during idle windows; the trigger only transfers the delta.
     bool bgPrecopyEnabled = false;
-    NnUint bgPrecopyMaxPasses = 0u;   // 0 = unlimited (DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES)
+    NnUint bgPrecopyMaxPasses = 0u;   // 0 = unlimited (EDGEVISOR_BACKGROUND_PRECOPY_MAX_PASSES)
     // EV reserves residency for the layers it may take over, before the fault.
     // Every other arm learns the layer only at the trigger and therefore pays a
     // weight upload inside the stall. Set by EDGEVISOR_WEIGHT_RESIDENCY=preallocated
@@ -725,7 +725,7 @@ private:
     NnUint bgCopiedPos = 0u;
     unsigned long long bgPrecopyBytesTotal = 0u;
     unsigned long long bgPrecopyPasses = 0u;
-    // PipeLive online patch (DLLAMA_PIPELIVE_PATCH=1): each decode step copies
+    // PipeLive online patch (EDGEVISOR_PIPELIVE_PATCH=1): each decode step copies
     // a bounded chunk of already-written KV and leaves `pipeLiveTau` positions
     // for the trigger. Chunk acks must not switch ownership.
     bool pipeLivePatchEnabled = false;
@@ -960,7 +960,7 @@ typedef struct {
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
 // True when worker PROFILE frames may be collected one token late. Controlled
-// by DLLAMA_DEFERRED_PROFILE (default on); only takes effect while profiling.
+// by EDGEVISOR_DEFERRED_PROFILE (default on); only takes effect while profiling.
 bool deferredProfileEnabled();
 // Between tokens, connect a reserved pool member and move a slice of the slowest donor onto it.
 void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position);

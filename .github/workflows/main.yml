@@ -30,4 +30,4 @@ jobs:
         id: dependencies
         run: sudo apt-get update && sudo apt-get install build-essential
       - name: Build and run Linux acceptance tests
-        run: make -j2 DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama check
+        run: make -j2 EDGEVISOR_CUDA=0 EDGEVISOR_VULKAN=0 edgevisor check

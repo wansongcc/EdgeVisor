@@ -304,7 +304,7 @@ void testEosDetectorWithoutPadding() {
 
 int main() {
 #if DEV_TESTS
-    Tokenizer tokenizer("models/llama3_2_1b_instruct_q40/dllama_tokenizer_llama3_2_1b_instruct_q40.t");
+    Tokenizer tokenizer("models/llama3_2_1b_instruct_q40/edgevisor_tokenizer_llama3_2_1b_instruct_q40.t");
     dev_testEncode(&tokenizer);
     dev_testDecoderEmoji(&tokenizer);
     dev_testDecoderEmojiWithEos(&tokenizer);

@@ -202,13 +202,13 @@ unsigned long currentPid() {
 }
 
 void flushAtExit() {
-    dllamaIoProbeFlush("atexit");
+    edgevisorIoProbeFlush("atexit");
 }
 
 void ensureConfiguredFromEnv(IoProbeState &s) {
     if (s.configured.load(std::memory_order_acquire)) return;
-    const char *path = std::getenv("DLLAMA_IO_PROFILE_LOG");
-    dllamaIoProbeConfigure(path);
+    const char *path = std::getenv("EDGEVISOR_IO_PROFILE_LOG");
+    edgevisorIoProbeConfigure(path);
 }
 
 void registerAtExit(IoProbeState &s) {
@@ -224,7 +224,7 @@ void add(std::atomic<std::uint64_t> &dst, std::uint64_t v) {
 
 } // namespace
 
-void dllamaIoProbeConfigure(const char *logPath) {
+void edgevisorIoProbeConfigure(const char *logPath) {
     IoProbeState &s = state();
     const bool hasPath = logPath != nullptr && logPath[0] != '\0';
     {
@@ -236,29 +236,29 @@ void dllamaIoProbeConfigure(const char *logPath) {
     if (hasPath) registerAtExit(s);
 }
 
-void dllamaIoProbeConfigureFromEnv() {
-    const char *path = std::getenv("DLLAMA_IO_PROFILE_LOG");
-    dllamaIoProbeConfigure(path);
+void edgevisorIoProbeConfigureFromEnv() {
+    const char *path = std::getenv("EDGEVISOR_IO_PROFILE_LOG");
+    edgevisorIoProbeConfigure(path);
 }
 
-void dllamaIoProbeSetNode(unsigned int nodeIndex, unsigned int stageIndex) {
+void edgevisorIoProbeSetNode(unsigned int nodeIndex, unsigned int stageIndex) {
     IoProbeState &s = state();
     s.nodeIndex.store(nodeIndex, std::memory_order_relaxed);
     s.stageIndex.store(stageIndex, std::memory_order_relaxed);
 }
 
-bool dllamaIoProbeEnabled() {
+bool edgevisorIoProbeEnabled() {
     IoProbeState &s = state();
     ensureConfiguredFromEnv(s);
     return s.enabled.load(std::memory_order_acquire);
 }
 
-std::uint64_t dllamaIoProbeNowUs() {
+std::uint64_t edgevisorIoProbeNowUs() {
     return (std::uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void dllamaIoProbeFlush(const char *reason) {
+void edgevisorIoProbeFlush(const char *reason) {
     IoProbeState &s = state();
     ensureConfiguredFromEnv(s);
     if (!s.enabled.load(std::memory_order_acquire)) return;
@@ -333,43 +333,43 @@ void dllamaIoProbeFlush(const char *reason) {
     std::fclose(f);
 }
 
-void dllamaIoProbeRecordNetWriteWall(std::uint64_t elapsedUs) {
+void edgevisorIoProbeRecordNetWriteWall(std::uint64_t elapsedUs) {
     IoProbeCounters &c = state().counters;
     add(c.netWriteOps, 1u);
     add(c.netWriteWallUs, elapsedUs);
 }
 
-void dllamaIoProbeRecordNetReadWall(std::uint64_t elapsedUs) {
+void edgevisorIoProbeRecordNetReadWall(std::uint64_t elapsedUs) {
     IoProbeCounters &c = state().counters;
     add(c.netReadOps, 1u);
     add(c.netReadWallUs, elapsedUs);
 }
 
-void dllamaIoProbeRecordNetSendSyscall(std::uint64_t elapsedUs, std::uint64_t bytes) {
+void edgevisorIoProbeRecordNetSendSyscall(std::uint64_t elapsedUs, std::uint64_t bytes) {
     IoProbeCounters &c = state().counters;
     add(c.netSendSyscalls, 1u);
     add(c.netSendSyscallUs, elapsedUs);
     add(c.netSendBytes, bytes);
 }
 
-void dllamaIoProbeRecordNetRecvSyscall(std::uint64_t elapsedUs, std::uint64_t bytes) {
+void edgevisorIoProbeRecordNetRecvSyscall(std::uint64_t elapsedUs, std::uint64_t bytes) {
     IoProbeCounters &c = state().counters;
     add(c.netRecvSyscalls, 1u);
     add(c.netRecvSyscallUs, elapsedUs);
     add(c.netRecvBytes, bytes);
 }
 
-void dllamaIoProbeRecordNetSendEagain() {
+void edgevisorIoProbeRecordNetSendEagain() {
     add(state().counters.netSendEagain, 1u);
 }
 
-void dllamaIoProbeRecordNetRecvEagain() {
+void edgevisorIoProbeRecordNetRecvEagain() {
     add(state().counters.netRecvEagain, 1u);
 }
 
-void dllamaIoProbeRecordHostMemcpy(DllamaIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes) {
+void edgevisorIoProbeRecordHostMemcpy(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes) {
     IoProbeCounters &c = state().counters;
-    if (direction == DLLAMA_IO_PROBE_H2D) {
+    if (direction == EDGEVISOR_IO_PROBE_H2D) {
         add(c.hostMemcpyH2DCalls, 1u);
         add(c.hostMemcpyH2DUs, elapsedUs);
         add(c.hostMemcpyH2DBytes, bytes);
@@ -380,23 +380,23 @@ void dllamaIoProbeRecordHostMemcpy(DllamaIoProbeDirection direction, std::uint64
     }
 }
 
-void dllamaIoProbeRecordVulkanFlush(std::uint64_t elapsedUs, std::uint64_t bytes) {
+void edgevisorIoProbeRecordVulkanFlush(std::uint64_t elapsedUs, std::uint64_t bytes) {
     IoProbeCounters &c = state().counters;
     add(c.vulkanFlushCalls, 1u);
     add(c.vulkanFlushUs, elapsedUs);
     add(c.vulkanFlushBytes, bytes);
 }
 
-void dllamaIoProbeRecordVulkanInvalidate(std::uint64_t elapsedUs, std::uint64_t bytes) {
+void edgevisorIoProbeRecordVulkanInvalidate(std::uint64_t elapsedUs, std::uint64_t bytes) {
     IoProbeCounters &c = state().counters;
     add(c.vulkanInvalidateCalls, 1u);
     add(c.vulkanInvalidateUs, elapsedUs);
     add(c.vulkanInvalidateBytes, bytes);
 }
 
-void dllamaIoProbeRecordVulkanCopyCommand(DllamaIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes) {
+void edgevisorIoProbeRecordVulkanCopyCommand(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes) {
     IoProbeCounters &c = state().counters;
-    if (direction == DLLAMA_IO_PROBE_H2D) {
+    if (direction == EDGEVISOR_IO_PROBE_H2D) {
         add(c.vulkanCopyH2DCalls, 1u);
         add(c.vulkanCopyH2DUs, elapsedUs);
         add(c.vulkanCopyH2DBytes, bytes);
@@ -407,9 +407,9 @@ void dllamaIoProbeRecordVulkanCopyCommand(DllamaIoProbeDirection direction, std:
     }
 }
 
-void dllamaIoProbeRecordCudaMemcpyAsync(DllamaIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes) {
+void edgevisorIoProbeRecordCudaMemcpyAsync(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes) {
     IoProbeCounters &c = state().counters;
-    if (direction == DLLAMA_IO_PROBE_H2D) {
+    if (direction == EDGEVISOR_IO_PROBE_H2D) {
         add(c.cudaMemcpyH2DCalls, 1u);
         add(c.cudaMemcpyH2DUs, elapsedUs);
         add(c.cudaMemcpyH2DBytes, bytes);
@@ -420,9 +420,9 @@ void dllamaIoProbeRecordCudaMemcpyAsync(DllamaIoProbeDirection direction, std::u
     }
 }
 
-void dllamaIoProbeRecordCudaStreamSync(DllamaIoProbeDirection direction, std::uint64_t elapsedUs) {
+void edgevisorIoProbeRecordCudaStreamSync(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs) {
     IoProbeCounters &c = state().counters;
-    if (direction == DLLAMA_IO_PROBE_H2D) {
+    if (direction == EDGEVISOR_IO_PROBE_H2D) {
         add(c.cudaSyncH2DCalls, 1u);
         add(c.cudaSyncH2DUs, elapsedUs);
     } else {

@@ -10,17 +10,17 @@
 
 class RootLlmInference;
 
-namespace dllama {
+namespace edgevisor {
 namespace dynamic_tpot {
 
 SchedulerConfig loadSchedulerConfigFromEnvironment();
 nlohmann::json makePpCommandRequest(uint32_t seq, const Candidate &candidate);
 
 } // namespace dynamic_tpot
-} // namespace dllama
+} // namespace edgevisor
 
 // Root-side single-request TPOT scheduler.
-// Enabled with DLLAMA_DYNAMIC_TPOT_ENABLE=1 and reuses the existing Plan UDS
+// Enabled with EDGEVISOR_DYNAMIC_TPOT_ENABLE=1 and reuses the existing Plan UDS
 // set_plan / set_pp_migration command paths.
 class DynamicTpotController {
 public:
@@ -35,13 +35,13 @@ private:
     DynamicTpotController(
         const std::string &socketPath,
         RootLlmInference *inference,
-        const dllama::dynamic_tpot::SchedulerConfig &config);
+        const edgevisor::dynamic_tpot::SchedulerConfig &config);
 
     void run();
 
     std::string socketPath_;
     RootLlmInference *inference_ = nullptr;
-    dllama::dynamic_tpot::SchedulerConfig config_;
+    edgevisor::dynamic_tpot::SchedulerConfig config_;
 
     std::atomic<bool> stop_{false};
     std::thread worker_;

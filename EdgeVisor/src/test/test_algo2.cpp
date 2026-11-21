@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace tpot = dllama::dynamic_tpot;
+namespace tpot = edgevisor::dynamic_tpot;
 
 static void require(bool cond, const char *msg) {
     if (!cond) {
@@ -94,7 +94,7 @@ int main() {
     require(near(tpot::clampTrendPenalty(30.0, 10.0), 1.3), "legacy trend clamp remains 1.3");
     require(std::string(tpot::algo2ModeName(tpot::parseAlgo2Mode("revised_variable_step"))) == "revised_variable_step",
         "mode name");
-    const char *modeEnv = std::getenv("DLLAMA_ALGO2_MODE");
+    const char *modeEnv = std::getenv("EDGEVISOR_ALGO2_MODE");
     const bool revisedEnv = modeEnv != nullptr &&
         (std::strcmp(modeEnv, "revised_single_layer") == 0 || std::strcmp(modeEnv, "revised_variable_step") == 0);
     require(tpot::algo2ForbidsFullKvFallback() == revisedEnv, "full KV fallback stays available unless revised mode is selected");

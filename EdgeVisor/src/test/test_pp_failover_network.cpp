@@ -18,8 +18,8 @@ static bool covered;
 // frames queued before the raw precommit ACK. Keep both frames for decode.
 // fault: 1=no ACK, 2=partial frame header, 3=partial payload, 4=invalid ACK.
 static void testControlAckFrames(bool turbo, unsigned fault = 0u) {
-    unsetenv("DLLAMA_IO_TIMEOUT_MS");
-    setenv("DLLAMA_KV_ACK_TIMEOUT_MS", "180000", 1);
+    unsetenv("EDGEVISOR_IO_TIMEOUT_MS");
+    setenv("EDGEVISOR_KV_ACK_TIMEOUT_MS", "180000", 1);
     int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     std::vector<NnSocket> sockets; sockets.emplace_back(pair[0]);
     std::vector<NnUint> peers{1u}; NnNetwork network(&sockets, &peers);
@@ -77,7 +77,7 @@ static void testControlAckFrames(bool turbo, unsigned fault = 0u) {
         }
     }
     delete[] net.nodeConfigs; releaseNetConfig(&net.netConfig);
-    unsetenv("DLLAMA_KV_ACK_TIMEOUT_MS"); setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
+    unsetenv("EDGEVISOR_KV_ACK_TIMEOUT_MS"); setenv("EDGEVISOR_IO_TIMEOUT_MS", "2000", 1);
 }
 
 // Exercise the real root frame reader without model weights or a GPU.
@@ -86,8 +86,8 @@ static void testControlAckFrames(bool turbo, unsigned fault = 0u) {
 // 6=closed partial header, 7=stalled partial header.
 static void testTailFrameClose(bool turbo, bool complete, bool profileFirst, unsigned fault = 0u) {
     const bool stalled = fault == 1u || fault == 2u || fault == 7u;
-    setenv("DLLAMA_KV_ACK_TIMEOUT_MS", "100", 1);
-    if (stalled) unsetenv("DLLAMA_IO_TIMEOUT_MS");
+    setenv("EDGEVISOR_KV_ACK_TIMEOUT_MS", "100", 1);
+    if (stalled) unsetenv("EDGEVISOR_IO_TIMEOUT_MS");
     int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     std::vector<NnSocket> sockets; sockets.emplace_back(pair[0]);
     std::vector<NnUint> peers{1u};
@@ -160,8 +160,8 @@ static void testTailFrameClose(bool turbo, bool complete, bool profileFirst, uns
         }
     }
     delete[] net.nodeConfigs; releaseNetConfig(&net.netConfig);
-    unsetenv("DLLAMA_KV_ACK_TIMEOUT_MS");
-    setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
+    unsetenv("EDGEVISOR_KV_ACK_TIMEOUT_MS");
+    setenv("EDGEVISOR_IO_TIMEOUT_MS", "2000", 1);
 }
 static void testBoundedFrameProbe(bool turbo) {
     int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
@@ -497,8 +497,8 @@ public:
     NnDeviceSegment *createSegment(NnUint) override { return new CountingSegment(count); }
 };
 static void testShadowOnce(const char *async) {
-    setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
-    setenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", async, 1);
+    setenv("EDGEVISOR_BUBBLE_SHADOW_KV", "1", 1);
+    setenv("EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC", async, 1);
     NnNetConfigBuilder netBuilder(1u, 1u);
     const NnUint pipe = netBuilder.addPipe("X", size2D(F_32, 1u, 1u));
     NnNodeConfigBuilder nodeBuilder(0u);
@@ -527,7 +527,7 @@ static void testShadowOnce(const char *async) {
         }
     }
     releaseNetConfig(&config); releaseNodeConfig(&node);
-    unsetenv("DLLAMA_BUBBLE_SHADOW_KV"); unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+    unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV"); unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC");
 }
 // The root is waiting on the tail, so a dead middle stage is not its next hop.
 // The wait must still relink that stage once, without replaying.
@@ -583,13 +583,13 @@ static void testDeadHopBeyondNext(bool turbo) {
     close(hop3[1]);
 }
 int main() {
-    setenv("DLLAMA_IO_TIMEOUT_MS", "2000", 1);
+    setenv("EDGEVISOR_IO_TIMEOUT_MS", "2000", 1);
     // The delivery probe sizes its answer window from TCP_USER_TIMEOUT
     // (userMs + 1s). The 20s production default would blow the ~2s bound the
     // buffered-send cases assert; keep a short default and let an explicit
     // external value win.
-    setenv("DLLAMA_TCP_USER_TIMEOUT_MS", "1000", 0);
-    setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+    setenv("EDGEVISOR_TCP_USER_TIMEOUT_MS", "1000", 0);
+    setenv("EDGEVISOR_LAST_STAGE_SAMPLING", "1", 1);
     for (unsigned fault = 0u; fault <= 4u; ++fault) {
         testControlAckFrames(false, fault); testControlAckFrames(true, fault);
     }

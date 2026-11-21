@@ -18,10 +18,10 @@
 #include <fstream>
 #endif
 
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
 #include "nn/nn-cuda.hpp"
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
 #include "nn/nn-vulkan.hpp"
 #endif
 
@@ -240,10 +240,10 @@ static double cpuLayerMs(const ModelShape &shape) {
 
 unsigned long long profileDeviceFreeBytes() {
     try {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         if (g_backend == PROFILE_CUDA) return nnCudaFreeBytes((unsigned)g_gpuIndex);
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
         if (g_backend == PROFILE_VULKAN) return nnVulkanDeviceLocalBytes((unsigned)g_gpuIndex);
 #endif
     } catch (...) {
@@ -258,14 +258,14 @@ SpeedDeviceProfile measureLocalProfile(const ModelShape &shape) {
     const char *name = "cpu";
     double layerMs = 0.0;
     try {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         if (g_backend == PROFILE_CUDA) {
             layerMs = nnCudaProfileLayerMs((unsigned)g_gpuIndex, shape.dim, shape.hiddenDim, shape.nHeads, shape.nKvHeads);
             freeBytes = nnCudaFreeBytes((unsigned)g_gpuIndex);
             name = "cuda";
         } else
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
         if (g_backend == PROFILE_VULKAN) {
             layerMs = nnVulkanProfileLayerMs((unsigned)g_gpuIndex, shape.dim, shape.hiddenDim, shape.nHeads, shape.nKvHeads);
             freeBytes = nnVulkanDeviceLocalBytes((unsigned)g_gpuIndex);
@@ -412,10 +412,10 @@ struct RepresentativeLayerBench::Impl {
     unsigned hidden;
     unsigned kv;
     unsigned threads;
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
     NnCudaLayerSoak *cuda;
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
     bool vulkan;
     unsigned gpuIndex;
     unsigned nHeads;
@@ -426,10 +426,10 @@ struct RepresentativeLayerBench::Impl {
     std::vector<float> output;
     Impl()
         : ready(false), dim(0u), hidden(0u), kv(0u), threads(1u)
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         , cuda(nullptr)
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
         , vulkan(false), gpuIndex(0u), nHeads(0u), nKvHeads(0u)
 #endif
     {}
@@ -467,7 +467,7 @@ RepresentativeLayerBench::RepresentativeLayerBench(const ModelShape &shape) : im
     impl->hidden = shape.hiddenDim == 0u ? shape.dim : shape.hiddenDim;
     impl->kv = kvDim == 0u ? shape.dim : kvDim;
     impl->threads = g_threads == 0u ? 1u : g_threads;
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
     if (g_backend == PROFILE_CUDA) {
         try {
             impl->cuda = new NnCudaLayerSoak(
@@ -479,7 +479,7 @@ RepresentativeLayerBench::RepresentativeLayerBench(const ModelShape &shape) : im
         return;
     }
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
     if (g_backend == PROFILE_VULKAN) {
         impl->vulkan = true;
         impl->gpuIndex = (unsigned)g_gpuIndex;
@@ -507,7 +507,7 @@ RepresentativeLayerBench::RepresentativeLayerBench(const ModelShape &shape) : im
 
 RepresentativeLayerBench::~RepresentativeLayerBench() {
     if (impl != nullptr) {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         delete impl->cuda;
         impl->cuda = nullptr;
 #endif
@@ -517,10 +517,10 @@ RepresentativeLayerBench::~RepresentativeLayerBench() {
 
 double RepresentativeLayerBench::runOnceMs() {
     if (impl == nullptr || !impl->ready) return -1.0;
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
     if (impl->cuda != nullptr) return impl->cuda->runOnceMs();
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
     if (impl->vulkan) {
         try {
             return nnVulkanProfileLayerMs(impl->gpuIndex, impl->dim, impl->hidden, impl->nHeads, impl->nKvHeads);

@@ -65,7 +65,7 @@ static inline unsigned long getIoTimeoutMs() {
     static std::atomic<bool> inited{false};
     if (!inited.load(std::memory_order_acquire)) {
         unsigned long v = 0ul;
-        if (const char *p = std::getenv("DLLAMA_IO_TIMEOUT_MS")) {
+        if (const char *p = std::getenv("EDGEVISOR_IO_TIMEOUT_MS")) {
             try {
                 v = std::stoul(std::string(p));
             } catch (...) {
@@ -100,7 +100,7 @@ static inline bool isEagainError() {
 }
 
 static inline bool debugLogitsGatherSliceStatsEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LOGITS_GATHER_SLICES");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LOGITS_GATHER_SLICES");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -113,7 +113,7 @@ static inline unsigned int getIoEagainYieldEvery() {
     static std::atomic<bool> inited{false};
     if (!inited.load(std::memory_order_acquire)) {
         unsigned int v = 256u;
-        if (const char *p = std::getenv("DLLAMA_IO_EAGAIN_YIELD_EVERY")) {
+        if (const char *p = std::getenv("EDGEVISOR_IO_EAGAIN_YIELD_EVERY")) {
             try {
                 v = (unsigned int)std::stoul(std::string(p));
             } catch (...) {
@@ -132,7 +132,7 @@ static inline unsigned int getIoEagainSleepUs() {
     static std::atomic<bool> inited{false};
     if (!inited.load(std::memory_order_acquire)) {
         unsigned int v = 0u;
-        if (const char *p = std::getenv("DLLAMA_IO_EAGAIN_SLEEP_US")) {
+        if (const char *p = std::getenv("EDGEVISOR_IO_EAGAIN_SLEEP_US")) {
             try {
                 v = (unsigned int)std::stoul(std::string(p));
             } catch (...) {
@@ -151,7 +151,7 @@ static inline bool getIoEagainPollEnabled() {
     static std::atomic<bool> inited{false};
     if (!inited.load(std::memory_order_acquire)) {
         bool v = true;
-        if (const char *p = std::getenv("DLLAMA_IO_EAGAIN_POLL")) {
+        if (const char *p = std::getenv("EDGEVISOR_IO_EAGAIN_POLL")) {
             v = !(std::strcmp(p, "0") == 0 ||
                   std::strcmp(p, "false") == 0 ||
                   std::strcmp(p, "False") == 0 ||
@@ -173,7 +173,7 @@ static inline NnSize getSyncDuplexMaxBytes() {
     static std::atomic<bool> inited{false};
     if (!inited.load(std::memory_order_acquire)) {
         NnSize v = (NnSize)(128 * 1024);
-        if (const char *p = std::getenv("DLLAMA_SYNC_DUPLEX_MAX_BYTES")) {
+        if (const char *p = std::getenv("EDGEVISOR_SYNC_DUPLEX_MAX_BYTES")) {
             try {
                 v = (NnSize)std::stoull(std::string(p));
             } catch (...) {
@@ -187,14 +187,14 @@ static inline NnSize getSyncDuplexMaxBytes() {
 }
 
 static inline unsigned long getNetSimDelayUs() {
-    // Test-only LAN simulator (DLLAMA_NET_SIM_DELAY_US): sleeps once per
+    // Test-only LAN simulator (EDGEVISOR_NET_SIM_DELAY_US): sleeps once per
     // writeMany/readMany batch to emulate per-round-trip network latency.
     // Default 0 (disabled).
     static std::atomic<unsigned long> cached{0ul};
     static std::atomic<bool> inited{false};
     if (!inited.load(std::memory_order_acquire)) {
         unsigned long v = 0ul;
-        if (const char *p = std::getenv("DLLAMA_NET_SIM_DELAY_US")) {
+        if (const char *p = std::getenv("EDGEVISOR_NET_SIM_DELAY_US")) {
             try {
                 v = std::stoul(std::string(p));
             } catch (...) {
@@ -210,12 +210,12 @@ static inline unsigned long getNetSimDelayUs() {
 static inline bool getSyncBcastAckEnabled() {
     // Default OFF: the broadcast ACK barrier in syncWithRoot is redundant with
     // TCP stream ordering and costs one round trip per broadcast per worker.
-    // DLLAMA_SYNC_BCAST_ACK=1 restores the legacy barrier; the setting must be
+    // EDGEVISOR_SYNC_BCAST_ACK=1 restores the legacy barrier; the setting must be
     // identical on every node or the root will wait for ACKs that never come.
     static std::atomic<bool> cached{false};
     static std::atomic<bool> inited{false};
     if (!inited.load(std::memory_order_acquire)) {
-        cached.store(envFlagEnabled("DLLAMA_SYNC_BCAST_ACK"), std::memory_order_release);
+        cached.store(envFlagEnabled("EDGEVISOR_SYNC_BCAST_ACK"), std::memory_order_release);
         inited.store(true, std::memory_order_release);
     }
     return cached.load(std::memory_order_acquire);
@@ -244,8 +244,8 @@ static inline void waitSocketReadyAfterEagain(int socket, bool wantWrite, unsign
     pfd.events = wantWrite ? POLLOUT : POLLIN;
     pfd.revents = 0;
     const char *timeoutMsg = wantWrite
-        ? "Socket write timeout while waiting for POLLOUT (DLLAMA_IO_TIMEOUT_MS)"
-        : "Socket read timeout while waiting for POLLIN (DLLAMA_IO_TIMEOUT_MS)";
+        ? "Socket write timeout while waiting for POLLOUT (EDGEVISOR_IO_TIMEOUT_MS)"
+        : "Socket read timeout while waiting for POLLIN (EDGEVISOR_IO_TIMEOUT_MS)";
     const int timeout = remainingPollTimeoutMs(timeoutMs, startMs, timeoutMsg);
     int rc;
     do {
@@ -389,11 +389,11 @@ static inline void setTcpKeepAlive(int socket) {
     // is reset before the forward finishes. Probes start after 10s of
     // idle, and unanswered TCP traffic is aborted at 20s. A process
     // that exits still closes the socket immediately.
-    const int idle = envIntOr("DLLAMA_TCP_KEEPIDLE_S", 10);
+    const int idle = envIntOr("EDGEVISOR_TCP_KEEPIDLE_S", 10);
     if (idle <= 0) return;
-    const int intvl = std::max(1, envIntOr("DLLAMA_TCP_KEEPINTVL_S", 2));
-    const int cnt = std::max(1, envIntOr("DLLAMA_TCP_KEEPCNT", 5));
-    int userMs = envIntOr("DLLAMA_TCP_USER_TIMEOUT_MS", 20000);
+    const int intvl = std::max(1, envIntOr("EDGEVISOR_TCP_KEEPINTVL_S", 2));
+    const int cnt = std::max(1, envIntOr("EDGEVISOR_TCP_KEEPCNT", 5));
+    int userMs = envIntOr("EDGEVISOR_TCP_USER_TIMEOUT_MS", 20000);
     int on = 1;
     if (setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0) return;
     setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
@@ -459,7 +459,7 @@ static bool isOfflineErrno(int err) {
         return true;
     case ETIMEDOUT:
         // Keepalive and TCP_USER_TIMEOUT report ETIMEDOUT and do not send RST.
-        // That is a dead peer whether or not DLLAMA_IO_TIMEOUT_MS is set.
+        // That is a dead peer whether or not EDGEVISOR_IO_TIMEOUT_MS is set.
         // The inference poll deadline throws NnTransferSocketException directly
         // and does not pass through this classifier.
         return true;
@@ -781,16 +781,16 @@ static void printBytes(const char* prefix, const void* data, NnSize size) {
 
 void writeSocket(int socket, const void *data, NnSize size) {
     printBytes("DEBUG: writeSocket", data, size);
-    const bool ioProfile = dllamaIoProbeEnabled();
+    const bool ioProfile = edgevisorIoProbeEnabled();
     const unsigned long timeoutMs = getIoTimeoutMs();
     const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
     unsigned int eagainSpins = 0u;
     while (size > 0) {
-        const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t syscallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         ssize_t s = send(socket, (const char*)data, size, MSG_NOSIGNAL);
         if (s < 0) {
             if (isEagainError()) {
-                if (ioProfile) dllamaIoProbeRecordNetSendEagain();
+                if (ioProfile) edgevisorIoProbeRecordNetSendEagain();
                 waitSocketReadyAfterEagain(socket, true, timeoutMs, startMs);
                 backoffOnEagain(eagainSpins);
                 continue;
@@ -801,7 +801,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
         } else if (s == 0) {
             throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket closed");
         }
-        if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
+        if (ioProfile) edgevisorIoProbeRecordNetSendSyscall(edgevisorIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
         eagainSpins = 0u;
         size -= s;
         data = (const char*)data + s;
@@ -810,7 +810,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
 
 static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned long maxAttempts, unsigned long deadlineMs = 0ul) {
     // maxAttempts = 0 means infinite attempts
-    const bool ioProfile = dllamaIoProbeEnabled();
+    const bool ioProfile = edgevisorIoProbeEnabled();
     const unsigned long timeoutMs = deadlineMs > 0ul ? deadlineMs : getIoTimeoutMs();
     const long long startMs = (timeoutMs > 0ul) ? nowMsSteady() : 0ll;
     NnSize s = size;
@@ -818,7 +818,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
     while (s > 0) {
         if (timeoutMs > 0ul && nowMsSteady() - startMs >= (long long)timeoutMs)
             throw NnTransferSocketException(ETIMEDOUT, "Socket read deadline exceeded");
-        const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t syscallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         int recvFlags = 0;
 #ifdef MSG_DONTWAIT
         if (maxAttempts > 0ul) recvFlags = MSG_DONTWAIT;
@@ -826,7 +826,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
         ssize_t r = recv(socket, (char*)data, s, recvFlags);
         if (r < 0) {
             if (isEagainError()) {
-                if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
+                if (ioProfile) edgevisorIoProbeRecordNetRecvEagain();
                 if (s == size && maxAttempts > 0) {
                     maxAttempts--;
                     if (maxAttempts == 0) {
@@ -845,7 +845,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
         } else if (r == 0) {
             throw NnTransferSocketException(NN_PEER_OFFLINE, "Socket closed");
         }
-        if (ioProfile) dllamaIoProbeRecordNetRecvSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
+        if (ioProfile) edgevisorIoProbeRecordNetRecvSyscall(edgevisorIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
         printBytes("DEBUG: readSocket", data, r);
         eagainSpins = 0u;
         data = (char*)data + r;
@@ -1659,7 +1659,7 @@ NnNetwork::NnNetwork(std::vector<NnSocket> *sockets, std::vector<NnUint> *peerNo
     }
     this->sentBytes = new NnSize[nSockets];
     this->recvBytes = new NnSize[nSockets];
-    this->commProfileEnabled = envFlagEnabled("DLLAMA_COMM_PROFILE");
+    this->commProfileEnabled = envFlagEnabled("EDGEVISOR_COMM_PROFILE");
 }
 
 NnNetwork::~NnNetwork() {
@@ -1804,8 +1804,8 @@ void NnNetwork::printCommProfile(const char *label, const NnCommProfileStats &s,
 void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize size) {
     assert(socketIndex < nSockets);
 
-    const bool ioProfile = dllamaIoProbeEnabled();
-    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const bool ioProfile = edgevisorIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
     try {
@@ -1822,14 +1822,14 @@ void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize s
         throw NnPeerOfflineException(peer, error.what());
     }
     sentBytes[socketIndex] += size;
-    if (ioProfile) dllamaIoProbeRecordNetWriteWall(dllamaIoProbeNowUs() - wallStartUs);
+    if (ioProfile) edgevisorIoProbeRecordNetWriteWall(edgevisorIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
     assert(socketIndex < nSockets);
 
-    const bool ioProfile = dllamaIoProbeEnabled();
-    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const bool ioProfile = edgevisorIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
     try {
@@ -1846,7 +1846,7 @@ void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
         throw NnPeerOfflineException(peer, error.what());
     }
     recvBytes[socketIndex] += size;
-    if (ioProfile) dllamaIoProbeRecordNetReadWall(dllamaIoProbeNowUs() - wallStartUs);
+    if (ioProfile) edgevisorIoProbeRecordNetReadWall(edgevisorIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::writeAck(const NnUint socketIndex) {
@@ -1880,7 +1880,7 @@ void NnNetwork::readAckWithTimeout(const NnUint socketIndex, unsigned long timeo
 
     const int rc = select(sockets[socketIndex] + 1, &rfds, nullptr, nullptr, &tv);
     if (rc == 0) {
-        throw NnTransferSocketException(ETIMEDOUT, "Socket ack timeout (DLLAMA_IO_TIMEOUT_MS)");
+        throw NnTransferSocketException(ETIMEDOUT, "Socket ack timeout (EDGEVISOR_IO_TIMEOUT_MS)");
     }
     if (rc < 0) {
         throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
@@ -2011,8 +2011,8 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios, bool dropOffline) {
         if (simDelayUs > 0ul) usleep(simDelayUs);
     }
     bool isWriting;
-    const bool ioProfile = dllamaIoProbeEnabled();
-    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const bool ioProfile = edgevisorIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     if (commProfileEnabled) commWriteManyCalls.fetch_add(1u, std::memory_order_relaxed);
     NnSize nBytes = 0;
     const unsigned long timeoutMs = getIoTimeoutMs();
@@ -2028,7 +2028,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios, bool dropOffline) {
         if (timeoutMs > 0ul) {
             const long long elapsed = nowMsSteady() - startMs;
             if (elapsed > (long long)timeoutMs) {
-                throw NnTransferSocketException(ETIMEDOUT, "Socket write timeout (DLLAMA_IO_TIMEOUT_MS)");
+                throw NnTransferSocketException(ETIMEDOUT, "Socket write timeout (EDGEVISOR_IO_TIMEOUT_MS)");
             }
         }
         isWriting = false;
@@ -2050,12 +2050,12 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios, bool dropOffline) {
                 if (blockedByEarlier) continue;
                 int socket = sockets[io->socketIndex];
                 ssize_t chunkSize = io->size > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : io->size;
-                const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+                const std::uint64_t syscallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
                 ssize_t s = send(socket, (const char*)io->data, chunkSize, MSG_NOSIGNAL);
                 if (s < 0) {
                     if (isEagainError()) {
                         recordCommSendEagain();
-                        if (ioProfile) dllamaIoProbeRecordNetSendEagain();
+                        if (ioProfile) edgevisorIoProbeRecordNetSendEagain();
                         waitSocketReadyAfterEagain(socket, true, timeoutMs, startMs);
                         backoffOnEagain(eagainSpins);
                         continue;
@@ -2073,7 +2073,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios, bool dropOffline) {
                     if (dropOffline) { io->size = 0; continue; }
                     throw NnPeerOfflineException(peer, "Socket closed");
                 }
-                if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
+                if (ioProfile) edgevisorIoProbeRecordNetSendSyscall(edgevisorIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
                 recordCommSend((NnSize)s);
                 eagainSpins = 0u;
                 io->size -= s;
@@ -2081,7 +2081,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios, bool dropOffline) {
             }
         }
     } while (isWriting);
-    if (ioProfile) dllamaIoProbeRecordNetWriteWall(dllamaIoProbeNowUs() - wallStartUs);
+    if (ioProfile) edgevisorIoProbeRecordNetWriteWall(edgevisorIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::writeAll(const void *data, NnSize size) {
@@ -2104,8 +2104,8 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios, const std::function<void()> 
         if (simDelayUs > 0ul) usleep(simDelayUs);
     }
     bool isReading;
-    const bool ioProfile = dllamaIoProbeEnabled();
-    const std::uint64_t wallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const bool ioProfile = edgevisorIoProbeEnabled();
+    const std::uint64_t wallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     if (commProfileEnabled) commReadManyCalls.fetch_add(1u, std::memory_order_relaxed);
     NnSize nBytes = 0;
     const unsigned long timeoutMs = getIoTimeoutMs();
@@ -2122,7 +2122,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios, const std::function<void()> 
         if (timeoutMs > 0ul) {
             const long long elapsed = nowMsSteady() - startMs;
             if (elapsed > (long long)timeoutMs) {
-                throw NnTransferSocketException(ETIMEDOUT, "Socket read timeout (DLLAMA_IO_TIMEOUT_MS)");
+                throw NnTransferSocketException(ETIMEDOUT, "Socket read timeout (EDGEVISOR_IO_TIMEOUT_MS)");
             }
         }
         isReading = false;
@@ -2143,7 +2143,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios, const std::function<void()> 
                 }
                 if (blockedByEarlier) continue;
                 int socket = sockets[io->socketIndex];
-                const std::uint64_t syscallStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+                const std::uint64_t syscallStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
                 int recvFlags = 0;
 #ifdef MSG_DONTWAIT
                 if (onWait) recvFlags = MSG_DONTWAIT;
@@ -2152,7 +2152,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios, const std::function<void()> 
                 if (r < 0) {
                     if (isEagainError()) {
                         recordCommRecvEagain();
-                        if (ioProfile) dllamaIoProbeRecordNetRecvEagain();
+                        if (ioProfile) edgevisorIoProbeRecordNetRecvEagain();
                         if (onWait) {
                             const long long now = nowMsSteady();
                             if (now - lastWaitCheckMs >= 50) {
@@ -2179,7 +2179,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios, const std::function<void()> 
                     deactivateNode(peer, 0u);
                     throw NnPeerOfflineException(peer, "Socket closed");
                 }
-                if (ioProfile) dllamaIoProbeRecordNetRecvSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
+                if (ioProfile) edgevisorIoProbeRecordNetRecvSyscall(edgevisorIoProbeNowUs() - syscallStartUs, (std::uint64_t)r);
                 recordCommRecv((NnSize)r);
                 eagainSpins = 0u;
                 io->size -= r;
@@ -2187,7 +2187,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios, const std::function<void()> 
             }
         }
     } while (isReading);
-    if (ioProfile) dllamaIoProbeRecordNetReadWall(dllamaIoProbeNowUs() - wallStartUs);
+    if (ioProfile) edgevisorIoProbeRecordNetReadWall(edgevisorIoProbeNowUs() - wallStartUs);
 }
 
 void NnNetwork::getStats(NnSize *sentBytes, NnSize *recvBytes) {
@@ -2538,7 +2538,7 @@ int NnNetwork::askPpDeliveryState(const NnUnevenPartitionPlan *plan, NnUint myNo
     // bounded by TCP_USER_TIMEOUT (4s in the tests, 20s by default). Returning
     // silence at 500ms skips the replay, and the next activation is then read
     // as this token.
-    const int userMs = envIntOr("DLLAMA_TCP_USER_TIMEOUT_MS", 20000);
+    const int userMs = envIntOr("EDGEVISOR_TCP_USER_TIMEOUT_MS", 20000);
     long long askMs = NN_PP_DELIVERY_ASK_TIMEOUT_MS;
     if (userMs > 0) {
         const long long bound = (long long)userMs + 1000ll;
@@ -2768,7 +2768,7 @@ static void syncWithRoot(
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
 
-        // The ACK barrier is optional (DLLAMA_SYNC_BCAST_ACK=1 restores it):
+        // The ACK barrier is optional (EDGEVISOR_SYNC_BCAST_ACK=1 restores it):
         // TCP stream ordering already guarantees workers consume this
         // broadcast before any later message, and the workers' next upstream
         // slice acts as the natural synchronization point, so the extra
@@ -2808,7 +2808,7 @@ static void syncWithRoot(
         ios.socketIndex = rootSocketIndex; // [修正] 使用查找到的 Socket，而不是硬编码 0
         network->readMany(1, &ios);
 
-        // Optional ACK barrier (DLLAMA_SYNC_BCAST_ACK=1): see the root side.
+        // Optional ACK barrier (EDGEVISOR_SYNC_BCAST_ACK=1): see the root side.
         if (getSyncBcastAckEnabled()) {
             network->writeAck(rootSocketIndex);
         }
@@ -3419,11 +3419,11 @@ NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(
     this->layerProfileEnabled = layerProfileEnabled;
 
     // Env toggles for layer profiling.
-    // - DLLAMA_LAYER_PROF_PRINT=1 enables stdout printing on stage root.
-    // - DLLAMA_LAYER_PROF_PATH sets explicit snapshot file path (stage root only).
-    const char *p = std::getenv("DLLAMA_LAYER_PROF_PRINT");
+    // - EDGEVISOR_LAYER_PROF_PRINT=1 enables stdout printing on stage root.
+    // - EDGEVISOR_LAYER_PROF_PATH sets explicit snapshot file path (stage root only).
+    const char *p = std::getenv("EDGEVISOR_LAYER_PROF_PRINT");
     layerPerfPrintEnabled = (p != nullptr && p[0] != '\0' && std::atoi(p) != 0);
-    const char *pathEnv = std::getenv("DLLAMA_LAYER_PROF_PATH");
+    const char *pathEnv = std::getenv("EDGEVISOR_LAYER_PROF_PATH");
     if (pathEnv != nullptr && pathEnv[0] != '\0') {
         layerPerfPath = std::string(pathEnv);
     }
@@ -3512,7 +3512,7 @@ void NnNetworkNodeSynchronizer::maybeInitLayerPerfSnapshot() {
         char buf[256];
         const char *user = std::getenv("USER");
         if (user == nullptr || user[0] == '\0') user = "unknown";
-        std::snprintf(buf, sizeof(buf), "/tmp/dllama_layer_prof_%s_uid%u_stage%u_root%u_pid%u.bin",
+        std::snprintf(buf, sizeof(buf), "/tmp/edgevisor_layer_prof_%s_uid%u_stage%u_root%u_pid%u.bin",
                       user,
                       (unsigned)::getuid(),
                       (unsigned)myStage->stageIndex,
@@ -3621,11 +3621,11 @@ void NnNetworkNodeSynchronizer::onSyncStepComplete(NnUint segmentIndex) {
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
 
-    static const bool kvAggProof = envFlagEnabled("DLLAMA_KV_AGGREGATE_PROOF");
-    static const bool kvAggProofAllBatches = envFlagEnabled("DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES");
-    static const bool syncTrace = envFlagEnabled("DLLAMA_SYNC_TRACE");
-    static const bool syncTraceAllThreads = envFlagEnabled("DLLAMA_SYNC_TRACE_ALL_THREADS");
-    static const bool syncProfile = envFlagEnabled("DLLAMA_SYNC_PROFILE");
+    static const bool kvAggProof = envFlagEnabled("EDGEVISOR_KV_AGGREGATE_PROOF");
+    static const bool kvAggProofAllBatches = envFlagEnabled("EDGEVISOR_KV_AGGREGATE_PROOF_ALL_BATCHES");
+    static const bool syncTrace = envFlagEnabled("EDGEVISOR_SYNC_TRACE");
+    static const bool syncTraceAllThreads = envFlagEnabled("EDGEVISOR_SYNC_TRACE_ALL_THREADS");
+    static const bool syncProfile = envFlagEnabled("EDGEVISOR_SYNC_PROFILE");
 
     auto nowUs = []() -> long long {
         return (long long)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -4000,17 +4000,17 @@ static inline void unsetEnvPortable(const char *name) {
 
 static std::vector<std::string> buildEnvSyncList() {
     // Default whitelist (debug/migration switches). Extend at runtime via:
-    //   DLLAMA_SYNC_ENV_VARS="FOO,BAR,BAZ"
+    //   EDGEVISOR_SYNC_ENV_VARS="FOO,BAR,BAZ"
     static const char *kDefaults[] = {
-        "DLLAMA_FORCE_MATMUL_VIEWS",
-        "DLLAMA_KV_AGGREGATE",
-        "DLLAMA_KV_AGGREGATE_PROOF",
-        "DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES",
-        "DLLAMA_SYNC_TRACE",
-        "DLLAMA_SYNC_TRACE_ALL_THREADS",
-        "DLLAMA_IO_TIMEOUT_MS",
-        "DLLAMA_CONTROL_LOG",
-        "DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT"
+        "EDGEVISOR_FORCE_MATMUL_VIEWS",
+        "EDGEVISOR_KV_AGGREGATE",
+        "EDGEVISOR_KV_AGGREGATE_PROOF",
+        "EDGEVISOR_KV_AGGREGATE_PROOF_ALL_BATCHES",
+        "EDGEVISOR_SYNC_TRACE",
+        "EDGEVISOR_SYNC_TRACE_ALL_THREADS",
+        "EDGEVISOR_IO_TIMEOUT_MS",
+        "EDGEVISOR_CONTROL_LOG",
+        "EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_SHIFT"
     };
 
     std::set<std::string> names;
@@ -4018,7 +4018,7 @@ static std::vector<std::string> buildEnvSyncList() {
         names.insert(std::string(kDefaults[i]));
     }
 
-    const char *extra = std::getenv("DLLAMA_SYNC_ENV_VARS");
+    const char *extra = std::getenv("EDGEVISOR_SYNC_ENV_VARS");
     if (extra != nullptr && extra[0] != '\0') {
         std::string s(extra);
         size_t start = 0;

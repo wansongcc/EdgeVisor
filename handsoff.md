@@ -156,3 +156,580 @@
 - 8 个 commit 全在 `perf/t4-cuda-speed` 上，都没推送。
 - 改动面（不含 `handsoff.md`）：11 个文件，+1941/−299。即 `EdgeVisor/Makefile`、`EdgeVisor/src/app.cpp`、`EdgeVisor/src/app.hpp`、`EdgeVisor/src/dllama.cpp`、`EdgeVisor/src/dynamic/dynamic_tpot.cpp`、`EdgeVisor/src/llm.cpp`、`EdgeVisor/src/nn/nn-cuda.cu`、`EdgeVisor/src/nn/nn-cuda.hpp`、`EdgeVisor/src/nn/nn-executor.cpp`、`EdgeVisor/src/nn/nn-executor.hpp`、`EdgeVisor/src/nn/nn-network.cpp`。其中第 5 轮新增/改动的是 `app.cpp`、`app.hpp`、`dllama.cpp`、`dynamic/dynamic_tpot.cpp`、`llm.cpp`、`nn/nn-executor.cpp`、`nn/nn-executor.hpp` 这 7 个。
 - 这次交接只改 `handsoff.md`，源码没有新改动。
+
+# 附录：纯推理速度对比复现指南（T4 单机 / 5 机边缘）
+
+本附录只做**纯推理吞吐（tok/s）**对比：单请求 PP、固定 prompt、`--temperature 0 --seed 1 --steps 64`、`--benchmark`、`--buffer-float-type q80`。**不涉及**迁移、掉线重连、影子 KV 覆盖、Algo2 等其他功能；那些功能的验证结论见正文。
+
+两个被对比的版本固定为：
+
+| 代号 | commit | 说明 |
+| --- | --- | --- |
+| `base` | `657900f` | 优化前 `main`（`Record the merged takeover fix...`） |
+| `r5` | `6699276` | 优化后当前 `main`。相对 `c92796e` 只多改了 `EdgeVisor/src/test/test_pp_failover_network.cpp` 和 `handsoff.md`，**推理路径逐字节一致**，因此正文里所有 `c92796e` 的实测数值可以直接对照 |
+
+目录约定：二进制统一放 `…/bins/<rev>/dllama`，**文件名必须正好是 `dllama`**（`comm` 只有 15 字符，名字长了 `pkill -9 -x dllama` 会漏杀，留下孤儿 worker 占显存）。两版靠**目录**区分，不靠文件名区分。
+
+---
+
+# 章节一：4×T4 纯推理速度对比复现（`yhs1` 本地 4×T4）
+
+机器：`yhs1` 自带 4 张 Tesla T4（cc 7.5 / sm_75 / 每张 14912 MB）。Worker 用 GPU 1/2/3，Root 用 GPU 0，四张卡各跑一个 stage。
+
+## 1.1 取两版源码并各自独立编译
+
+`git worktree` 最省事（不碰当前工作区，也不影响 `experiments/algo2/logs/t4_rejoin/`）。也可以换成 `git archive` 解到 `/tmp`，效果一样。
+
+```bash
+cd /home/byh/B01/EdgeVisor-wansongcc
+mkdir -p /tmp/ev_speed_bins /tmp/ev_speed_build
+
+for rev in 657900f 6699276; do
+  tag=base; [ "$rev" = 6699276 ] && tag=r5
+  rm -rf "/tmp/ev_speed_build/$rev"
+  # rm -rf 只删目录，.git/worktrees 里的注册记录还在；不 prune 会报
+  # "missing but already registered worktree"，脚本第二次跑就断在这
+  git worktree prune
+  git worktree add --detach "/tmp/ev_speed_build/$rev" "$rev"
+  # T4 是 sm_75；CUDA_ARCHS 留默认 auto 就会自动探测到 sm_75
+  make -C "/tmp/ev_speed_build/$rev/EdgeVisor" -j 12 dllama \
+       DLLAMA_CUDA=1 DLLAMA_VULKAN=0 > "/tmp/ev_speed_build/$rev.build.log" 2>&1 \
+    || { echo "BUILD FAIL $rev"; tail -20 "/tmp/ev_speed_build/$rev.build.log"; break; }
+  mkdir -p "/tmp/ev_speed_bins/$tag"
+  cp -f "/tmp/ev_speed_build/$rev/EdgeVisor/dllama" "/tmp/ev_speed_bins/$tag/dllama"
+  chmod +x "/tmp/ev_speed_bins/$tag/dllama"
+  md5sum "/tmp/ev_speed_bins/$tag/dllama"
+done
+
+# 清掉 worktree（编译树 ~几百 MB，别留在 /home）
+for rev in 657900f 6699276; do git worktree remove --force "/tmp/ev_speed_build/$rev"; done
+```
+
+`git archive` 等价写法：
+
+```bash
+git archive --format=tar.gz -o /tmp/ev_speed_build/base.tar.gz 657900f
+git archive --format=tar.gz -o /tmp/ev_speed_build/r5.tar.gz   6699276
+# 解包后同样 make -C <dir>/EdgeVisor -j 12 dllama DLLAMA_CUDA=1 DLLAMA_VULKAN=0
+```
+
+CUDA 版不依赖 `src/nn/vulkan/*.spv`，随便哪个 cwd 都能跑；只有 Vulkan 版需要（见章节二）。
+
+## 1.2 单次运行（手工一条命令照抄）
+
+公共环境变量（两个版本都一样，`DLLAMA_IGNORE_EOS=1` 让 64 步不被 EOS 提前截断）：
+
+```bash
+export DLLAMA_IGNORE_EOS=1
+export DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3
+export DLLAMA_TCP_USER_TIMEOUT_MS=4000
+
+BIN=/tmp/ev_speed_bins/r5/dllama          # base 用 /tmp/ev_speed_bins/base/dllama
+MODEL=/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+TOK=/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
+PROMPT="What is 2+2? Answer briefly."
+```
+
+启动 3 个 worker（本机 4 个进程用的模型路径完全相同，所以 worker **可以省略** `--model`；原因见本节末）：
+
+```bash
+stdbuf -oL -eL "$BIN" worker --backend cuda --port 29611 --nthreads 1 --gpu-index 1 > /tmp/w1.log 2>&1 &
+stdbuf -oL -eL "$BIN" worker --backend cuda --port 29612 --nthreads 1 --gpu-index 2 > /tmp/w2.log 2>&1 &
+stdbuf -oL -eL "$BIN" worker --backend cuda --port 29613 --nthreads 1 --gpu-index 3 > /tmp/w3.log 2>&1 &
+sleep 4
+```
+
+Root（GPU 0，4 段各 7 层 = 28 层）：
+
+```bash
+stdbuf -oL -eL "$BIN" inference \
+  --model "$MODEL" --tokenizer "$TOK" --prompt "$PROMPT" \
+  --steps 64 --ratios '1@7*1@7*1@7*1@7' \
+  --workers 127.0.0.1:29611 127.0.0.1:29612 127.0.0.1:29613 \
+  --gpu-index 0 --backend cuda --nthreads 1 \
+  --max-seq-len 512 --temperature 0 --seed 1 \
+  --benchmark --buffer-float-type q80
+```
+
+注意 `--max-seq-len 512`（边缘 5 机用的是 `256`，两边别抄混）。`--nthreads 1` 是影子 KV 的硬约束，这里也统一用 1，保证和归档值可直接比。
+
+**`--model` 是怎么到 worker 的（不是 root 把权重推过去）：** `--ratios` 走的是非均匀 / PP 模式，root 只通过 bootstrap 包把**模型路径字符串**（连同 ratios / maxSeqLen / syncType）发给各 worker；worker 收到后**在自己本机 mmap 打开那个文件**、只加载自己 stage 的那几层，网络上跑的是激活和 KV，权重一个字节都不过网。所以真正的要求是「root 发的那个路径字符串在 worker 上也能打开」：
+
+- 本机 4×T4：4 个进程共用同一个路径，root 的字符串在 worker 上直接有效，worker 省略 `--model` 没问题；
+- 边缘 5 机：`rog` 是 `/home/cc/models/…`、Jetson 是 `/home/jetson/cc/models/…`，前缀不同，root 发的字符串在 Jetson 上打不开，**Jetson worker 必须用自己的 `--model` 覆盖**（worker 侧优先用 CLI 的 `--model`，没给才回退到 bootstrap 传来那条）。
+
+（对照组：不带 `--ratios` 的均匀模式才是 root 通过网络把权重分发给 worker，别和上面这套混了。）
+
+正常输出结尾是：
+
+```
+[e1-end] pos=64 t_mono_ns=…
+tokens/s: 49.72 (20.11 ms/tok)
+```
+
+清理：`pkill -f -- '--port 29611'`（29612 / 29613 同理），或直接 `pkill -9 -x dllama`。
+
+## 1.3 3 轮交错对比脚本（直接跑）
+
+存成 `/tmp/ev_speed_t4.sh`，`bash /tmp/ev_speed_t4.sh 3`。**必须交错**：T4 有 clock drift，单跑一遍的差可以到 10% 以上，不能当倍速用。
+
+```bash
+#!/usr/bin/env bash
+# 4xT4 纯推理交错对比：base(657900f) vs r5(6699276)
+# 用法: bash /tmp/ev_speed_t4.sh [rounds]
+set -u
+ROUNDS="${1:-3}"
+BINS=/tmp/ev_speed_bins
+OUT=/tmp/ev_speed_t4
+MODEL=/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
+TOK=/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
+P1=29611; P2=29612; P3=29613
+PROMPT="What is 2+2? Answer briefly."
+mkdir -p "$OUT"; : > "$OUT/summary.txt"
+
+export DLLAMA_IGNORE_EOS=1
+export DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3
+export DLLAMA_TCP_USER_TIMEOUT_MS=4000
+
+cleanup() {
+  for p in "$P1" "$P2" "$P3"; do pkill -f -- "--port $p" >/dev/null 2>&1 || true; done
+  sleep 2
+}
+
+run_one() {   # run_one <base|r5> <round>
+  local tag="$1" r="$2" bin="$BINS/$1/dllama" out="$OUT/${1}_r$2"
+  rm -rf "$out"; mkdir -p "$out"; cleanup
+
+  stdbuf -oL -eL "$bin" worker --backend cuda --port "$P1" --nthreads 1 --gpu-index 1 >"$out/w1.log" 2>&1 &
+  stdbuf -oL -eL "$bin" worker --backend cuda --port "$P2" --nthreads 1 --gpu-index 2 >"$out/w2.log" 2>&1 &
+  stdbuf -oL -eL "$bin" worker --backend cuda --port "$P3" --nthreads 1 --gpu-index 3 >"$out/w3.log" 2>&1 &
+  sleep 4
+
+  stdbuf -oL -eL "$bin" inference \
+    --model "$MODEL" --tokenizer "$TOK" --prompt "$PROMPT" \
+    --steps 64 --ratios '1@7*1@7*1@7*1@7' \
+    --workers "127.0.0.1:$P1" "127.0.0.1:$P2" "127.0.0.1:$P3" \
+    --gpu-index 0 --backend cuda --nthreads 1 --max-seq-len 512 \
+    --temperature 0 --seed 1 --benchmark --buffer-float-type q80 \
+    >"$out/root.log" 2>&1
+  echo "$?" > "$out/rc.txt"
+  cleanup
+
+  # 文本指纹：去掉 pos=/t_mono_ns= 后逐字节比较
+  sed -n '/^4$/,/e1-end/p' "$out/root.log" \
+    | sed 's/ pos=[0-9]* t_mono_ns=[0-9]*//' | sed 's/\[e1-end\]//' > "$out/txt.txt"
+  md5sum "$out/txt.txt" | awk '{print $1}' > "$out/txt.md5"
+  sed -n '/Stage\/Node Profile Summary/,$p' "$out/root.log" > "$out/profile.txt"
+
+  local tps ms
+  tps=$(grep -aoE 'tokens/s: [0-9.]+' "$out/root.log" | tail -1 | grep -oE '[0-9.]+')
+  ms=$(grep -aoE '\([0-9.]+ ms/tok\)' "$out/root.log" | tail -1 | tr -d '()' | awk '{print $1}')
+  echo "$tag $r ${tps:-0} ${ms:-0} $(cat "$out/rc.txt") $(cat "$out/txt.md5")" >> "$OUT/summary.txt"
+  echo "  $tag r$r rc=$(cat "$out/rc.txt") ${tps:-NO_TPS} tok/s ${ms:-?} ms/tok md5=$(cat "$out/txt.md5")"
+}
+
+med() { sort -n | awk '{a[NR]=$1} END{ if(NR==0){print "NA"; exit}
+        if(NR%2) printf "%.2f\n", a[(NR+1)/2]; else printf "%.2f\n", (a[NR/2]+a[NR/2+1])/2 }'; }
+
+for r in $(seq 1 "$ROUNDS"); do
+  # 奇偶轮换顺序，避免某一版总固定在同一热/冷槽位
+  if [ $(( r % 2 )) -eq 1 ]; then ORDER="base r5"; else ORDER="r5 base"; fi
+  for tag in $ORDER; do run_one "$tag" "$r"; done
+done
+
+for tag in base r5; do
+  awk -v t="$tag" '$1==t{print $3}' "$OUT/summary.txt" > "$OUT/$tag.tps"
+  awk -v t="$tag" '$1==t{print $4}' "$OUT/summary.txt" > "$OUT/$tag.ms"
+done
+B=$(med < "$OUT/base.tps"); R=$(med < "$OUT/r5.tps")
+echo "median base=${B} tok/s  r5=${R} tok/s  speedup=$(awk -v b="$B" -v r="$R" 'BEGIN{printf "%.2fx", r/b}')" | tee -a "$OUT/summary.txt"
+```
+
+## 1.4 预期参考基准
+
+| 臂 | `657900f` | `6699276` | 加速比 |
+| --- | --- | --- | --- |
+| Plain PP（本指南跑的这条） | 16.32 tok/s（61.3 ms/tok） | ~49.7–52.4 tok/s（19.1–20.1 ms/tok） | **约 3.1×** |
+
+- 优化前基线来自第 4 轮 `/tmp/ev_perf_base/armA`（16.87 / 16.03，中位 16.32）；优化后来自 `/tmp/ev_r5_t4_verify/fix1/A` 两轮 49.72 / 52.39（同为纯 PP、lss=0），另加第 4 轮 c4 的 51.73。
+- **文本一致性**：4×T4 上两版输出逐字节相同，`txt.md5` 都应是 `fa945fe6b651db1da18c55e91978bd24`。这是 T4 侧的强校验——如果 r5 跑出别的 md5，说明编译或参数抄错了，不要当成“优化改变了输出”。
+- 可选追加 `DLLAMA_LAST_STAGE_SAMPLING=1`（尾段采样下沉）后 r5 约 50.9–53.4 tok/s（`/tmp/ev_r5_t4_verify/fix1/C`）。4×T4 上这一项收益很小，正文已说明第 5 轮的主战场在边缘集群。
+
+---
+
+# 章节二：5 机边缘设备集纯推理速度对比复现（`rog` + `nx1` + `nx2` + `nano1` + `nano2`）
+
+## 2.1 硬件、IP、路径、后端、GPU 索引
+
+| 节点 | 角色 | stage | 硬件 | 后端 | `--gpu-index` | IP | 模型路径 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `rog` | Root | 0 | RTX 3060 Laptop 6 GB + AMD 核显 | Vulkan | **1** | `10.47.72.162`（ssh 别名 `rog`，用户 `cc`） | `/home/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m` |
+| `nx1` | Worker | 1 | Jetson Orin 15.6 GB | CUDA sm_87 | 0 | `192.168.137.13` | `/home/jetson/cc/models/…` |
+| `nx2` | Worker | 2 | Jetson Orin 15.6 GB | CUDA sm_87 | 0 | `192.168.137.15` | 同上 |
+| `nano1` | Worker | 3 | Jetson Orin 7.6 GB | CUDA sm_87 | 0 | `192.168.137.18` | 同上 |
+| `nano2` | Worker | 4 | Jetson Orin 7.6 GB | CUDA sm_87 | 0 | `192.168.137.16` | 同上 |
+
+tokenizer（rog 侧）：`/home/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t`，Jetson 侧在同一个 `/home/jetson/cc/models/…` 前缀下。
+
+**必须记住的三条硬件约束：**
+
+1. `rog` 的 `--gpu-index 1` 才是 RTX 3060。`vulkaninfo --summary` 里 GPU0 = AMD Radeon (RADV RENOIR，核显)、GPU1 = NVIDIA GeForce RTX 3060 Laptop GPU（discrete）、GPU2 = llvmpipe。**用 0 会跑到核显上**，速度直接掉一个量级。启动日志的自检行应是：
+   `device: backend=vulkan threads=1 Vulkan[1]: NVIDIA GeForce RTX 3060 Laptop GPU, deviceLocal=6144 MB`
+2. 四台 Jetson 的 Tegra GPU 都是 `--gpu-index 0`；编译前必须 `export PATH=/usr/local/cuda/bin:$PATH`，否则 `nvcc` 找不到。
+3. Vulkan 二进制运行时需要 `./src/nn/vulkan/*.spv`（24 个 shader，由 `make` 从同名 `.comp` 生成；两版 shader 完全相同，拷一份就够），**cwd 必须是包含 `./src/nn/vulkan/` 的目录**，否则 Vulkan 后端起不来。
+
+SSH 通道：`yhs1` 到 `rog` 走 `~/.ssh/config` 里的别名；`yhs1` 到四台 Jetson 直连，密钥 `~/.ssh/id_ed25519_lab`；Jetson 之间互信用 `~/.ssh/id_ed25519`。
+
+## 2.2 编译与分发
+
+二进制布局（**文件名必须是 `dllama`，靠目录区分版本**）：
+
+```
+rog:                          /tmp/ev_speed/bins/base/dllama   (Vulkan)
+                              /tmp/ev_speed/bins/r5/dllama     (Vulkan)
+nx1/nx2/nano1/nano2:          /tmp/ev_speed/bins/base/dllama   (CUDA sm_87)
+                              /tmp/ev_speed/bins/r5/dllama     (CUDA sm_87)
+rog:                          /tmp/ev_speed/run/src/nn/vulkan/*.spv   (root 的 cwd)
+```
+
+### (a) `rog` 上编 Vulkan 版（两版各一次）
+
+```bash
+cd /home/byh/B01/EdgeVisor-wansongcc
+for rev in 657900f 6699276; do
+  tag=base; [ "$rev" = 6699276 ] && tag=r5
+  git archive --format=tar.gz -o "/tmp/ev_speed_build/edge-$rev.tar.gz" "$rev"
+done
+
+for rev in 657900f 6699276; do
+  tag=base; [ "$rev" = 6699276 ] && tag=r5
+  scp -q "/tmp/ev_speed_build/edge-$rev.tar.gz" rog:/tmp/
+  ssh rog "set -e
+    rm -rf /tmp/ev_speed_build/$rev-vulkan && mkdir -p /tmp/ev_speed_build/$rev-vulkan
+    tar xzf /tmp/edge-$rev.tar.gz -C /tmp/ev_speed_build/$rev-vulkan
+    make -C /tmp/ev_speed_build/$rev-vulkan/EdgeVisor dllama -j 8 \
+         DLLAMA_CUDA=0 DLLAMA_VULKAN=1 > /tmp/ev_speed_build/build-$rev-vulkan.log 2>&1
+    mkdir -p /tmp/ev_speed/bins/$tag
+    cp -f /tmp/ev_speed_build/$rev-vulkan/EdgeVisor/dllama /tmp/ev_speed/bins/$tag/dllama
+    chmod +x /tmp/ev_speed/bins/$tag/dllama
+    mkdir -p /tmp/ev_speed/run/src/nn/vulkan
+    cp -f /tmp/ev_speed_build/$rev-vulkan/EdgeVisor/src/nn/vulkan/*.spv /tmp/ev_speed/run/src/nn/vulkan/
+    md5sum /tmp/ev_speed/bins/$tag/dllama
+    ls /tmp/ev_speed/run/src/nn/vulkan/*.spv | wc -l
+    rm -rf /tmp/ev_speed_build/$rev-vulkan"
+done
+```
+
+`rog` 的 `/` 分区很小，编完**立刻删源码树**（上面已经带 `rm -rf`）。历史参考 md5：`657900f` Vulkan 版 `4d33af3ab3f5f9e291223f51c027194a`，`c92796e` Vulkan 版 `8970700a3a6f6939ac189a80124e43c7`。shader 数应为 24。
+
+### (b) `nx1` 上编 CUDA sm_87 版，再 `scp` 分发给另外三台
+
+```bash
+cd /home/byh/B01/EdgeVisor-wansongcc
+for rev in 657900f 6699276; do
+  tag=base; [ "$rev" = 6699276 ] && tag=r5
+  scp -q "/tmp/ev_speed_build/edge-$rev.tar.gz" "jetson@192.168.137.13:/tmp/"
+  ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_lab jetson@192.168.137.13 "set -e
+    export PATH=/usr/local/cuda/bin:\$PATH
+    rm -rf /tmp/ev_speed_build/$rev-cuda && mkdir -p /tmp/ev_speed_build/$rev-cuda
+    tar xzf /tmp/edge-$rev.tar.gz -C /tmp/ev_speed_build/$rev-cuda
+    make -C /tmp/ev_speed_build/$rev-cuda/EdgeVisor dllama -j 4 \
+         DLLAMA_CUDA=1 DLLAMA_VULKAN=0 CUDA_ARCHS=87 > /tmp/ev_speed_build/build-$rev-cuda.log 2>&1
+    mkdir -p /tmp/ev_speed/bins/$tag
+    cp -f /tmp/ev_speed_build/$rev-cuda/EdgeVisor/dllama /tmp/ev_speed/bins/$tag/dllama
+    chmod +x /tmp/ev_speed/bins/$tag/dllama
+    md5sum /tmp/ev_speed/bins/$tag/dllama
+    rm -rf /tmp/ev_speed_build/$rev-cuda"
+done
+```
+
+分发（从 `nx1` 推到 `nx2` / `nano1` / `nano2`；`nx1` 自己的那份已经在本地了）：
+
+```bash
+ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_lab jetson@192.168.137.13 '
+  for ip in 192.168.137.15 192.168.137.18 192.168.137.16; do
+    for tag in base r5; do
+      ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 jetson@$ip \
+        "mkdir -p /tmp/ev_speed/bins/$tag"
+      scp -q -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 \
+        /tmp/ev_speed/bins/$tag/dllama "jetson@$ip:/tmp/ev_speed/bins/$tag/dllama"
+      ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 jetson@$ip \
+        "chmod +x /tmp/ev_speed/bins/$tag/dllama && md5sum /tmp/ev_speed/bins/$tag/dllama"
+    done
+  done'
+```
+
+历史参考 md5：`657900f` CUDA 版 `8e39d7bab462e98e56e010db393028a9`，`c92796e` CUDA 版 `c87a1f68da1340147eab14c470357498`。四台 Jetson 上同名二进制应逐字节相同。
+
+清理时必须 `pkill -9 -x dllama`（短名才能精确匹配）；不要用 `pkill -f dllama_…`，长名在 `comm` 里被截断到 15 字符，匹配不上就留下孤儿进程。
+
+## 2.3 单次运行（手工一条命令照抄）
+
+先在 `rog` 上写好 root 启动器（`--ratios '1@8*1@6*1@4*1@5*1@5'` = 28 层）：
+
+```bash
+cat > /tmp/ev_speed/root_bench.sh <<'EOF'
+#!/bin/bash
+# argv: <base|r5> <port> [ratios]
+set -u
+REV="$1"; PORT="$2"; RATIOS="${3:-1@8*1@6*1@4*1@5*1@5}"
+export DLLAMA_IGNORE_EOS=1
+export DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3
+export DLLAMA_TCP_USER_TIMEOUT_MS=5000
+cd /tmp/ev_speed/run || exit 4          # 必须是含 ./src/nn/vulkan/ 的目录
+exec stdbuf -oL -eL "/tmp/ev_speed/bins/$REV/dllama" inference \
+  --model /home/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m \
+  --tokenizer /home/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t \
+  --prompt "What is 2+2? Answer briefly." \
+  --steps 64 --temperature 0 --seed 1 \
+  --benchmark --buffer-float-type q80 --max-seq-len 256 --nthreads 1 \
+  --backend vulkan --gpu-index 1 --ratios "$RATIOS" \
+  --workers 192.168.137.13:$PORT 192.168.137.15:$PORT \
+            192.168.137.18:$PORT 192.168.137.16:$PORT
+EOF
+chmod +x /tmp/ev_speed/root_bench.sh
+```
+
+四台 Jetson 各起一个 worker（`--port 18095 --nthreads 1 --gpu-index 0`，**worker 需要 `--model`**）：
+
+```bash
+for ip in 192.168.137.13 192.168.137.15 192.168.137.18 192.168.137.16; do
+  ssh -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_lab jetson@$ip \
+    "setsid nohup stdbuf -oL -eL /tmp/ev_speed/bins/r5/dllama worker \
+       --port 18095 \
+       --model /home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m \
+       --nthreads 1 --backend cuda --gpu-index 0 \
+       > /tmp/ev_speed/w.log 2>&1 < /dev/null &"
+done
+sleep 12     # Jetson 加载权重慢，等端口确实在听
+```
+
+把 `bins/r5` 换成 `bins/base` 就是优化前那版；**worker 与 root 必须同版本**。
+
+在 `rog` 上跑 root（stdout 直接落到本地日志即可）：
+
+```bash
+ssh rog 'bash /tmp/ev_speed/root_bench.sh r5 18095' > /tmp/ev_speed/r5_once.log 2>&1
+```
+
+收尾清理（在 `yhs1` 上跑，`rog` + 四台 Jetson 一起清 —— 只清 4 台 Jetson 会把 `rog` 上的 root 留成孤儿，下一轮抢 GPU）：
+
+```bash
+for h in rog nx1 nx2 nano1 nano2; do
+  ssh -o BatchMode=yes "$h" 'pkill -9 -x dllama' >/dev/null 2>&1 || true
+done
+```
+
+（`rog` 和四台 Jetson 的别名都在 `yhs1` 的 `~/.ssh/config` 里、各带自己的 `IdentityFile`，所以不用再写 IP 和 `-i`。如果你是在 `rog` 上手动清：`rog` 本机直接 `pkill -9 -x dllama`，Jetson 在那边的别名是 `lab-nx1` / `lab-nx2` / `lab-nano1` / `lab-nano2`。）
+
+可选臂（在 root 和四台 worker 上同时加同名环境变量）：
+
+- `DLLAMA_LAST_STAGE_SAMPLING=1` —— 尾段采样下沉，就是正文的 E-C。
+- 4×Jetson 纯 CUDA 变体（不用 `rog`）：`nx1` 当 root，ratios 改 `1@9*1@7*1@6*1@6`，root 用 `--backend cuda --gpu-index 0` 且 cwd 无所谓，worker 只留 `nx2/nano1/nano2` 三台。
+
+## 2.4 3 轮交错对比脚本（直接跑）
+
+存成 `/tmp/ev_speed/bench_edge.sh`，`bash /tmp/ev_speed/bench_edge.sh 3`。脚本会先把 worker 启动器铺到四台 Jetson 上，再交错跑 base/r5，每轮 5 台全清、逐 run 过有效性门。
+
+```bash
+#!/usr/bin/env bash
+# 5 机边缘纯推理交错对比：base(657900f) vs r5(6699276)
+# 前置：5 台机器上已有 /tmp/ev_speed/bins/{base,r5}/dllama，rog 上有 root_bench.sh
+# 用法: bash /tmp/ev_speed/bench_edge.sh [rounds] [ratios]
+set -u
+ROUNDS="${1:-3}"
+RATIOS="${2:-1@8*1@6*1@4*1@5*1@5}"
+PORT=18095
+BASE=/tmp/ev_speed
+OUT=$BASE/out
+JSKEY=$HOME/.ssh/id_ed25519_lab
+declare -A IP=([nx1]=192.168.137.13 [nx2]=192.168.137.15 [nano1]=192.168.137.18 [nano2]=192.168.137.16)
+WORKERS="nx1 nx2 nano1 nano2"
+mkdir -p "$OUT"; : > "$OUT/summary.txt"
+
+js()  { local h=$1; shift; ssh -o BatchMode=yes -o ConnectTimeout=8 -o IdentitiesOnly=yes -i "$JSKEY" "jetson@${IP[$h]}" "$@"; }
+rsh() { ssh -o BatchMode=yes -o ConnectTimeout=8 rog "$@"; }
+
+# ---- 一次性铺 worker 启动器（double-fork + setsid，ssh 立即返回）----
+install_starter() {
+  local s
+  s=$(cat <<'STARTER'
+#!/bin/bash
+# argv: <base|r5> <port> <log> [ENV=VAL ...]
+set -u
+BIN="/tmp/ev_speed/bins/$1/dllama"; PORT=$2; LOG=$3; shift 3
+python3 - "$BIN" "$PORT" "$LOG" "$@" <<'PY'
+import os, sys
+b, p, l = sys.argv[1:4]
+extra = dict(kv.split("=", 1) for kv in sys.argv[4:] if "=" in kv)
+if os.fork() > 0: os._exit(0)
+os.setsid()
+if os.fork() > 0: os._exit(0)
+fd = os.open(l, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.dup2(fd, 1); os.dup2(fd, 2)
+nul = os.open("/dev/null", os.O_RDONLY); os.dup2(nul, 0)
+env = dict(os.environ); env.update(extra)
+os.execve("/usr/bin/stdbuf", ["stdbuf", "-oL", "-eL", b, "worker",
+    "--port", p,
+    "--model", "/home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m",
+    "--nthreads", "1", "--backend", "cuda", "--gpu-index", "0"], env)
+PY
+STARTER
+)
+  local h
+  for h in $WORKERS; do
+    printf '%s\n' "$s" | js "$h" 'mkdir -p /tmp/ev_speed && cat > /tmp/ev_speed/start_worker.sh && chmod +x /tmp/ev_speed/start_worker.sh'
+  done
+}
+
+stop_all() {
+  pkill -9 -x dllama >/dev/null 2>&1 || true
+  local h
+  for h in $WORKERS; do js "$h" 'pkill -9 -x dllama >/dev/null 2>&1 || true' >/dev/null 2>&1 & done
+  wait >/dev/null 2>&1 || true
+  sleep 4
+}
+
+wait_ports() {
+  local i h ok
+  for i in $(seq 1 90); do
+    ok=1
+    for h in $WORKERS; do
+      js "$h" "ss -ltn | grep -q ':$PORT '" >/dev/null 2>&1 || ok=0
+    done
+    [ "$ok" -eq 1 ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+run_one() {   # run_one <base|r5> <round> [ARM_ENV]
+  local rev="$1" r="$2" arm_env="${3:-}" out="$OUT/${rev}_r$2"
+  rm -rf "$out"; mkdir -p "$out"
+  stop_all
+
+  local h
+  for h in $WORKERS; do
+    js "$h" "nohup bash /tmp/ev_speed/start_worker.sh $rev $PORT /tmp/ev_speed/w_${rev}_$h.log $arm_env >/dev/null 2>&1 < /dev/null &" >/dev/null 2>&1
+  done
+  if ! wait_ports; then
+    echo "$rev r$r PORTS_NOT_READY" | tee -a "$OUT/summary.txt"
+    for h in $WORKERS; do echo "--- $h ---"; js "$h" "tail -5 /tmp/ev_speed/w_${rev}_$h.log 2>/dev/null"; done
+    stop_all; return 1
+  fi
+  sleep 3
+
+  local t0; t0=$(date +%s)
+  # 可选臂：把 arm_env 里的开关同时塞给 root
+  rsh "env $arm_env bash /tmp/ev_speed/root_bench.sh $rev $PORT '$RATIOS'" > "$out/root.log" 2>&1
+  echo "$?" > "$out/rc.txt"
+  echo "$(( $(date +%s) - t0 ))" > "$out/wall_s.txt"
+
+  for h in $WORKERS; do js "$h" "cat /tmp/ev_speed/w_${rev}_$h.log" > "$out/w_$h.log" 2>/dev/null; done
+  stop_all
+
+  # ---- 有效性门 ----
+  local valid=1
+  [ "$(cat "$out/rc.txt")" = 0 ] || valid=0
+  grep -aq '\[e1-end\] pos=64' "$out/root.log" || valid=0
+  grep -aqE 'deactivated|peer offline' "$out/root.log" && valid=0
+  for h in $WORKERS; do grep -aqE 'weights|loaded' "$out/w_$h.log" || valid=0; done
+  echo "$valid" > "$out/valid.txt"
+
+  # ---- 取证：tok/s、ms/tok、文本 md5、各 stage profile ----
+  local tps ms
+  tps=$(grep -aoE 'tokens/s: [0-9.]+' "$out/root.log" | tail -1 | grep -oE '[0-9.]+')
+  ms=$(grep -aoE '\([0-9.]+ ms/tok\)' "$out/root.log" | tail -1 | tr -d '()' | awk '{print $1}')
+  sed -n '/^4$/,/e1-end/p' "$out/root.log" \
+    | sed 's/ pos=[0-9]* t_mono_ns=[0-9]*//' | sed 's/\[e1-end\]//' > "$out/txt.txt"
+  md5sum "$out/txt.txt" | awk '{print $1}' > "$out/txt.md5"
+  sed -n '/Stage\/Node Profile Summary/,$p' "$out/root.log" > "$out/profile.txt"
+
+  echo "$rev $r ${tps:-0} ${ms:-0} $(cat "$out/rc.txt") $(cat "$out/txt.md5") valid=$valid" >> "$OUT/summary.txt"
+  echo "  $rev r$r rc=$(cat "$out/rc.txt") valid=$valid ${tps:-NO_TPS} tok/s ${ms:-?} ms/tok md5=$(cat "$out/txt.md5")"
+}
+
+med() { sort -n | awk '{a[NR]=$1} END{ if(NR==0){print "NA"; exit}
+        if(NR%2) printf "%.2f\n", a[(NR+1)/2]; else printf "%.2f\n", (a[NR/2]+a[NR/2+1])/2 }'; }
+
+install_starter
+stop_all
+
+for r in $(seq 1 "$ROUNDS"); do
+  if [ $(( r % 2 )) -eq 1 ]; then ORDER="base r5"; else ORDER="r5 base"; fi
+  for rev in $ORDER; do run_one "$rev" "$r"; done
+done
+
+for rev in base r5; do
+  awk -v t="$rev" '$1==t && $NF=="valid=1"{print $3}' "$OUT/summary.txt" > "$OUT/$rev.tps"
+  awk -v t="$rev" '$1==t && $NF=="valid=1"{print $4}' "$OUT/summary.txt" > "$OUT/$rev.ms"
+done
+B=$(med < "$OUT/base.tps"); R=$(med < "$OUT/r5.tps")
+echo "median base=$B tok/s  r5=$R tok/s  speedup=$(awk -v b="$B" -v r="$R" 'BEGIN{printf "%.2fx", r/b}')" | tee -a "$OUT/summary.txt"
+```
+
+跑可选臂时把 `run_one` 的第三个参数传进来，例如：
+
+```bash
+# E-C：尾段采样下沉
+sed -i 's|for rev in $ORDER; do run_one "$rev" "$r"; done|for rev in $ORDER; do run_one "$rev" "$r" "DLLAMA_LAST_STAGE_SAMPLING=1"; done|' /tmp/ev_speed/bench_edge.sh
+```
+
+## 2.5 启动命令速查（四条参考配置）
+
+| 配置 | ratios | root | 说明 |
+| --- | --- | --- | --- |
+| 5 机 GPU 混合 | `1@8*1@6*1@4*1@5*1@5` | `rog`，`--backend vulkan --gpu-index 1` | 本指南主线；8 个候选里最快 |
+| 5 机 + 尾段采样 | 同上 | 同上 + `DLLAMA_LAST_STAGE_SAMPLING=1` | 正文 E-C |
+| 4×Jetson 纯 CUDA | `1@9*1@7*1@6*1@6` | `nx1`，`--backend cuda --gpu-index 0` | 无 rog；worker 只有 `nx2/nano1/nano2` |
+| 5 机 CPU 校验 | 同 5 机 | 全 `--backend cpu` | 只证明管线成立，约慢 7× |
+
+4×Jetson 纯 CUDA 的 root 命令（`nx1` 上执行）：
+
+```bash
+cd /tmp/ev_speed
+stdbuf -oL -eL /tmp/ev_speed/bins/r5/dllama inference \
+  --model /home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m \
+  --tokenizer /home/jetson/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t \
+  --prompt "What is 2+2? Answer briefly." \
+  --steps 64 --temperature 0 --seed 1 \
+  --benchmark --buffer-float-type q80 --max-seq-len 256 --nthreads 1 \
+  --backend cuda --gpu-index 0 --ratios '1@9*1@7*1@6*1@6' \
+  --workers 192.168.137.15:18095 192.168.137.18:18095 192.168.137.16:18095
+```
+
+## 2.6 预期参考基准
+
+5 机 GPU 混合，3 轮交错中位数（括号内 ms/tok）：
+
+| 臂 | `657900f` | `6699276` | 加速比 |
+| --- | --- | --- | --- |
+| E-A 纯 PP | 4.79（208.98） | **12.83**（77.93） | **2.68×** |
+| E-B Shadow KV | 4.45（224.72） | **12.99**（76.97） | **2.92×** |
+| E-C Shadow + 尾段采样 | 4.63（216.04） | **13.85**（72.20） | **2.99×** |
+
+4×Jetson 纯 CUDA，同法（`--ratios '1@9*1@7*1@6*1@6'`）：
+
+| 臂 | `657900f` | `6699276` | 加速比 |
+| --- | --- | --- | --- |
+| J-A 纯 PP | 4.40 | **10.93** | 2.48× |
+| J-B Shadow KV | 4.29 | **10.88** | 2.54× |
+| J-C Shadow + 尾段采样 | 4.48 | **11.56** | 2.58× |
+
+- 收益来源（不是矩阵算得更快，是串行链塌缩）：E-B 的 stage 0 `rootWait` 211.8 → 84.1 ms，stage 1 `sync` 25.8 → 4.8 ms，stage 2 `sync` 64.1 → 19.1 ms，stage 3 `sync` 92.6 → 29.1 ms；`exec` 几乎不动。E-C 再把 stage 4 `exec` 从 18.2 ms 打到 1.0 ms。
+- **文本一致性**：边缘 5 机上两版**不是**逐字节相同，这是预期行为，不是回归。
+  - `base` = `fa945fe6b651db1da18c55e91978bd24`（与 4×T4 是同一份文本），收在 `… I'm glad I could correct my earlier response`
+  - `r5` = `282a87b320ce0aba06317853f364a481`，收在 `… I made a mistake earlier. The correct answer`
+  - 两版前 213 字节完全相同，只差最后一次 detokenize 窗口（尾段采样路径改变），同 prompt / 同 seed / 同权重。
+- 校验要点：每个 **arm × rev 内部**所有轮次必须 md5 一致；跨版本不一致但前缀一致，才是正确状态。
+- 有效性门（不满足的 run 直接丢弃、目录删掉，不要留在表里）：`rc=0`、日志里有 `[e1-end] pos=64`、四台 worker 都加载了权重、日志里没有 `deactivated` / `peer offline`。
+
+## 2.7 已知坑（照抄时最容易踩的）
+
+- **别的会话在抢这 5 台机器**。它们的清理按名字杀 `dllama`、不看端口，会把本次 run 打断（表现是 `rc=137` 或 worker 半路消失）。看到诡异失败先怀疑这个；重跑前把失败的 run 目录删掉。
+- 别用 `pkill -f dllama_<rev>_cuda`：`comm` 15 字符截断导致匹配不上，孤儿 worker 占着显存，下一轮 `--gpu-index` 会报分配失败。统一 `pkill -9 -x dllama` + 目录区分版本。
+- `rog` 只有 6 GB 显存，29 个进程就能把它打爆并掉卡（历史事故：`nvidia-smi: Unknown Error`，只能整机重启，`/tmp` 在根分区所以全丢）。跑之前先 `pgrep -x dllama` 确认为空。
+- Vulkan root 必须在 `/tmp/ev_speed/run`（含 `./src/nn/vulkan/`）下启动，否则后端初始化失败。
+- `--max-seq-len` 别抄混：T4 用 `512`，边缘 5 机用 `256`。
+- 每轮之间必须 `sleep` 足够（脚本里 `stop_all` 后 4 s、起 worker 后等端口 + 3 s），Jetson 加载权重慢，端口没起来就发 root 会直接失败。
+- 只做纯推理对比时**不要**加 `--enable-pp-migration` / `--runtime-redundant-boundary-layers`，那是迁移与覆盖功能的开关；加了就不再是同一件事。

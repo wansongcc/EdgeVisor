@@ -15,8 +15,8 @@ NX2=jetson@10.47.235.49
 NANO1=jetson@10.47.107.34
 NANO2=jetson@10.47.215.50
 LAPTOP=cc@10.47.72.162
-MODEL_JETSON=/home/jetson/cc/models/qwen3_14b_q40/dllama_model_qwen3_14b_q40.m
-MODEL_LAPTOP=/home/cc/models/qwen3_14b_q40/dllama_model_qwen3_14b_q40.m
+MODEL_JETSON=/home/jetson/cc/models/qwen3_14b_q40/edgevisor_model_qwen3_14b_q40.m
+MODEL_LAPTOP=/home/cc/models/qwen3_14b_q40/edgevisor_model_qwen3_14b_q40.m
 ROOT_LOG=/tmp/ui_demo_root.log
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new"
 TIMELINE_PID=""
@@ -32,11 +32,11 @@ stop_demo() {
         wait "$TIMELINE_PID" >/dev/null 2>&1 || true
         TIMELINE_PID=""
     fi
-    remote "$NX2" "pkill -x gpu_hog >/dev/null 2>&1 || true; pkill -x dllama >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    remote "$NX2" "pkill -x gpu_hog >/dev/null 2>&1 || true; pkill -x edgevisor >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
     for target in "$NANO1" "$NANO2" "$LAPTOP"; do
-        remote "$target" "pkill -x dllama >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+        remote "$target" "pkill -x edgevisor >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
     done
-    pkill -x dllama >/dev/null 2>&1 || true
+    pkill -x edgevisor >/dev/null 2>&1 || true
     tmux kill-session -t evdemo >/dev/null 2>&1 || true
 }
 
@@ -59,7 +59,7 @@ os.dup2(log, 1)
 os.dup2(log, 2)
 null = os.open("/dev/null", os.O_RDONLY)
 os.dup2(null, 0)
-os.execv("./dllama", ["./dllama", "worker", "--port", "18091", "--model", os.environ["WORKER_MODEL"]])
+os.execv("./edgevisor", ["./edgevisor", "worker", "--port", "18091", "--model", os.environ["WORKER_MODEL"]])
 PY
 exit 0
 EOF
@@ -167,7 +167,7 @@ run_timeline() {
     fi
     sleep 8
     if [ "$offline" = "1" ]; then
-        remote "$NANO1" "pkill -x dllama; echo KILLED" >/dev/null 2>&1 || true
+        remote "$NANO1" "pkill -x edgevisor; echo KILLED" >/dev/null 2>&1 || true
         if wait_root "offline" 90; then
             echo "offline $(date '+%H:%M:%S')" >> /tmp/ui_demo_timeline.log
         else
@@ -203,7 +203,7 @@ done
 rm -f "$ROOT_LOG" /tmp/ui_demo_timeline.log
 cols=$(tput cols 2>/dev/null || echo 110)
 lines=$(tput lines 2>/dev/null || echo 32)
-tmux new-session -d -s evdemo -x "$cols" -y "$lines" "stdbuf -oL -eL ./dllama inference --prompt 'What is the capital of France?' --steps 600 --model $MODEL_JETSON --tokenizer /home/jetson/cc/models/qwen3_14b_q40/dllama_tokenizer_qwen3_14b_q40.t --workers 192.168.137.15:18091 192.168.137.31:18091 192.168.137.16:18091 192.168.137.18:18091 --auto --ui"
+tmux new-session -d -s evdemo -x "$cols" -y "$lines" "stdbuf -oL -eL ./edgevisor inference --prompt 'What is the capital of France?' --steps 600 --model $MODEL_JETSON --tokenizer /home/jetson/cc/models/qwen3_14b_q40/edgevisor_tokenizer_qwen3_14b_q40.t --workers 192.168.137.15:18091 192.168.137.31:18091 192.168.137.16:18091 192.168.137.18:18091 --auto --ui"
 tmux set-option -t evdemo status off
 tmux set-option -t evdemo remain-on-exit on
 tmux pipe-pane -t evdemo -o "stdbuf -oL cat >> $ROOT_LOG"

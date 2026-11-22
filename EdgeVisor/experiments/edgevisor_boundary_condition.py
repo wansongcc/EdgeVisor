@@ -517,7 +517,7 @@ def main():
         "-v", f"{suite.PROJ}:/workspace/EdgeVisor",
         "-w", "/workspace/EdgeVisor",
         suite.IMAGE,
-        "bash", "-lc", "make -j$(nproc) dllama",
+        "bash", "-lc", "make -j$(nproc) edgevisor",
     ], check=False, timeout=900)
     (OUT / "build.log").write_text(build.stdout or "", encoding="utf-8", errors="ignore")
     if build.returncode != 0:

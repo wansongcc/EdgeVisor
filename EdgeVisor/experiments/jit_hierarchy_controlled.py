@@ -486,7 +486,7 @@ def main():
             suite.IMAGE,
             "bash",
             "-lc",
-            "make clean >/dev/null 2>&1 || true; make -j$(nproc) dllama",
+            "make clean >/dev/null 2>&1 || true; make -j$(nproc) edgevisor",
         ],
         check=False,
         timeout=900,

@@ -18,14 +18,14 @@ WORKERS = [
 MASTER = {"host": "192.168.182.16", "user": "jetson"}
 
 # Common project path
-PROJECT_PATH = "~/yanhui/distributed-llama"
-WORKER_CMD = f"cd {PROJECT_PATH} && ./dllama worker --port 9999 --nthreads 4"
+PROJECT_PATH = "~/yanhui/EdgeVisor/EdgeVisor"
+WORKER_CMD = f"cd {PROJECT_PATH} && ./edgevisor worker --port 9999 --nthreads 4"
 
 # Master command with specified worker order: 15, 11, 12, 13, 17
 MASTER_CMD = (
-    f"cd {PROJECT_PATH} && ./dllama inference "
-    "--model /home/models/dllama_model_qwen3_8b_q40.m "
-    "--tokenizer /home/models/dllama_tokenizer_qwen3_8b_q40.t "
+    f"cd {PROJECT_PATH} && ./edgevisor inference "
+    "--model /home/models/edgevisor_model_qwen3_8b_q40.m "
+    "--tokenizer /home/models/edgevisor_tokenizer_qwen3_8b_q40.t "
     "--buffer-float-type q80 "
     "--benchmark "
     "--nthreads 4 "
@@ -75,8 +75,8 @@ def start_worker(worker_config, stop_event):
         return
 
     try:
-        # First, kill any existing dllama processes to ensure a clean state
-        client.exec_command("pkill -f dllama")
+        # First, kill any existing edgevisor processes to ensure a clean state
+        client.exec_command("pkill -f edgevisor")
         time.sleep(1) # Wait for cleanup
         
         print(f"[{host}] Starting worker: {WORKER_CMD}")
@@ -99,7 +99,7 @@ def start_worker(worker_config, stop_event):
         try:
             stdin.write('\x03') # Ctrl+C
             time.sleep(1)
-            client.exec_command("pkill -f dllama")
+            client.exec_command("pkill -f edgevisor")
         except:
             pass
         client.close()
@@ -109,7 +109,7 @@ def main():
     threads = []
     stop_event = threading.Event()
     
-    print("--- Starting Distributed Llama Inference ---")
+    print("--- Starting EdgeVisor Inference ---")
     
     # 1. Start Workers
     print("\n>>> Starting Workers...")
@@ -129,7 +129,7 @@ def main():
         try:
             print(f"[{MASTER['host']}] Executing inference...")
             # Run cleanup on master too, just in case
-            master_client.exec_command("pkill -f dllama")
+            master_client.exec_command("pkill -f edgevisor")
             time.sleep(1)
             
             # Run the inference command

@@ -31,7 +31,7 @@ if __name__ == '__main__':
         tokens.append(b)
         scores.append(s)
 
-    outputFileName = 'dllama_tokenizer_llama2.t'
+    outputFileName = 'edgevisor_tokenizer_llama2.t'
     with open(outputFileName, 'wb') as outputFile:
         writer.writeTokenizer(
             outputFile,

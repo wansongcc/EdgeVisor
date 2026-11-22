@@ -17,28 +17,28 @@
 #include "nn-quants.hpp"
 #include "llamafile/sgemm.hpp"
 
-#ifndef DLLAMA_DEBUG_ATTN
-#define DLLAMA_DEBUG_ATTN 0
+#ifndef EDGEVISOR_DEBUG_ATTN
+#define EDGEVISOR_DEBUG_ATTN 0
 #endif
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
 
 static inline bool kvCacheDebugEnabled() {
     // Primary switch requested by users.
     if (std::getenv("kvcache_debug") != nullptr) return true;
     // Legacy alias used by existing tracing in nn-cpu.cpp.
-    if (std::getenv("DLLAMA_DEBUG_KV_RANGE") != nullptr) return true;
+    if (std::getenv("EDGEVISOR_DEBUG_KV_RANGE") != nullptr) return true;
     return false;
 }
 
 static inline bool kvCachePerHeadEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD");
     if (v == nullptr) return false;
     return std::atoi(v) != 0;
 }
 
 static inline bool kvCachePerHeadPassesFilter(const char *opName) {
-    const char *filter = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_FILTER");
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_FILTER");
     if (filter == nullptr || filter[0] == '\0') return true;
     if (opName == nullptr) return false;
     return std::strstr(opName, filter) != nullptr;
@@ -46,7 +46,7 @@ static inline bool kvCachePerHeadPassesFilter(const char *opName) {
 
 static inline NnUint kvCachePerHeadLimit() {
     // 0 means unlimited.
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_LIMIT");
     if (v == nullptr) return 32u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -55,7 +55,7 @@ static inline NnUint kvCachePerHeadLimit() {
 }
 
 static inline NnUint kvCachePerHeadBatch() {
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_BATCH");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_BATCH");
     if (v == nullptr) return 0u;
     const long n = std::strtol(v, nullptr, 10);
     if (n < 0) return 0u;
@@ -65,15 +65,15 @@ static inline NnUint kvCachePerHeadBatch() {
 
 static inline long kvCachePerHeadSelectKvHead() {
     // >=0: only print that global kvHead; -1: print all owned kvHeads.
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEAD");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_KVHEAD");
     if (v == nullptr) return -1;
     return std::strtol(v, nullptr, 10);
 }
 
 static inline const char *kvCachePerHeadSelectKvHeadsSpec() {
     // Optional: comma-separated list / ranges of global kvHeads to print, e.g. "4,5" or "4-7".
-    // When set, this overrides DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEAD.
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEADS");
+    // When set, this overrides EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_KVHEAD.
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_KVHEADS");
     if (v == nullptr || v[0] == '\0') return nullptr;
     return v;
 }
@@ -82,7 +82,7 @@ static inline bool kvCachePerHeadGlobalEnabled() {
     // When enabled, printing in MHA uses global kvHead numbering directly (0..nKvHeads),
     // and can print heads outside the owned kvStart/kvDim0 slice (e.g. redundant compute heads),
     // as long as the KV cache buffers are allocated as full global tensors.
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_GLOBAL");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_GLOBAL");
     if (v == nullptr) return false;
     return std::atoi(v) != 0;
 }
@@ -132,14 +132,14 @@ static inline bool kvHeadMatchesSelection(NnUint globalKvHead, const char *spec,
 
 static inline long kvCachePerHeadSelectPos() {
     // >=0: only print at that position; -1: print all positions.
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_POS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_POS");
     if (v == nullptr) return -1;
     return std::strtol(v, nullptr, 10);
 }
 
 static inline NnUint kvCachePerHeadDims() {
     // Number of dims to print per head. 0 means "print full headDim".
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_DIMS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_DIMS");
     if (v == nullptr) return 8u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -148,13 +148,13 @@ static inline NnUint kvCachePerHeadDims() {
 }
 
 static inline bool kvCachePerHeadShiftEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_SHIFT");
     if (v == nullptr) return false;
     return std::atoi(v) != 0;
 }
 
 static inline NnUint kvCachePerHeadHeadDimOverride() {
-    const char *v = std::getenv("DLLAMA_DEBUG_KVCACHE_PER_HEAD_HEADDIM");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_HEADDIM");
     if (v == nullptr) return 0u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -163,13 +163,13 @@ static inline NnUint kvCachePerHeadHeadDimOverride() {
 }
 
 static inline bool attDebugEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT");
     if (v == nullptr) return false;
     return std::atoi(v) != 0;
 }
 
 static inline bool attDebugPassesFilter(const char *opName) {
-    const char *filter = std::getenv("DLLAMA_DEBUG_ATT_FILTER");
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_ATT_FILTER");
     if (filter == nullptr || filter[0] == '\0') return true;
     if (opName == nullptr) return false;
     return std::strstr(opName, filter) != nullptr;
@@ -177,7 +177,7 @@ static inline bool attDebugPassesFilter(const char *opName) {
 
 static inline NnUint attDebugLimit() {
     // 0 means unlimited.
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_LIMIT");
     if (v == nullptr) return 0u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -186,7 +186,7 @@ static inline NnUint attDebugLimit() {
 }
 
 static inline NnUint attDebugBatch() {
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_BATCH");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_BATCH");
     if (v == nullptr) return 0u;
     const long n = std::strtol(v, nullptr, 10);
     if (n < 0) return 0u;
@@ -196,15 +196,15 @@ static inline NnUint attDebugBatch() {
 
 static inline long attDebugHead() {
     // >=0: print only that local q-head; -1: print all local q-heads.
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_HEAD");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_HEAD");
     if (v == nullptr) return 0;
     return std::strtol(v, nullptr, 10);
 }
 
 static inline bool attQkEnabled() {
     // Print attention inputs Q/K and dot(q,k) for the selected head.
-    // Enable with: DLLAMA_DEBUG_ATT_QK=1
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK");
+    // Enable with: EDGEVISOR_DEBUG_ATT_QK=1
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_QK");
     if (v == nullptr) return false;
     return std::atoi(v) != 0;
 }
@@ -212,7 +212,7 @@ static inline bool attQkEnabled() {
 static inline NnUint attQkDims() {
     // Number of dims to print from Q/K vectors.
     // 0 means full headDim (capped).
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK_DIMS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_QK_DIMS");
     if (v == nullptr) return 16u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -222,7 +222,7 @@ static inline NnUint attQkDims() {
 
 static inline NnUint attQkTopK() {
     // Print K vectors for the top-K attention weights (after softmax).
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK_TOPK");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_QK_TOPK");
     if (v == nullptr) return 5u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -232,15 +232,15 @@ static inline NnUint attQkTopK() {
 
 static inline long attQkForcePos() {
     // If set to >=0, print only this position index (within [0,len)).
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_QK_POS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_QK_POS");
     if (v == nullptr) return -1;
     return std::strtol(v, nullptr, 10);
 }
 
 static inline bool attScoresEnabled() {
     // Print per-head attention scores/weights (the softmax row) as a list.
-    // Enable with: DLLAMA_DEBUG_ATT_SCORES=1
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_SCORES");
+    // Enable with: EDGEVISOR_DEBUG_ATT_SCORES=1
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_SCORES");
     if (v == nullptr) return false;
     return std::atoi(v) != 0;
 }
@@ -248,7 +248,7 @@ static inline bool attScoresEnabled() {
 static inline NnUint attScoresMaxLen() {
     // Max number of positions to print from the attention row.
     // 0 means print full length (capped).
-    const char *v = std::getenv("DLLAMA_DEBUG_ATT_SCORES_MAXLEN");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ATT_SCORES_MAXLEN");
     if (v == nullptr) return 64u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -314,15 +314,15 @@ static double l2NormSq_F32(const float *v, NnUint n) {
 }
 
 static inline bool matmulIoDebugEnabledForOp(const char *opName) {
-    if (std::getenv("DLLAMA_DEBUG_MATMUL_IO") == nullptr) return false;
-    const char *filter = std::getenv("DLLAMA_DEBUG_MATMUL_IO_FILTER");
+    if (std::getenv("EDGEVISOR_DEBUG_MATMUL_IO") == nullptr) return false;
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_MATMUL_IO_FILTER");
     if (filter == nullptr || filter[0] == '\0') return true;
     if (opName == nullptr) return false;
     return (std::strstr(opName, filter) != nullptr);
 }
 
 static inline NnUint matmulIoDebugLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_MATMUL_IO_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_MATMUL_IO_LIMIT");
     if (v == nullptr) return 20u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -331,7 +331,7 @@ static inline NnUint matmulIoDebugLimit() {
 }
 
 static inline NnUint matmulIoOutOffset() {
-    const char *v = std::getenv("DLLAMA_DEBUG_MATMUL_IO_OUT_OFFSET");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_MATMUL_IO_OUT_OFFSET");
     if (v == nullptr) return 0u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -340,7 +340,7 @@ static inline NnUint matmulIoOutOffset() {
 }
 
 static inline NnUint matmulIoOutLen() {
-    const char *v = std::getenv("DLLAMA_DEBUG_MATMUL_IO_OUT_LEN");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_MATMUL_IO_OUT_LEN");
     if (v == nullptr) return 64u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -430,15 +430,15 @@ static void printMatmulInSummaryQ80(
 }
 
 static inline bool ropeIoDebugEnabledForOp(const char *opName) {
-    if (std::getenv("DLLAMA_DEBUG_ROPE_IO") == nullptr) return false;
-    const char *filter = std::getenv("DLLAMA_DEBUG_ROPE_IO_FILTER");
+    if (std::getenv("EDGEVISOR_DEBUG_ROPE_IO") == nullptr) return false;
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_ROPE_IO_FILTER");
     if (filter == nullptr || filter[0] == '\0') return true;
     if (opName == nullptr) return false;
     return (std::strstr(opName, filter) != nullptr);
 }
 
 static inline NnUint ropeIoDebugLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_ROPE_IO_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ROPE_IO_LIMIT");
     if (v == nullptr) return 50u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -447,7 +447,7 @@ static inline NnUint ropeIoDebugLimit() {
 }
 
 static inline NnUint ropeIoOffset() {
-    const char *v = std::getenv("DLLAMA_DEBUG_ROPE_IO_OFFSET");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ROPE_IO_OFFSET");
     if (v == nullptr) return 0u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -456,7 +456,7 @@ static inline NnUint ropeIoOffset() {
 }
 
 static inline NnUint ropeIoLen() {
-    const char *v = std::getenv("DLLAMA_DEBUG_ROPE_IO_LEN");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ROPE_IO_LEN");
     if (v == nullptr) return 256u;
     const long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -551,7 +551,7 @@ static void printAttRowSummary(const float *attRow, NnUint len, NnUint globalQHe
     printf("\n");
 }
 
-#endif // DLLAMA_DEBUG_ATTN
+#endif // EDGEVISOR_DEBUG_ATTN
 
 static void noopForward(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     (void)nThreads;
@@ -1922,9 +1922,9 @@ static void initMatmulForward(NnCpuOpContext *context) {
 }
 
 static inline bool debugWeightRangesEnabledForOp(const char *opName) {
-    if (std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES") == nullptr)
+    if (std::getenv("EDGEVISOR_DEBUG_WEIGHT_RANGES") == nullptr)
         return false;
-    const char *filter = std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES_FILTER");
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_WEIGHT_RANGES_FILTER");
     if (filter == nullptr || filter[0] == '\0')
         return true;
     if (opName == nullptr)
@@ -1942,7 +1942,7 @@ static inline void debugMatmulWeightReadRangeOnce(
 
     static std::atomic<NnUint> printed{0u};
     NnUint limit = 200u;
-    if (const char *limitEnv = std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES_LIMIT")) {
+    if (const char *limitEnv = std::getenv("EDGEVISOR_DEBUG_WEIGHT_RANGES_LIMIT")) {
         try { limit = (NnUint)std::stoul(limitEnv); } catch (...) {}
     }
     const NnUint idx = printed.fetch_add(1u);
@@ -1986,13 +1986,13 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
         return false;
 
     // Debug hook: confirm when the llamafile fast path is taken.
-    if (threadIndex == 0u && std::getenv("DLLAMA_DEBUG_MATMUL_VIEWS") != nullptr) {
-        const char *filter = std::getenv("DLLAMA_DEBUG_MATMUL_VIEWS_FILTER");
+    if (threadIndex == 0u && std::getenv("EDGEVISOR_DEBUG_MATMUL_VIEWS") != nullptr) {
+        const char *filter = std::getenv("EDGEVISOR_DEBUG_MATMUL_VIEWS_FILTER");
         const bool passesFilter = (filter == nullptr) || (std::strstr(context->name, filter) != nullptr);
         if (passesFilter) {
             static std::atomic<NnUint> printed{0u};
             NnUint limit = 50u;
-            if (const char *limitEnv = std::getenv("DLLAMA_DEBUG_MATMUL_VIEWS_LIMIT")) {
+            if (const char *limitEnv = std::getenv("EDGEVISOR_DEBUG_MATMUL_VIEWS_LIMIT")) {
                 try { limit = (NnUint)std::stoul(limitEnv); } catch (...) {}
             }
             const NnUint idx = printed.fetch_add(1u);
@@ -2000,7 +2000,7 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
                 const bool viewAware = (config->aView.offset != 0u || config->aView.sizeX != 0u || config->cView.offset != 0u || config->cView.sizeX != 0u);
                 const bool forceStyle = viewAware && (config->aView.strideX == 0u) && (config->cView.strideX == 0u);
                 const bool offsetActive = (config->aView.offset != 0u || config->cView.offset != 0u);
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
                 printf("🔎 [matmul][llamafile] op=%s viewMode=%u aView={off=%u sizeX=%u strideX=%u} cView={off=%u sizeX=%u strideX=%u} batch=%u nThreads=%u\n",
                     context->name,
                     config->view,
@@ -2032,7 +2032,7 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
     );
 
     // Optional matmul IO debug summary (best-effort; prints from thread 0).
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     if (ok && threadIndex == 0u) {
         static std::atomic<NnUint> ioPrinted{0u};
         const bool ioDbg = matmulIoDebugEnabledForOp(context->name);
@@ -2071,7 +2071,7 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
     const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
     const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     static std::atomic<NnUint> ioPrinted{0u};
     const bool ioDbg = matmulIoDebugEnabledForOp(context->name);
     const NnUint ioLimit = matmulIoDebugLimit();
@@ -2140,7 +2140,7 @@ static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUin
             }
             DEBUG_VECTOR(context, "output", output);
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
             if (ioDbg && threadIndex == 0u) {
                 const NnUint idx = ioPrinted.fetch_add(1u, std::memory_order_relaxed);
                 if (ioLimit == 0u || idx < ioLimit) {
@@ -2170,7 +2170,7 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
     const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
     const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     static std::atomic<NnUint> ioPrinted{0u};
     const bool ioDbg = matmulIoDebugEnabledForOp(context->name);
     const NnUint ioLimit = matmulIoDebugLimit();
@@ -2244,7 +2244,7 @@ static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUin
             }
             DEBUG_VECTOR(context, "output", output);
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
             if (ioDbg && threadIndex == 0u) {
                 const NnUint idx = ioPrinted.fetch_add(1u, std::memory_order_relaxed);
                 if (ioLimit == 0u || idx < ioLimit) {
@@ -2383,7 +2383,7 @@ static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
 
     assert(strideX == 1u);
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     static std::atomic<NnUint> ropePrinted{0u};
     const bool ropeDbg = ropeIoDebugEnabledForOp(context->name);
     const NnUint ropeLimit = ropeIoDebugLimit();
@@ -2395,7 +2395,7 @@ static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
         float *x = (float *)context->input[batchIndex];
         const NnUint pos = (NnUint)positions[batchIndex];
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
         if (ropeDbg && threadIndex == 0u) {
             const NnUint idx = ropePrinted.fetch_add(1u, std::memory_order_relaxed);
             if (ropeLimit == 0u || idx < ropeLimit) {
@@ -2432,7 +2432,7 @@ static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
             throw std::runtime_error("Unsupported rope type");
         }
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
         if (ropeDbg && threadIndex == 0u) {
             const NnUint idx = ropePrinted.load(std::memory_order_relaxed);
             // Use the same budget as the pre-print.
@@ -2468,7 +2468,7 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
     const float *positions = (float *)context->pipes[config->positionPipeIndex];
     const float *slots = (config->kvSlotStride != 0u) ? (float *)context->pipes[config->slotPipeIndex] : nullptr;
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     static std::atomic<NnUint> dbgPrinted{0u};
     const bool dbg = kvCacheDebugEnabled();
     const NnUint dbgLimit = kvCacheDebugLimit();
@@ -2512,15 +2512,15 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
         float *valueCacheBatch = valueCache + kvSlotBase;
 
         // Debug: print K/V cache values per owned KV-head on this node.
-        // Enable with: DLLAMA_DEBUG_KVCACHE_PER_HEAD=1
+        // Enable with: EDGEVISOR_DEBUG_KVCACHE_PER_HEAD=1
         // Optional:
-        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_FILTER=substring (match op name)
-        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_LIMIT=N (default 32, 0 unlimited)
-        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_BATCH=N (default 0)
-        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_POS=P (default -1 = all)
-        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEAD=H (default -1 = all owned)
-        // - DLLAMA_DEBUG_KVCACHE_PER_HEAD_DIMS=D (default 8, 0 = full headDim)
-    #if DLLAMA_DEBUG_ATTN
+        // - EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_FILTER=substring (match op name)
+        // - EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_LIMIT=N (default 32, 0 unlimited)
+        // - EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_BATCH=N (default 0)
+        // - EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_POS=P (default -1 = all)
+        // - EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_KVHEAD=H (default -1 = all owned)
+        // - EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_DIMS=D (default 8, 0 = full headDim)
+    #if EDGEVISOR_DEBUG_ATTN
         if (kvPerHeadDbg && threadIndex == 0u && batchIndex == kvPerHeadBatchSel && kvCachePerHeadPassesFilter(context->name)) {
             if (kvPerHeadPosSel < 0 || (NnUint)kvPerHeadPosSel == pos) {
                 const NnUint idx = kvPerHeadPrinted.fetch_add(1u, std::memory_order_relaxed);
@@ -2626,7 +2626,7 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
             }
         }
 
-    #endif // DLLAMA_DEBUG_ATTN
+    #endif // EDGEVISOR_DEBUG_ATTN
 
         DEBUG_VECTOR(context, "input", y);
         DEBUG_VECTOR(context, "q", q);
@@ -2641,13 +2641,13 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
             config->headDim, config->seqLen, nThreads, threadIndex);
 
         // Attention debug: print per forward position (after softmax).
-        // Enable with: DLLAMA_DEBUG_ATT=1
+        // Enable with: EDGEVISOR_DEBUG_ATT=1
         // Optional:
-        // - DLLAMA_DEBUG_ATT_FILTER=substring (only ops whose name matches)
-        // - DLLAMA_DEBUG_ATT_BATCH=N (default 0)
-        // - DLLAMA_DEBUG_ATT_HEAD=H (default 0), -1 prints all local heads
-        // - DLLAMA_DEBUG_ATT_LIMIT=N (0 unlimited)
-    #if DLLAMA_DEBUG_ATTN
+        // - EDGEVISOR_DEBUG_ATT_FILTER=substring (only ops whose name matches)
+        // - EDGEVISOR_DEBUG_ATT_BATCH=N (default 0)
+        // - EDGEVISOR_DEBUG_ATT_HEAD=H (default 0), -1 prints all local heads
+        // - EDGEVISOR_DEBUG_ATT_LIMIT=N (0 unlimited)
+    #if EDGEVISOR_DEBUG_ATTN
         if (attDbg && threadIndex == 0u && batchIndex == attBatch && attDebugPassesFilter(context->name)) {
             const NnUint idx = attPrinted.fetch_add(1u, std::memory_order_relaxed);
             if (attLimit == 0u || idx < attLimit) {
@@ -2825,7 +2825,7 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
             }
         }
 
-	#endif // DLLAMA_DEBUG_ATTN
+	#endif // EDGEVISOR_DEBUG_ATTN
 
         DEBUG_VECTOR(context, "output", y);
     }
@@ -3160,7 +3160,7 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
     const NnSize dimBytes = getBytes(F_32, context->inputSize.x);
     NnByte *output = context->output[0];
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     // Optional debug: print KV cache values per KV-head written by this shift.
     // This is the right place to observe KV redundancy compute (kvHeadComputeSplit), because
     // MHA reads only owned kvHeadSplit but SHIFT may write a wider range.
@@ -3206,7 +3206,7 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
                 nThreads,
                 threadIndex);
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
             // Print after the write so we read from the actual cache.
             if (kvPerHeadDbg && threadIndex == 0u) {
                 if (kvPerHeadPosSel < 0 || (NnUint)kvPerHeadPosSel == (NnUint)index) {
@@ -3215,7 +3215,7 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
                         NnUint headDim = config->dstColStartUnit;
                         if (headDim == 0u) headDim = headDimOverride;
                         if (headDim == 0u) {
-                            printf("🧠 [kvcache][kvhead][shift][skip] node=%u op=%s opIndex=%u pos=%u need headDim; set DLLAMA_DEBUG_KVCACHE_PER_HEAD_HEADDIM=... (dstColStartUnit=0)\n",
+                            printf("🧠 [kvcache][kvhead][shift][skip] node=%u op=%s opIndex=%u pos=%u need headDim; set EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_HEADDIM=... (dstColStartUnit=0)\n",
                                 (unsigned)context->nodeIndex,
                                 (context->name ? context->name : "Unknown"),
                                 (unsigned)context->opIndex,

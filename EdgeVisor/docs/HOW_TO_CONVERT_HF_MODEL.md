@@ -1,6 +1,6 @@
 # How to Convert 🤗 Hugging Face Model
 
-Currently, Distributed Llama supports these Hugging Face models: `llama`, `mistral`, `qwen3` and `qwen3_moe`. You can try to convert any compatible Hugging Face model and run it with Distributed Llama.
+Currently, EdgeVisor supports these Hugging Face models: `llama`, `mistral`, `qwen3` and `qwen3_moe`. You can try to convert any compatible Hugging Face model and run it with EdgeVisor.
 
 > [!IMPORTANT]
 > All converters are in the early stages of development. After conversion, the model may not work correctly.
@@ -20,13 +20,14 @@ python convert-hf.py path/to/hf/model q40 mistral-7b-0.3
 python convert-tokenizer-hf.py path/to/hf/model mistral-7b-0.3
 ```
 
-5. That's it! Now you can run the Distributed Llama.
+5. That's it! Now you can run EdgeVisor from the engine directory:
 
 ```sh
-./dllama inference \
+cd ..
+./edgevisor inference \
   --prompt "Hello world" \
   --steps 64 \
-  --model dllama_model_mistral-7b-0.3_q40.m \
-  --tokenizer dllama_tokenizer_mistral-7b-0.3.t \
+  --model edgevisor_model_mistral-7b-0.3_q40.m \
+  --tokenizer edgevisor_tokenizer_mistral-7b-0.3.t \
   --buffer-float-type q80
 ```

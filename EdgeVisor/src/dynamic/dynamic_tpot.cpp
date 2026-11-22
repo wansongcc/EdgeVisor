@@ -30,7 +30,7 @@
 #endif
 
 using json = nlohmann::json;
-namespace tpot = dllama::dynamic_tpot;
+namespace tpot = edgevisor::dynamic_tpot;
 
 namespace {
 
@@ -207,24 +207,24 @@ static double parseEnvUnitInterval(const char *name, double fallback) {
 
 static tpot::SchedulerConfig loadSchedulerConfigFromEnvironmentImpl() {
     tpot::SchedulerConfig cfg;
-    cfg.windowTokens = std::max(1, parseEnvInt("DLLAMA_TPOT_WINDOW_TOKENS", cfg.windowTokens));
-    cfg.minSamples = std::max(1, parseEnvInt("DLLAMA_TPOT_MIN_SAMPLES", cfg.minSamples));
-    cfg.cooldownTokens = std::max(0, parseEnvInt("DLLAMA_TPOT_COOLDOWN_TOKENS", cfg.cooldownTokens));
-    cfg.rollbackWindow = std::max(1, parseEnvInt("DLLAMA_TPOT_ROLLBACK_WINDOW", cfg.rollbackWindow));
-    cfg.ewmaAlpha = parseEnvDouble("DLLAMA_TPOT_EWMA_ALPHA", cfg.ewmaAlpha);
+    cfg.windowTokens = std::max(1, parseEnvInt("EDGEVISOR_TPOT_WINDOW_TOKENS", cfg.windowTokens));
+    cfg.minSamples = std::max(1, parseEnvInt("EDGEVISOR_TPOT_MIN_SAMPLES", cfg.minSamples));
+    cfg.cooldownTokens = std::max(0, parseEnvInt("EDGEVISOR_TPOT_COOLDOWN_TOKENS", cfg.cooldownTokens));
+    cfg.rollbackWindow = std::max(1, parseEnvInt("EDGEVISOR_TPOT_ROLLBACK_WINDOW", cfg.rollbackWindow));
+    cfg.ewmaAlpha = parseEnvDouble("EDGEVISOR_TPOT_EWMA_ALPHA", cfg.ewmaAlpha);
     if (cfg.ewmaAlpha <= 0.0 || cfg.ewmaAlpha > 1.0) cfg.ewmaAlpha = 0.2;
-    cfg.minPpGainMs = parseEnvDouble("DLLAMA_TPOT_MIN_PP_GAIN_MS", cfg.minPpGainMs);
-    cfg.minTpGainMs = parseEnvDouble("DLLAMA_TPOT_MIN_TP_GAIN_MS", cfg.minTpGainMs);
-    cfg.loadPenaltyBeta = parseEnvDouble("DLLAMA_TPOT_LOAD_PENALTY_BETA", cfg.loadPenaltyBeta);
-    cfg.ppGainRatio = parseEnvUnitInterval("DLLAMA_TPOT_PP_GAIN_RATIO", cfg.ppGainRatio);
-    cfg.ppRiskMarginMs = parseEnvDouble("DLLAMA_TPOT_PP_RISK_MARGIN_MS", cfg.ppRiskMarginMs);
-    cfg.tpRiskMarginMs = parseEnvDouble("DLLAMA_TPOT_TP_RISK_MARGIN_MS", cfg.tpRiskMarginMs);
-    cfg.ppMigrationCostMs = parseEnvDouble("DLLAMA_TPOT_PP_MIGRATION_COST_MS", cfg.ppMigrationCostMs);
-    cfg.tpMigrationCostMs = parseEnvDouble("DLLAMA_TPOT_TP_MIGRATION_COST_MS", cfg.tpMigrationCostMs);
-    cfg.expectedRemainingTokens = std::max(1, parseEnvInt("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS", cfg.expectedRemainingTokens));
-    cfg.maxPpLayerMove = parseEnvBoundedUint("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", cfg.maxPpLayerMove, 1, 64);
-    cfg.maxHeadMove = (uint32_t)std::max(1, parseEnvInt("DLLAMA_TPOT_MAX_HEAD_MOVE", (int)cfg.maxHeadMove));
-    cfg.maxFfnMove = (uint32_t)std::max(1, parseEnvInt("DLLAMA_TPOT_MAX_FFN_MOVE", (int)cfg.maxFfnMove));
+    cfg.minPpGainMs = parseEnvDouble("EDGEVISOR_TPOT_MIN_PP_GAIN_MS", cfg.minPpGainMs);
+    cfg.minTpGainMs = parseEnvDouble("EDGEVISOR_TPOT_MIN_TP_GAIN_MS", cfg.minTpGainMs);
+    cfg.loadPenaltyBeta = parseEnvDouble("EDGEVISOR_TPOT_LOAD_PENALTY_BETA", cfg.loadPenaltyBeta);
+    cfg.ppGainRatio = parseEnvUnitInterval("EDGEVISOR_TPOT_PP_GAIN_RATIO", cfg.ppGainRatio);
+    cfg.ppRiskMarginMs = parseEnvDouble("EDGEVISOR_TPOT_PP_RISK_MARGIN_MS", cfg.ppRiskMarginMs);
+    cfg.tpRiskMarginMs = parseEnvDouble("EDGEVISOR_TPOT_TP_RISK_MARGIN_MS", cfg.tpRiskMarginMs);
+    cfg.ppMigrationCostMs = parseEnvDouble("EDGEVISOR_TPOT_PP_MIGRATION_COST_MS", cfg.ppMigrationCostMs);
+    cfg.tpMigrationCostMs = parseEnvDouble("EDGEVISOR_TPOT_TP_MIGRATION_COST_MS", cfg.tpMigrationCostMs);
+    cfg.expectedRemainingTokens = std::max(1, parseEnvInt("EDGEVISOR_TPOT_EXPECTED_REMAINING_TOKENS", cfg.expectedRemainingTokens));
+    cfg.maxPpLayerMove = parseEnvBoundedUint("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", cfg.maxPpLayerMove, 1, 64);
+    cfg.maxHeadMove = (uint32_t)std::max(1, parseEnvInt("EDGEVISOR_TPOT_MAX_HEAD_MOVE", (int)cfg.maxHeadMove));
+    cfg.maxFfnMove = (uint32_t)std::max(1, parseEnvInt("EDGEVISOR_TPOT_MAX_FFN_MOVE", (int)cfg.maxFfnMove));
     return cfg;
 }
 
@@ -897,7 +897,7 @@ static void logDecision(
 
 } // namespace
 
-namespace dllama {
+namespace edgevisor {
 namespace dynamic_tpot {
 
 SchedulerConfig loadSchedulerConfigFromEnvironment() {
@@ -922,7 +922,7 @@ nlohmann::json makePpCommandRequest(uint32_t seq, const Candidate &candidate) {
 }
 
 } // namespace dynamic_tpot
-} // namespace dllama
+} // namespace edgevisor
 
 std::unique_ptr<DynamicTpotController> DynamicTpotController::start(const std::string &socketPath, RootLlmInference *inference) {
 #ifdef _WIN32
@@ -930,12 +930,12 @@ std::unique_ptr<DynamicTpotController> DynamicTpotController::start(const std::s
     (void)inference;
     return nullptr;
 #else
-    if (!parseEnvBool("DLLAMA_DYNAMIC_TPOT_ENABLE", false)) return nullptr;
+    if (!parseEnvBool("EDGEVISOR_DYNAMIC_TPOT_ENABLE", false)) return nullptr;
 
-    const char *logEnv = std::getenv("DLLAMA_TPOT_LOG");
+    const char *logEnv = std::getenv("EDGEVISOR_TPOT_LOG");
     const std::string logPath = (logEnv != nullptr && logEnv[0] != '\0')
         ? std::string(logEnv)
-        : std::string("/tmp/dllama_tpot_scheduler.log");
+        : std::string("/tmp/edgevisor_tpot_scheduler.log");
 
     tpot::SchedulerConfig config;
     try {
@@ -949,7 +949,7 @@ std::unique_ptr<DynamicTpotController> DynamicTpotController::start(const std::s
     }
 
     if (socketPath.empty()) {
-        appendLog(logPath, "tpot_sched seq=0 state=DISABLED best=none gain_ms=0 note=missing_DLLAMA_PLAN_CTRL_SOCKET");
+        appendLog(logPath, "tpot_sched seq=0 state=DISABLED best=none gain_ms=0 note=missing_EDGEVISOR_PLAN_CTRL_SOCKET");
         return nullptr;
     }
     if (inference == nullptr) {
@@ -1046,7 +1046,7 @@ static void logAlgo2(const std::string &path, const tpot::Algo2TokenObs &obs, co
         << " slope_trusted=" << (decision.contextSlopeTrusted ? 1 : 0)
         << " noise=" << (decision.noiseCalibrated ? "calibrated" : "uncalibrated");
     appendLog(path, line.str());
-    const char *outDir = std::getenv("DLLAMA_ALGO2_OUT");
+    const char *outDir = std::getenv("EDGEVISOR_ALGO2_OUT");
     if (outDir == nullptr || outDir[0] == '\0') return;
     const std::string events = std::string(outDir) + "/migration_events.jsonl";
     FILE *f = std::fopen(events.c_str(), "a");
@@ -1098,7 +1098,7 @@ static void stepAlgo2(
     // Bound the map by dropping the oldest token ids. A completion whose
     // observation never arrives must not accumulate for the whole run.
     while (rt.e2eByToken.size() > 1024u) rt.e2eByToken.erase(rt.e2eByToken.begin());
-    rt.algo2->setBoundaries(parseAlgo2Boundaries(std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS")));
+    rt.algo2->setBoundaries(parseAlgo2Boundaries(std::getenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS")));
     rt.algo2->setSerialRequest(true);
 
     if (rt.freshTokens.empty()) {
@@ -1200,7 +1200,7 @@ static void stepAlgo2(
             }
         } else if (!rt.algo2WaitApply && decision.issue) {
             PlanCommand command = makeEmptyPlanCommand();
-            command.version = DLLAMA_PLAN_CMD_VERSION_V2;
+            command.version = EDGEVISOR_PLAN_CMD_VERSION_V2;
             command.mode = PLAN_CMD_MODE_NEXT_BARRIER;
             command.fromNodeIndex = decision.candidate.fromNodeIndex;
             command.toNodeIndex = decision.candidate.toNodeIndex;
@@ -1232,13 +1232,13 @@ void DynamicTpotController::run() {
 #else
     ControllerRuntime rt;
     rt.cfg = config_;
-    rt.pollMs = std::max(10, parseEnvInt("DLLAMA_TPOT_POLL_MS", 200));
-    rt.timeoutMs = std::max(100, parseEnvInt("DLLAMA_TPOT_UDS_TIMEOUT_MS", 2000));
+    rt.pollMs = std::max(10, parseEnvInt("EDGEVISOR_TPOT_POLL_MS", 200));
+    rt.timeoutMs = std::max(100, parseEnvInt("EDGEVISOR_TPOT_UDS_TIMEOUT_MS", 2000));
     rt.topologyFenceTimeoutTokens = (uint32_t)std::max(1,
-        parseEnvInt("DLLAMA_TPOT_TOPOLOGY_TIMEOUT_TOKENS", std::max(32, rt.cfg.rollbackWindow * 2)));
-    const char *logEnv = std::getenv("DLLAMA_TPOT_LOG");
-    rt.logPath = (logEnv != nullptr && logEnv[0] != '\0') ? std::string(logEnv) : std::string("/tmp/dllama_tpot_scheduler.log");
-    rt.algo2Mode = tpot::parseAlgo2Mode(std::getenv("DLLAMA_ALGO2_MODE"));
+        parseEnvInt("EDGEVISOR_TPOT_TOPOLOGY_TIMEOUT_TOKENS", std::max(32, rt.cfg.rollbackWindow * 2)));
+    const char *logEnv = std::getenv("EDGEVISOR_TPOT_LOG");
+    rt.logPath = (logEnv != nullptr && logEnv[0] != '\0') ? std::string(logEnv) : std::string("/tmp/edgevisor_tpot_scheduler.log");
+    rt.algo2Mode = tpot::parseAlgo2Mode(std::getenv("EDGEVISOR_ALGO2_MODE"));
     if (rt.algo2Mode != tpot::Algo2Mode::LEGACY) {
         rt.captureAlgo2 = true;
         rt.algo2.reset(new tpot::Algo2Session(tpot::algo2ConfigFromEnvironment()));
@@ -1363,7 +1363,7 @@ void DynamicTpotController::run() {
                         auto candidate = tpot::ppCandidateForMove(source, target, count, rt.cfg);
                         if (!candidate.valid) continue;
                         PlanCommand command = makeEmptyPlanCommand();
-                        command.version = DLLAMA_PLAN_CMD_VERSION_V2;
+                        command.version = EDGEVISOR_PLAN_CMD_VERSION_V2;
                         command.mode = PLAN_CMD_MODE_NEXT_BARRIER;
                         command.fromNodeIndex = candidate.fromNodeIndex;
                         command.toNodeIndex = candidate.toNodeIndex;

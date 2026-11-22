@@ -59,7 +59,7 @@ static NnSize3D tokenEmbeddingFileSize(const LlmHeader *h) {
 }
 
 static NnUint q80EmbeddingLoadThreads() {
-    int requested = getenvIntOrDefaultLlm("DLLAMA_EMBEDDING_Q80_LOAD_THREADS", 0);
+    int requested = getenvIntOrDefaultLlm("EDGEVISOR_EMBEDDING_Q80_LOAD_THREADS", 0);
     if (requested <= 0) requested = (int)std::thread::hardware_concurrency();
     if (requested <= 0) requested = 1;
     if (requested > 8) requested = 8;
@@ -135,14 +135,14 @@ static NnSize loadRootTokenEmbeddingQ80Chunk(
 }
 
 static bool lastStageSamplingPlanSupportedLlm(const NnUnevenPartitionPlan *plan) {
-    if (!envFlagEnabledDefaultLlm("DLLAMA_LAST_STAGE_SAMPLING", false)) return false;
+    if (!envFlagEnabledDefaultLlm("EDGEVISOR_LAST_STAGE_SAMPLING", false)) return false;
     if (plan == nullptr || plan->stages == nullptr || plan->nStages < 2u) return false;
     const NnStageConfig *last = pipelineTailStage(plan);
     return last != nullptr && last->nNodes > 0u && last->rootNodeIndex < plan->nNodes;
 }
 
 static bool graphBuildDumpEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_GRAPH_BUILD");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_GRAPH_BUILD");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -150,11 +150,11 @@ static bool graphBuildDumpEnabled() {
 }
 
 static int graphBuildDumpLayerFilter() {
-    return getenvIntOrDefaultLlm("DLLAMA_DEBUG_GRAPH_BUILD_LAYER", 0);
+    return getenvIntOrDefaultLlm("EDGEVISOR_DEBUG_GRAPH_BUILD_LAYER", 0);
 }
 
 static int graphBuildDumpNodeFilter() {
-    return getenvIntOrDefaultLlm("DLLAMA_DEBUG_GRAPH_BUILD_NODE", -1);
+    return getenvIntOrDefaultLlm("EDGEVISOR_DEBUG_GRAPH_BUILD_NODE", -1);
 }
 
 static const char *pointerSourceToString(NnPointerSource src) {
@@ -309,7 +309,7 @@ static const char *hiddenActToString(LlmHiddenAct act) {
 }
 
 static bool siluMulFusionEnabled() {
-    return std::getenv("DLLAMA_DISABLE_SILU_MUL_FUSION") == nullptr;
+    return std::getenv("EDGEVISOR_DISABLE_SILU_MUL_FUSION") == nullptr;
 }
 
 static const char *ropeTypeToString(NnRopeType type) {
@@ -535,7 +535,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint maxActiv
     // Opt-in: force all OP_MATMUL ops to take the view-aware code path.
     // This is useful for distributed A/B checks while keeping buffer layouts unchanged (offset=0).
     // NOTE: This will likely disable some fast paths (e.g. llamafile sgemm) when enabled.
-    const bool forceMatmulViews = (std::getenv("DLLAMA_FORCE_MATMUL_VIEWS") != nullptr);
+    const bool forceMatmulViews = (std::getenv("EDGEVISOR_FORCE_MATMUL_VIEWS") != nullptr);
     auto makeMatmulCfg = [&](NnUint nExperts, NnUint nActiveExperts, NnUint activeExpertIndexesBufferIndex, NnUint inLen, NnUint outLen) -> NnMatmulOpConfig {
         NnMatmulOpConfig cfg{};
         cfg.nExperts = nExperts;
@@ -1062,11 +1062,11 @@ static NnNodeConfig buildLlmNodeInternal(
     // NOTE: Legacy env hard-migrate variables are treated as a deprecated *enable signal*
     // only. Actual trigger/move parameters are now provided via PlanCommand cache.
     const bool legacyHardMigrateRequested =
-        (std::getenv("DLLAMA_HARD_MIGRATE_POS") != nullptr) ||
-        (std::getenv("DLLAMA_HARD_MIGRATE_LAYER") != nullptr) ||
-        (std::getenv("DLLAMA_HARD_MIGRATE_KIND") != nullptr) ||
-        (std::getenv("DLLAMA_HARD_MIGRATE_HEAD_MOVE") != nullptr) ||
-        (std::getenv("DLLAMA_HARD_MIGRATE_FFN_MOVE") != nullptr);
+        (std::getenv("EDGEVISOR_HARD_MIGRATE_POS") != nullptr) ||
+        (std::getenv("EDGEVISOR_HARD_MIGRATE_LAYER") != nullptr) ||
+        (std::getenv("EDGEVISOR_HARD_MIGRATE_KIND") != nullptr) ||
+        (std::getenv("EDGEVISOR_HARD_MIGRATE_HEAD_MOVE") != nullptr) ||
+        (std::getenv("EDGEVISOR_HARD_MIGRATE_FFN_MOVE") != nullptr);
 
     const bool enablePlanBarrier = g_enablePlanBarrier || legacyHardMigrateRequested;
 
@@ -1084,7 +1084,7 @@ static NnNodeConfig buildLlmNodeInternal(
             }
         }
 
-        if (std::getenv("DLLAMA_RUNTIME_PLAN_PRINT") != nullptr) {
+        if (std::getenv("EDGEVISOR_RUNTIME_PLAN_PRINT") != nullptr) {
             printf("🧭 [runtime-role] node=%u stage=%u active=%zu redundant=%zu range=[%u,%u)\n",
                 (unsigned)nodeIndex,
                 (unsigned)stageIndex,
@@ -1214,7 +1214,7 @@ static NnNodeConfig buildLlmNodeInternal(
         ropeSliceK.cacheSize = size2D(F_32, h->seqLen, h->headDim);
     }
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     printf("🔍 [Node %u DEBUG] RoPE Q Slice: qStart=%u qLen=%u kvStart=%u kvLen=%u headDim=%u\n",
         nodeIndex, ropeSliceQ.qDimStart, ropeSliceQ.qDim0, ropeSliceQ.kvDimStart, ropeSliceQ.kvDim0, ropeSliceQ.headDim);
     printf("🔍 [Node %u DEBUG] RoPE K Slice%s: qStart=%u qLen=%u kvStart=%u kvLen=%u headDim=%u\n",
@@ -1239,7 +1239,7 @@ static NnNodeConfig buildLlmNodeInternal(
 
     // 3. 构建 Node Config
     NnNodeConfigBuilder nodeBuilder(nodeIndex);
-    const bool segBuildPrint = (std::getenv("DLLAMA_SEG_BUILD_PRINT") != nullptr);
+    const bool segBuildPrint = (std::getenv("EDGEVISOR_SEG_BUILD_PRINT") != nullptr);
     const NnUint logStageIndex = (myStage != nullptr) ? myStage->stageIndex : 0xFFFFFFFFu;
     auto addSegmentLogged = [&](NnSegmentConfigBuilder &builder, const char *segKind, NnUint layerIndex) {
         NnSegmentConfig seg = builder.build();
@@ -1306,7 +1306,7 @@ static NnNodeConfig buildLlmNodeInternal(
         return dst;
     };
 
-    int kvAggCollectLayer = getenvIntOrDefaultLlm("DLLAMA_ASYNC_KV_COLLECT_LAYER", -1);
+    int kvAggCollectLayer = getenvIntOrDefaultLlm("EDGEVISOR_ASYNC_KV_COLLECT_LAYER", -1);
     if (kvAggCollectLayer < 0 && myStage != nullptr && myStage->endLayer > myStage->startLayer) {
         kvAggCollectLayer = (int)(myStage->endLayer - 1u);
     }
@@ -1381,7 +1381,7 @@ static NnNodeConfig buildLlmNodeInternal(
 
     // Opt-in: force all OP_MATMUL ops to take the view-aware code path.
     // This is useful for distributed A/B checks while keeping buffer layouts unchanged (offset=0).
-    const bool forceMatmulViews = (std::getenv("DLLAMA_FORCE_MATMUL_VIEWS") != nullptr);
+    const bool forceMatmulViews = (std::getenv("EDGEVISOR_FORCE_MATMUL_VIEWS") != nullptr);
 
     auto makeRowMatmulCfg = [&](NnUint inLen, NnUint outLen, NnUint outStart, NnUint residentStart = 0u, bool useResidentView = false) -> NnMatmulOpConfig {
         NnMatmulOpConfig cfg{};
@@ -1893,7 +1893,7 @@ static NnNodeConfig buildLlmNodeInternal(
                 pointerBatchConfig(SRC_BUFFER, shadowScratch.yq), lSlicePtr,
                 w3Slice.sliceSize,
                 makeRowMatmulCfgTagged(NN_SLICE_FFN, 1u, w3Slice.n, w3Slice.inLen, w3Slice.inStart));
-            const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+            const bool testSplit = (std::getenv("EDGEVISOR_TEST_SILU_VIEW_SPLIT") != nullptr);
             const NnUint actDim = w1Slice.inLen;
             NnMulOpCodeConfig mulCfg = NnMulOpCodeConfig{shadowScratch.l};
             if (fullFfnBuffers) {
@@ -2137,7 +2137,7 @@ static NnNodeConfig buildLlmNodeInternal(
                 n->slotPipeIndex,
                 fullAttBuffers ? fullKvSlotStride : localKvSlotStride});
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
         printf(" [Node %u DEBUG] MHA: nHeads=%u nHeads0=%u qStart=%u qSliceD0=%u kvStart=%u kvDim0=%u kvStride=%u%s\n",
             nodeIndex,
             multiHeadAttSlice.nHeads,
@@ -2216,7 +2216,7 @@ static NnNodeConfig buildLlmNodeInternal(
                 ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeLBufferIndex), w3ExpertSliceSize, w3Cfg);
             }
             {
-                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+                const bool testSplit = (std::getenv("EDGEVISOR_TEST_SILU_VIEW_SPLIT") != nullptr);
                 const NnUint actDim = w1Slice.inLen;
                 if (testSplit && layerIndex == 0u && actDim >= 2u) {
                     const NnUint half = actDim / 2u;
@@ -2270,7 +2270,7 @@ static NnNodeConfig buildLlmNodeInternal(
                 mulCfg.view = NnTensorView{ffnStart0, 0u, ffnLen0, 0u, 1u};
             }
             {
-                const bool testSplit = (std::getenv("DLLAMA_TEST_SILU_VIEW_SPLIT") != nullptr);
+                const bool testSplit = (std::getenv("EDGEVISOR_TEST_SILU_VIEW_SPLIT") != nullptr);
                 const NnUint actDim = w1Slice.inLen;
                 if (testSplit && layerIndex == 0u && actDim >= 2u) {
                     const NnUint half = actDim / 2u;
@@ -2508,7 +2508,7 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
         return (int)x;
     };
 
-    const int boundarySpan = std::max(0, parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", 1));
+    const int boundarySpan = std::max(0, parseEnvInt("EDGEVISOR_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", 1));
     // Probe hook: coverage (how many boundaries) and depth (how many layers per
     // boundary) are separate. One uniform span cannot express "deep next to the
     // degraded stage, shallow elsewhere", and on a five-stage chain raising it
@@ -2516,11 +2516,11 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
     // memory. Both default to `boundarySpan`, so an unset environment is
     // byte-identical to the published behaviour.
     const int budget = std::max(0, parseEnvInt(
-        "DLLAMA_REDUNDANT_BOUNDARY_BUDGET", boundarySpan));
+        "EDGEVISOR_REDUNDANT_BOUNDARY_BUDGET", boundarySpan));
     const int depth = std::max(0, parseEnvInt(
-        "DLLAMA_REDUNDANT_BOUNDARY_DEPTH", boundarySpan));
+        "EDGEVISOR_REDUNDANT_BOUNDARY_DEPTH", boundarySpan));
 
-    // P1 admission-policy ablation. DLLAMA_COVERAGE_POLICY selects how the
+    // P1 admission-policy ablation. EDGEVISOR_COVERAGE_POLICY selects how the
     // redundant (shadow) coverage budget is spent across PP-stage boundaries:
     //   edgevisor    - boundary-proximal BOTH sides, depth=span per boundary
     //                  (default; marginal-utility order, cost-normalized)
@@ -2531,9 +2531,9 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
     //   cost_only    - receiving-side only, depth=2*span (the same memory
     //                  budget buys double depth when placement is cost-aware)
     //   benefit_only - receiving-side only, depth=span (top-benefit side)
-    const char *policyStr = std::getenv("DLLAMA_COVERAGE_POLICY");
+    const char *policyStr = std::getenv("EDGEVISOR_COVERAGE_POLICY");
     const std::string coveragePolicy = (policyStr != nullptr && policyStr[0] != '\0') ? std::string(policyStr) : std::string("edgevisor");
-    const unsigned coverageSeed = (unsigned)parseEnvInt("DLLAMA_COVERAGE_SEED", 42);
+    const unsigned coverageSeed = (unsigned)parseEnvInt("EDGEVISOR_COVERAGE_SEED", 42);
     const NnUint poolDepth = (NnUint)std::max(4, depth);
 
     // Primary ownership from stage ranges.
@@ -2548,7 +2548,7 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
 
     {
         std::vector<std::pair<NnUint, NnUint> > depths;
-        const char *spec = std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        const char *spec = std::getenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS");
         if (parseBoundaryDepthSpec(spec, depths) && depths.size() + 1u == (size_t)plan->nStages) {
             auto admitCopy = [&](NnUint stage, NnUint layer) {
                 if (layer < nLayers && out.getRole(stage, layer) == RUNTIME_LAYER_DISABLED) {
@@ -2613,7 +2613,7 @@ RuntimeStageLayerPlan buildRuntimeStageLayerPlan(const NnUnevenPartitionPlan *pl
     //   C(b)  = prep cost = span × layers/boundary (uniform)
     // → Score(b) ∝ p(b) since R and C are uniform per boundary.
 
-    const char *scenProbStr = std::getenv("DLLAMA_SCENARIO_PROBABILITIES");
+    const char *scenProbStr = std::getenv("EDGEVISOR_SCENARIO_PROBABILITIES");
     double probs[8] = {0.4, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0};
     if (scenProbStr != nullptr && scenProbStr[0] != '\0') {
         // parse comma-separated probabilities
@@ -2879,7 +2879,7 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnU
                 redundantMarks);
         }
 
-        if (std::getenv("DLLAMA_RUNTIME_PLAN_PRINT") != nullptr) {
+        if (std::getenv("EDGEVISOR_RUNTIME_PLAN_PRINT") != nullptr) {
             for (NnUint stage = 0; stage < n.runtimeStageLayerPlan.nStages; ++stage) {
                 size_t stageActive = 0u;
                 size_t stageRedundant = 0u;

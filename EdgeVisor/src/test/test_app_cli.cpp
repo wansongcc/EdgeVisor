@@ -19,23 +19,23 @@ static AppCliArgs parseArgs(int argc, char **argv) {
 }
 
 static void clearTpotEnvironment() {
-    unsetenv("DLLAMA_TPOT_WINDOW_TOKENS");
-    unsetenv("DLLAMA_TPOT_MIN_SAMPLES");
-    unsetenv("DLLAMA_TPOT_COOLDOWN_TOKENS");
-    unsetenv("DLLAMA_TPOT_ROLLBACK_WINDOW");
-    unsetenv("DLLAMA_TPOT_MIN_PP_GAIN_MS");
-    unsetenv("DLLAMA_TPOT_PP_RISK_MARGIN_MS");
-    unsetenv("DLLAMA_TPOT_PP_MIGRATION_COST_MS");
-    unsetenv("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS");
-    unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
-    unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
-    unsetenv("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS");
-    unsetenv("DLLAMA_LAYER_PROF_ENABLE");
-    unsetenv("DLLAMA_SYNC_ENV_VARS");
+    unsetenv("EDGEVISOR_TPOT_WINDOW_TOKENS");
+    unsetenv("EDGEVISOR_TPOT_MIN_SAMPLES");
+    unsetenv("EDGEVISOR_TPOT_COOLDOWN_TOKENS");
+    unsetenv("EDGEVISOR_TPOT_ROLLBACK_WINDOW");
+    unsetenv("EDGEVISOR_TPOT_MIN_PP_GAIN_MS");
+    unsetenv("EDGEVISOR_TPOT_PP_RISK_MARGIN_MS");
+    unsetenv("EDGEVISOR_TPOT_PP_MIGRATION_COST_MS");
+    unsetenv("EDGEVISOR_TPOT_EXPECTED_REMAINING_TOKENS");
+    unsetenv("EDGEVISOR_TPOT_PP_GAIN_RATIO");
+    unsetenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE");
+    unsetenv("EDGEVISOR_RUNTIME_REDUNDANT_BOUNDARY_LAYERS");
+    unsetenv("EDGEVISOR_LAYER_PROF_ENABLE");
+    unsetenv("EDGEVISOR_SYNC_ENV_VARS");
 }
 
 static bool rejectsPpGainRatio(const char *text) {
-    char arg0[] = "dllama";
+    char arg0[] = "edgevisor";
     char arg1[] = "inference";
     char arg2[] = "--tpot-pp-gain-ratio";
     char value[32];
@@ -50,19 +50,19 @@ static bool rejectsPpGainRatio(const char *text) {
 }
 
 static bool rejectsEnvironmentPpGainRatio(const char *text) {
-    setenv("DLLAMA_TPOT_PP_GAIN_RATIO", text, 1);
+    setenv("EDGEVISOR_TPOT_PP_GAIN_RATIO", text, 1);
     try {
-        (void)dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        (void)edgevisor::dynamic_tpot::loadSchedulerConfigFromEnvironment();
     } catch (...) {
-        unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+        unsetenv("EDGEVISOR_TPOT_PP_GAIN_RATIO");
         return true;
     }
-    unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+    unsetenv("EDGEVISOR_TPOT_PP_GAIN_RATIO");
     return false;
 }
 
 static bool rejectsMaxPpLayerMove(const char *text) {
-    char arg0[] = "dllama";
+    char arg0[] = "edgevisor";
     char arg1[] = "inference";
     char arg2[] = "--tpot-max-pp-layer-move";
     char value[32];
@@ -77,14 +77,14 @@ static bool rejectsMaxPpLayerMove(const char *text) {
 }
 
 static bool rejectsEnvironmentMaxPpLayerMove(const char *text) {
-    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", text, 1);
+    setenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", text, 1);
     try {
-        (void)dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        (void)edgevisor::dynamic_tpot::loadSchedulerConfigFromEnvironment();
     } catch (...) {
-        unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
+        unsetenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE");
         return true;
     }
-    unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
+    unsetenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE");
     return false;
 }
 
@@ -113,7 +113,7 @@ static void testReservedMigrationAdmission() {
     {
         NnNetExecution execution(1u, &net.netConfig);
         RootLlmInference inference(&net, &execution, nullptr, nullptr, &plan, false, true);
-        PlanCommand cmd = makeEmptyPlanCommand(); cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+        PlanCommand cmd = makeEmptyPlanCommand(); cmd.version = EDGEVISOR_PLAN_CMD_VERSION_V2;
         cmd.mode = PLAN_CMD_MODE_NEXT_BARRIER; cmd.fromNodeIndex = 0u; cmd.toNodeIndex = 2u;
         cmd.triggerLayer = 2u; cmd.reserved0 = 1u;
         assert(!inference.validatePpMigrationCommand(cmd)); // not on the active chain yet
@@ -152,11 +152,11 @@ static void testPpStageInsertReaffirm() {
 }
 
 int main() {
-    unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
+    unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV");
     testReservedMigrationAdmission();
     testPpStageInsertReaffirm();
     {
-        char program[] = "dllama", action[] = "inference";
+        char program[] = "edgevisor", action[] = "inference";
         char *defaults[] = {program, action};
         for (AppCliArgs::Backend backend : {AppCliArgs::BACKEND_CPU, AppCliArgs::BACKEND_CUDA, AppCliArgs::BACKEND_VULKAN}) {
             AppCliArgs args = parseArgs(2, defaults);
@@ -173,22 +173,22 @@ int main() {
         assert(args.nThreadsExplicit && args.nThreads == 16u);
     }
     {
-        char program[] = "dllama", action[] = "worker";
+        char program[] = "edgevisor", action[] = "worker";
         char *defaults[] = {program, action};
         for (AppCliArgs::Backend backend : {AppCliArgs::BACKEND_CPU, AppCliArgs::BACKEND_CUDA, AppCliArgs::BACKEND_VULKAN}) {
             AppCliArgs args = parseArgs(2, defaults);
             const NnUint hardwareThreads = args.nThreads;
             args.backend = backend;
             args.applyBackendThreadDefaults(); // initial worker startup
-            setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1); // root bootstrap arrives later
+            setenv("EDGEVISOR_BUBBLE_SHADOW_KV", "1", 1); // root bootstrap arrives later
             args.applyBackendThreadDefaults();
             assert(args.nThreads == 1u && !args.nThreadsExplicit);
-            unsetenv("DLLAMA_BUBBLE_SHADOW_KV"); // next session on the same worker
+            unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV"); // next session on the same worker
             args.applyBackendThreadDefaults();
             assert(args.nThreads == (backend == AppCliArgs::BACKEND_VULKAN ? 1u : hardwareThreads));
 
             char flag[] = "--nthreads", one[] = "1", many[] = "2";
-            setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
+            setenv("EDGEVISOR_BUBBLE_SHADOW_KV", "1", 1);
             char *allowed[] = {program, action, flag, one};
             args = parseArgs(4, allowed); args.backend = backend;
             args.applyBackendThreadDefaults();
@@ -201,11 +201,11 @@ int main() {
                 rejected = std::strstr(error.what(), "Shadow KV requires --nthreads 1") != nullptr;
             }
             assert(rejected);
-            unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
+            unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV");
         }
     }
     {
-        char program[] = "dllama", action[] = "inference", flag[] = "--max-seq-len";
+        char program[] = "edgevisor", action[] = "inference", flag[] = "--max-seq-len";
         char *defaults[] = {program, action};
         assert(parseArgs(2, defaults).maxSeqLen == 4096u);
         for (const char *text : {"0", "512", "8192"}) {
@@ -223,7 +223,7 @@ int main() {
     }
     static_assert(sizeof(PlanCommand) == 1336u, "PlanCommand wire layout must remain unchanged");
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--memory-limit-gib";
         char arg3[] = "4.5";
@@ -233,7 +233,7 @@ int main() {
     }
 
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--memory-limit-gib";
         char arg3[] = "0";
@@ -269,7 +269,7 @@ int main() {
         assert(ppStartLayerSwitchFlag(&provision, 1u, 2u, 1u, &plan) == LLM_LAYER_SWITCH_NEW_PP_START);
     }
     {
-        // Each boundary in DLLAMA_REDUNDANT_BOUNDARY_DEPTHS is a
+        // Each boundary in EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS is a
         // `backward,forward` pair: the left stage reserves the right stage's
         // prefix (reachable by a right-to-left move), the right stage reserves
         // the left stage's suffix (reachable by a left-to-right move).  1,3 on
@@ -292,7 +292,7 @@ int main() {
             stage.nodeIndices = new NnUint[1]{stageIndex};
         }
 
-        setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", "0,0;1,3;0,0", 1);
+        setenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS", "0,0;1,3;0,0", 1);
         const RuntimeStageLayerPlan depthRoles = buildRuntimeStageLayerPlan(&depthPlan, 16u);
 
         // Boundary 1|2: forward depth 3 -> stage 2 holds 5,6,7.
@@ -342,7 +342,7 @@ int main() {
 
         // Later buildRuntimeStageLayerPlan calls in this process must see the
         // default spec, not this one.
-        unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        unsetenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS");
         // NnStageConfig owns nodeIndices and releases it from its destructor.
         delete[] depthPlan.stages;
         depthPlan.stages = nullptr;
@@ -350,35 +350,35 @@ int main() {
 
     clearTpotEnvironment();
     {
-        const dllama::dynamic_tpot::SchedulerConfig cfg =
-            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        const edgevisor::dynamic_tpot::SchedulerConfig cfg =
+            edgevisor::dynamic_tpot::loadSchedulerConfigFromEnvironment();
         assert(cfg.ppGainRatio == 0.03);
         assert(cfg.maxPpLayerMove == 1u);
     }
-    setenv("DLLAMA_TPOT_PP_GAIN_RATIO", "0.5", 1);
+    setenv("EDGEVISOR_TPOT_PP_GAIN_RATIO", "0.5", 1);
     {
-        const dllama::dynamic_tpot::SchedulerConfig cfg =
-            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        const edgevisor::dynamic_tpot::SchedulerConfig cfg =
+            edgevisor::dynamic_tpot::loadSchedulerConfigFromEnvironment();
         assert(cfg.ppGainRatio == 0.5);
     }
-    unsetenv("DLLAMA_TPOT_PP_GAIN_RATIO");
+    unsetenv("EDGEVISOR_TPOT_PP_GAIN_RATIO");
 
-    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", "4", 1);
+    setenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", "4", 1);
     {
-        const dllama::dynamic_tpot::SchedulerConfig cfg =
-            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        const edgevisor::dynamic_tpot::SchedulerConfig cfg =
+            edgevisor::dynamic_tpot::loadSchedulerConfigFromEnvironment();
         assert(cfg.maxPpLayerMove == 4u);
     }
-    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", "64", 1);
+    setenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", "64", 1);
     {
-        const dllama::dynamic_tpot::SchedulerConfig cfg =
-            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        const edgevisor::dynamic_tpot::SchedulerConfig cfg =
+            edgevisor::dynamic_tpot::loadSchedulerConfigFromEnvironment();
         assert(cfg.maxPpLayerMove == 64u);
     }
-    unsetenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE");
+    unsetenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE");
 
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--enable-dynamic-tpot";
         char arg3[] = "--dynamic-tpot-profile";
@@ -392,16 +392,16 @@ int main() {
         char *argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10};
         AppCliArgs args = parseArgs(11, argv);
         assert(args.lastStageSampling);
-        assert(strcmp(getenv("DLLAMA_TPOT_WINDOW_TOKENS"), "9") == 0);
-        assert(strcmp(getenv("DLLAMA_TPOT_MIN_SAMPLES"), "6") == 0);
-        assert(strcmp(getenv("DLLAMA_TPOT_COOLDOWN_TOKENS"), "8") == 0);
-        assert(strcmp(getenv("DLLAMA_TPOT_PP_GAIN_RATIO"), "0") == 0);
-        assert(strcmp(getenv("DLLAMA_LAYER_PROF_ENABLE"), "1") == 0);
-        assert(strstr(getenv("DLLAMA_SYNC_ENV_VARS"), "DLLAMA_LAYER_PROF_ENABLE") != nullptr);
+        assert(strcmp(getenv("EDGEVISOR_TPOT_WINDOW_TOKENS"), "9") == 0);
+        assert(strcmp(getenv("EDGEVISOR_TPOT_MIN_SAMPLES"), "6") == 0);
+        assert(strcmp(getenv("EDGEVISOR_TPOT_COOLDOWN_TOKENS"), "8") == 0);
+        assert(strcmp(getenv("EDGEVISOR_TPOT_PP_GAIN_RATIO"), "0") == 0);
+        assert(strcmp(getenv("EDGEVISOR_LAYER_PROF_ENABLE"), "1") == 0);
+        assert(strstr(getenv("EDGEVISOR_SYNC_ENV_VARS"), "EDGEVISOR_LAYER_PROF_ENABLE") != nullptr);
     }
 
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--enable-dynamic-tpot";
         char arg3[] = "--tpot-max-pp-layer-move";
@@ -409,28 +409,28 @@ int main() {
         char *argv[] = {arg0, arg1, arg2, arg3, arg4};
         AppCliArgs args = parseArgs(5, argv);
         (void)args;
-        assert(strcmp(getenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE"), "4") == 0);
+        assert(strcmp(getenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE"), "4") == 0);
         assert(args.runtimeRedundantBoundaryLayers == 4u);
     }
 
     clearTpotEnvironment();
-    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", "2", 1);
+    setenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", "2", 1);
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--enable-dynamic-tpot";
         char arg3[] = "--tpot-max-pp-layer-move";
         char arg4[] = "64";
         char *argv[] = {arg0, arg1, arg2, arg3, arg4};
         AppCliArgs args = parseArgs(5, argv);
-        assert(strcmp(getenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE"), "64") == 0);
+        assert(strcmp(getenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE"), "64") == 0);
         assert(args.runtimeRedundantBoundaryLayers == 64u);
     }
 
     clearTpotEnvironment();
-    setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", "4", 1);
+    setenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", "4", 1);
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--enable-dynamic-tpot";
         char *argv[] = {arg0, arg1, arg2};
@@ -440,7 +440,7 @@ int main() {
 
     clearTpotEnvironment();
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--enable-dynamic-tpot";
         char arg3[] = "--tpot-max-pp-layer-move";
@@ -458,7 +458,7 @@ int main() {
     }
 
     clearTpotEnvironment();
-    setenv("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", "4", 1);
+    setenv("EDGEVISOR_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", "4", 1);
     NnUnevenPartitionPlan rangePlan;
     rangePlan.nNodes = 2u;
     rangePlan.nStages = 2u;
@@ -488,8 +488,8 @@ int main() {
         assert(runtimePlan.getRole(1u, layer) == RUNTIME_LAYER_PRIMARY);
     }
 
-    dllama::dynamic_tpot::Candidate issued;
-    issued.kind = dllama::dynamic_tpot::CandidateKind::PP_MOVE;
+    edgevisor::dynamic_tpot::Candidate issued;
+    issued.kind = edgevisor::dynamic_tpot::CandidateKind::PP_MOVE;
     issued.valid = true;
     issued.fromStageIndex = 0u;
     issued.toStageIndex = 1u;
@@ -497,7 +497,7 @@ int main() {
     issued.toNodeIndex = 1u;
     issued.layerIndex = 4u;
     issued.layerCount = 4u;
-    const json request = dllama::dynamic_tpot::makePpCommandRequest(17u, issued);
+    const json request = edgevisor::dynamic_tpot::makePpCommandRequest(17u, issued);
     assert(request.at("op").get<std::string>() == "set_pp_migration");
     assert(request.at("cmd").at("firstLayer").get<uint32_t>() == 4u);
     assert(request.at("cmd").at("layerCount").get<uint32_t>() == 4u);
@@ -511,9 +511,9 @@ int main() {
     assert(resolvePpMigrationLayers(forward, &rangePlan, &runtimePlan, forwardLayers, &rangeReason));
     assert((forwardLayers == std::vector<NnUint>{4u, 5u, 6u, 7u}));
 
-    dllama::dynamic_tpot::Candidate rollback = dllama::dynamic_tpot::reversePpCandidate(issued);
+    edgevisor::dynamic_tpot::Candidate rollback = edgevisor::dynamic_tpot::reversePpCandidate(issued);
     const PlanCommand reverse = decodePpMigrationCommand(
-        dllama::dynamic_tpot::makePpCommandRequest(18u, rollback).at("cmd"));
+        edgevisor::dynamic_tpot::makePpCommandRequest(18u, rollback).at("cmd"));
     std::vector<NnUint> reverseLayers;
     assert(resolvePpMigrationLayers(reverse, &rangePlan, &runtimePlan, reverseLayers, &rangeReason));
     assert(reverseLayers == forwardLayers);
@@ -615,7 +615,7 @@ int main() {
         stage.nNodes = 1u;
         stage.nodeIndices = new NnUint[1]{stageIndex};
     }
-    setenv("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", "4", 1);
+    setenv("EDGEVISOR_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", "4", 1);
     const RuntimeStageLayerPlan staticProvision = buildRuntimeStageLayerPlan(&runtimeBypassPlan, 40u);
     RuntimePrimaryOwnership runtimeOwnership;
     assert(initializeRuntimePrimaryOwnership(&staticProvision, runtimeOwnership, &rangeReason));
@@ -635,7 +635,7 @@ int main() {
     clearTpotEnvironment();
 
     {
-        char arg0[] = "dllama";
+        char arg0[] = "edgevisor";
         char arg1[] = "inference";
         char arg2[] = "--tpot-max-pp-layer-move";
         char *argv[] = {arg0, arg1, arg2};

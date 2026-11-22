@@ -10,10 +10,10 @@
 #include <vector>
 #include <stdexcept>
 
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
     #include "nn/nn-vulkan.hpp"
 #endif
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
     #include "nn/nn-cuda.hpp"
 #endif
 
@@ -198,13 +198,13 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         args.backend = (args.gpuIndex >= 0) ? BACKEND_VULKAN : BACKEND_CPU;
     else if ((args.backend == BACKEND_VULKAN || args.backend == BACKEND_CUDA) && args.gpuIndex < 0)
         args.gpuIndex = 0;
-#if !defined(DLLAMA_VULKAN)
+#if !defined(EDGEVISOR_VULKAN)
     if (args.backend == BACKEND_VULKAN)
-        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with EDGEVISOR_VULKAN=1");
 #endif
-#if !defined(DLLAMA_CUDA)
+#if !defined(EDGEVISOR_CUDA)
     if (args.backend == BACKEND_CUDA)
-        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with EDGEVISOR_CUDA=1");
 #endif
     return args;
 }
@@ -230,24 +230,24 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     }
 
     if (args->backend == AppCliArgs::BACKEND_VULKAN) {
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
         devices.push_back(NnExecutorDevice(
             new NnVulkanDevice(args->gpuIndex, netConfig, nodeConfig, netExecution),
             args->gpuSegmentFrom,
             args->gpuSegmentTo
         ));
 #else
-        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with EDGEVISOR_VULKAN=1");
 #endif
     } else if (args->backend == AppCliArgs::BACKEND_CUDA) {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         devices.push_back(NnExecutorDevice(
             new NnCudaDevice(args->gpuIndex, netConfig, nodeConfig, netExecution, plan),
             args->gpuSegmentFrom,
             args->gpuSegmentTo
         ));
 #else
-        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with EDGEVISOR_CUDA=1");
 #endif
     } else {
         throw std::runtime_error("Internal error: unresolved backend " + std::string(AppCliArgs::backendToString(args->backend)));

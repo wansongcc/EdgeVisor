@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace dllama {
+namespace edgevisor {
 namespace dynamic_tpot {
 
 static double maxDouble(double a, double b) {
@@ -502,4 +502,4 @@ const char *candidateKindName(CandidateKind kind) {
 }
 
 } // namespace dynamic_tpot
-} // namespace dllama
+} // namespace edgevisor

@@ -46,7 +46,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run a looping LangGraph agent with a swappable LLM backend.")
     parser.add_argument(
         "--backend",
-        choices=["mock", "prima", "edgevisor", "dllama", "edgevisor_exo", "edgevisor_lingualinked", "edgevisor_ablation"],
+        choices=["mock", "prima", "edgevisor", "edgevisor", "edgevisor_exo", "edgevisor_lingualinked", "edgevisor_ablation"],
         required=True,
     )
     parser.add_argument(
@@ -92,8 +92,8 @@ def main() -> int:
         default=0,
         help="Override KV migration ACK/control I/O timeout; 0 keeps the runtime default.",
     )
-    parser.add_argument("--dllama-worker-gpus", default="1", help="Comma-separated worker GPU indices for Dllama.")
-    parser.add_argument("--dllama-ratios", default="1:1")
+    parser.add_argument("--edgevisor-worker-gpus", default="1", help="Comma-separated worker GPU indices for EdgeVisor.")
+    parser.add_argument("--edgevisor-ratios", default="1:1")
     parser.add_argument("--edge-exo-gpus", default="0,1,2", help="Comma-separated GPU indices for EdgeVisor-EXO.")
     parser.add_argument("--edge-exo-total-layers", type=int, default=28)
     parser.add_argument("--edge-exo-memory-field", choices=["total", "free"], default="total")
@@ -157,14 +157,14 @@ def main() -> int:
             "virtual_topology": virtual_topology,
             "last_stage_sampling": args.edge_last_stage_sampling,
         }
-    elif args.backend == "dllama":
+    elif args.backend == "edgevisor":
         backend_kwargs = {
             "cuda_visible": args.cuda_visible,
             "ctx": args.ctx,
             "steps": args.edge_steps,
             "timeout_s": args.edge_timeout_s,
-            "ratios": args.dllama_ratios,
-            "worker_gpus": parse_gpu_list(args.dllama_worker_gpus),
+            "ratios": args.edgevisor_ratios,
+            "worker_gpus": parse_gpu_list(args.edgevisor_worker_gpus),
         }
     elif args.backend == "edgevisor_exo":
         backend_kwargs = {
@@ -191,12 +191,12 @@ def main() -> int:
         extra_env: Dict[str, str] = {}
         if args.kv_ack_timeout_ms > 0:
             timeout_ms = str(args.kv_ack_timeout_ms)
-            extra_env["DLLAMA_KV_ACK_TIMEOUT_MS"] = timeout_ms
-            extra_env["DLLAMA_IO_TIMEOUT_MS"] = timeout_ms
+            extra_env["EDGEVISOR_KV_ACK_TIMEOUT_MS"] = timeout_ms
+            extra_env["EDGEVISOR_IO_TIMEOUT_MS"] = timeout_ms
         if args.edge_fixed_port_base > 0:
             extra_env["EDGEVISOR_FIXED_PORT_BASE"] = str(args.edge_fixed_port_base)
         if args.bubble_shadow_kv:
-            extra_env["DLLAMA_BUBBLE_SHADOW_KV"] = "1"
+            extra_env["EDGEVISOR_BUBBLE_SHADOW_KV"] = "1"
         ablation_config = load_ablation_config(args.edgevisor_ablation_config)
         ablation_config.update(
             {

@@ -2,7 +2,7 @@
 """Run EdgeVisor Docker ablation experiments and write raw CSV results.
 
 The suite intentionally keeps all persistent outputs under /home/cc/yhbian/B01.
-It uses real distributed dllama runs for migration events.  For ablation
+It uses real distributed edgevisor runs for migration events.  For ablation
 variants that the current runtime does not expose as separate code paths
 (`without Shadow KV` and `without Pointer Swizzling`), it performs measured
 state-preparation or rebinding work before issuing the same UDS migration.
@@ -28,12 +28,12 @@ PROJ = BASE / "EdgeVisor"
 ENGINE_DIR = PROJ / "EdgeVisor"
 CONTAINER_ENGINE_DIR = "/workspace/EdgeVisor/EdgeVisor"
 UDS_CLIENT = ENGINE_DIR / "examples/plan-uds-client.py"
-HOST_MODEL_DIR = Path(os.environ.get("B01_MODEL_DIR", "/home/cc/dllama/distributed-llama/models"))
-IMAGE = "dllama-exp-env:latest"
-TOKENIZER = "/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t"
+HOST_MODEL_DIR = Path(os.environ.get("B01_MODEL_DIR", "/home/cc/EdgeVisor/EdgeVisor/models"))
+IMAGE = "edgevisor-exp-env:latest"
+TOKENIZER = "/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t"
 MODELS = {
     "3B": {
-        "path": "/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m",
+        "path": "/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m",
         "layers": 28,
         "kv_heads": 8,
         "q_heads": 24,
@@ -41,7 +41,7 @@ MODELS = {
         "dim": 3072,
     },
     "8B": {
-        "path": "/models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m",
+        "path": "/models/llama3.1_instruct_q40/edgevisor_model_llama3.1_instruct_q40.m",
         "layers": 32,
         "kv_heads": 8,
         "q_heads": 32,
@@ -152,7 +152,7 @@ def ensure_dirs():
                 "base_net_mbps": BASE_NET_MBPS,
                 "models": MODELS,
                 "method_note": (
-                    "Each model uses real dllama distributed inference in 8 Docker containers. "
+                    "Each model uses real edgevisor distributed inference in 8 Docker containers. "
                     "The preferred full experiment keeps the 3/3/2 multi-stage partition active and "
                     "injects a Stage-1 straggler on node 4, migrating node-4 attention heads to nodes 3 and 5. "
                     "No-shadow variants add measured real TCP state transfer or measured CPU "
@@ -324,7 +324,7 @@ def start_cluster(model_name, variant, exp_name, steps=96, max_seq_len=2048, ext
                 IMAGE,
                 "bash",
                 "-lc",
-                f"./dllama worker --port 9999 --nthreads {WORKER_THREADS}",
+                f"./edgevisor worker --port 9999 --nthreads {WORKER_THREADS}",
             ]
         ).stdout.strip()
         (test_dir / f"{worker}.cid").write_text(cid + "\n")
@@ -336,7 +336,7 @@ def start_cluster(model_name, variant, exp_name, steps=96, max_seq_len=2048, ext
     worker_args = " ".join(f"{w}:9999" for w in workers[:ACTIVE_WORKER_COUNT])
     model = MODELS[model_name]["path"]
     root_cmd = (
-        f"./dllama inference --prompt {shlex.quote(prompt)} --steps {steps} "
+        f"./edgevisor inference --prompt {shlex.quote(prompt)} --steps {steps} "
         f"--model {shlex.quote(model)} --tokenizer {shlex.quote(TOKENIZER)} "
         f"--buffer-float-type q80 --nthreads {ROOT_THREADS} --max-seq-len {max_seq_len} "
         f"--benchmark --workers {worker_args} --ratios {shlex.quote(RATIOS)} {extra_args}"
@@ -365,7 +365,7 @@ def start_cluster(model_name, variant, exp_name, steps=96, max_seq_len=2048, ext
             "-w",
             CONTAINER_ENGINE_DIR,
             "-e",
-            f"DLLAMA_PLAN_CTRL_SOCKET={sock_cont}",
+            f"EDGEVISOR_PLAN_CTRL_SOCKET={sock_cont}",
             IMAGE,
             "bash",
             "-lc",
@@ -690,7 +690,7 @@ def main():
             IMAGE,
             "bash",
             "-lc",
-            "make clean >/dev/null 2>&1 || true; make -j$(nproc) dllama",
+            "make clean >/dev/null 2>&1 || true; make -j$(nproc) edgevisor",
         ],
         check=False,
         timeout=900,

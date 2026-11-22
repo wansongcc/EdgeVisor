@@ -64,12 +64,12 @@ static void logCpuPlanApplyAblationEvent(
     edgevisorAblationLogEvent(ev);
 }
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
 
 static bool debugWeightRangesEnabled(const char *opName) {
-    if (std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES") == nullptr)
+    if (std::getenv("EDGEVISOR_DEBUG_WEIGHT_RANGES") == nullptr)
         return false;
-    const char *filter = std::getenv("DLLAMA_DEBUG_WEIGHT_RANGES_FILTER");
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_WEIGHT_RANGES_FILTER");
     if (filter == nullptr || filter[0] == '\0')
         return true;
     if (opName == nullptr)
@@ -78,9 +78,9 @@ static bool debugWeightRangesEnabled(const char *opName) {
 }
 
 static bool debugSliceParamsEnabled(const char *opName) {
-    if (std::getenv("DLLAMA_DEBUG_SLICE_PARAMS") == nullptr)
+    if (std::getenv("EDGEVISOR_DEBUG_SLICE_PARAMS") == nullptr)
         return false;
-    const char *filter = std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FILTER");
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_SLICE_PARAMS_FILTER");
     if (filter == nullptr || filter[0] == '\0')
         return true;
     if (opName == nullptr)
@@ -89,9 +89,9 @@ static bool debugSliceParamsEnabled(const char *opName) {
 }
 
 static bool debugSliceParamsForwardEnabled(const char *opName) {
-    if (std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FWD") == nullptr)
+    if (std::getenv("EDGEVISOR_DEBUG_SLICE_PARAMS_FWD") == nullptr)
         return false;
-    const char *filter = std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FILTER");
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_SLICE_PARAMS_FILTER");
     if (filter == nullptr || filter[0] == '\0')
         return true;
     if (opName == nullptr)
@@ -100,7 +100,7 @@ static bool debugSliceParamsForwardEnabled(const char *opName) {
 }
 
 static bool debugSliceParamsForwardRepeat() {
-    const char *v = std::getenv("DLLAMA_DEBUG_SLICE_PARAMS_FWD_REPEAT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_SLICE_PARAMS_FWD_REPEAT");
     if (v == nullptr)
         return false;
     // Treat "0" / "false" as disabled.
@@ -123,7 +123,7 @@ static inline int getenvIntOr(const char *name, int fallback) {
 }
 
 static inline bool debugResolvePointerEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESOLVE_POINTER");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESOLVE_POINTER");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -131,7 +131,7 @@ static inline bool debugResolvePointerEnabled() {
 }
 
 static inline bool debugResolvePointerPassesFilter(NnPointerSource src, NnUint idx, NnPointerType type, NnSliceTag tag) {
-    const char *filter = std::getenv("DLLAMA_DEBUG_RESOLVE_POINTER_FILTER");
+    const char *filter = std::getenv("EDGEVISOR_DEBUG_RESOLVE_POINTER_FILTER");
     if (filter == nullptr || filter[0] == '\0') return true;
 
     // Accept either a numeric buffer/pipe index, or a tag substring like "HEAD" / "KV".
@@ -152,7 +152,7 @@ static inline bool debugResolvePointerPassesFilter(NnPointerSource src, NnUint i
 }
 
 static inline NnUint debugResolvePointerLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESOLVE_POINTER_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESOLVE_POINTER_LIMIT");
     if (v == nullptr) return 200u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -162,28 +162,28 @@ static inline NnUint debugResolvePointerLimit() {
 
 static inline bool tpRangeTargetEnabled() {
     // Enable when either explicit debug env is present, or a PlanCommand(EXACT) target exists.
-    if (std::getenv("DLLAMA_DEBUG_TP_RANGES") != nullptr)
+    if (std::getenv("EDGEVISOR_DEBUG_TP_RANGES") != nullptr)
         return true;
-    const int p = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_POS", -1);
-    const int l = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER", -1);
+    const int p = getenvIntOr("EDGEVISOR_DEBUG_TP_RANGES_POS", -1);
+    const int l = getenvIntOr("EDGEVISOR_DEBUG_TP_RANGES_LAYER", -1);
     if (p >= 0 && l >= 0)
         return true;
     const PlanCommandSnapshot snap = planCommandCache().load();
     const PlanCommand &pc = snap.cmd;
-    if (pc.magic != DLLAMA_PLAN_CMD_MAGIC || pc.version != DLLAMA_PLAN_CMD_VERSION_V2)
+    if (pc.magic != EDGEVISOR_PLAN_CMD_MAGIC || pc.version != EDGEVISOR_PLAN_CMD_VERSION_V2)
         return false;
     return (pc.mode == PLAN_CMD_MODE_EXACT && pc.triggerPos != 0xFFFFFFFFu && pc.triggerLayer != 0xFFFFFFFFu);
 }
 
 static inline bool tpRangeTargetMatch(NnUint layerIndex, NnUint pos) {
-    int targetPos = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_POS", -1);
-    int targetLayer = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER", -1);
-    int span = getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER_SPAN", -1);
+    int targetPos = getenvIntOr("EDGEVISOR_DEBUG_TP_RANGES_POS", -1);
+    int targetLayer = getenvIntOr("EDGEVISOR_DEBUG_TP_RANGES_LAYER", -1);
+    int span = getenvIntOr("EDGEVISOR_DEBUG_TP_RANGES_LAYER_SPAN", -1);
     const bool explicitTarget = (targetPos >= 0 && targetLayer >= 0);
     if (targetPos < 0 || targetLayer < 0) {
         const PlanCommandSnapshot snap = planCommandCache().load();
         const PlanCommand &pc = snap.cmd;
-        if (pc.magic == DLLAMA_PLAN_CMD_MAGIC && pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.mode == PLAN_CMD_MODE_EXACT) {
+        if (pc.magic == EDGEVISOR_PLAN_CMD_MAGIC && pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.mode == PLAN_CMD_MODE_EXACT) {
             targetPos = (pc.triggerPos == 0xFFFFFFFFu) ? -1 : (int)pc.triggerPos;
             targetLayer = (pc.triggerLayer == 0xFFFFFFFFu) ? -1 : (int)pc.triggerLayer;
             // Default behavior: when using PlanCommand(EXACT) target as the debug anchor,
@@ -202,8 +202,8 @@ static inline bool tpRangeTargetMatch(NnUint layerIndex, NnUint pos) {
     const int li = (int)layerIndex;
     const int tl = (int)targetLayer;
     const int d = (li >= tl) ? (li - tl) : (tl - li);
-    // If the user explicitly specifies DLLAMA_DEBUG_TP_RANGES_LAYER, respect it strictly unless span was set.
-    if (explicitTarget && getenvIntOr("DLLAMA_DEBUG_TP_RANGES_LAYER_SPAN", -1) < 0)
+    // If the user explicitly specifies EDGEVISOR_DEBUG_TP_RANGES_LAYER, respect it strictly unless span was set.
+    if (explicitTarget && getenvIntOr("EDGEVISOR_DEBUG_TP_RANGES_LAYER_SPAN", -1) < 0)
         return li == tl;
     return d <= span;
 }
@@ -248,9 +248,9 @@ static inline void maybeDumpHardcodedLayerKvCacheOnce(
 
     char kPath[256];
     char vPath[256];
-    std::snprintf(kPath, sizeof(kPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_k.bin",
+    std::snprintf(kPath, sizeof(kPath), "/tmp/edgevisor_kvcache_layer%u_pos%u_node%u_k.bin",
         (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
-    std::snprintf(vPath, sizeof(vPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_v.bin",
+    std::snprintf(vPath, sizeof(vPath), "/tmp/edgevisor_kvcache_layer%u_pos%u_node%u_v.bin",
         (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
 
     auto dumpOne = [&](const char *path, const NnSize3D &size, NnByte *data) {
@@ -512,9 +512,9 @@ static inline void printTpAffectedRange(
     (void)segmentConfig;
 }
 
-#endif // DLLAMA_DEBUG_ATTN
+#endif // EDGEVISOR_DEBUG_ATTN
 
-#if !DLLAMA_DEBUG_ATTN
+#if !EDGEVISOR_DEBUG_ATTN
 
 static inline NnUint loadPosFromPipe(const NnCpuOpContext *context, NnUint pipeIndex) {
     if (context == nullptr || context->pipes == nullptr)
@@ -556,9 +556,9 @@ static inline void maybeDumpHardcodedLayerKvCacheOnce(
 
     char kPath[256];
     char vPath[256];
-    std::snprintf(kPath, sizeof(kPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_k.bin",
+    std::snprintf(kPath, sizeof(kPath), "/tmp/edgevisor_kvcache_layer%u_pos%u_node%u_k.bin",
         (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
-    std::snprintf(vPath, sizeof(vPath), "/tmp/dllama_kvcache_layer%u_pos%u_node%u_v.bin",
+    std::snprintf(vPath, sizeof(vPath), "/tmp/edgevisor_kvcache_layer%u_pos%u_node%u_v.bin",
         (unsigned)layerIndex, (unsigned)pos, (unsigned)nodeIndex);
 
     auto dumpOne = [&](const char *path, const NnSize3D &size, NnByte *data) {
@@ -631,7 +631,7 @@ static inline void maybeTraceRedundantInferencePath(
     std::fflush(stdout);
 }
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
 
 static inline void printPtrSampleDbg(const char *label, NnByte **ptrs, const NnSize3D &sz) {
     if (ptrs == nullptr) {
@@ -681,7 +681,7 @@ static inline void printTensorViewDbg(const char *label, const NnTensorView &v, 
 }
 
 static void printOpSliceParamsDbg(const char *opName, const NnOpCode opCode, const void *opConfig, const NnPointerConfig *inPtr, const NnPointerConfig *outPtr, const NnSize3D &inSize, const NnSize3D &outSize) {
-    // If caller provides pointer configs, gate by DLLAMA_DEBUG_SLICE_PARAMS (build-time).
+    // If caller provides pointer configs, gate by EDGEVISOR_DEBUG_SLICE_PARAMS (build-time).
     // If pointer configs are null, allow forward-time logging gate to control output.
     if (inPtr != nullptr || outPtr != nullptr) {
         if (!debugSliceParamsEnabled(opName))
@@ -765,10 +765,10 @@ static void printOpSliceParamsDbg(const char *opName, const NnOpCode opCode, con
     }
 }
 
-#endif // DLLAMA_DEBUG_ATTN
+#endif // EDGEVISOR_DEBUG_ATTN
 
 static inline bool migrationOpTraceEnabled() {
-    const char *v = std::getenv("DLLAMA_MIGRATION_OP_TRACE");
+    const char *v = std::getenv("EDGEVISOR_MIGRATION_OP_TRACE");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -776,7 +776,7 @@ static inline bool migrationOpTraceEnabled() {
 }
 
 static inline bool finalNormInputTraceEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_FINAL_NORM_INPUT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_FINAL_NORM_INPUT");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -784,7 +784,7 @@ static inline bool finalNormInputTraceEnabled() {
 }
 
 static inline NnUint finalNormInputTraceLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_FINAL_NORM_INPUT_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_FINAL_NORM_INPUT_LIMIT");
     if (v == nullptr) return 64u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -793,7 +793,7 @@ static inline NnUint finalNormInputTraceLimit() {
 }
 
 static inline NnUint finalNormInputTraceSampleCount() {
-    const char *v = std::getenv("DLLAMA_DEBUG_FINAL_NORM_INPUT_SAMPLE");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_FINAL_NORM_INPUT_SAMPLE");
     if (v == nullptr) return 8u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -802,7 +802,7 @@ static inline NnUint finalNormInputTraceSampleCount() {
 }
 
 static inline bool finalLogitsSliceTraceEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_FINAL_LOGITS_SLICE");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_FINAL_LOGITS_SLICE");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -810,7 +810,7 @@ static inline bool finalLogitsSliceTraceEnabled() {
 }
 
 static inline NnUint finalLogitsSliceTraceLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_FINAL_LOGITS_SLICE_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_FINAL_LOGITS_SLICE_LIMIT");
     if (v == nullptr) return 128u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -819,7 +819,7 @@ static inline NnUint finalLogitsSliceTraceLimit() {
 }
 
 static inline bool layerOutTraceEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_TRACE");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_TRACE");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -827,19 +827,19 @@ static inline bool layerOutTraceEnabled() {
 }
 
 static inline int layerOutTracePosFilter() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_TRACE_POS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_TRACE_POS");
     if (v == nullptr || v[0] == '\0') return -1;
     return std::atoi(v);
 }
 
 static inline int layerOutTraceLayerFilter() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_TRACE_LAYER");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_TRACE_LAYER");
     if (v == nullptr || v[0] == '\0') return -1;
     return std::atoi(v);
 }
 
 static inline NnUint layerOutTraceLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_TRACE_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_TRACE_LIMIT");
     if (v == nullptr) return 256u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -848,7 +848,7 @@ static inline NnUint layerOutTraceLimit() {
 }
 
 static inline bool layerOutCompareEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_COMPARE");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_COMPARE");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -856,7 +856,7 @@ static inline bool layerOutCompareEnabled() {
 }
 
 static inline bool residualChainTraceEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -864,19 +864,19 @@ static inline bool residualChainTraceEnabled() {
 }
 
 static inline int residualChainTracePosFilter() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_POS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_POS");
     if (v == nullptr || v[0] == '\0') return -1;
     return std::atoi(v);
 }
 
 static inline int residualChainTraceLayerFilter() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_LAYER");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_LAYER");
     if (v == nullptr || v[0] == '\0') return -1;
     return std::atoi(v);
 }
 
 static inline NnUint residualChainTraceLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_LIMIT");
     if (v == nullptr) return 256u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -885,7 +885,7 @@ static inline NnUint residualChainTraceLimit() {
 }
 
 static inline NnUint residualChainTraceSliceLimit() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_SLICES");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_SLICES");
     if (v == nullptr) return 0u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -894,7 +894,7 @@ static inline NnUint residualChainTraceSliceLimit() {
 }
 
 static inline NnUint residualChainTraceSamples() {
-    const char *v = std::getenv("DLLAMA_DEBUG_RESIDUAL_CHAIN_TRACE_SAMPLES");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_RESIDUAL_CHAIN_TRACE_SAMPLES");
     if (v == nullptr) return 4u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 1u;
@@ -1049,13 +1049,13 @@ static inline void printResidualChainStats(
 }
 
 static inline const char *layerOutCompareMode() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_COMPARE_MODE");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_COMPARE_MODE");
     return (v == nullptr || v[0] == '\0') ? "compare" : v;
 }
 
 static inline const char *layerOutCompareFile() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_COMPARE_FILE");
-    return (v == nullptr || v[0] == '\0') ? "/tmp/dllama_layer_out_baseline.log" : v;
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_COMPARE_FILE");
+    return (v == nullptr || v[0] == '\0') ? "/tmp/edgevisor_layer_out_baseline.log" : v;
 }
 
 static inline bool layerOutCompareModeIs(const char *mode) {
@@ -1063,14 +1063,14 @@ static inline bool layerOutCompareModeIs(const char *mode) {
 }
 
 static inline double layerOutCompareRelEps() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_COMPARE_REL_EPS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_COMPARE_REL_EPS");
     if (v == nullptr || v[0] == '\0') return 1e-3;
     const double x = std::strtod(v, nullptr);
     return (x > 0.0) ? x : 1e-3;
 }
 
 static inline double layerOutCompareAbsEps() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LAYER_OUT_COMPARE_ABS_EPS");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LAYER_OUT_COMPARE_ABS_EPS");
     if (v == nullptr || v[0] == '\0') return 1e-4;
     const double x = std::strtod(v, nullptr);
     return (x > 0.0) ? x : 1e-4;
@@ -1278,7 +1278,7 @@ static void layerOutCompareRun(
 }
 
 static inline NnUint migrationOpTraceLimit() {
-    const char *v = std::getenv("DLLAMA_MIGRATION_OP_TRACE_LIMIT");
+    const char *v = std::getenv("EDGEVISOR_MIGRATION_OP_TRACE_LIMIT");
     if (v == nullptr) return 0u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -1287,7 +1287,7 @@ static inline NnUint migrationOpTraceLimit() {
 }
 
 static inline NnUint migrationKvTraceDims() {
-    const char *v = std::getenv("DLLAMA_MIGRATION_KV_TRACE_DIMS");
+    const char *v = std::getenv("EDGEVISOR_MIGRATION_KV_TRACE_DIMS");
     if (v == nullptr) return 8u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 0u;
@@ -1519,7 +1519,7 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
         outputsPtr[opIndex] = resolvePointer(&outputSize, &opConfig->output);
 
         // Debug: print slice/view parameters for full-buffer + local-slice execution.
-    #if DLLAMA_DEBUG_ATTN
+    #if EDGEVISOR_DEBUG_ATTN
         printOpSliceParamsDbg(opConfig->name, opConfig->code, opConfig->config, &opConfig->input, &opConfig->output, inputSize, outputSize);
     #endif
 
@@ -1599,7 +1599,7 @@ NnDeviceSegment *NnCpuDevice::createSegment(NnUint segmentIndex) {
             opContext->weight = nullptr;
 #endif
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
         if (opContext->weightSize.nBytes > 0 && debugWeightRangesEnabled(opContext->name)) {
             printf("🧱 [weights][alloc] op=%s idx=%u code=%s weightBytes=%zu required=[0,%zu) dims(z,y,x)=(%u,%u,%u) type=%u\n",
                 opContext->name,
@@ -1687,7 +1687,7 @@ void NnCpuDeviceSegment::loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes
     assert(opIndex < nOps);
     NnCpuOpContext *context = &opContexts[opIndex];
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     if (context->weightSize.nBytes > 0 && debugWeightRangesEnabled(context->name)) {
         const NnSize end = offset + nBytes;
         context->weightLoadCalls += 1u;
@@ -1764,10 +1764,10 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
                 (pc.cmdKind == PLAN_CMD_KIND_HEAD ||
                  pc.cmdKind == PLAN_CMD_KIND_FFN ||
                  pc.cmdKind == PLAN_CMD_KIND_BOTH ||
-                 (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u));
+                 (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u));
             const bool hasCmd =
-                (pc.magic == DLLAMA_PLAN_CMD_MAGIC) &&
-                (pc.version == DLLAMA_PLAN_CMD_VERSION_V1 || pc.version == DLLAMA_PLAN_CMD_VERSION_V2) &&
+                (pc.magic == EDGEVISOR_PLAN_CMD_MAGIC) &&
+                (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V1 || pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2) &&
                 (pc.mode == PLAN_CMD_MODE_EXACT || pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) &&
                 hasPlanPayload;
 
@@ -1824,8 +1824,8 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
             if (trigger) {
                 emitEpoch = curEpoch + 1u;
-                const bool useSingleMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u);
-                const bool useMoveList = (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 1u);
+                const bool useSingleMoveList = (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u);
+                const bool useMoveList = (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves > 1u);
                 if (useSingleMoveList) {
                     // Encode the single v2 move directly in the broadcast pipe. Workers do not
                     // share the root process planCommandCache, so cmdlist-by-seq is unsafe here.
@@ -2044,7 +2044,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
 
                             const uint32_t stageNodes = st->nNodes;
                             uint32_t maxMovesAllowed = (uint32_t)(2u * stageNodes);
-                            if (maxMovesAllowed > DLLAMA_PLAN_CMD_MAX_MOVES) maxMovesAllowed = DLLAMA_PLAN_CMD_MAX_MOVES;
+                            if (maxMovesAllowed > EDGEVISOR_PLAN_CMD_MAX_MOVES) maxMovesAllowed = EDGEVISOR_PLAN_CMD_MAX_MOVES;
                             if (pc2.nMoves > maxMovesAllowed) {
                                 printf("🧭 [plan][apply] node=%u stage=%u epoch=%u layer=%u pos=%u reject: nMoves=%u > maxAllowed=%u (stageNodes=%u)\n",
                                     (unsigned)myNode,
@@ -2760,15 +2760,15 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     // ------------------------------------------------------------------
     // Debug: KV compute / attention KV range tracing
     // Enable with: kvcache_debug=1
-    // Legacy alias: DLLAMA_DEBUG_KV_RANGE=1
+    // Legacy alias: EDGEVISOR_DEBUG_KV_RANGE=1
     // This prints the effective KV ranges used by:
     // - K/V projection (matmul_k/matmul_v)
     // - K RoPE (rope_k)
     // - KV cache writes (shift_k/shift_v)
     // - Attention KV reads (multihead_att)
     // ------------------------------------------------------------------
-#if DLLAMA_DEBUG_ATTN
-    const bool kvCacheDebug = (std::getenv("kvcache_debug") != nullptr) || (std::getenv("DLLAMA_DEBUG_KV_RANGE") != nullptr);
+#if EDGEVISOR_DEBUG_ATTN
+    const bool kvCacheDebug = (std::getenv("kvcache_debug") != nullptr) || (std::getenv("EDGEVISOR_DEBUG_KV_RANGE") != nullptr);
     if (threadIndex == 0u && device != nullptr && kvCacheDebug) {
         const NnUint nodeIndex = device->getNodeIndex();
         const unsigned int epoch = device->getPlanEpoch();
@@ -3086,7 +3086,7 @@ void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadI
     //     }
     // }
 
-#if DLLAMA_DEBUG_ATTN
+#if EDGEVISOR_DEBUG_ATTN
     // Forward-time slice logging (prints once per op per segment).
     // This validates that each device/node sees the expected start/len/stride AND that
     // the resolved base pointers match the intended physical slots.
@@ -3607,7 +3607,7 @@ void NnCpuDeviceSegment::refreshPointers() {
             }
         }
 
-    #if DLLAMA_DEBUG_ATTN
+    #if EDGEVISOR_DEBUG_ATTN
         // Debug: after refresh, print updated params.
         printOpSliceParamsDbg(opContext->name, opContext->opCode, opContext->opConfig, &opConfig->input, &opConfig->output, opContext->inputSize, opContext->outputSize);
     #endif

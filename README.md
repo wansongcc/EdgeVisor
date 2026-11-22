@@ -4,16 +4,16 @@ Pipeline-parallel Q40 inference for a few Linux machines on a LAN.
 
 ## One machine
 
-Prepare a compatible EdgeVisor/DLLama Q40 model (`.m`) and its matching tokenizer (`.t`) yourself. EdgeVisor does not provide model downloads or distribute model weights. The examples use Qwen3 0.6B Q40; place your files in the paths below, or replace those paths.
+Prepare a compatible EdgeVisor Q40 model (`.m`) and its matching tokenizer (`.t`) yourself. EdgeVisor does not provide model downloads or distribute model weights. The examples use Qwen3 0.6B Q40; place your files in the paths below, or replace those paths.
 
 From a clean Linux checkout:
 
 ```bash
-make dllama
+make edgevisor
 cd EdgeVisor
-./dllama inference \
-  --model models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m \
-  --tokenizer models/qwen3_0.6b_q40/dllama_tokenizer_qwen3_0.6b_q40.t \
+./edgevisor inference \
+  --model models/qwen3_0.6b_q40/edgevisor_model_qwen3_0.6b_q40.m \
+  --tokenizer models/qwen3_0.6b_q40/edgevisor_tokenizer_qwen3_0.6b_q40.t \
   --prompt "The capital of France is" \
   --max-seq-len 4096 \
   --steps 256
@@ -21,9 +21,9 @@ cd EdgeVisor
 
 You need `g++` and `make`, plus the development tools for your GPU backend. Python 3 is needed only for optional conversion utilities. The tested 0.6B Q40 model file is about 958 MB (914 MiB), plus a 2.2 MB tokenizer.
 
-`make dllama` compiles CUDA when `nvcc` is on the path, and Vulkan when `glslc` or `glslangValidator` is on the path. Otherwise it builds the CPU binary. `make DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama` forces CPU.
+`make edgevisor` compiles CUDA when `nvcc` is on the path, and Vulkan when `glslc` or `glslangValidator` is on the path. Otherwise it builds the CPU binary. `make EDGEVISOR_CUDA=0 EDGEVISOR_VULKAN=0 edgevisor` forces CPU.
 
-`./dllama --list-devices` prints the compiled backends and exits. The default backend is `auto`: CUDA, then Vulkan, then CPU. `--backend cpu` forces CPU. CPU and CUDA default to the hardware thread count. Vulkan starts with one executor thread because GPU computation runs on thread 0; tensor-parallel stages may automatically use more threads for peer exchanges. An explicit `--nthreads N` takes precedence, except that shadow KV requires one thread on all participating stages. Q40 weights use q80 activation buffers by default; these are separate from the KV cache.
+`./edgevisor --list-devices` prints the compiled backends and exits. The default backend is `auto`: CUDA, then Vulkan, then CPU. `--backend cpu` forces CPU. CPU and CUDA default to the hardware thread count. Vulkan starts with one executor thread because GPU computation runs on thread 0; tensor-parallel stages may automatically use more threads for peer exchanges. An explicit `--nthreads N` takes precedence, except that shadow KV requires one thread on all participating stages. Q40 weights use q80 activation buffers by default; these are separate from the KV cache.
 
 For CUDA on a single GPU or a pipeline stage with one device, `--nthreads 1` can reduce executor overhead. On Vulkan, increasing the thread count for a single-device stage can add substantial synchronization overhead even with an idle GPU. A successful memory allocation does not guarantee predictable latency under competing GPU workloads.
 
@@ -42,16 +42,16 @@ Choose a capacity from the memory budget before launching. 2048, 4096, 8192, etc
 Copy the same model onto the second machine, build there, and start a worker from its `EdgeVisor` directory:
 
 ```bash
-./dllama worker --port 9999 \
-  --model models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m
+./edgevisor worker --port 9999 \
+  --model models/qwen3_0.6b_q40/edgevisor_model_qwen3_0.6b_q40.m
 ```
 
 On the first machine, pass that worker. The worker order is the pipeline order. The root supplies the context configuration to workers.
 
 ```bash
-./dllama inference \
-  --model models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m \
-  --tokenizer models/qwen3_0.6b_q40/dllama_tokenizer_qwen3_0.6b_q40.t \
+./edgevisor inference \
+  --model models/qwen3_0.6b_q40/edgevisor_model_qwen3_0.6b_q40.m \
+  --tokenizer models/qwen3_0.6b_q40/edgevisor_tokenizer_qwen3_0.6b_q40.t \
   --prompt "The capital of France is" \
   --max-seq-len 4096 \
   --steps 256 \
@@ -64,9 +64,9 @@ Explicit ratios skip automatic placement/profiling. Their layer counts must sum 
 
 ## Joining and failure recovery
 
-Normally the root samples tokens after gathering the last stage's logits. `--auto` enables dynamic placement/migration and last-stage sampling; results and profiling return to the root over framed messages. Dynamic mode sets `DLLAMA_KV_ACK_TIMEOUT_MS` and `DLLAMA_IO_TIMEOUT_MS` to 180000 ms when they are unset. Override the former to change KV/frame and sampled-token wait deadlines; these deadlines do not provide a watchdog for GPU execution.
+Normally the root samples tokens after gathering the last stage's logits. `--auto` enables dynamic placement/migration and last-stage sampling; results and profiling return to the root over framed messages. Dynamic mode sets `EDGEVISOR_KV_ACK_TIMEOUT_MS` and `EDGEVISOR_IO_TIMEOUT_MS` to 180000 ms when they are unset. Override the former to change KV/frame and sampled-token wait deadlines; these deadlines do not provide a watchdog for GPU execution.
 
-- A failed middle stage can be bypassed when its predecessor has both the complete redundant weights and ready shadow KV history. Otherwise the root restarts from the prompt plus text already generated. Shadow KV is opt-in (`DLLAMA_BUBBLE_SHADOW_KV=1`) and needs enough `--runtime-redundant-boundary-layers` to cover the entire failed stage. Enabling it selects one executor thread on all backends, including workers that receive this setting from the root; an explicit `--nthreads` greater than 1 is rejected. Shadow computation runs synchronously after primary compute and network sync finish, because it shares scratch buffers with the primary graph. The legacy `DLLAMA_BUBBLE_SHADOW_KV_ASYNC` setting is ignored. Weight overlap alone does not make the cache ready. Hot takeover is attempted only when the next hop is found offline before sending the current activation. If a send fails or the next hop disconnects while waiting for a result, delivery is ambiguous and the session restarts rather than replaying a possible duplicate.
+- A failed middle stage can be bypassed when its predecessor has both the complete redundant weights and ready shadow KV history. Otherwise the root restarts from the prompt plus text already generated. Shadow KV is opt-in (`EDGEVISOR_BUBBLE_SHADOW_KV=1`) and needs enough `--runtime-redundant-boundary-layers` to cover the entire failed stage. Enabling it selects one executor thread on all backends, including workers that receive this setting from the root; an explicit `--nthreads` greater than 1 is rejected. Shadow computation runs synchronously after primary compute and network sync finish, because it shares scratch buffers with the primary graph. The legacy `EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC` setting is ignored. Weight overlap alone does not make the cache ready. Hot takeover is attempted only when the next hop is found offline before sending the current activation. If a send fails or the next hop disconnects while waiting for a result, delivery is ambiguous and the session restarts rather than replaying a possible duplicate.
 - A failed final stage uses session restart. A sampled-token wait timeout also requests a restart; a local timeout does not prove the device is offline. The CLI allows at most two session restarts. Complete buffered results are consumed before EOF; truncated results cause recovery, while invalid frame headers or token identities remain errors. Restart can change subsequent tokens; it is not seamless cache recovery.
 - An unavailable worker listed at startup may keep a reserved slot. When it becomes reachable, it loads weights and the complete preceding KV history, acknowledges that history, and joins between tokens. Dynamic scheduling waits for this join to commit, then resumes using the active pipeline order and updated layer ownership. This is reserved-slot joining, not arbitrary hot-add of an unlisted device.
 
@@ -74,4 +74,10 @@ Older guides in `docs/archive/` describe experiments and may not match current b
 
 ## Validation
 
-From the repository root, `make -j2 DLLAMA_CUDA=0 DLLAMA_VULKAN=0 dllama check` builds the CPU binary and runs the model-free Linux acceptance suite. GitHub Actions runs this gate on x86-64 and ARM64. CUDA/Vulkan and live joining/recovery need device tests with a model and tokenizer prepared by the user; see `docs/test_records/` for the tested configurations and limits.
+From the repository root, `make -j2 EDGEVISOR_CUDA=0 EDGEVISOR_VULKAN=0 edgevisor check` builds the CPU binary and runs the model-free Linux acceptance suite. GitHub Actions runs this gate on x86-64 and ARM64. CUDA/Vulkan and live joining/recovery need device tests with a model and tokenizer prepared by the user; see `docs/test_records/` for the tested configurations and limits.
+
+## Acknowledgements
+
+EdgeVisor originated as a fork of [Distributed LLaMA](https://github.com/b4rtaz/distributed-llama). We thank **b4rtaz and the Distributed LLaMA contributors** for the original inference engine, model conversion utilities, and CPU/GPU backend foundations.
+
+EdgeVisor builds on that foundation with uneven TP/PP placement, online migration, Shadow KV fault recovery, dynamic scheduling, and edge-oriented performance optimizations. The original license is retained in `EdgeVisor/LICENSE`.

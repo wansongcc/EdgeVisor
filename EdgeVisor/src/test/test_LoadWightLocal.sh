@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # 配置 (请修改为您的实际路径)
-MODEL_PATH="/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m"
-TOKENIZER_PATH="/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_tokenizer_qwen3_0.6b_q40.t"
+MODEL_PATH="/workspace/EdgeVisor/EdgeVisor/models/qwen3_0.6b_q40/edgevisor_model_qwen3_0.6b_q40.m"
+TOKENIZER_PATH="/workspace/EdgeVisor/EdgeVisor/models/qwen3_0.6b_q40/edgevisor_tokenizer_qwen3_0.6b_q40.t"
 WORKER_PORT=9999
 RATIOS="1.0,2.0" # 1:2 比例 (Total 3 nodes? No, ratios length == nodes. Let's say 2 nodes)
 
@@ -11,14 +11,14 @@ RATIOS="1.0,2.0"
 
 echo "=== 分布式本地加载测试 ==="
 echo "清理旧进程..."
-pkill -f "dllama worker"
-pkill -f "dllama inference"
+pkill -f "edgevisor worker"
+pkill -f "edgevisor inference"
 sleep 1
 
 echo "1. 启动 Worker (Node 1) [本地加载模式]"
 echo "   注意: 必须提供 --model 和 --ratios 才能触发本地加载"
 # 在后台启动，重定向日志到 worker.log
-./dllama worker \
+./edgevisor worker \
     --port $WORKER_PORT \
     --nthreads 4 \
     --model "$MODEL_PATH" \
@@ -36,7 +36,7 @@ head -n 10 worker.log
 echo ""
 echo "2. 启动 Root (Node 0) [本地加载模式]"
 # Root 连接到 Worker
-./dllama inference \
+./edgevisor inference \
     --model "$MODEL_PATH" \
     --tokenizer "$TOKENIZER_PATH" \
     --buffer-float-type q80 \

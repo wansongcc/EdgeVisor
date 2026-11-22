@@ -26,7 +26,7 @@ run_logged() {
 }
 
 run_logged 00_clean_cpu make clean
-run_logged 01_cpu_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" dllama nn-cpu-test nn-cpu-ops-test tokenizer-test nn-slice-test
+run_logged 01_cpu_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" edgevisor nn-cpu-test nn-cpu-ops-test tokenizer-test nn-slice-test
 run_logged 02_nn_cpu_test ./nn-cpu-test
 run_logged 03_nn_cpu_ops_test ./nn-cpu-ops-test
 run_logged 04_tokenizer_test ./tokenizer-test
@@ -34,9 +34,9 @@ run_logged 05_nn_slice_test ./nn-slice-test
 
 run_logged 06_clean_cuda make clean
 if [ -n "${CUDA_ARCHS:-}" ]; then
-    run_logged 07_cuda_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" DLLAMA_CUDA=1 CUDA_ARCHS="$CUDA_ARCHS" dllama nn-cuda-test
+    run_logged 07_cuda_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" EDGEVISOR_CUDA=1 CUDA_ARCHS="$CUDA_ARCHS" edgevisor nn-cuda-test
 else
-    run_logged 07_cuda_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" DLLAMA_CUDA=1 dllama nn-cuda-test
+    run_logged 07_cuda_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" EDGEVISOR_CUDA=1 edgevisor nn-cuda-test
 fi
 run_logged 08_nn_cuda_test ./nn-cuda-test --gpu-index "$GPU_INDEX"
 

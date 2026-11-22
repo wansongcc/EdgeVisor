@@ -17,7 +17,7 @@ cd "${BASE}" || exit 2
 
 PORT1=19101
 PORT2=19102
-SOCK=/tmp/dllama_gpu_patch_plan.sock
+SOCK=/tmp/edgevisor_gpu_patch_plan.sock
 
 cleanup() {
   if [[ -n "${P1:-}" ]]; then kill "${P1}" 2>/dev/null || true; fi
@@ -28,9 +28,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-./dllama worker --port "${PORT1}" --nthreads 1 --gpu-index 1 >"${LOG_DIR}/worker_gpu1.log" 2>&1 &
+./edgevisor worker --port "${PORT1}" --nthreads 1 --gpu-index 1 >"${LOG_DIR}/worker_gpu1.log" 2>&1 &
 P1=$!
-./dllama worker --port "${PORT2}" --nthreads 1 --gpu-index 2 >"${LOG_DIR}/worker_gpu2.log" 2>&1 &
+./edgevisor worker --port "${PORT2}" --nthreads 1 --gpu-index 2 >"${LOG_DIR}/worker_gpu2.log" 2>&1 &
 P2=$!
 sleep 4
 
@@ -50,7 +50,7 @@ common_args=(
 
 if [[ "${MODE}" == "dynamic" ]]; then
   rm -f "${SOCK}"
-  DLLAMA_PLAN_CTRL_SOCKET="${SOCK}" ./dllama "${common_args[@]}" \
+  EDGEVISOR_PLAN_CTRL_SOCKET="${SOCK}" ./edgevisor "${common_args[@]}" \
     --steps "${DYN_STEPS}" \
     --enable-plan-barrier \
     --enable-kv-redundancy-during-migration 1 \
@@ -74,7 +74,7 @@ if [[ "${MODE}" == "dynamic" ]]; then
   wait "${ROOT_PID}"
   RC=$?
 else
-  ./dllama "${common_args[@]}" >"${LOG_DIR}/root_gpu0.log" 2>&1
+  ./edgevisor "${common_args[@]}" >"${LOG_DIR}/root_gpu0.log" 2>&1
   RC=$?
 fi
 

@@ -72,8 +72,8 @@ void RootKvCollector::run() {
     int collectLayer = -1;
     int collectPos = -1;
 
-    const int pollMs = std::max(1, kvcParseEnvInt("DLLAMA_ASYNC_KV_COLLECT_POLL_MS", 20));
-    const bool submitTransfer = kvcEnvFlagEnabledDefault("DLLAMA_ASYNC_KV_COLLECT_SUBMIT", false);
+    const int pollMs = std::max(1, kvcParseEnvInt("EDGEVISOR_ASYNC_KV_COLLECT_POLL_MS", 20));
+    const bool submitTransfer = kvcEnvFlagEnabledDefault("EDGEVISOR_ASYNC_KV_COLLECT_SUBMIT", false);
     NnUint kvDim = 0u;
     NnUint seqLen = 0u;
     bool collectorReady = false;
@@ -119,8 +119,8 @@ void RootKvCollector::run() {
 
                     char kPath[256];
                     char vPath[256];
-                    std::snprintf(kPath, sizeof(kPath), "/tmp/dllama_async_layer%u_pos%u_root_k.bin", (unsigned)collectLayer, (unsigned)collectPos);
-                    std::snprintf(vPath, sizeof(vPath), "/tmp/dllama_async_layer%u_pos%u_root_v.bin", (unsigned)collectLayer, (unsigned)collectPos);
+                    std::snprintf(kPath, sizeof(kPath), "/tmp/edgevisor_async_layer%u_pos%u_root_k.bin", (unsigned)collectLayer, (unsigned)collectPos);
+                    std::snprintf(vPath, sizeof(vPath), "/tmp/edgevisor_async_layer%u_pos%u_root_v.bin", (unsigned)collectLayer, (unsigned)collectPos);
 
                     auto dumpOne = [&](const char *path, const std::vector<float> &row) {
                         std::unique_ptr<FILE, int(*)(FILE *)> f(std::fopen(path, "wb"), std::fclose);

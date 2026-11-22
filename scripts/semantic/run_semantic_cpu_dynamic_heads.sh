@@ -13,7 +13,7 @@ mkdir -p "${LOG_DIR}"
 cd "${BASE}" || exit 2
 PORT1=19711
 PORT2=19712
-SOCK=/tmp/dllama_semantic_cpu_heads.sock
+SOCK=/tmp/edgevisor_semantic_cpu_heads.sock
 PROMPT="Write a comma-separated list of the numbers from 1 to 20."
 cleanup() {
   if [[ -n "${P1:-}" ]]; then kill "${P1}" 2>/dev/null || true; fi
@@ -24,12 +24,12 @@ cleanup() {
 }
 trap cleanup EXIT
 rm -f "${SOCK}"
-./dllama worker --port "${PORT1}" --nthreads 1 >"${LOG_DIR}/worker_cpu1.log" 2>&1 &
+./edgevisor worker --port "${PORT1}" --nthreads 1 >"${LOG_DIR}/worker_cpu1.log" 2>&1 &
 P1=$!
-./dllama worker --port "${PORT2}" --nthreads 1 >"${LOG_DIR}/worker_cpu2.log" 2>&1 &
+./edgevisor worker --port "${PORT2}" --nthreads 1 >"${LOG_DIR}/worker_cpu2.log" 2>&1 &
 P2=$!
 sleep 4
-DLLAMA_PLAN_CTRL_SOCKET="${SOCK}" ./dllama inference \
+EDGEVISOR_PLAN_CTRL_SOCKET="${SOCK}" ./edgevisor inference \
   --prompt "${PROMPT}" \
   --steps 64 \
   --model "${MODEL3}" \

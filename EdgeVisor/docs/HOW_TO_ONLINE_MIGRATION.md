@@ -1,6 +1,6 @@
 # 在线迁移（PlanCommand + UDS 控制器）使用与验证指南
 
-本文说明如何在 `dllama` 推理过程中，通过 **UDS（Unix Domain Socket）控制器**下发一次性迁移命令，并验证迁移已经生效。
+本文说明如何在 `edgevisor` 推理过程中，通过 **UDS（Unix Domain Socket）控制器**下发一次性迁移命令，并验证迁移已经生效。
 
 > 适用范围：本文主要说明手动 UDS 迁移。TP `set_plan` 依赖 plan barrier/apply；PP layer 迁移使用 `set_pp_migration` + KV export/transfer/ack/switch。自动单请求 TPOT 调度请优先使用 `--enable-dynamic-tpot`，参数清单见 [README_ENV_VARS.md](README_ENV_VARS.md)。
 
@@ -34,13 +34,13 @@
 当前推荐把 UDS socket 写在 root 启动参数中：
 
 ```bash
---plan-ctrl-socket /tmp/dllama_plan.sock
+--plan-ctrl-socket /tmp/edgevisor_plan.sock
 ```
 
 兼容环境变量仍可用：
 
 ```bash
-export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock
+export EDGEVISOR_PLAN_CTRL_SOCKET=/tmp/edgevisor_plan.sock
 ```
 
 手动 UDS `set_plan` 还需要 `--enable-plan-barrier`。自动 TPOT 调度使用 `--enable-dynamic-tpot`，会自动补齐 plan barrier、PP migration、socket timeout 和 collector 默认行为。
@@ -69,8 +69,8 @@ docker compose -f docker-compose-rpi.yml up -d
 #### 终端 A：启动 worker
 
 ```bash
-cd /workspace/dllama/distributed-llama
-./dllama worker --port 9999 --nthreads 4
+cd /workspace/EdgeVisor/EdgeVisor
+./edgevisor worker --port 9999 --nthreads 4
 ```
 
 #### 终端 B：启动 root 推理（inference）
@@ -82,15 +82,15 @@ cd /workspace/dllama/distributed-llama
 - 自动 TPOT 迁移：开启 `--enable-dynamic-tpot` + `--plan-ctrl-socket`。
 
 ```bash
-cd /workspace/dllama/distributed-llama
-./dllama inference \
+cd /workspace/EdgeVisor/EdgeVisor
+./edgevisor inference \
   --interactive \
   --prompt "The capital of France is" \
   --steps 64 \
-  --model /workspace/dllama/distributed-llama/models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
-  --tokenizer /workspace/dllama/distributed-llama/models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
+  --model /workspace/EdgeVisor/EdgeVisor/models/qwen3_8b_q40/edgevisor_model_qwen3_8b_q40.m \
+  --tokenizer /workspace/EdgeVisor/EdgeVisor/models/qwen3_8b_q40/edgevisor_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
-  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --plan-ctrl-socket /tmp/edgevisor_plan.sock \
   --enable-plan-barrier \
   --kv-redundancy 2 \
   --nthreads 2 \
@@ -113,8 +113,8 @@ UDS 是“一次连接一条请求”的 JSON 行协议：
 ### 3.1 先确认控制器可用
 
 ```bash
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock ping
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock ping
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock status
 ```
 
 `status` 会返回：
@@ -126,7 +126,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
 “下一次 barrier 立即触发”（用于真实运行时最稳的方式）：
 
 ```bash
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock set_plan \
   --seq 1 --mode next_barrier \
   --stage 0 --from 0 --to 1 \
   --kind 3 --heads 1 --ffn 256
@@ -145,7 +145,7 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
 只有当到达“指定 token position + layer”才触发：
 
 ```bash
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock set_plan \
   --seq 2 --mode exact \
   --stage 0 --from 0 --to 1 --kind 3 --heads 1 --ffn 256 \
   --trigger-pos 30 --trigger-layer 5
@@ -162,17 +162,17 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
 如果目标是在线自动迁移，不需要手工运行 `set_plan`/`set_pp_migration`。root 加入：
 
 ```bash
-./dllama inference ... \
+./edgevisor inference ... \
   --enable-dynamic-tpot \
-  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --plan-ctrl-socket /tmp/edgevisor_plan_pp_auto.sock \
   --runtime-redundant-boundary-layers 1
 ```
 
 纯 PP 测试时可关闭 TP 候选：
 
 ```bash
-export DLLAMA_TPOT_MIN_TP_GAIN_MS=1000000
-export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
+export EDGEVISOR_TPOT_MIN_TP_GAIN_MS=1000000
+export EDGEVISOR_TPOT_TP_RISK_MARGIN_MS=1000000
 ```
 
 迁移成功的关键日志：
@@ -212,7 +212,7 @@ tail -n 40 /tmp/edgevisor_disturbance/gpu_disturb_8b.log
 ./scripts/gpu_compute_disturbance.sh stop
 ```
 
-Do not use `pkill -x dllama` after workers are running；这会同时杀掉同机的 EdgeVisor worker。脚本只记录并停止自己的扰动进程组。
+Do not use `pkill -x edgevisor` after workers are running；这会同时杀掉同机的 EdgeVisor worker。脚本只记录并停止自己的扰动进程组。
 
 常用覆盖参数：
 
@@ -237,7 +237,7 @@ Do not use `pkill -x dllama` after workers are running；这会同时杀掉同�
 2) 反复 `status`
 
 ```bash
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock status
 ```
 
 你应该看到：
@@ -253,14 +253,14 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
 
 ### 4.2 严格验证（推荐）：开启在线迁移日志并观察 emit/apply
 
-`OP_PLAN_BARRIER` 和 `OP_PLAN_APPLY` 的关键日志位于编译期宏 `DLLAMA_DEBUG_ONLINE_CHANGE` 下。推荐用它来验证迁移确实 apply 并 bump epoch。
+`OP_PLAN_BARRIER` 和 `OP_PLAN_APPLY` 的关键日志位于编译期宏 `EDGEVISOR_DEBUG_ONLINE_CHANGE` 下。推荐用它来验证迁移确实 apply 并 bump epoch。
 
-重新编译（只影响 dllama）：
+重新编译（只影响 edgevisor）：
 
 ```bash
-cd /workspace/dllama/distributed-llama
+cd /workspace/EdgeVisor/EdgeVisor
 make clean
-DLLAMA_DEBUG_ONLINE_CHANGE=1 make -j dllama
+EDGEVISOR_DEBUG_ONLINE_CHANGE=1 make -j edgevisor
 ```
 
 然后按第 2 节启动 root/worker，并下发 `set_plan`。
@@ -273,9 +273,9 @@ DLLAMA_DEBUG_ONLINE_CHANGE=1 make -j dllama
 
 ### 4.3 进一步验证（可选）：用 slice/KV tracing 观察“切分范围变化”
 
-如果你还想观察迁移前后某些 op 的 slice 范围变化，可以配合注意力调试能力（需要 `DLLAMA_DEBUG_ATTN=1` 编译）使用：
-- KV 范围：`kvcache_debug=1`（或 `DLLAMA_DEBUG_KV_RANGE=1`）
-- per-head dump：`DLLAMA_DEBUG_KVCACHE_PER_HEAD=1`
+如果你还想观察迁移前后某些 op 的 slice 范围变化，可以配合注意力调试能力（需要 `EDGEVISOR_DEBUG_ATTN=1` 编译）使用：
+- KV 范围：`kvcache_debug=1`（或 `EDGEVISOR_DEBUG_KV_RANGE=1`）
+- per-head dump：`EDGEVISOR_DEBUG_KVCACHE_PER_HEAD=1`
 
 相关变量清单见：[docs/README_ENV_VARS.md](README_ENV_VARS.md)
 
@@ -286,10 +286,10 @@ DLLAMA_DEBUG_ONLINE_CHANGE=1 make -j dllama
 ### 5.1 socket 文件没有出现 / `ping` 连接失败
 
 - 确认 root 进程设置了：
-  - 手动 UDS：`--plan-ctrl-socket /tmp/dllama_plan.sock --enable-plan-barrier`
-  - 自动 TPOT：`--enable-dynamic-tpot --plan-ctrl-socket /tmp/dllama_plan.sock`
+  - 手动 UDS：`--plan-ctrl-socket /tmp/edgevisor_plan.sock --enable-plan-barrier`
+  - 自动 TPOT：`--enable-dynamic-tpot --plan-ctrl-socket /tmp/edgevisor_plan.sock`
 - root stderr 应该打印：`[plan-uds] listening on ...`
-- 若提示 bind 失败：删除旧 socket：`rm -f /tmp/dllama_plan.sock`
+- 若提示 bind 失败：删除旧 socket：`rm -f /tmp/edgevisor_plan.sock`
 
 ### 5.2 `status` 里 cmd 一直不变（没有被消费）
 
@@ -301,7 +301,7 @@ DLLAMA_DEBUG_ONLINE_CHANGE=1 make -j dllama
 
 ### 5.3 看到了消费，但不确定 apply 是否真的改变了 plan
 
-- 使用 4.2 的 `DLLAMA_DEBUG_ONLINE_CHANGE=1` 重新编译并观察 `🧭 [plan][apply]` 日志
+- 使用 4.2 的 `EDGEVISOR_DEBUG_ONLINE_CHANGE=1` 重新编译并观察 `🧭 [plan][apply]` 日志
 - 或配合 4.3 的 KV/slice tracing 做更“黑盒”的证明
 
 ### 5.4 from/to 不在同一 stage 或迁移量非法
@@ -318,5 +318,5 @@ DLLAMA_DEBUG_ONLINE_CHANGE=1 make -j dllama
 
 1) 单机 2 进程（root+worker）跑通 + `ping/status` 正常
 2) `next_barrier` 下发命令，确认 `status` 里 cmd 变回 `none`
-3) 打开 `DLLAMA_DEBUG_ONLINE_CHANGE=1` 重编译，确认 `emit/apply` 日志
-4) 需要更强证据时，再加 `DLLAMA_DEBUG_ATTN=1` 的 KV/slice tracing
+3) 打开 `EDGEVISOR_DEBUG_ONLINE_CHANGE=1` 重编译，确认 `emit/apply` 日志
+4) 需要更强证据时，再加 `EDGEVISOR_DEBUG_ATTN=1` 的 KV/slice tracing

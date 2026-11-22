@@ -5,9 +5,9 @@
 # steps cover the keep decision.
 set -u
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="${BIN:-$ROOT_DIR/EdgeVisor/dllama}"
-MODEL="${MODEL:-/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m}"
-TOK="${TOK:-/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t}"
+BIN="${BIN:-$ROOT_DIR/EdgeVisor/edgevisor}"
+MODEL="${MODEL:-/home/byh/B01/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m}"
+TOK="${TOK:-/home/byh/B01/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t}"
 OUT="${OUT:-$ROOT_DIR/experiments/algo2/logs/t4_k_compare}"
 STEPS="${STEPS:-80}"
 CODE="$(git -C "$ROOT_DIR" rev-parse HEAD)"
@@ -30,42 +30,42 @@ run_one() {
   local DIR="$OUT/$name"
   rm -rf "$DIR"
   mkdir -p "$DIR"
-  unset DLLAMA_ALGO2_FORCE_FROM || true
-  unset DLLAMA_ALGO2_FORCE_TO || true
-  unset DLLAMA_ALGO2_FORCE_K || true
-  unset DLLAMA_ALGO2_MAX_ISSUES || true
+  unset EDGEVISOR_ALGO2_FORCE_FROM || true
+  unset EDGEVISOR_ALGO2_FORCE_TO || true
+  unset EDGEVISOR_ALGO2_FORCE_K || true
+  unset EDGEVISOR_ALGO2_MAX_ISSUES || true
   if [[ "$arm" == "k1" ]]; then
-    export DLLAMA_ALGO2_FORCE_FROM=2
-    export DLLAMA_ALGO2_FORCE_TO=3
-    export DLLAMA_ALGO2_FORCE_K=1
-    export DLLAMA_ALGO2_MAX_ISSUES=1
+    export EDGEVISOR_ALGO2_FORCE_FROM=2
+    export EDGEVISOR_ALGO2_FORCE_TO=3
+    export EDGEVISOR_ALGO2_FORCE_K=1
+    export EDGEVISOR_ALGO2_MAX_ISSUES=1
   elif [[ "$arm" == "k6" ]]; then
-    export DLLAMA_ALGO2_MAX_ISSUES=1
+    export EDGEVISOR_ALGO2_MAX_ISSUES=1
   fi
-  export DLLAMA_ALGO2_MODE="$mode"
-  export DLLAMA_ALGO2_OUT="$DIR"
-  export DLLAMA_TPOT_LOG="$DIR/tpot.log"
-  export DLLAMA_ALGO2_METRICS_WINDOW=8
-  export DLLAMA_ALGO2_DECISION_WINDOW=8
-  export DLLAMA_ALGO2_DECISION_STRIDE=8
-  export DLLAMA_ALGO2_MIN_DECISION_INTERVAL_MS=0
-  export DLLAMA_ALGO2_SETTLE_TOKENS=4
-  export DLLAMA_ALGO2_VERIFY_TOKENS=8
-  export DLLAMA_ALGO2_VERIFY_MAX_TOKENS=16
-  export DLLAMA_ALGO2_COOLDOWN_TOKENS=4
-  export DLLAMA_ALGO2_COOLDOWN_MIN_MS=0
-  export DLLAMA_IGNORE_EOS=1
+  export EDGEVISOR_ALGO2_MODE="$mode"
+  export EDGEVISOR_ALGO2_OUT="$DIR"
+  export EDGEVISOR_TPOT_LOG="$DIR/tpot.log"
+  export EDGEVISOR_ALGO2_METRICS_WINDOW=8
+  export EDGEVISOR_ALGO2_DECISION_WINDOW=8
+  export EDGEVISOR_ALGO2_DECISION_STRIDE=8
+  export EDGEVISOR_ALGO2_MIN_DECISION_INTERVAL_MS=0
+  export EDGEVISOR_ALGO2_SETTLE_TOKENS=4
+  export EDGEVISOR_ALGO2_VERIFY_TOKENS=8
+  export EDGEVISOR_ALGO2_VERIFY_MAX_TOKENS=16
+  export EDGEVISOR_ALGO2_COOLDOWN_TOKENS=4
+  export EDGEVISOR_ALGO2_COOLDOWN_MIN_MS=0
+  export EDGEVISOR_IGNORE_EOS=1
   export EDGEVISOR_SHADOW_ALLOCATION=equal
   export EDGEVISOR_SHADOW_BUDGET_CAP=6
   export EDGEVISOR_SHADOW_PROFILE_SECONDS=8
   export EDGEVISOR_SHADOW_PROFILE_WARMUP=2
   export EDGEVISOR_SHADOW_PROFILE_DIR="$DIR/profile"
-  export DLLAMA_BUBBLE_SHADOW_KV=1
-  export DLLAMA_TEST_COMPUTE_DELAY_US=15000
-  export DLLAMA_TEST_COMPUTE_DELAY_NODE=2
-  export DLLAMA_TEST_COMPUTE_DELAY_DECODE_ONLY=1
-  export DLLAMA_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS=24
-  unset DLLAMA_REDUNDANT_BOUNDARY_DEPTHS || true
+  export EDGEVISOR_BUBBLE_SHADOW_KV=1
+  export EDGEVISOR_TEST_COMPUTE_DELAY_US=15000
+  export EDGEVISOR_TEST_COMPUTE_DELAY_NODE=2
+  export EDGEVISOR_TEST_COMPUTE_DELAY_DECODE_ONLY=1
+  export EDGEVISOR_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS=24
+  unset EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS || true
   local w1="" w2="" w3=""
   cleanup() {
     [[ -n "$w1" ]] && kill "$w1" 2>/dev/null || true

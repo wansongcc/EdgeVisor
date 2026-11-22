@@ -19,12 +19,12 @@ cleanup() {
   wait 2>/dev/null || true
 }
 trap cleanup EXIT
-./dllama worker --port "${PORT1}" --nthreads 1 --gpu-index 1 >"${LOG_DIR}/worker_gpu1.log" 2>&1 &
+./edgevisor worker --port "${PORT1}" --nthreads 1 --gpu-index 1 >"${LOG_DIR}/worker_gpu1.log" 2>&1 &
 P1=$!
-./dllama worker --port "${PORT2}" --nthreads 1 --gpu-index 2 >"${LOG_DIR}/worker_gpu2.log" 2>&1 &
+./edgevisor worker --port "${PORT2}" --nthreads 1 --gpu-index 2 >"${LOG_DIR}/worker_gpu2.log" 2>&1 &
 P2=$!
 sleep 4
-./dllama inference \
+./edgevisor inference \
   --prompt "What is 2+2? Answer with only the number." \
   --steps 32 \
   --model "${MODEL3}" \

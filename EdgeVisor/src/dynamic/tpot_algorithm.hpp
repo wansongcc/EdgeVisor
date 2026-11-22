@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace dllama {
+namespace edgevisor {
 namespace dynamic_tpot {
 
 enum class CandidateKind {
@@ -133,4 +133,4 @@ void applyRollbackPenalty(StageSnapshot &target);
 const char *candidateKindName(CandidateKind kind);
 
 } // namespace dynamic_tpot
-} // namespace dllama
+} // namespace edgevisor

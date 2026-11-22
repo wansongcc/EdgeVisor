@@ -6,7 +6,7 @@
 | `PNTR_RAW`, `PNTR_BATCH`, `PNTR_BATCHED_SLICE` | Yes | Yes | Common resolver available; PR4-PR12 ops use resolved layouts |
 | Tagged uneven and stage-local slices | Yes | Yes | Yes for CUDA operator coverage, static TP/PP, and dynamic plan refresh |
 | `NnTensorView` validation | Yes | Yes | Yes for PR4 ops, RoPE, Softmax, and F32 Matmul A/C views |
-| CUDA build (`DLLAMA_CUDA=1`, optional `CUDA_ARCHS=75 87 ...`) | N/A | N/A | Yes; defaults to local GPU auto-detect and falls back to `75` if detection is unavailable |
+| CUDA build (`EDGEVISOR_CUDA=1`, optional `CUDA_ARCHS=75 87 ...`) | N/A | N/A | Yes; defaults to local GPU auto-detect and falls back to `75` if detection is unavailable |
 | CUDA device enumeration and selection | N/A | N/A | Yes |
 | CUDA stream lifecycle | N/A | N/A | Yes |
 | CUDA hardware-aware launch configuration | N/A | N/A | Yes; detects compute capability/integrated GPU and selects block sizes per kernel family |

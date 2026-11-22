@@ -543,7 +543,7 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
 }
 
 static void server(AppInferenceContext *context) {
-    const char *apiBind = std::getenv("DLLAMA_API_BIND");
+    const char *apiBind = std::getenv("EDGEVISOR_API_BIND");
     if (apiBind == nullptr || apiBind[0] == '\0') apiBind = "127.0.0.1";
     NnSocket serverSocket(createServerSocket(context->args->port, apiBind));
 
@@ -583,9 +583,9 @@ static void server(AppInferenceContext *context) {
 }
 
 #ifdef _WIN32
-    #define EXECUTABLE_NAME "dllama-api.exe"
+    #define EXECUTABLE_NAME "edgevisor-api.exe"
 #else
-    #define EXECUTABLE_NAME "dllama-api"
+    #define EXECUTABLE_NAME "edgevisor-api"
 #endif
 
 void usage() {
@@ -600,9 +600,9 @@ void usage() {
     fprintf(stderr, "        [--topp <t>]\n");
     fprintf(stderr, "        [--seed <s>]\n");
     fprintf(stderr, "Example:\n");
-    fprintf(stderr, "  sudo nice -n -20 ./dllama-api --port 9990 --nthreads 4 \\\n");
-    fprintf(stderr, "    --model dllama_model_llama3_2_3b_instruct_q40.m \\\n");
-    fprintf(stderr, "    --tokenizer dllama_tokenizer_llama3_2_3b_instruct_q40.t \\\n");
+    fprintf(stderr, "  sudo nice -n -20 ./edgevisor-api --port 9990 --nthreads 4 \\\n");
+    fprintf(stderr, "    --model edgevisor_model_llama3_2_3b_instruct_q40.m \\\n");
+    fprintf(stderr, "    --tokenizer edgevisor_tokenizer_llama3_2_3b_instruct_q40.t \\\n");
     fprintf(stderr, "    --buffer-float-type q80 --max-seq-len 8192 \\\n");
     fprintf(stderr, "    --workers 10.0.0.2:9998 10.0.0.3:9998 10.0.0.4:9998\n");
     fflush(stderr);

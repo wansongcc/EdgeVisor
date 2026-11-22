@@ -2,7 +2,7 @@
 // but let the test controller change worker availability after bootstrap and
 // before the very first token. No timing sleeps are inserted in production.
 #define main edgeVisorCliMain
-#include "../dllama.cpp"
+#include "../edgevisor.cpp"
 #undef main
 
 #include <fstream>

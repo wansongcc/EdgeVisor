@@ -9,7 +9,7 @@ using std::endl;
 using std::vector;
 
 int main() {
-    cout << "=== Distributed Llama Initialization Test ===" << endl;
+    cout << "=== EdgeVisor Initialization Test ===" << endl;
 
     // 1. 模拟物理设备 (Devices)
     // 假设有 4 台设备：

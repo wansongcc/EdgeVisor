@@ -1717,49 +1717,49 @@ void NnCudaBuffer::write(const NnByte *data, NnSize offset, NnSize nBytes, void 
     if (nBytes == 0u) return;
     if (data == nullptr) throw std::runtime_error("CUDA write received null host pointer for buffer " + name);
     validateRange("write", name, bufferSize, offset, nBytes);
-    const bool ioProfile = dllamaIoProbeEnabled();
+    const bool ioProfile = edgevisorIoProbeEnabled();
     if (staging == nullptr) {
-        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t copyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync((NnByte *)devicePointer + offset, data, nBytes, cudaMemcpyHostToDevice, (cudaStream_t)stream));
-        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+        if (ioProfile) edgevisorIoProbeRecordCudaMemcpyAsync(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
         return;
     }
     void *host = staging->ensure(nBytes);
-    const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const std::uint64_t memcpyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     std::memcpy(host, data, nBytes);
-    if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)nBytes);
-    const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - memcpyStartUs, (std::uint64_t)nBytes);
+    const std::uint64_t copyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaMemcpyAsync((NnByte *)devicePointer + offset, host, nBytes, cudaMemcpyHostToDevice, (cudaStream_t)stream));
-    if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
-    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    if (ioProfile) edgevisorIoProbeRecordCudaMemcpyAsync(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+    const std::uint64_t syncStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
-    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - syncStartUs);
+    if (ioProfile) edgevisorIoProbeRecordCudaStreamSync(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - syncStartUs);
 }
 
 void NnCudaBuffer::read(NnByte *data, NnSize offset, NnSize nBytes, void *stream, NnCudaPinnedStaging *staging) {
     if (nBytes == 0u) return;
     if (data == nullptr) throw std::runtime_error("CUDA read received null host pointer for buffer " + name);
     validateRange("read", name, bufferSize, offset, nBytes);
-    const bool ioProfile = dllamaIoProbeEnabled();
+    const bool ioProfile = edgevisorIoProbeEnabled();
     if (staging == nullptr) {
-        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t copyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync(data, (NnByte *)devicePointer + offset, nBytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream));
-        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
-        const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        if (ioProfile) edgevisorIoProbeRecordCudaMemcpyAsync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+        const std::uint64_t syncStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
-        if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+        if (ioProfile) edgevisorIoProbeRecordCudaStreamSync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - syncStartUs);
         return;
     }
     void *host = staging->ensure(nBytes);
-    const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const std::uint64_t copyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaMemcpyAsync(host, (NnByte *)devicePointer + offset, nBytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream));
-    if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
-    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    if (ioProfile) edgevisorIoProbeRecordCudaMemcpyAsync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+    const std::uint64_t syncStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream));
-    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
-    const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    if (ioProfile) edgevisorIoProbeRecordCudaStreamSync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - syncStartUs);
+    const std::uint64_t memcpyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     std::memcpy(data, host, nBytes);
-    if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)nBytes);
+    if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - memcpyStartUs, (std::uint64_t)nBytes);
 }
 
 void NnCudaBuffer::clear(void *stream) {
@@ -2129,7 +2129,7 @@ bool NnCudaDevice::publishPipesToHost(const std::vector<NnUint> &pipes, NnUint b
 
     NnByte *host = (NnByte *)downloadStaging.ensure(totalBytes);
     if (host == nullptr) throw std::runtime_error("CUDA residency publish staging allocation failed");
-    const bool ioProfile = dllamaIoProbeEnabled();
+    const bool ioProfile = edgevisorIoProbeEnabled();
     cudaStream_t s = (cudaStream_t)stream;
     NN_CUDA_CHECK(cudaSetDevice((int)gpuIndex));
 
@@ -2143,25 +2143,25 @@ bool NnCudaDevice::publishPipesToHost(const std::vector<NnUint> &pipes, NnUint b
         sizes[i] = nBytes;
         cursor += nBytes;
         if (nBytes == 0u) continue;
-        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t copyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync(host + offsets[i], pipe->data(), nBytes, cudaMemcpyDeviceToHost, s));
-        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
+        if (ioProfile) edgevisorIoProbeRecordCudaMemcpyAsync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - copyStartUs, (std::uint64_t)nBytes);
     }
 
     // One synchronize for the whole publish set. It also retires the pending H2D
     // batch, so the pinned upload block is free again.
-    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const std::uint64_t syncStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaStreamSynchronize(s));
-    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+    if (ioProfile) edgevisorIoProbeRecordCudaStreamSync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - syncStartUs);
     uploadEventPending = false;
 
     for (std::size_t i = 0u; i < pipes.size(); ++i) {
         if (sizes[i] == 0u) continue;
         NnByte *dst = netExecution->pipes[pipes[i]];
         if (dst == nullptr) throw std::runtime_error("CUDA residency publish received null host pipe " + std::to_string(pipes[i]));
-        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t memcpyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         std::memcpy(dst, host + offsets[i], sizes[i]);
-        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+        if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
         markPipeSynchronized(pipes[i]);
     }
     return true;
@@ -2576,7 +2576,7 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize, bool onlyHostDir
     NnByte *host = (NnByte *)device->uploadStaging.ensure(totalBytes);
     if (host == nullptr) throw std::runtime_error("CUDA segment upload staging allocation failed");
 
-    const bool ioProfile = dllamaIoProbeEnabled();
+    const bool ioProfile = edgevisorIoProbeEnabled();
     cudaStream_t stream = (cudaStream_t)device->getStream();
 
     for (std::size_t i = 0u; i < toUpload.size(); ++i) {
@@ -2586,14 +2586,14 @@ void NnCudaDeviceSegment::uploadSegmentInputs(NnUint batchSize, bool onlyHostDir
         if (src == nullptr) {
             throw std::runtime_error("CUDA segment upload received null host pipe " + std::to_string(pipeIndex));
         }
-        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t memcpyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         std::memcpy(host + offsets[i], src, sizes[i]);
-        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+        if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
 
         NnCudaBuffer *pipe = device->data.resolvePipe(pipeIndex);
-        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t copyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync(pipe->data(), host + offsets[i], sizes[i], cudaMemcpyHostToDevice, stream));
-        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_H2D, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
+        if (ioProfile) edgevisorIoProbeRecordCudaMemcpyAsync(EDGEVISOR_IO_PROBE_H2D, edgevisorIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
         if (onlyHostDirty) device->markPipeDeviceOwned(pipeIndex);
     }
 
@@ -2664,21 +2664,21 @@ bool NnCudaDeviceSegment::downloadSegmentOutputs(NnUint batchSize) {
     NnByte *host = (NnByte *)device->downloadStaging.ensure(totalBytes);
     if (host == nullptr) throw std::runtime_error("CUDA segment download staging allocation failed");
 
-    const bool ioProfile = dllamaIoProbeEnabled();
+    const bool ioProfile = edgevisorIoProbeEnabled();
     cudaStream_t stream = (cudaStream_t)device->getStream();
 
     for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
         if (sizes[i] == 0u) continue;
         NnCudaBuffer *pipe = device->data.resolvePipe(downloadPipeIndices[i]);
-        const std::uint64_t copyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t copyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         NN_CUDA_CHECK(cudaMemcpyAsync(host + offsets[i], pipe->data(), sizes[i], cudaMemcpyDeviceToHost, stream));
-        if (ioProfile) dllamaIoProbeRecordCudaMemcpyAsync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
+        if (ioProfile) edgevisorIoProbeRecordCudaMemcpyAsync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - copyStartUs, (std::uint64_t)sizes[i]);
     }
 
     // Exactly one sync for the whole download set.
-    const std::uint64_t syncStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+    const std::uint64_t syncStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
     NN_CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (ioProfile) dllamaIoProbeRecordCudaStreamSync(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - syncStartUs);
+    if (ioProfile) edgevisorIoProbeRecordCudaStreamSync(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - syncStartUs);
 
     for (std::size_t i = 0u; i < downloadPipeIndices.size(); ++i) {
         if (sizes[i] == 0u) continue;
@@ -2686,9 +2686,9 @@ bool NnCudaDeviceSegment::downloadSegmentOutputs(NnUint batchSize) {
         if (dst == nullptr) {
             throw std::runtime_error("CUDA segment download received null host pipe " + std::to_string(downloadPipeIndices[i]));
         }
-        const std::uint64_t memcpyStartUs = ioProfile ? dllamaIoProbeNowUs() : 0u;
+        const std::uint64_t memcpyStartUs = ioProfile ? edgevisorIoProbeNowUs() : 0u;
         std::memcpy(dst, host + offsets[i], sizes[i]);
-        if (ioProfile) dllamaIoProbeRecordHostMemcpy(DLLAMA_IO_PROBE_D2H, dllamaIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
+        if (ioProfile) edgevisorIoProbeRecordHostMemcpy(EDGEVISOR_IO_PROBE_D2H, edgevisorIoProbeNowUs() - memcpyStartUs, (std::uint64_t)sizes[i]);
     }
     return true;
 }
@@ -3408,7 +3408,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                 pc.cmdKind == PLAN_CMD_KIND_HEAD ||
                 pc.cmdKind == PLAN_CMD_KIND_FFN ||
                 pc.cmdKind == PLAN_CMD_KIND_BOTH ||
-                (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u);
+                (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves != 0u);
             const bool hasCmd =
                 isValidPlanCommandHeader(pc) &&
                 (pc.mode == PLAN_CMD_MODE_EXACT || pc.mode == PLAN_CMD_MODE_NEXT_BARRIER) &&
@@ -3440,7 +3440,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
             }
             if (trigger) {
                 emitEpoch += 1u;
-                if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u) {
+                if (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves == 1u) {
                     const PlanMove &m = pc.moves[0];
                     cmd = m.cmdKind;
                     fromNode = m.fromNodeIndex;
@@ -3452,7 +3452,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                         else if (headMove != 0u) cmd = PLAN_CMD_KIND_HEAD;
                         else if (ffnMove != 0u) cmd = PLAN_CMD_KIND_FFN;
                     }
-                } else if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 1u) {
+                } else if (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves > 1u) {
                     cmd = 4u;
                     fromNode = pc.seq;
                 } else {
@@ -3544,7 +3544,7 @@ void NnCudaDeviceSegment::executeOp(NnUint opIndex, NnUint batchSize) {
                     std::fflush(stdout);
                     return;
                 }
-                const uint32_t maxMovesAllowed = std::min<uint32_t>(DLLAMA_PLAN_CMD_MAX_MOVES, (uint32_t)(2u * stage->nNodes));
+                const uint32_t maxMovesAllowed = std::min<uint32_t>(EDGEVISOR_PLAN_CMD_MAX_MOVES, (uint32_t)(2u * stage->nNodes));
                 if (pc.nMoves > maxMovesAllowed) return;
                 for (uint32_t i = 0u; i < pc.nMoves; ++i) {
                     const PlanMove &m = pc.moves[i];
@@ -3908,7 +3908,7 @@ bool NnCudaDeviceSegment::applyTransferredKvRow(
             const NnSize offset = ((NnSize)position * (NnSize)bSize.x + (NnSize)dstStart) * sizeof(float);
             device->writeBuffer(bufIdx, (const NnByte *)(srcRow.data() + srcStart), offset, (NnSize)writeLen * sizeof(float));
             wroteAny = true;
-            if (std::getenv("DLLAMA_MIGRATION_VERBOSE_LOG") != nullptr && std::strcmp(std::getenv("DLLAMA_MIGRATION_VERBOSE_LOG"), "0") != 0) {
+            if (std::getenv("EDGEVISOR_MIGRATION_VERBOSE_LOG") != nullptr && std::strcmp(std::getenv("EDGEVISOR_MIGRATION_VERBOSE_LOG"), "0") != 0) {
                 std::printf("🧩 [kv-write-cuda] node=%u seg=%u layer=%u pos=%u %sBuf=%u srcRange=[%u,%u) dstRange=[%u,%u) partial=%u\n",
                     (unsigned)device->getNodeIndex(),
                     (unsigned)segmentIndex,

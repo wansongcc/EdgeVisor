@@ -5,17 +5,17 @@
 #include <string>
 
 static void testEnvGate() {
-    unsetenv("DLLAMA_TOKEN_TIMING_PRINT");
-    assert(!dllamaTokenTimingPrintEnabled());
+    unsetenv("EDGEVISOR_TOKEN_TIMING_PRINT");
+    assert(!edgevisorTokenTimingPrintEnabled());
 
-    setenv("DLLAMA_TOKEN_TIMING_PRINT", "0", 1);
-    assert(!dllamaTokenTimingPrintEnabled());
+    setenv("EDGEVISOR_TOKEN_TIMING_PRINT", "0", 1);
+    assert(!edgevisorTokenTimingPrintEnabled());
 
-    setenv("DLLAMA_TOKEN_TIMING_PRINT", "false", 1);
-    assert(!dllamaTokenTimingPrintEnabled());
+    setenv("EDGEVISOR_TOKEN_TIMING_PRINT", "false", 1);
+    assert(!edgevisorTokenTimingPrintEnabled());
 
-    setenv("DLLAMA_TOKEN_TIMING_PRINT", "1", 1);
-    assert(dllamaTokenTimingPrintEnabled());
+    setenv("EDGEVISOR_TOKEN_TIMING_PRINT", "1", 1);
+    assert(edgevisorTokenTimingPrintEnabled());
 }
 
 static void testFormatRootLine() {
@@ -24,7 +24,7 @@ static void testFormatRootLine() {
 }
 
 static void testFormatNodeLine() {
-    DllamaTokenNodeTiming timing{};
+    EdgeVisorTokenNodeTiming timing{};
     timing.nodeIndex = 2u;
     timing.stageIndex = 1u;
     timing.hasStage = true;

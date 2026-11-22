@@ -6,7 +6,7 @@
 #include <sstream>
 #include <string>
 
-namespace dllama {
+namespace edgevisor {
 namespace dynamic_tpot {
 
 inline std::string sanitizeCandidateLogValue(const std::string &value) {
@@ -49,4 +49,4 @@ inline std::string formatSelectedCandidateLogFields(const Candidate &candidate) 
 }
 
 } // namespace dynamic_tpot
-} // namespace dllama
+} // namespace edgevisor

@@ -6,8 +6,8 @@
 #
 #   bash /home/byh/B01/EdgeVisor-wansongcc/scripts/demo_dropout_rejoin.sh
 #
-# 二进制在各机器 /tmp/ev_demo1/EdgeVisor/dllama。没有就现场编 CPU 版。
-# 加 --rebuild 强制重编。Ctrl-C 会停掉五台机器上的 dllama。
+# 二进制在各机器 /tmp/ev_demo1/EdgeVisor/edgevisor。没有就现场编 CPU 版。
+# 加 --rebuild 强制重编。Ctrl-C 会停掉五台机器上的 edgevisor。
 
 set -u
 
@@ -29,10 +29,10 @@ OFFLINE_HOLD_SEC=8
 REMOTE_DIR=/tmp/ev_demo1/EdgeVisor
 TYPESCRIPT=/tmp/ev_demo1_ui.typescript
 DRIVER_LOG=/tmp/ev_demo1_ui_driver.log
-MODEL_JETSON=/home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
-TOK_JETSON=/home/jetson/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
-MODEL_ROG=/home/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
-TOK_ROG=/home/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
+MODEL_JETSON=/home/jetson/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m
+TOK_JETSON=/home/jetson/cc/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t
+MODEL_ROG=/home/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m
+TOK_ROG=/home/cc/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1)
 LAB_SSH="ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_lab"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -70,7 +70,7 @@ remote() {
 stop_all() {
     local host
     for host in "$ROOT_HOST" "${WORKER_HOSTS[@]}"; do
-        remote "$host" 'pkill -x dllama >/dev/null 2>&1 || true' >/dev/null 2>&1 &
+        remote "$host" 'pkill -x edgevisor >/dev/null 2>&1 || true' >/dev/null 2>&1 &
     done
     wait || true
 }
@@ -125,7 +125,7 @@ os.dup2(log, 1)
 os.dup2(log, 2)
 null = os.open("/dev/null", os.O_RDONLY)
 os.dup2(null, 0)
-os.execv("./dllama", ["./dllama", "worker", "--port", "18091",
+os.execv("./edgevisor", ["./edgevisor", "worker", "--port", "18091",
                       "--model", model, "--nthreads", nthreads])
 PY
 exit 0
@@ -166,38 +166,38 @@ ensure_binaries() {
         missing=1
     else
         for host in "$ROOT_HOST" "${WORKER_HOSTS[@]}"; do
-            if ! remote "$host" "test -x ${REMOTE_DIR}/dllama"; then
+            if ! remote "$host" "test -x ${REMOTE_DIR}/edgevisor"; then
                 missing=1
                 break
             fi
         done
     fi
     if [ "$missing" -eq 0 ]; then
-        say "使用各机器上已有的 /tmp/ev_demo1/EdgeVisor/dllama。"
+        say "使用各机器上已有的 /tmp/ev_demo1/EdgeVisor/edgevisor。"
         return 0
     fi
     say "同步源码到 rog，编译 rog 和 nx1，再把 aarch64 二进制拷到其余三台..."
     "${SSH[@]}" rog 'mkdir -p /tmp/ev_demo1'
     rsync -az \
-        --exclude '*.o' --exclude '*.d' --exclude 'dllama' --exclude 'dllama-api' \
+        --exclude '*.o' --exclude '*.d' --exclude 'edgevisor' --exclude 'edgevisor-api' \
         --exclude '*-test' --exclude '.git' \
         "${REPO}/EdgeVisor/" rog:${REMOTE_DIR}/
     "${SSH[@]}" rog 'bash -s' << EOF
 set -e
-cd ${REMOTE_DIR} && export DLLAMA_VULKAN=0 && make dllama -j4 DLLAMA_CUDA=0
+cd ${REMOTE_DIR} && export EDGEVISOR_VULKAN=0 && make edgevisor -j4 EDGEVISOR_CUDA=0
 RSH="ssh -o BatchMode=yes -o IdentitiesOnly=yes -i \$HOME/.ssh/id_ed25519_lab"
 rsync -az -e "\$RSH" \
-    --exclude '*.o' --exclude '*.d' --exclude 'dllama' --exclude 'dllama-api' \
+    --exclude '*.o' --exclude '*.d' --exclude 'edgevisor' --exclude 'edgevisor-api' \
     --exclude '*-test' --exclude '.git' \
     ${REMOTE_DIR}/ jetson@192.168.137.13:${REMOTE_DIR}/
-\$RSH jetson@192.168.137.13 'cd ${REMOTE_DIR} && export DLLAMA_VULKAN=0 && make dllama -j4 DLLAMA_CUDA=0'
-rsync -az -e "\$RSH" jetson@192.168.137.13:${REMOTE_DIR}/dllama /tmp/ev_aarch64_dllama
+\$RSH jetson@192.168.137.13 'cd ${REMOTE_DIR} && export EDGEVISOR_VULKAN=0 && make edgevisor -j4 EDGEVISOR_CUDA=0'
+rsync -az -e "\$RSH" jetson@192.168.137.13:${REMOTE_DIR}/edgevisor /tmp/ev_aarch64_edgevisor
 for ip in 192.168.137.15 192.168.137.18 192.168.137.16; do
     \$RSH jetson@\$ip 'mkdir -p ${REMOTE_DIR}'
-    rsync -az -e "\$RSH" /tmp/ev_aarch64_dllama jetson@\$ip:${REMOTE_DIR}/dllama
-    \$RSH jetson@\$ip 'chmod +x ${REMOTE_DIR}/dllama'
+    rsync -az -e "\$RSH" /tmp/ev_aarch64_edgevisor jetson@\$ip:${REMOTE_DIR}/edgevisor
+    \$RSH jetson@\$ip 'chmod +x ${REMOTE_DIR}/edgevisor'
 done
-rm -f /tmp/ev_aarch64_dllama
+rm -f /tmp/ev_aarch64_edgevisor
 EOF
 }
 
@@ -245,7 +245,7 @@ if [ "\$pos" -lt "\$KILL_POS" ]; then
     exit 2
 fi
 log "decode pos=\$pos, killing ${DROP_HOST}"
-"\${SSH[@]}" "\$LAB jetson@\$DROP_IP 'pkill -x dllama >/dev/null 2>&1 || true'"
+"\${SSH[@]}" "\$LAB jetson@\$DROP_IP 'pkill -x edgevisor >/dev/null 2>&1 || true'"
 log "${DROP_HOST} killed"
 
 took=0
@@ -295,7 +295,7 @@ say "EdgeVisor 掉线 / 上线演示（主控 rog）"
 say "终端宽度 ${cols} 列。100 列以上时五段流水线能排在一行里。"
 say "五跳都在 192.168.137.x：rog → nx1 → nx2 → nano1 → nano2 → rog。"
 say "顺序：五台一起推理 → 关掉中间的 nx2（面板 off）→ 再启动 nx2（回到原来的层，面板 live）。"
-say "这一轮大约两三分钟。Ctrl-C 会停掉五台机器上的 dllama。"
+say "这一轮大约两三分钟。Ctrl-C 会停掉五台机器上的 edgevisor。"
 say
 
 say "检查五台机器（经 rog 的 192.168.137.x）..."
@@ -319,7 +319,7 @@ for host in "$ROOT_HOST" "${WORKER_HOSTS[@]}"; do
     install_worker_starter "$host"
 done
 
-say "停掉残留的 dllama..."
+say "停掉残留的 edgevisor..."
 stop_all
 sleep 1
 
@@ -347,7 +347,7 @@ say "面板现在切到这个终端。nx2 会在大约第 ${KILL_POS} 步被关�
 sleep 2
 
 WORKERS="${INFER_ADDR[0]}:${PORT} ${INFER_ADDR[1]}:${PORT} ${INFER_ADDR[2]}:${PORT} ${INFER_ADDR[3]}:${PORT}"
-"${SSH[@]}" -t rog "rm -f ${TYPESCRIPT}; cd ${REMOTE_DIR} && script -q -f -c 'DLLAMA_IGNORE_EOS=1 DLLAMA_BUBBLE_SHADOW_KV=1 stdbuf -oL -eL ./dllama inference --model ${MODEL_ROG} --tokenizer ${TOK_ROG} --prompt Hi --steps ${STEPS} --temperature 0 --seed 1 --buffer-float-type q80 --max-seq-len 256 --nthreads 1 --ui --enable-pp-migration --workers ${WORKERS}' ${TYPESCRIPT}"
+"${SSH[@]}" -t rog "rm -f ${TYPESCRIPT}; cd ${REMOTE_DIR} && script -q -f -c 'EDGEVISOR_IGNORE_EOS=1 EDGEVISOR_BUBBLE_SHADOW_KV=1 stdbuf -oL -eL ./edgevisor inference --model ${MODEL_ROG} --tokenizer ${TOK_ROG} --prompt Hi --steps ${STEPS} --temperature 0 --seed 1 --buffer-float-type q80 --max-seq-len 256 --nthreads 1 --ui --enable-pp-migration --workers ${WORKERS}' ${TYPESCRIPT}"
 ui_rc=$?
 
 say
@@ -357,5 +357,5 @@ if [ -f "$DRIVER_LOG" ]; then
 fi
 say "---- rog 日志里的接管 / 上线 ----"
 remote rog "tr -d '\\r' < ${TYPESCRIPT} 2>/dev/null | grep -aE 'takeover deadNode|dropout node=|rejoining |rejoined |ambiguous|inference stopped|\\[e1-end\\]|tokens/s' | grep -av redundant-infer" || true
-say "界面进程退出码 ${ui_rc}。五台 dllama 正在停掉。"
+say "界面进程退出码 ${ui_rc}。五台 edgevisor 正在停掉。"
 exit "$ui_rc"

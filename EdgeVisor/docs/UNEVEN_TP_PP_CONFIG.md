@@ -42,7 +42,7 @@
 | `--ratios` | TP/PP 工作量分配比例 | `"1:1*2:3"` | 均匀分配 |
 | `--kv-redundancy` | 每个节点的 KV 冗余头数量 | `"2"` 或 `"2,3,2,3"` | `2` |
 | `--enable-plan-barrier` | 启用手动 UDS 在线迁移屏障 | `1` 或 `0` | `0` |
-| `--plan-ctrl-socket` | 指定 UDS 控制器 socket | `/tmp/dllama_plan.sock` | 未设置 |
+| `--plan-ctrl-socket` | 指定 UDS 控制器 socket | `/tmp/edgevisor_plan.sock` | 未设置 |
 | `--enable-pp-migration` | 启用 PP layer 迁移路径 | `1` 或 `0` | `0` |
 | `--enable-dynamic-tpot` | 启用 root 自动 TPOT 在线调度 | `1` 或 `0` | `0` |
 
@@ -161,11 +161,11 @@ KV 冗余用于在线迁移时保持计算连续性。每个节点可以存储�
 ### 示例 1：单 Stage，2 节点非均匀 TP
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   --prompt "Hello world" \
   --steps 64 \
-  --model models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
-  --tokenizer models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
+  --model models/qwen3_8b_q40/edgevisor_model_qwen3_8b_q40.m \
+  --tokenizer models/qwen3_8b_q40/edgevisor_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
   --nthreads 8 \
   --workers 127.0.0.1:9999 \
@@ -181,11 +181,11 @@ KV 冗余用于在线迁移时保持计算连续性。每个节点可以存储�
 ### 示例 2：双 Stage，4 节点非均匀分配
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   --prompt "Explain quantum computing" \
   --steps 128 \
-  --model models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
-  --tokenizer models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
+  --model models/qwen3_8b_q40/edgevisor_model_qwen3_8b_q40.m \
+  --tokenizer models/qwen3_8b_q40/edgevisor_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
   --nthreads 8 \
   --workers 10.0.0.2:9999 10.0.0.3:9999 10.0.0.4:9999 \
@@ -202,11 +202,11 @@ KV 冗余用于在线迁移时保持计算连续性。每个节点可以存储�
 ### 示例 3：双 Stage，使用权重分配层数
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   --prompt "Write a story" \
   --steps 256 \
-  --model models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
-  --tokenizer models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
+  --model models/qwen3_8b_q40/edgevisor_model_qwen3_8b_q40.m \
+  --tokenizer models/qwen3_8b_q40/edgevisor_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
   --nthreads 8 \
   --workers 10.0.0.2:9999 10.0.0.3:9999 10.0.0.4:9999 \
@@ -224,14 +224,14 @@ KV 冗余用于在线迁移时保持计算连续性。每个节点可以存储�
 ### 示例 4：手动 UDS 在线迁移
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   --prompt "The capital of France is" \
   --steps 128 \
-  --model models/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m \
-  --tokenizer models/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t \
+  --model models/qwen3_8b_q40/edgevisor_model_qwen3_8b_q40.m \
+  --tokenizer models/qwen3_8b_q40/edgevisor_tokenizer_qwen3_8b_q40.t \
   --buffer-float-type q80 \
   --nthreads 8 \
-  --plan-ctrl-socket /tmp/dllama_plan.sock \
+  --plan-ctrl-socket /tmp/edgevisor_plan.sock \
   --enable-plan-barrier \
   --enable-stage-full-weights \
   --enable-kv-redundancy-during-migration 1 \
@@ -244,21 +244,21 @@ KV 冗余用于在线迁移时保持计算连续性。每个节点可以存储�
 
 ```bash
 # 发送迁移计划：从节点 0 向节点 1 移动 1 个 head 和 256 个 FFN 单元
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock set_plan \
   --seq 1 --mode next_barrier --stage 0 --from 0 --to 1 --kind 3 --heads 1 --ffn 256
 ```
 
 ### 示例 5：自动 TPOT PP 在线迁移
 
 ```bash
-./dllama inference \
+./edgevisor inference \
   --prompt "introduce yourself" \
   --steps 256 \
-  --model models/llama3.1_instruct_q40/dllama_model_llama3.1_instruct_q40.m \
-  --tokenizer models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t \
+  --model models/llama3.1_instruct_q40/edgevisor_model_llama3.1_instruct_q40.m \
+  --tokenizer models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t \
   --buffer-float-type q80 \
   --nthreads 1 \
-  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --plan-ctrl-socket /tmp/edgevisor_plan_pp_auto.sock \
   --enable-dynamic-tpot \
   --runtime-redundant-boundary-layers 1 \
   --workers 127.0.0.1:9999 127.0.0.1:9998 127.0.0.1:9997 \

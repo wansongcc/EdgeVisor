@@ -34,15 +34,15 @@ run_logged() {
 
 run_logged 00_clean make clean
 if [ -n "${CUDA_ARCHS:-}" ]; then
-    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" DLLAMA_CUDA=1 CUDA_ARCHS="$CUDA_ARCHS" dllama nn-cuda-test
+    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" EDGEVISOR_CUDA=1 CUDA_ARCHS="$CUDA_ARCHS" edgevisor nn-cuda-test
 else
-    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" DLLAMA_CUDA=1 dllama nn-cuda-test
+    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" EDGEVISOR_CUDA=1 edgevisor nn-cuda-test
 fi
 run_logged 02_nn_cuda_test ./nn-cuda-test --gpu-index "$GPU_INDEX"
 
 if [ -n "${EDGEVISOR_MODEL3:-}" ] && [ -n "${EDGEVISOR_TOKENIZER:-}" ]; then
     run_logged 03_single_gpu_cuda_model \
-        ./dllama inference \
+        ./edgevisor inference \
         --backend cuda \
         --gpu-index "$GPU_INDEX" \
         --model "$EDGEVISOR_MODEL3" \
@@ -69,7 +69,7 @@ if [ "${EDGEVISOR_RUN_L4:-0}" = "1" ]; then
     # Example: EDGEVISOR_WORKERS="10.0.0.2:9999 10.0.0.3:9999".
     # shellcheck disable=SC2086
     run_logged 04_l4_tp_uneven \
-        ./dllama inference \
+        ./edgevisor inference \
         --backend cuda \
         --gpu-index "$GPU_INDEX" \
         --model "$EDGEVISOR_MODEL3" \
@@ -87,7 +87,7 @@ if [ "${EDGEVISOR_RUN_L4:-0}" = "1" ]; then
 
     # shellcheck disable=SC2086
     run_logged 05_l4_pp_three_stage \
-        ./dllama inference \
+        ./edgevisor inference \
         --backend cuda \
         --gpu-index "$GPU_INDEX" \
         --model "$EDGEVISOR_MODEL3" \
@@ -105,7 +105,7 @@ if [ "${EDGEVISOR_RUN_L4:-0}" = "1" ]; then
 
     # shellcheck disable=SC2086
     run_logged 06_l4_tppp \
-        ./dllama inference \
+        ./edgevisor inference \
         --backend cuda \
         --gpu-index "$GPU_INDEX" \
         --model "$EDGEVISOR_MODEL3" \

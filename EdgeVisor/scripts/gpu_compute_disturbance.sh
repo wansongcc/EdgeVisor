@@ -15,12 +15,12 @@ groups recorded in its own pid files, so it does not kill EdgeVisor workers.
 Options:
   --duration SEC          Disturbance loop duration for each workload (default: 240)
   --preheat SEC           Sleep after start before returning (default: 60)
-  --bin-dir PATH          Directory containing ./dllama (default: /home/jetson/cc/EdgeVisor/EdgeVisor)
+  --bin-dir PATH          Directory containing ./edgevisor (default: /home/jetson/cc/EdgeVisor/EdgeVisor)
   --models-src PATH       Source model directory for /tmp symlink (default: /home/jetson/cc/models)
   --model-link PATH       Model symlink used by commands (default: /tmp/edgevisor_models)
   --log-dir PATH          Log/pid directory (default: /tmp/edgevisor_disturbance)
   --gpu-index INDEX       Vulkan GPU index (default: 0)
-  --buffer-float-type T   dllama buffer float type (default: q80)
+  --buffer-float-type T   edgevisor buffer float type (default: q80)
   --max-seq-len N         Disturbance max sequence length (default: 512)
   --steps N               Disturbance generation steps (default: 512)
   --prompt TEXT           Disturbance prompt
@@ -113,7 +113,7 @@ LOG_8B="${LOG_DIR}/gpu_disturb_8b.log"
 ensure_paths() {
   mkdir -p "${LOG_DIR}"
   if [[ ! -d "${BIN_DIR}" ]]; then
-    echo "Missing dllama directory: ${BIN_DIR}" >&2
+    echo "Missing edgevisor directory: ${BIN_DIR}" >&2
     exit 1
   fi
   if [[ -d "${MODELS_SRC}" ]]; then
@@ -192,7 +192,7 @@ start_workload() {
     setsid bash -lc '
       end=$((SECONDS + DISTURB_DURATION))
       while [ "$SECONDS" -lt "$end" ]; do
-        ./dllama inference \
+        ./edgevisor inference \
           --model "$DISTURB_MODEL" \
           --tokenizer "$DISTURB_TOKENIZER" \
           --backend vulkan \
@@ -216,14 +216,14 @@ case "${ACTION}" in
     stop_all
     start_workload \
       "qwen3-14b" \
-      "${MODEL_LINK}/qwen3_14b_q40/dllama_model_qwen3_14b_q40.m" \
-      "${MODEL_LINK}/qwen3_14b_q40/dllama_tokenizer_qwen3_14b_q40.t" \
+      "${MODEL_LINK}/qwen3_14b_q40/edgevisor_model_qwen3_14b_q40.m" \
+      "${MODEL_LINK}/qwen3_14b_q40/edgevisor_tokenizer_qwen3_14b_q40.t" \
       "${LOG_14B}" \
       "${PID_14B}"
     start_workload \
       "qwen3-8b" \
-      "${MODEL_LINK}/qwen3_8b_q40/dllama_model_qwen3_8b_q40.m" \
-      "${MODEL_LINK}/qwen3_8b_q40/dllama_tokenizer_qwen3_8b_q40.t" \
+      "${MODEL_LINK}/qwen3_8b_q40/edgevisor_model_qwen3_8b_q40.m" \
+      "${MODEL_LINK}/qwen3_8b_q40/edgevisor_tokenizer_qwen3_8b_q40.t" \
       "${LOG_8B}" \
       "${PID_8B}"
     if [[ "${PREHEAT}" != "0" ]]; then

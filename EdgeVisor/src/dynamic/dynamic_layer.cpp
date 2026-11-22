@@ -286,7 +286,7 @@ std::unique_ptr<DynamicLayerController> DynamicLayerController::start(const std:
 	(void)inference;
 	return nullptr;
 #else
-	const bool enabled = dynParseEnvBool("DLLAMA_DYNAMIC_LAYER_ENABLE", false);
+	const bool enabled = dynParseEnvBool("EDGEVISOR_DYNAMIC_LAYER_ENABLE", false);
 	if (!enabled) return nullptr;
 	if (socketPath.empty()) return nullptr;
 
@@ -321,19 +321,19 @@ void DynamicLayerController::run() {
 #ifdef _WIN32
 	return;
 #else
-	const int pollMs = std::max(10, dynParseEnvInt("DLLAMA_DYN_POLL_MS", 200));
-	const int timeoutMs = std::max(100, dynParseEnvInt("DLLAMA_DYN_UDS_TIMEOUT_MS", 2000));
-	const double dropRatio = dynNormalizeDropRatio(dynParseEnvDouble("DLLAMA_DYN_DROP_RATIO", 0.30));
+	const int pollMs = std::max(10, dynParseEnvInt("EDGEVISOR_DYN_POLL_MS", 200));
+	const int timeoutMs = std::max(100, dynParseEnvInt("EDGEVISOR_DYN_UDS_TIMEOUT_MS", 2000));
+	const double dropRatio = dynNormalizeDropRatio(dynParseEnvDouble("EDGEVISOR_DYN_DROP_RATIO", 0.30));
 
-	const bool alwaysOptimize = dynParseEnvBool("DLLAMA_DYN_ALWAYS_OPTIMIZE", false);
-	const bool forceOnce = dynParseEnvBool("DLLAMA_DYN_FORCE_TRIGGER", false);
-	const int forcedLayer = dynParseEnvInt("DLLAMA_DYN_OPT_LAYER", 0);
+	const bool alwaysOptimize = dynParseEnvBool("EDGEVISOR_DYN_ALWAYS_OPTIMIZE", false);
+	const bool forceOnce = dynParseEnvBool("EDGEVISOR_DYN_FORCE_TRIGGER", false);
+	const int forcedLayer = dynParseEnvInt("EDGEVISOR_DYN_OPT_LAYER", 0);
 
-	int stageIndexEnv = dynParseEnvInt("DLLAMA_DYN_STAGE_INDEX", 0);
+	int stageIndexEnv = dynParseEnvInt("EDGEVISOR_DYN_STAGE_INDEX", 0);
 
 	unsigned long long lastEpoch = 0ull;
 	unsigned long long lastIssuedEpoch = 0ull;
-	uint32_t seq = (uint32_t)std::max(1, dynParseEnvInt("DLLAMA_DYN_SEQ_START", 1));
+	uint32_t seq = (uint32_t)std::max(1, dynParseEnvInt("EDGEVISOR_DYN_SEQ_START", 1));
 	bool forcedUsed = false;
 
 	while (!stop_.load()) {
@@ -352,7 +352,7 @@ void DynamicLayerController::run() {
 			}
 
 			uint32_t rootNodeIndex = (uint32_t)stage->rootNodeIndex;
-			const int rootNodeEnv = dynParseEnvInt("DLLAMA_DYN_ROOT_NODE_INDEX", -1);
+			const int rootNodeEnv = dynParseEnvInt("EDGEVISOR_DYN_ROOT_NODE_INDEX", -1);
 			if (rootNodeEnv >= 0) rootNodeIndex = (uint32_t)rootNodeEnv;
 
 			json req;
@@ -361,7 +361,7 @@ void DynamicLayerController::run() {
 			req["stageIndex"] = stageIndex;
 			req["rootNodeIndex"] = rootNodeIndex;
 
-			const char *pathEnv = std::getenv("DLLAMA_DYN_LAYER_PROF_PATH");
+			const char *pathEnv = std::getenv("EDGEVISOR_DYN_LAYER_PROF_PATH");
 			if (pathEnv != nullptr && pathEnv[0] != '\0') {
 				req["path"] = std::string(pathEnv);
 			}

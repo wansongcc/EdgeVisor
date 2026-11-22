@@ -36,11 +36,11 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
 #include <cstdlib>
     #include "nn/nn-vulkan.hpp"
 #endif
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
     #include "nn/nn-cuda.hpp"
 #endif
 
@@ -49,14 +49,14 @@
 
 // ---------------------------------------------------------
 // Root control-packet logging (default OFF)
-// Enable with: -DDLLAMA_CONTROL_LOG=1
+// Enable with: -DEDGEVISOR_CONTROL_LOG=1
 // ---------------------------------------------------------
-#ifndef DLLAMA_CONTROL_LOG
-#define DLLAMA_CONTROL_LOG 0
+#ifndef EDGEVISOR_CONTROL_LOG
+#define EDGEVISOR_CONTROL_LOG 0
 #endif
 
 static inline void logRootControlSend(const LlmControlPacket& p) {
-#if DLLAMA_CONTROL_LOG
+#if EDGEVISOR_CONTROL_LOG
     // Match worker-side format for easy diff/align.
     printf("📤 [Root] Send Control: Batch=%u, Pos=%u, Flags=0x%x\n", p.batchSize, p.position, p.flags);
 #else
@@ -77,12 +77,12 @@ static bool envFlagEnabledDefault(const char *name, bool fallback) {
     return true;
 }
 
-// E5 test-only phase marker.  It is a no-op unless DLLAMA_E5_PHASE_LOG is
+// E5 test-only phase marker.  It is a no-op unless EDGEVISOR_E5_PHASE_LOG is
 // configured; the optional hold lets an external fault injector land inside
 // a named protocol phase instead of racing an arbitrary token.
 static void e5PhaseHook(const char *phase, NnUint pos, NnUint fromNode,
                         NnUint toNode, NnUint layer) {
-    const char *path = std::getenv("DLLAMA_E5_PHASE_LOG");
+    const char *path = std::getenv("EDGEVISOR_E5_PHASE_LOG");
     if (path == nullptr || path[0] == '\0') return;
     const unsigned long long nowMs = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -96,7 +96,7 @@ static void e5PhaseHook(const char *phase, NnUint pos, NnUint fromNode,
             << ",\"layer\":" << (unsigned)layer << ",\"ts_ms\":" << nowMs << "}\n";
         out.flush();
     }
-    const char *holdText = std::getenv("DLLAMA_E5_PHASE_HOLD_MS");
+    const char *holdText = std::getenv("EDGEVISOR_E5_PHASE_HOLD_MS");
     if (holdText == nullptr || holdText[0] == '\0') return;
     char *end = nullptr;
     const unsigned long holdMs = std::strtoul(holdText, &end, 10);
@@ -154,9 +154,9 @@ static void validateMaxPpLayerMoveOption(const char *name, const char *value) {
 }
 
 static void appendSyncedEnvironmentVariable(const char *name) {
-    const char *current = std::getenv("DLLAMA_SYNC_ENV_VARS");
+    const char *current = std::getenv("EDGEVISOR_SYNC_ENV_VARS");
     if (current == nullptr || current[0] == '\0') {
-        setenv("DLLAMA_SYNC_ENV_VARS", name, 1);
+        setenv("EDGEVISOR_SYNC_ENV_VARS", name, 1);
         return;
     }
     std::stringstream stream(current);
@@ -167,28 +167,28 @@ static void appendSyncedEnvironmentVariable(const char *name) {
     std::string merged(current);
     merged += ",";
     merged += name;
-    setenv("DLLAMA_SYNC_ENV_VARS", merged.c_str(), 1);
+    setenv("EDGEVISOR_SYNC_ENV_VARS", merged.c_str(), 1);
 }
 
 static void setTpotProfileDefaults(const char *profile) {
     if (std::strcmp(profile, "conservative") == 0) {
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_WINDOW_TOKENS", "16");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_SAMPLES", "8");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_COOLDOWN_TOKENS", "32");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_ROLLBACK_WINDOW", "16");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_PP_GAIN_MS", "5");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_WINDOW_TOKENS", "16");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_MIN_SAMPLES", "8");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_COOLDOWN_TOKENS", "32");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_ROLLBACK_WINDOW", "16");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_MIN_PP_GAIN_MS", "5");
     } else if (std::strcmp(profile, "balanced") == 0) {
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_WINDOW_TOKENS", "8");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_SAMPLES", "8");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_COOLDOWN_TOKENS", "16");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_ROLLBACK_WINDOW", "12");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_PP_GAIN_MS", "3");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_WINDOW_TOKENS", "8");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_MIN_SAMPLES", "8");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_COOLDOWN_TOKENS", "16");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_ROLLBACK_WINDOW", "12");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_MIN_PP_GAIN_MS", "3");
     } else if (std::strcmp(profile, "aggressive") == 0) {
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_WINDOW_TOKENS", "6");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_SAMPLES", "6");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_COOLDOWN_TOKENS", "8");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_ROLLBACK_WINDOW", "8");
-        setEnvIfUnsetOrEmpty("DLLAMA_TPOT_MIN_PP_GAIN_MS", "1");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_WINDOW_TOKENS", "6");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_MIN_SAMPLES", "6");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_COOLDOWN_TOKENS", "8");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_ROLLBACK_WINDOW", "8");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_TPOT_MIN_PP_GAIN_MS", "1");
     } else {
         throw std::runtime_error("Invalid --dynamic-tpot-profile: " + std::string(profile) +
             " (expected conservative, balanced, or aggressive)");
@@ -201,18 +201,18 @@ static void setTpotOverride(const char *environmentName, const char *value) {
 
 static void configureDynamicTpot(const AppCliArgs &args) {
     setTpotProfileDefaults(args.dynamicTpotProfile == nullptr ? "balanced" : args.dynamicTpotProfile);
-    setTpotOverride("DLLAMA_TPOT_WINDOW_TOKENS", args.tpotWindowTokensStr);
-    setTpotOverride("DLLAMA_TPOT_MIN_SAMPLES", args.tpotMinSamplesStr);
-    setTpotOverride("DLLAMA_TPOT_COOLDOWN_TOKENS", args.tpotCooldownTokensStr);
-    setTpotOverride("DLLAMA_TPOT_ROLLBACK_WINDOW", args.tpotRollbackWindowStr);
-    setTpotOverride("DLLAMA_TPOT_MIN_PP_GAIN_MS", args.tpotMinPpGainMsStr);
-    setTpotOverride("DLLAMA_TPOT_PP_GAIN_RATIO", args.tpotPpGainRatioStr);
-    setTpotOverride("DLLAMA_TPOT_PP_RISK_MARGIN_MS", args.tpotPpRiskMarginMsStr);
-    setTpotOverride("DLLAMA_TPOT_PP_MIGRATION_COST_MS", args.tpotPpMigrationCostMsStr);
-    setTpotOverride("DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS", args.tpotExpectedRemainingTokensStr);
-    setTpotOverride("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", args.tpotMaxPpLayerMoveStr);
-    setenv("DLLAMA_LAYER_PROF_ENABLE", "1", 1);
-    appendSyncedEnvironmentVariable("DLLAMA_LAYER_PROF_ENABLE");
+    setTpotOverride("EDGEVISOR_TPOT_WINDOW_TOKENS", args.tpotWindowTokensStr);
+    setTpotOverride("EDGEVISOR_TPOT_MIN_SAMPLES", args.tpotMinSamplesStr);
+    setTpotOverride("EDGEVISOR_TPOT_COOLDOWN_TOKENS", args.tpotCooldownTokensStr);
+    setTpotOverride("EDGEVISOR_TPOT_ROLLBACK_WINDOW", args.tpotRollbackWindowStr);
+    setTpotOverride("EDGEVISOR_TPOT_MIN_PP_GAIN_MS", args.tpotMinPpGainMsStr);
+    setTpotOverride("EDGEVISOR_TPOT_PP_GAIN_RATIO", args.tpotPpGainRatioStr);
+    setTpotOverride("EDGEVISOR_TPOT_PP_RISK_MARGIN_MS", args.tpotPpRiskMarginMsStr);
+    setTpotOverride("EDGEVISOR_TPOT_PP_MIGRATION_COST_MS", args.tpotPpMigrationCostMsStr);
+    setTpotOverride("EDGEVISOR_TPOT_EXPECTED_REMAINING_TOKENS", args.tpotExpectedRemainingTokensStr);
+    setTpotOverride("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", args.tpotMaxPpLayerMoveStr);
+    setenv("EDGEVISOR_LAYER_PROF_ENABLE", "1", 1);
+    appendSyncedEnvironmentVariable("EDGEVISOR_LAYER_PROF_ENABLE");
 }
 
 static void applyProcessMemoryLimit(NnSize memoryLimitBytes) {
@@ -246,19 +246,19 @@ static void validateStaticMemoryBudget(NnSize memoryLimitBytes, const NnNetConfi
 }
 
 static bool bubbleShadowKvEnabled() {
-    return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV", false);
+    return envFlagEnabledDefault("EDGEVISOR_BUBBLE_SHADOW_KV", false);
 }
 
 static bool bubbleShadowKvDuringForwardEnabled() {
-    return bubbleShadowKvEnabled() && envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD", true);
+    return bubbleShadowKvEnabled() && envFlagEnabledDefault("EDGEVISOR_BUBBLE_SHADOW_KV_DURING_FORWARD", true);
 }
 
 static bool bubbleShadowKvLogEnabled() {
-    return envFlagEnabledDefault("DLLAMA_BUBBLE_SHADOW_KV_LOG", false);
+    return envFlagEnabledDefault("EDGEVISOR_BUBBLE_SHADOW_KV_LOG", false);
 }
 
 static bool lastStageSamplingEnabled() {
-    return envFlagEnabledDefault("DLLAMA_LAST_STAGE_SAMPLING", false);
+    return envFlagEnabledDefault("EDGEVISOR_LAST_STAGE_SAMPLING", false);
 }
 
 // Deferring the worker PROFILE drain by one token keeps the worker frames from
@@ -266,7 +266,7 @@ static bool lastStageSamplingEnabled() {
 // frames arrive while the root is already sampling, so the wait is off the
 // critical path. On by default when profiling is on.
 bool deferredProfileEnabled() {
-    return envFlagEnabledDefault("DLLAMA_DEFERRED_PROFILE", true);
+    return envFlagEnabledDefault("EDGEVISOR_DEFERRED_PROFILE", true);
 }
 
 static bool lastStageSamplingPlanSupported(const NnUnevenPartitionPlan *plan) {
@@ -321,7 +321,7 @@ static NnBubbleShadowStats maybeRunBubbleShadowKv(NnExecutor *executor, const ch
 static NnBubbleShadowStats runToolWindowBubbleShadowKv(NnExecutor *executor, const char *who, NnUint nodeIndex, NnUint position, NnUint batchSize) {
     // Tool-window work is deliberately synchronous: it must be completed and
     // profiled before the root releases the tool result.  Its elapsed time is
-    // charged against that round's fixed tool-wait budget in dllama.cpp.
+    // charged against that round's fixed tool-wait budget in edgevisor.cpp.
     return runBubbleShadowKv(executor, who, nodeIndex, position, batchSize);
 }
 
@@ -337,8 +337,8 @@ static bool parseEnvInt(const char *name, int &out) {
 
 static int kvAckWaitTimeoutMs() {
     int timeoutMs = 0;
-    if (parseEnvInt("DLLAMA_KV_ACK_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
-    if (parseEnvInt("DLLAMA_IO_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
+    if (parseEnvInt("EDGEVISOR_KV_ACK_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
+    if (parseEnvInt("EDGEVISOR_IO_TIMEOUT_MS", timeoutMs) && timeoutMs > 0) return timeoutMs;
     return 5000;
 }
 
@@ -504,13 +504,13 @@ static void setRuntimeRedundantEnv(NnUint boundaryLayers, bool activeSegEnabled,
     std::string boundary = std::to_string((unsigned)boundaryLayers);
     std::string active = activeSegEnabled ? "1" : "0";
     std::string redundant = redundantSegEnabled ? "1" : "0";
-    setenv("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", boundary.c_str(), 1);
-    setenv("DLLAMA_RUNTIME_ACTIVE_SEG_ENABLED", active.c_str(), 1);
-    setenv("DLLAMA_RUNTIME_REDUNDANT_SEG_ENABLED", redundant.c_str(), 1);
+    setenv("EDGEVISOR_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", boundary.c_str(), 1);
+    setenv("EDGEVISOR_RUNTIME_ACTIVE_SEG_ENABLED", active.c_str(), 1);
+    setenv("EDGEVISOR_RUNTIME_REDUNDANT_SEG_ENABLED", redundant.c_str(), 1);
     if (primarySkipLayersStr != nullptr && primarySkipLayersStr[0] != '\0') {
-        setenv("DLLAMA_RUNTIME_PRIMARY_SKIP_LAYERS", primarySkipLayersStr, 1);
+        setenv("EDGEVISOR_RUNTIME_PRIMARY_SKIP_LAYERS", primarySkipLayersStr, 1);
     } else {
-        unsetenv("DLLAMA_RUNTIME_PRIMARY_SKIP_LAYERS");
+        unsetenv("EDGEVISOR_RUNTIME_PRIMARY_SKIP_LAYERS");
     }
 }
 
@@ -519,30 +519,30 @@ static void maybeSeedPlanCommandFromLegacyEnv() {
     // External controller should be preferred.
     int pos = -1;
     int layer = -1;
-    bool hasPos = parseEnvInt("DLLAMA_HARD_MIGRATE_POS", pos);
-    bool hasLayer = parseEnvInt("DLLAMA_HARD_MIGRATE_LAYER", layer);
+    bool hasPos = parseEnvInt("EDGEVISOR_HARD_MIGRATE_POS", pos);
+    bool hasLayer = parseEnvInt("EDGEVISOR_HARD_MIGRATE_LAYER", layer);
     if (!hasPos && !hasLayer) return;
 
     static bool warned = false;
     if (!warned) {
         std::fprintf(stderr,
-            "[DEPRECATED] DLLAMA_HARD_MIGRATE_* env hooks are deprecated. "
+            "[DEPRECATED] EDGEVISOR_HARD_MIGRATE_* env hooks are deprecated. "
             "Use PlanCommand via UDS controller instead. (env will be used as fallback)\n");
         warned = true;
     }
 
     if (!(hasPos && hasLayer) || pos < 0 || layer < 0) {
         std::fprintf(stderr,
-            "[plan][env] ignored: DLLAMA_HARD_MIGRATE_POS and DLLAMA_HARD_MIGRATE_LAYER must both be set (>=0)\n");
+            "[plan][env] ignored: EDGEVISOR_HARD_MIGRATE_POS and EDGEVISOR_HARD_MIGRATE_LAYER must both be set (>=0)\n");
         return;
     }
 
     int kind = 3;
-    (void)parseEnvInt("DLLAMA_HARD_MIGRATE_KIND", kind);
+    (void)parseEnvInt("EDGEVISOR_HARD_MIGRATE_KIND", kind);
     int headMove = 1;
-    (void)parseEnvInt("DLLAMA_HARD_MIGRATE_HEAD_MOVE", headMove);
+    (void)parseEnvInt("EDGEVISOR_HARD_MIGRATE_HEAD_MOVE", headMove);
     int ffnMove = 256;
-    (void)parseEnvInt("DLLAMA_HARD_MIGRATE_FFN_MOVE", ffnMove);
+    (void)parseEnvInt("EDGEVISOR_HARD_MIGRATE_FFN_MOVE", ffnMove);
 
     PlanCommand cmd = makeEmptyPlanCommand();
     cmd.mode = PLAN_CMD_MODE_EXACT;
@@ -695,7 +695,7 @@ static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const A
     p.magic = LLM_BOOTSTRAP_MAGIC;
     p.version = LLM_BOOTSTRAP_VERSION;
     p.flags = 0u;
-    p.benchmarkEnabled = (args->benchmark || envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false)) ? 1u : 0u;
+    p.benchmarkEnabled = (args->benchmark || envFlagEnabledDefault("EDGEVISOR_DYNAMIC_TPOT_ENABLE", false)) ? 1u : 0u;
     p.enablePlanBarrier = args->enablePlanBarrier ? 1u : 0u;
     p.enableStageFullWeights = args->enableStageFullWeights ? 1u : 0u;
     p.enableKvRedundancyDuringMigration = args->enableKvRedundancyDuringMigration ? 1u : 0u;
@@ -875,7 +875,7 @@ void AppCliArgs::applyBackendThreadDefaults() {
     // thread, on every backend. Workers reapply this after receiving bootstrap.
     if (bubbleShadowKvEnabled()) {
         if (nThreadsExplicit && nThreads != 1u)
-            throw std::runtime_error("Shadow KV requires --nthreads 1; remove the explicit thread count or disable DLLAMA_BUBBLE_SHADOW_KV");
+            throw std::runtime_error("Shadow KV requires --nthreads 1; remove the explicit thread count or disable EDGEVISOR_BUBBLE_SHADOW_KV");
         nThreads = 1u;
     } else if (!nThreadsExplicit) {
         // Recompute the baseline so a worker relistening without shadow KV
@@ -898,7 +898,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.mode = nullptr;
     args.nThreadsExplicit = false;
     args.nBatches = 32;
-    if (const char *p = std::getenv("DLLAMA_NBATCHES")) {
+    if (const char *p = std::getenv("EDGEVISOR_NBATCHES")) {
         // Test knob: larger prefill chunks amortize the per-forward sync
         // round trips over more prompt tokens.
         try {
@@ -952,7 +952,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.allowNoShadowHeadMigration = false;
     args.enableKvAggregate = false;
     args.enablePpMigration = false;
-    args.enableDynamicTpot = envFlagEnabledDefault("DLLAMA_DYNAMIC_TPOT_ENABLE", false);
+    args.enableDynamicTpot = envFlagEnabledDefault("EDGEVISOR_DYNAMIC_TPOT_ENABLE", false);
     args.autoRuntime = false;
     args.showTerminalUi = false;
     args.dynamicTpotProfile = nullptr;
@@ -966,8 +966,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.tpotPpMigrationCostMsStr = nullptr;
     args.tpotExpectedRemainingTokensStr = nullptr;
     args.tpotMaxPpLayerMoveStr = nullptr;
-    args.planCtrlSocketPath = std::getenv("DLLAMA_PLAN_CTRL_SOCKET") != nullptr && std::getenv("DLLAMA_PLAN_CTRL_SOCKET")[0] != '\0'
-        ? const_cast<char*>(std::getenv("DLLAMA_PLAN_CTRL_SOCKET"))
+    args.planCtrlSocketPath = std::getenv("EDGEVISOR_PLAN_CTRL_SOCKET") != nullptr && std::getenv("EDGEVISOR_PLAN_CTRL_SOCKET")[0] != '\0'
+        ? const_cast<char*>(std::getenv("EDGEVISOR_PLAN_CTRL_SOCKET"))
         : nullptr;
     args.runtimeRedundantBoundaryLayers = 1u;
     args.runtimeRedundantBoundaryLayersExplicit = false;
@@ -985,13 +985,13 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.fallbackPolicyStr = nullptr;
     args.ablationLogPath = nullptr;
     args.experimentId = nullptr;
-    args.ioProfileLogPath = std::getenv("DLLAMA_IO_PROFILE_LOG") != nullptr && std::getenv("DLLAMA_IO_PROFILE_LOG")[0] != '\0'
-        ? const_cast<char*>(std::getenv("DLLAMA_IO_PROFILE_LOG"))
+    args.ioProfileLogPath = std::getenv("EDGEVISOR_IO_PROFILE_LOG") != nullptr && std::getenv("EDGEVISOR_IO_PROFILE_LOG")[0] != '\0'
+        ? const_cast<char*>(std::getenv("EDGEVISOR_IO_PROFILE_LOG"))
         : nullptr;
 
     {
         int envBoundaryLayers = -1;
-        bool hasEnvBoundaryLayers = parseEnvInt("DLLAMA_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", envBoundaryLayers);
+        bool hasEnvBoundaryLayers = parseEnvInt("EDGEVISOR_RUNTIME_REDUNDANT_BOUNDARY_LAYERS", envBoundaryLayers);
         if (hasEnvBoundaryLayers) {
             if (envBoundaryLayers < 0) envBoundaryLayers = 0;
             args.runtimeRedundantBoundaryLayers = (NnUint)envBoundaryLayers;
@@ -1068,7 +1068,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 args.lastStageSampling = true;
                 i += 1;
             }
-            setenv("DLLAMA_LAST_STAGE_SAMPLING", args.lastStageSampling ? "1" : "0", 1);
+            setenv("EDGEVISOR_LAST_STAGE_SAMPLING", args.lastStageSampling ? "1" : "0", 1);
             continue;
         }
 
@@ -1428,20 +1428,20 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         args.gpuIndex = 0;
     }
     productSetLogLevel(args.logLevel);
-#if !defined(DLLAMA_VULKAN)
+#if !defined(EDGEVISOR_VULKAN)
     if (args.backend == BACKEND_VULKAN) {
-        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with EDGEVISOR_VULKAN=1");
     }
 #endif
-#if !defined(DLLAMA_CUDA)
+#if !defined(EDGEVISOR_CUDA)
     if (args.backend == BACKEND_CUDA) {
-        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with EDGEVISOR_CUDA=1");
     }
 #endif
     if (args.enableDynamicTpot) {
         configureDynamicTpot(args);
-        const dllama::dynamic_tpot::SchedulerConfig schedulerConfig =
-            dllama::dynamic_tpot::loadSchedulerConfigFromEnvironment();
+        const edgevisor::dynamic_tpot::SchedulerConfig schedulerConfig =
+            edgevisor::dynamic_tpot::loadSchedulerConfigFromEnvironment();
         if (args.runtimeRedundantBoundaryLayersExplicit &&
                 args.runtimeRedundantBoundaryLayers < schedulerConfig.maxPpLayerMove) {
             throw std::runtime_error(
@@ -1452,7 +1452,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.runtimeRedundantBoundaryLayers,
             schedulerConfig.maxPpLayerMove);
         if (args.planCtrlSocketPath == nullptr || args.planCtrlSocketPath[0] == '\0') {
-            args.planCtrlSocketPath = (char *)"/tmp/dllama_plan.sock";
+            args.planCtrlSocketPath = (char *)"/tmp/edgevisor_plan.sock";
             if (!args.autoRuntime)
                 std::printf("plan socket: %s\n", args.planCtrlSocketPath);
         }
@@ -1466,28 +1466,28 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             if (!args.autoRuntime)
                 std::printf("pp migration enabled\n");
         }
-        setenv("DLLAMA_DYNAMIC_TPOT_ENABLE", "1", 1);
-        setenv("DLLAMA_PLAN_CTRL_SOCKET", args.planCtrlSocketPath, 1);
-        setEnvIfUnsetOrEmpty("DLLAMA_KV_ACK_TIMEOUT_MS", "180000");
-        setEnvIfUnsetOrEmpty("DLLAMA_IO_TIMEOUT_MS", "180000");
-        setEnvIfUnsetOrEmpty("DLLAMA_ASYNC_KV_COLLECT_SUBMIT", "0");
+        setenv("EDGEVISOR_DYNAMIC_TPOT_ENABLE", "1", 1);
+        setenv("EDGEVISOR_PLAN_CTRL_SOCKET", args.planCtrlSocketPath, 1);
+        setEnvIfUnsetOrEmpty("EDGEVISOR_KV_ACK_TIMEOUT_MS", "180000");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_IO_TIMEOUT_MS", "180000");
+        setEnvIfUnsetOrEmpty("EDGEVISOR_ASYNC_KV_COLLECT_SUBMIT", "0");
         if (args.nWorkers > 0u && !args.lastStageSampling) {
             args.lastStageSampling = true;
-            setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+            setenv("EDGEVISOR_LAST_STAGE_SAMPLING", "1", 1);
             if (!args.autoRuntime)
                 std::printf("last-stage sampling enabled\n");
         }
     } else {
-        setenv("DLLAMA_DYNAMIC_TPOT_ENABLE", "0", 1);
+        setenv("EDGEVISOR_DYNAMIC_TPOT_ENABLE", "0", 1);
         if (args.planCtrlSocketPath != nullptr && args.planCtrlSocketPath[0] != '\0') {
-            setenv("DLLAMA_PLAN_CTRL_SOCKET", args.planCtrlSocketPath, 1);
+            setenv("EDGEVISOR_PLAN_CTRL_SOCKET", args.planCtrlSocketPath, 1);
         }
     }
 
     if (args.continuousBatching) {
         if (args.nWorkers > 0u && !args.lastStageSampling) {
             args.lastStageSampling = true;
-            setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+            setenv("EDGEVISOR_LAST_STAGE_SAMPLING", "1", 1);
             std::printf("[continuous-batching] auto enabling last-stage sampling for PP in-flight decode\n");
             std::fflush(stdout);
         }
@@ -1521,7 +1521,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         std::fflush(stdout);
     }
     if (args.ioProfileLogPath != nullptr && args.ioProfileLogPath[0] != '\0') {
-        setenv("DLLAMA_IO_PROFILE_LOG", args.ioProfileLogPath, 1);
+        setenv("EDGEVISOR_IO_PROFILE_LOG", args.ioProfileLogPath, 1);
     }
     return args;
 }
@@ -2105,7 +2105,7 @@ static std::vector<WarmupCandidate> buildWarmupCandidates(NnUint maxWorkers, NnU
 
 static int warmupRelistenDelayMs() {
     int delayMs = 1000;
-    parseEnvInt("DLLAMA_WARMUP_RELISTEN_DELAY_MS", delayMs);
+    parseEnvInt("EDGEVISOR_WARMUP_RELISTEN_DELAY_MS", delayMs);
     if (delayMs < 0) delayMs = 0;
     return delayMs;
 }
@@ -2512,24 +2512,24 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     }
 
     if (args->backend == AppCliArgs::BACKEND_VULKAN) {
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
         devices.push_back(NnExecutorDevice(
             new NnVulkanDevice(args->gpuIndex, netConfig, nodeConfig, netExecution, plan),
             args->gpuSegmentFrom,
             args->gpuSegmentTo
         ));
 #else
-        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with EDGEVISOR_VULKAN=1");
 #endif
     } else if (args->backend == AppCliArgs::BACKEND_CUDA) {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         devices.push_back(NnExecutorDevice(
             new NnCudaDevice(args->gpuIndex, netConfig, nodeConfig, netExecution, plan),
             args->gpuSegmentFrom,
             args->gpuSegmentTo
         ));
 #else
-        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with EDGEVISOR_CUDA=1");
 #endif
     } else {
         throw std::runtime_error("Internal error: unresolved backend " + std::string(AppCliArgs::backendToString(args->backend)));
@@ -2939,7 +2939,7 @@ static bool getHeadMigrationTargetRangeLocal(
     NnUint f = 0u;
     NnUint t = 0u;
     NnUint move = 0u;
-    if (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves > 0u) {
+    if (cmd.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && cmd.nMoves > 0u) {
         const PlanMove &m = cmd.moves[0];
         if (m.cmdKind != PLAN_CMD_KIND_HEAD && m.cmdKind != PLAN_CMD_KIND_BOTH) return false;
         f = m.fromNodeIndex;
@@ -3096,7 +3096,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
         }
     }
 
-    migrationLayers = parseLayerListEnv("DLLAMA_MIGRATION_LAYER_LIST");
+    migrationLayers = parseLayerListEnv("EDGEVISOR_MIGRATION_LAYER_LIST");
     migrationLayerListPinnedByEnv = !migrationLayers.empty();
     if (migrationLayerCount < 1) migrationLayerCount = 1;
     if (migrationLayers.empty() && boundaryLayerForMigration >= 0) {
@@ -3110,7 +3110,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     std::sort(migrationLayers.begin(), migrationLayers.end());
 
     {
-        const char *bgEnv = std::getenv("DLLAMA_BACKGROUND_PRECOPY");
+        const char *bgEnv = std::getenv("EDGEVISOR_BACKGROUND_PRECOPY");
         bgPrecopyEnabled = (bgEnv != nullptr && bgEnv[0] == '1');
         // EV hit reserves layer weights before the fault; everything else pays
         // at the trigger. Default is on_demand so an unset variable is charged.
@@ -3121,19 +3121,19 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
             std::printf("🧱 [weight-load] residency=on_demand: uploading at trigger\n");
             std::fflush(stdout);
         }
-        const char *bgMax = std::getenv("DLLAMA_BACKGROUND_PRECOPY_MAX_PASSES");
+        const char *bgMax = std::getenv("EDGEVISOR_BACKGROUND_PRECOPY_MAX_PASSES");
         if (bgMax != nullptr && bgMax[0] != '\0') bgPrecopyMaxPasses = (NnUint)std::strtoul(bgMax, nullptr, 10);
-        const char *pipeLive = std::getenv("DLLAMA_PIPELIVE_PATCH");
+        const char *pipeLive = std::getenv("EDGEVISOR_PIPELIVE_PATCH");
         pipeLivePatchEnabled = (pipeLive != nullptr && pipeLive[0] == '1');
         if (pipeLivePatchEnabled) bgPrecopyEnabled = true;
-        const char *chunkEnv = std::getenv("DLLAMA_PIPELIVE_CHUNK");
+        const char *chunkEnv = std::getenv("EDGEVISOR_PIPELIVE_CHUNK");
         if (chunkEnv != nullptr && chunkEnv[0] != '\0') {
             const unsigned long parsed = std::strtoul(chunkEnv, nullptr, 10);
             if (parsed > 0ul) pipeLiveChunk = (NnUint)parsed;
         }
-        const char *tauEnv = std::getenv("DLLAMA_PIPELIVE_TAU");
+        const char *tauEnv = std::getenv("EDGEVISOR_PIPELIVE_TAU");
         if (tauEnv != nullptr && tauEnv[0] != '\0') pipeLiveTau = (NnUint)std::strtoul(tauEnv, nullptr, 10);
-        const char *armEnv = std::getenv("DLLAMA_PIPELIVE_ARM_POS");
+        const char *armEnv = std::getenv("EDGEVISOR_PIPELIVE_ARM_POS");
         if (armEnv != nullptr && armEnv[0] != '\0') pipeLiveArmPos = (NnUint)std::strtoul(armEnv, nullptr, 10);
     }
     if (pipeLivePatchEnabled) {
@@ -3168,9 +3168,9 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     }
 
     int envPpPos = -1;
-    if (this->ppMigrationEnabled && parseEnvInt("DLLAMA_PP_MIGRATION_POS", envPpPos) && envPpPos >= 0) {
+    if (this->ppMigrationEnabled && parseEnvInt("EDGEVISOR_PP_MIGRATION_POS", envPpPos) && envPpPos >= 0) {
         asyncKvCollectPos = envPpPos;
-        std::printf("🧭 [kv-migrate] armed by env DLLAMA_PP_MIGRATION_POS=%d\n", asyncKvCollectPos);
+        std::printf("🧭 [kv-migrate] armed by env EDGEVISOR_PP_MIGRATION_POS=%d\n", asyncKvCollectPos);
         std::fflush(stdout);
     }
 }
@@ -3657,7 +3657,7 @@ bool RootLlmInference::collectSourceStageKvTransfers(
         slot.sources += 1u;
         exported += 1u;
         rxBytes += (uint64_t)sizeof(LlmKvTransferHeader) + (uint64_t)kRow.size() * sizeof(float) + (uint64_t)vRow.size() * sizeof(float);
-        if (envFlagEnabledDefault("DLLAMA_MIGRATION_VERBOSE_LOG", false)) {
+        if (envFlagEnabledDefault("EDGEVISOR_MIGRATION_VERBOSE_LOG", false)) {
             std::printf("🧩 [kv-export-merge] sourceNode=%u layer=%u pos=%u kvDim=%u\n",
                 (unsigned)sourceNode,
                 (unsigned)layer,
@@ -4188,7 +4188,7 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
             }
             if (abh.magic == LLM_KV_ACK_MAGIC && abh.version == LLM_KV_ACK_VERSION) {
                 drainStrayKvAckRemainder(network, (NnUint)socketIndex);
-                std::printf("⚠️  [kv-migrate] discarded stray unbatched ack while waiting batch from node=%u; check all nodes use the same dllama binary\n",
+                std::printf("⚠️  [kv-migrate] discarded stray unbatched ack while waiting batch from node=%u; check all nodes use the same edgevisor binary\n",
                     (unsigned)ackNode);
                 std::fflush(stdout);
                 continue;
@@ -4298,7 +4298,7 @@ bool RootLlmInference::flushPendingKvTransfersControlOnly(uint64_t *targetTransf
                 ackPos = ack.position;
                 ackPosSet = true;
             }
-            if (envFlagEnabledDefault("DLLAMA_MIGRATION_VERBOSE_LOG", false)) {
+            if (envFlagEnabledDefault("EDGEVISOR_MIGRATION_VERBOSE_LOG", false)) {
                 std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
                     (unsigned)ack.layerIndex,
                     (unsigned)ack.position,
@@ -4361,7 +4361,7 @@ bool RootLlmInference::verifyPendingLayerSwitchPrecommit() {
     // binding write.  Unlike dropping the shared data-plane link, this
     // isolates the migration channel and leaves the old active pipeline
     // healthy, which is the precondition for rollback continuation.
-    e5MaybeFailMigrationPhaseOnce("DLLAMA_E5_FAIL_PRECOMMIT_ONCE", "precommit");
+    e5MaybeFailMigrationPhaseOnce("EDGEVISOR_E5_FAIL_PRECOMMIT_ONCE", "precommit");
     LlmControlPacket probe = controlPacket;
     probe.flags = LLM_CTRL_CONTROL_ONLY | LLM_CTRL_PRECOMMIT_PROBE;
     probe.batchSize = 1u;
@@ -4421,7 +4421,7 @@ bool RootLlmInference::explicitSwitchAckMatches() const {
 }
 
 void RootLlmInference::pollRevisedSwitchReconcile() {
-    if (!dllama::dynamic_tpot::algo2ForbidsFullKvFallback()) return;
+    if (!edgevisor::dynamic_tpot::algo2ForbidsFullKvFallback()) return;
     if (switchCommitInDoubt && explicitSwitchAckMatches()) {
         recordPpMigrationApplied();
         explicitCommitRecorded = true;
@@ -4481,7 +4481,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         std::lock_guard<std::mutex> lk(kvTransferMutex);
         if (pendingLayerSwitchLayers.empty()) return false;
         switchLayers = pendingLayerSwitchLayers;
-        if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !pendingStageBypass) {
+        if (edgevisor::dynamic_tpot::algo2ForbidsFullKvFallback() && !pendingStageBypass) {
             if (!explicitSwitchReplayPending) {
                 explicitSwitchTransaction += 1u;
                 if (explicitSwitchTransaction == 0u) explicitSwitchTransaction = 1u;
@@ -4507,7 +4507,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         // caller can still fall back to a real transfer.
         if (!installKv && executor != nullptr &&
                 areNodesInSameStageLocal(plan, 0u, nextStageRootNode)) {
-            const bool revisedBoundary = dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !pendingStageBypass;
+            const bool revisedBoundary = edgevisor::dynamic_tpot::algo2ForbidsFullKvFallback() && !pendingStageBypass;
             const NnUint coverPos = revisedBoundary ? explicitSwitchPosition : controlPacket.position;
             for (NnUint layer : switchLayers) {
                 if (!executor->shadowCovers(layer, layer + 1u, coverPos)) {
@@ -4609,7 +4609,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         switchPkt.reserved0 = carryStageBypass ? LLM_LAYER_SWITCH_STAGE_BYPASS : 0u;
         if (layer == ppStartBoundaryLayer) switchPkt.reserved0 |= ppStartFlag;
         if (installKv) switchPkt.reserved0 |= LLM_LAYER_SWITCH_INSTALL;
-        const bool explicitAck = dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !stageBypass;
+        const bool explicitAck = edgevisor::dynamic_tpot::algo2ForbidsFullKvFallback() && !stageBypass;
         if (explicitAck) switchPkt.reserved0 |= LLM_LAYER_SWITCH_EXPLICIT_ACK;
         switchPkt.reserved1 = carryStageBypass ? bypassEjectedStage : (explicitAck ? explicitSwitchTransaction : 0u);
         switchPkt.reserved2 = carryStageBypass ? bypassTargetStage : (explicitAck ? explicitSwitchPosition : 0u);
@@ -4621,7 +4621,7 @@ bool RootLlmInference::sendPendingLayerSwitchControlOnly(bool installKv) {
         layerSwitchControlWriteStarted = true;
     }
         layerSwitchControlWriteStarted = false;
-    if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback() && !stageBypass &&
+    if (edgevisor::dynamic_tpot::algo2ForbidsFullKvFallback() && !stageBypass &&
             (nextStageRootNode == 0u || areNodesInSameStageLocal(plan, 0u, nextStageRootNode))) {
         takeoverAcked = true;
         takeoverAck.magic = LLM_TAKEOVER_ACK_MAGIC;
@@ -5609,7 +5609,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
         const PlanCommand &pc = preSnap.cmd;
         const bool hasHeadPayload =
             (pc.cmdKind == PLAN_CMD_KIND_HEAD || pc.cmdKind == PLAN_CMD_KIND_BOTH) ||
-            (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u);
+            (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u);
         const bool shouldCache =
             getAllowNoShadowHeadMigration() &&
             isValidPlanCommandHeader(pc) &&
@@ -5681,7 +5681,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
             if (abh.magic != LLM_KV_ACK_BATCH_MAGIC || abh.version != LLM_KV_ACK_BATCH_VERSION) {
                 if (abh.magic == LLM_KV_ACK_MAGIC && abh.version == LLM_KV_ACK_VERSION) {
                     drainStrayKvAckRemainder(network, (NnUint)socketIndex);
-                    std::printf("⚠️  [kv-migrate] discarded stray unbatched ack on node=%u; check all nodes use the same dllama binary\n",
+                    std::printf("⚠️  [kv-migrate] discarded stray unbatched ack on node=%u; check all nodes use the same edgevisor binary\n",
                         (unsigned)ackNode);
                 } else {
                     std::printf("⚠️  [kv-migrate] unexpected ack-framed packet on node=%u (magic=0x%08x ver=%u), skip\n",
@@ -5711,7 +5711,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
                     ackPos = ack.position;
                     ackPosSet = true;
                 }
-            if (envFlagEnabledDefault("DLLAMA_MIGRATION_VERBOSE_LOG", false)) {
+            if (envFlagEnabledDefault("EDGEVISOR_MIGRATION_VERBOSE_LOG", false)) {
                 std::printf("🔁 [kv-migrate] ack received layer=%u pos=%u fromNode=%u\n",
                     (unsigned)ack.layerIndex,
                     (unsigned)ack.position,
@@ -5773,12 +5773,12 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
         const bool isNewPpCommand = (snap.cacheSeq != lastPpPlanCacheSeqApplied);
         const bool isStageBypassCmd =
             (pc.cmdKind == PLAN_CMD_KIND_STAGE_BYPASS) &&
-            (pc.version == DLLAMA_PLAN_CMD_VERSION_V2) &&
+            (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2) &&
             (pc.nMoves == 0u);
         const bool isPpMigrationCmd =
             (pc.cmdKind == 0u) &&
-            ((pc.version == DLLAMA_PLAN_CMD_VERSION_V1) ||
-             (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves == 0u));
+            ((pc.version == EDGEVISOR_PLAN_CMD_VERSION_V1) ||
+             (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves == 0u));
         if (isNewPpCommand && isValidPlanCommandHeader(pc) && pc.mode != PLAN_CMD_MODE_NONE && isStageBypassCmd) {
             if (waitingKvAck) {
                 std::printf("⚠️  [stage-bypass] defer command cacheSeq=%llu: waiting previous ack\n",
@@ -5858,7 +5858,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
 
             NnUint routeFromNode = migrationFromNodeIndex;
             NnUint routeToNode = nextStageRootNode;
-            if (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u) {
+            if (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u) {
                 routeFromNode = pc.moves[0].fromNodeIndex;
                 routeToNode = pc.moves[0].toNodeIndex;
                 if (pc.nMoves > 1u) {
@@ -6009,7 +6009,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
         const bool isNewHeadCommand = (snap.cacheSeq != lastHeadRecoveryPlanCacheSeqApplied);
         const bool hasHeadPayload =
             (pc.cmdKind == PLAN_CMD_KIND_HEAD || pc.cmdKind == PLAN_CMD_KIND_BOTH) ||
-            (pc.version == DLLAMA_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u);
+            (pc.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && pc.nMoves > 0u);
         if (isNewHeadCommand &&
             isValidPlanCommandHeader(pc) &&
             pc.mode != PLAN_CMD_MODE_NONE &&
@@ -6112,7 +6112,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
             const bool switched = sendPendingLayerSwitchControlOnly(false);
             const int targetSocket = (network != nullptr)
                 ? network->getSocketIndexForNode(nextStageRootNode, 0u) : -1;
-            const bool requireExplicitAck = dllama::dynamic_tpot::algo2ForbidsFullKvFallback();
+            const bool requireExplicitAck = edgevisor::dynamic_tpot::algo2ForbidsFullKvFallback();
             if (switched && targetSocket >= 0 && nextStageRootNode != 0u) {
                 // Legacy mode treats silence during this grace as acceptance.
                 // Revised mode does not: it leaves as soon as an explicit ACK
@@ -6164,13 +6164,13 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
                         protocolWaitMs);
                     std::fflush(stdout);
                 }
-            } else if (dllama::dynamic_tpot::algo2ForbidsFullKvFallback()) {
-                const char *catchupEnv = std::getenv("DLLAMA_ALGO2_ROLLBACK_CATCHUP");
+            } else if (edgevisor::dynamic_tpot::algo2ForbidsFullKvFallback()) {
+                const char *catchupEnv = std::getenv("EDGEVISOR_ALGO2_ROLLBACK_CATCHUP");
                 const int catchupLimit = (catchupEnv != nullptr && catchupEnv[0] != '\0')
                     ? std::atoi(catchupEnv) : 128;
                 const int cursor = takeoverRejectFilled == 0xFFFFFFFFu ? -1 : (int)takeoverRejectFilled;
                 bool gapKnown = false;
-                const unsigned gap = dllama::dynamic_tpot::exclusiveCursorGap(
+                const unsigned gap = edgevisor::dynamic_tpot::exclusiveCursorGap(
                     cursor, explicitSwitchPosition, &gapKnown);
                 bool caughtUp = false;
                 if (gapKnown && gap > 0u && (int)gap <= catchupLimit) {
@@ -6246,7 +6246,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
                 uint64_t sourceBytes = 0u;
                 e5PhaseHook("freeze_quiesce", endPos, migrationFromNodeIndex, nextStageRootNode,
                     migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
-                e5MaybeFailMigrationPhaseOnce("DLLAMA_E5_FAIL_FREEZE_ONCE", "freeze_quiesce");
+                e5MaybeFailMigrationPhaseOnce("EDGEVISOR_E5_FAIL_FREEZE_ONCE", "freeze_quiesce");
                 if (!weightResidencyPreallocated) {
                     sendWeightLoadRequest(migrationLayers);
                 }
@@ -6307,7 +6307,7 @@ void RootLlmInference::forward(bool collectProfile, bool deferProfileCollect) {
             uint64_t sourceBytes = 0u;
             e5PhaseHook("freeze_quiesce", endPos, migrationFromNodeIndex, nextStageRootNode,
                 migrationLayers.empty() ? 0xFFFFFFFFu : migrationLayers.back());
-            e5MaybeFailMigrationPhaseOnce("DLLAMA_E5_FAIL_FREEZE_ONCE", "freeze_quiesce");
+            e5MaybeFailMigrationPhaseOnce("EDGEVISOR_E5_FAIL_FREEZE_ONCE", "freeze_quiesce");
             const bool bgActive = (bgPrecopyEnabled && bgPrecopyPasses > 0u);
             const NnUint deltaStart = bgActive ? (bgCopiedPos + 1u) : 0u;
             const bool fullyCopied = bgActive && (bgCopiedPos >= endPos);
@@ -6521,7 +6521,7 @@ bool WorkerLlmInference::tryReadControlPacket() {
     if ((controlPacket.flags & LLM_CTRL_HAS_PLAN_CMD) != 0u) {
         PlanCommand cmd;
         network->read(ROOT_SOCKET_INDEX, &cmd, sizeof(cmd));
-        if (cmd.magic == DLLAMA_PLAN_CMD_MAGIC && (cmd.version == DLLAMA_PLAN_CMD_VERSION_V1 || cmd.version == DLLAMA_PLAN_CMD_VERSION_V2)) {
+        if (cmd.magic == EDGEVISOR_PLAN_CMD_MAGIC && (cmd.version == EDGEVISOR_PLAN_CMD_VERSION_V1 || cmd.version == EDGEVISOR_PLAN_CMD_VERSION_V2)) {
             // Avoid redundant stores when multiple forwards share the same seq.
             if (controlPacket.planCmdSeq != lastPlanCmdSeqRecv) {
                 planCommandCache().store(cmd);
@@ -6984,9 +6984,9 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     }
     const NnUint prevMs = (prev != (NnUint)-1 && prev < LLM_STAGE_SPEED_SLOTS) ? g_stageExecMs[prev] : 0u;
     const NnUint nextMs = (next != (NnUint)-1 && next < LLM_STAGE_SPEED_SLOTS) ? g_stageExecMs[next] : 0u;
-    // DLLAMA_TAKEOVER_PREV_WINS keeps the overlap on the previous stage. It is
+    // EDGEVISOR_TAKEOVER_PREV_WINS keeps the overlap on the previous stage. It is
     // the control for the speed split: same shadow, different cut.
-    const bool prevWins = std::getenv("DLLAMA_TAKEOVER_PREV_WINS") != nullptr;
+    const bool prevWins = std::getenv("EDGEVISOR_TAKEOVER_PREV_WINS") != nullptr;
     const ShadowTakeoverSplit split = bidirectionalShadowTakeover(
         dead.startLayer, dead.endLayer, prefix, suffix,
         prevWins ? 0u : prevMs, prevWins ? 0u : nextMs);
@@ -7235,10 +7235,10 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
     if (!args->enablePpMigration && !bubbleShadowKvEnabled()) return;
     if (args->runtimeRedundantBoundaryLayersExplicit) {
         std::printf("shadow-alloc: bypass reason=explicit-boundary-layers\n");
-        unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        unsetenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS");
         return;
     }
-    const char *pinned = std::getenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+    const char *pinned = std::getenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS");
     if (pinned != nullptr && pinned[0] != '\0') {
         std::printf("shadow-alloc: bypass reason=pinned-depths\n");
         g_autoBoundaryDepths = pinned;
@@ -7415,10 +7415,10 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
         : assignBoundaryOverlap(primary, caps, &bubbleCap, &weights, linkForAlloc, experimentCap);
     g_autoBoundaryDepths = formatBoundaryOverlap(overlaps);
     if (g_autoBoundaryDepths.empty()) {
-        unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+        unsetenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS");
         return;
     }
-    setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", g_autoBoundaryDepths.c_str(), 1);
+    setenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS", g_autoBoundaryDepths.c_str(), 1);
     args->boundaryDepthsStr = g_autoBoundaryDepths.c_str();
     if (useLink) {
         std::printf("shadow-link-policy: device_link_max is untested; a high link score does not mean extra copies reduce steady-state traffic\n");
@@ -7514,7 +7514,7 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
             record << "}\n";
         }
     }
-    if (std::getenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE") == nullptr) {
+    if (std::getenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE") == nullptr) {
         unsigned step = 1u;
         for (size_t i = 0u; i < overlaps.size(); ++i) {
             if (overlaps[i].leftHolds > step) step = overlaps[i].leftHolds;
@@ -7522,7 +7522,7 @@ static void installAutoBoundaryDepths(AppCliArgs *args, const NnUnevenPartitionP
         }
         if (step > 64u) step = 64u;
         const std::string stepText = std::to_string(step);
-        setenv("DLLAMA_TPOT_MAX_PP_LAYER_MOVE", stepText.c_str(), 1);
+        setenv("EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE", stepText.c_str(), 1);
     }
 }
 
@@ -7752,13 +7752,13 @@ static int profileBackendFor(AppCliArgs::Backend backend) {
 static void printSelectedDevice(const AppCliArgs *args) {
     std::printf("device: backend=%s threads=%u", AppCliArgs::backendToString(args->backend), (unsigned)args->nThreads);
     try {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         if (args->backend == AppCliArgs::BACKEND_CUDA) {
             const int index = args->gpuIndex < 0 ? 0 : args->gpuIndex;
             std::printf(" %s", nnCudaDeviceInfo((NnUint)index).c_str());
         }
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
         if (args->backend == AppCliArgs::BACKEND_VULKAN) {
             const int index = args->gpuIndex < 0 ? 0 : args->gpuIndex;
             std::printf(" %s", nnVulkanDeviceInfo((NnUint)index).c_str());
@@ -7773,7 +7773,7 @@ static void printSelectedDevice(const AppCliArgs *args) {
 
 static void resolveAutoBackend(AppCliArgs *args) {
     if (args->backend == AppCliArgs::BACKEND_AUTO) {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
         try {
             if (nnCudaDeviceCount() > 0) {
                 args->backend = AppCliArgs::BACKEND_CUDA;
@@ -7781,7 +7781,7 @@ static void resolveAutoBackend(AppCliArgs *args) {
             }
         } catch (const std::exception &) {}
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
         if (args->backend == AppCliArgs::BACKEND_AUTO) {
             try {
                 if (nnVulkanDeviceCount() > 0) {
@@ -7794,13 +7794,13 @@ static void resolveAutoBackend(AppCliArgs *args) {
         if (args->backend == AppCliArgs::BACKEND_AUTO)
             args->backend = AppCliArgs::BACKEND_CPU;
     }
-#if !defined(DLLAMA_VULKAN)
+#if !defined(EDGEVISOR_VULKAN)
     if (args->backend == AppCliArgs::BACKEND_VULKAN)
-        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with DLLAMA_VULKAN=1");
+        throw std::runtime_error("--backend vulkan requested, but this build was not compiled with EDGEVISOR_VULKAN=1");
 #endif
-#if !defined(DLLAMA_CUDA)
+#if !defined(EDGEVISOR_CUDA)
     if (args->backend == AppCliArgs::BACKEND_CUDA)
-        throw std::runtime_error("--backend cuda requested, but this build was not compiled with DLLAMA_CUDA=1");
+        throw std::runtime_error("--backend cuda requested, but this build was not compiled with EDGEVISOR_CUDA=1");
 #endif
     args->applyBackendThreadDefaults();
     publishProfileRuntime(profileBackendFor(args->backend), args->gpuIndex, args->nThreads);
@@ -7808,7 +7808,7 @@ static void resolveAutoBackend(AppCliArgs *args) {
 }
 
 void printAvailableDevices() {
-#if defined(DLLAMA_CUDA)
+#if defined(EDGEVISOR_CUDA)
     try {
         const int count = nnCudaDeviceCount();
         if (count <= 0) std::printf("CUDA: none\n");
@@ -7820,7 +7820,7 @@ void printAvailableDevices() {
 #else
     std::printf("CUDA: not compiled\n");
 #endif
-#if defined(DLLAMA_VULKAN)
+#if defined(EDGEVISOR_VULKAN)
     try {
         const int count = nnVulkanDeviceCount();
         const int preferred = count > 0 ? nnVulkanPreferredDeviceIndex() : -1;
@@ -7950,9 +7950,9 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     setNnPpFailoverHook(failoverBypassDeadNode);
     applyProcessMemoryLimit(args->memoryLimitBytes);
     if (args != nullptr && args->ioProfileLogPath != nullptr && args->ioProfileLogPath[0] != '\0') {
-        dllamaIoProbeConfigure(args->ioProfileLogPath);
+        edgevisorIoProbeConfigure(args->ioProfileLogPath);
     } else {
-        dllamaIoProbeConfigureFromEnv();
+        edgevisorIoProbeConfigureFromEnv();
     }
     NnUint nNodes = args->nWorkers + 1;
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
@@ -8128,7 +8128,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
 
     const bool dynamicTpotEnabled = args->enableDynamicTpot;
     const bool profileEnabled = args->benchmark || dynamicTpotEnabled;
-    const bool layerProfileEnabled = profileEnabled && envFlagEnabledDefault("DLLAMA_LAYER_PROF_ENABLE", false);
+    const bool layerProfileEnabled = profileEnabled && envFlagEnabledDefault("EDGEVISOR_LAYER_PROF_ENABLE", false);
 
     if (nNodes == 1) {
         synchronizer.reset(new NnFakeNodeSynchronizer());
@@ -8174,7 +8174,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
         loadLlmNetWeight(args->modelPath, &net, &weightLoader);
     }
 
-    dllamaIoProbeSetNode(0u, getStageIndexForNode(planPtr.get(), 0u));
+    edgevisorIoProbeSetNode(0u, getStageIndexForNode(planPtr.get(), 0u));
 
     RootLlmInference inference(&net, &execution, &executor, network, planPtr.get(), profileEnabled, args->enablePpMigration);
 
@@ -8183,11 +8183,11 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
 
     // enablePlanBarrier was already applied before net construction.
 
-    // Step 4: external controller (UDS). Enabled by --plan-ctrl-socket or DLLAMA_PLAN_CTRL_SOCKET.
+    // Step 4: external controller (UDS). Enabled by --plan-ctrl-socket or EDGEVISOR_PLAN_CTRL_SOCKET.
     std::unique_ptr<PlanUdsController> planCtrl;
     const char *planSock = args->planCtrlSocketPath;
     if (planSock == nullptr || planSock[0] == '\0') {
-        planSock = std::getenv("DLLAMA_PLAN_CTRL_SOCKET");
+        planSock = std::getenv("EDGEVISOR_PLAN_CTRL_SOCKET");
     }
     if (planSock != nullptr && planSock[0] != '\0') {
         planCtrl = PlanUdsController::start(std::string(planSock), &inference);
@@ -8268,7 +8268,7 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     g_joinNet = nullptr;
 
     inference.finish();
-    dllamaIoProbeFlush("root-inference");
+    edgevisorIoProbeFlush("root-inference");
 }
 
 static void writeJoinPacket(NnNetwork *network, NnUint socketIndex, const LlmDeviceJoinPacket &pkt) {
@@ -8742,7 +8742,7 @@ void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
     if (g_dropped.rejoinPhase == REJOIN_PROBE) {
         // The 200 ms connect probe used to run on every token. Once per stride
         // is enough to notice the device is back; the decode loop stays clear.
-        if (!offlineProbeDue(position, envUnsignedOr("DLLAMA_REJOIN_PROBE_STRIDE", kRejoinProbeStride))) return;
+        if (!offlineProbeDue(position, envUnsignedOr("EDGEVISOR_REJOIN_PROBE_STRIDE", kRejoinProbeStride))) return;
         if (!probeWorkerReachable(host, port, 200)) return;
         // The probe is a real TCP accept. Give the worker time to listen again.
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -8843,8 +8843,8 @@ void maybeRejoinDroppedDevice(AppInferenceContext *context, NnUint position) {
 
     if (g_dropped.rejoinPhase != REJOIN_CATCHUP) return;
 
-    const unsigned threshold = envUnsignedOr("DLLAMA_REJOIN_CATCHUP_TOKENS", kRejoinCatchupTokens);
-    const unsigned chunk = envUnsignedOr("DLLAMA_REJOIN_CATCHUP_CHUNK", kRejoinCatchupChunk);
+    const unsigned threshold = envUnsignedOr("EDGEVISOR_REJOIN_CATCHUP_TOKENS", kRejoinCatchupTokens);
+    const unsigned chunk = envUnsignedOr("EDGEVISOR_REJOIN_CATCHUP_CHUNK", kRejoinCatchupChunk);
     const RejoinCatchupStep step = planRejoinCatchup(
         g_dropped.kvFilledThrough, position, threshold, chunk);
     try {
@@ -9041,10 +9041,10 @@ void runWorkerApp(AppCliArgs *args) {
         std::string bootBoundaryDepths;
         LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios, bootPrimarySkipLayers, bootKvRedundancy, bootIoProfileLogPath, bootBoundaryDepths);
         if (!bootIoProfileLogPath.empty()) {
-            setenv("DLLAMA_IO_PROFILE_LOG", bootIoProfileLogPath.c_str(), 1);
-            dllamaIoProbeConfigure(bootIoProfileLogPath.c_str());
+            setenv("EDGEVISOR_IO_PROFILE_LOG", bootIoProfileLogPath.c_str(), 1);
+            edgevisorIoProbeConfigure(bootIoProfileLogPath.c_str());
         } else {
-            dllamaIoProbeConfigureFromEnv();
+            edgevisorIoProbeConfigureFromEnv();
         }
 
         const bool hasBootModel = !bootModelPath.empty();
@@ -9068,22 +9068,22 @@ void runWorkerApp(AppCliArgs *args) {
         const bool bootBubbleShadowKvEnabled = ((boot.flags & LLM_BOOTSTRAP_ENABLE_BUBBLE_SHADOW_KV) != 0u) || boot.bubbleShadowKvEnabled != 0u;
         const bool bootLastStageSamplingEnabled = (boot.flags & LLM_BOOTSTRAP_LAST_STAGE_SAMPLING) != 0u;
         if (bootBubbleShadowKvEnabled) {
-            setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
+            setenv("EDGEVISOR_BUBBLE_SHADOW_KV", "1", 1);
             setenv(
-                "DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD",
+                "EDGEVISOR_BUBBLE_SHADOW_KV_DURING_FORWARD",
                 (boot.flags & LLM_BOOTSTRAP_BUBBLE_SHADOW_KV_DURING_FORWARD) != 0u ? "1" : "0",
                 1);
             // Legacy async settings are accepted but do not launch background work.
-            setenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", "0", 1);
+            setenv("EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC", "0", 1);
         } else {
-            unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
-            unsetenv("DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD");
-            unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+            unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV");
+            unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV_DURING_FORWARD");
+            unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC");
         }
         if (bootLastStageSamplingEnabled) {
-            setenv("DLLAMA_LAST_STAGE_SAMPLING", "1", 1);
+            setenv("EDGEVISOR_LAST_STAGE_SAMPLING", "1", 1);
         } else {
-            unsetenv("DLLAMA_LAST_STAGE_SAMPLING");
+            unsetenv("EDGEVISOR_LAST_STAGE_SAMPLING");
         }
 
         const NnUint previousThreads = args->nThreads;
@@ -9107,9 +9107,9 @@ void runWorkerApp(AppCliArgs *args) {
             bootRuntimeRedundantSegEnabled && !bubbleShadowKvEnabled(),
             bootPrimarySkipLayers.c_str());
         if (!bootBoundaryDepths.empty()) {
-            setenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS", bootBoundaryDepths.c_str(), 1);
+            setenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS", bootBoundaryDepths.c_str(), 1);
         } else {
-            unsetenv("DLLAMA_REDUNDANT_BOUNDARY_DEPTHS");
+            unsetenv("EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS");
         }
 
         NnWorkerConfigReader configReader(network);
@@ -9157,14 +9157,14 @@ void runWorkerApp(AppCliArgs *args) {
              }
         }
 
-        dllamaIoProbeSetNode(nodeConfig.nodeIndex, getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex));
+        edgevisorIoProbeSetNode(nodeConfig.nodeIndex, getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex));
 
         autoTuneThreads(args, planPtr.get(), nodeConfig.nodeIndex, netConfig.nNodes);
         NnNetExecution execution(args->nThreads, &netConfig);
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
         // Initialize Synchronizer with Plan
-        const bool layerProfileEnabled = bootBenchmarkEnabled && envFlagEnabledDefault("DLLAMA_LAYER_PROF_ENABLE", false);
+        const bool layerProfileEnabled = bootBenchmarkEnabled && envFlagEnabledDefault("EDGEVISOR_LAYER_PROF_ENABLE", false);
         NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get(), layerProfileEnabled);
         
         // Benchmark flag is provided by root to keep all nodes consistent.
@@ -9709,7 +9709,7 @@ void runWorkerApp(AppCliArgs *args) {
                 break;
             }
         }
-        dllamaIoProbeFlush("worker-session");
+        edgevisorIoProbeFlush("worker-session");
         } catch (const std::exception &e) {
             std::printf("🚨 Worker session ended: %s\n", e.what());
             std::fflush(stdout);

@@ -12,15 +12,15 @@
 #include "nn-core.hpp"
 
 // Compile-time gate for heavy attention / slicing debug logging.
-// Default is OFF; enable by building with: -DDLLAMA_DEBUG_ATTN=1
-#ifndef DLLAMA_DEBUG_ATTN
-#define DLLAMA_DEBUG_ATTN 0
+// Default is OFF; enable by building with: -DEDGEVISOR_DEBUG_ATTN=1
+#ifndef EDGEVISOR_DEBUG_ATTN
+#define EDGEVISOR_DEBUG_ATTN 0
 #endif
 
 // Online plan changes / migration logging.
-// Default is OFF; enable by building with: -DDLLAMA_DEBUG_ONLINE_CHANGE=1
-#ifndef DLLAMA_DEBUG_ONLINE_CHANGE
-#define DLLAMA_DEBUG_ONLINE_CHANGE 0
+// Default is OFF; enable by building with: -DEDGEVISOR_DEBUG_ONLINE_CHANGE=1
+#ifndef EDGEVISOR_DEBUG_ONLINE_CHANGE
+#define EDGEVISOR_DEBUG_ONLINE_CHANGE 0
 #endif
 
 // ======================================================================================

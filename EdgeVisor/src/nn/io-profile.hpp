@@ -1,32 +1,32 @@
-#ifndef DLLAMA_IO_PROFILE_HPP
-#define DLLAMA_IO_PROFILE_HPP
+#ifndef EDGEVISOR_IO_PROFILE_HPP
+#define EDGEVISOR_IO_PROFILE_HPP
 
 #include <cstdint>
 
-enum DllamaIoProbeDirection {
-    DLLAMA_IO_PROBE_H2D = 0,
-    DLLAMA_IO_PROBE_D2H = 1,
+enum EdgeVisorIoProbeDirection {
+    EDGEVISOR_IO_PROBE_H2D = 0,
+    EDGEVISOR_IO_PROBE_D2H = 1,
 };
 
-void dllamaIoProbeConfigure(const char *logPath);
-void dllamaIoProbeConfigureFromEnv();
-void dllamaIoProbeSetNode(unsigned int nodeIndex, unsigned int stageIndex);
-bool dllamaIoProbeEnabled();
-std::uint64_t dllamaIoProbeNowUs();
-void dllamaIoProbeFlush(const char *reason);
+void edgevisorIoProbeConfigure(const char *logPath);
+void edgevisorIoProbeConfigureFromEnv();
+void edgevisorIoProbeSetNode(unsigned int nodeIndex, unsigned int stageIndex);
+bool edgevisorIoProbeEnabled();
+std::uint64_t edgevisorIoProbeNowUs();
+void edgevisorIoProbeFlush(const char *reason);
 
-void dllamaIoProbeRecordNetWriteWall(std::uint64_t elapsedUs);
-void dllamaIoProbeRecordNetReadWall(std::uint64_t elapsedUs);
-void dllamaIoProbeRecordNetSendSyscall(std::uint64_t elapsedUs, std::uint64_t bytes);
-void dllamaIoProbeRecordNetRecvSyscall(std::uint64_t elapsedUs, std::uint64_t bytes);
-void dllamaIoProbeRecordNetSendEagain();
-void dllamaIoProbeRecordNetRecvEagain();
+void edgevisorIoProbeRecordNetWriteWall(std::uint64_t elapsedUs);
+void edgevisorIoProbeRecordNetReadWall(std::uint64_t elapsedUs);
+void edgevisorIoProbeRecordNetSendSyscall(std::uint64_t elapsedUs, std::uint64_t bytes);
+void edgevisorIoProbeRecordNetRecvSyscall(std::uint64_t elapsedUs, std::uint64_t bytes);
+void edgevisorIoProbeRecordNetSendEagain();
+void edgevisorIoProbeRecordNetRecvEagain();
 
-void dllamaIoProbeRecordHostMemcpy(DllamaIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes);
-void dllamaIoProbeRecordVulkanFlush(std::uint64_t elapsedUs, std::uint64_t bytes);
-void dllamaIoProbeRecordVulkanInvalidate(std::uint64_t elapsedUs, std::uint64_t bytes);
-void dllamaIoProbeRecordVulkanCopyCommand(DllamaIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes);
-void dllamaIoProbeRecordCudaMemcpyAsync(DllamaIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes);
-void dllamaIoProbeRecordCudaStreamSync(DllamaIoProbeDirection direction, std::uint64_t elapsedUs);
+void edgevisorIoProbeRecordHostMemcpy(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes);
+void edgevisorIoProbeRecordVulkanFlush(std::uint64_t elapsedUs, std::uint64_t bytes);
+void edgevisorIoProbeRecordVulkanInvalidate(std::uint64_t elapsedUs, std::uint64_t bytes);
+void edgevisorIoProbeRecordVulkanCopyCommand(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes);
+void edgevisorIoProbeRecordCudaMemcpyAsync(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs, std::uint64_t bytes);
+void edgevisorIoProbeRecordCudaStreamSync(EdgeVisorIoProbeDirection direction, std::uint64_t elapsedUs);
 
 #endif

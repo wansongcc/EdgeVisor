@@ -19,30 +19,30 @@ from typing import Any, Dict, Iterable, List, Optional
 ROOT = Path(os.environ.get("B01_ROOT", "/home/byh/B01"))
 EDGE_PROJECT = Path(os.environ.get("EDGE_PROJECT", str(ROOT / "EdgeVisor")))
 EDGE_ENGINE = Path(os.environ.get("EDGE_ENGINE", str(EDGE_PROJECT / "EdgeVisor")))
-EDGE_DLLAMA = Path(os.environ.get("EDGE_DLLAMA", str(EDGE_ENGINE / "dllama")))
-EDGE_DLLAMA_API = Path(os.environ.get("EDGE_DLLAMA_API", str(EDGE_ENGINE / "dllama-api")))
-EDGE_MODEL = Path(os.environ.get("EDGE_MODEL", str(ROOT / "models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m")))
-EDGE_TOKENIZER = Path(os.environ.get("EDGE_TOKENIZER", str(ROOT / "models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t")))
+EDGE_EDGEVISOR = Path(os.environ.get("EDGE_EDGEVISOR", str(EDGE_ENGINE / "edgevisor")))
+EDGE_EDGEVISOR_API = Path(os.environ.get("EDGE_EDGEVISOR_API", str(EDGE_ENGINE / "edgevisor-api")))
+EDGE_MODEL = Path(os.environ.get("EDGE_MODEL", str(ROOT / "models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m")))
+EDGE_TOKENIZER = Path(os.environ.get("EDGE_TOKENIZER", str(ROOT / "models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t")))
 
 EDGE_EXO_PROJECT = ROOT / "EdgeVisor-EXO"
 EDGE_EXO_ENGINE = EDGE_EXO_PROJECT / "EdgeVisor"
-EDGE_EXO_DLLAMA = EDGE_EXO_ENGINE / "dllama"
+EDGE_EXO_EDGEVISOR = EDGE_EXO_ENGINE / "edgevisor"
 EDGE_EXO_PLAN = EDGE_EXO_ENGINE / "src/edgevisor_exo_plan.py"
 EDGE_EXO_MODEL = EDGE_MODEL
 EDGE_EXO_TOKENIZER = EDGE_TOKENIZER
 
 EDGE_LL_PROJECT = ROOT / "EdgeVisor-LinguaLinked"
 EDGE_LL_ENGINE = EDGE_LL_PROJECT / "EdgeVisor"
-EDGE_LL_DLLAMA = EDGE_LL_ENGINE / "dllama"
+EDGE_LL_EDGEVISOR = EDGE_LL_ENGINE / "edgevisor"
 EDGE_LL_PLAN = EDGE_LL_ENGINE / "src/lingualinked_plan.py"
 EDGE_LL_MODEL = EDGE_MODEL
 EDGE_LL_TOKENIZER = EDGE_TOKENIZER
 
-DLLAMA_PROJECT = ROOT / "distributed-llama"
-DLLAMA_ENGINE = DLLAMA_PROJECT
-DLLAMA_CLI = DLLAMA_ENGINE / "dllama"
-DLLAMA_MODEL = EDGE_MODEL
-DLLAMA_TOKENIZER = EDGE_TOKENIZER
+EDGEVISOR_PROJECT = ROOT / "distributed-llama"
+EDGEVISOR_ENGINE = EDGEVISOR_PROJECT
+EDGEVISOR_CLI = EDGEVISOR_ENGINE / "edgevisor"
+EDGEVISOR_MODEL = EDGE_MODEL
+EDGEVISOR_TOKENIZER = EDGE_TOKENIZER
 
 PRIMA_DIR = ROOT / "prima_cpp_work/prima.cpp"
 PRIMA_CLI = PRIMA_DIR / "llama-cli"
@@ -570,8 +570,8 @@ class EdgeVisorBackend(Backend):
         backend_name: Optional[str] = None,
         project_dir: Path = EDGE_PROJECT,
         engine_dir: Path = EDGE_ENGINE,
-        dllama_path: Path = EDGE_DLLAMA,
-        api_path: Path = EDGE_DLLAMA_API,
+        edgevisor_path: Path = EDGE_EDGEVISOR,
+        api_path: Path = EDGE_EDGEVISOR_API,
         model_path: Path = EDGE_MODEL,
         tokenizer_path: Path = EDGE_TOKENIZER,
         vulkan_project: Optional[Path] = None,
@@ -583,7 +583,7 @@ class EdgeVisorBackend(Backend):
         ablation_config: Optional[Dict[str, Any]] = None,
         virtual_topology: Optional[Dict[str, Any]] = None,
     ):
-        ensure_paths([dllama_path, model_path, tokenizer_path])
+        ensure_paths([edgevisor_path, model_path, tokenizer_path])
         if backend_name:
             self.name = backend_name
         self.cuda_visible = cuda_visible
@@ -594,7 +594,7 @@ class EdgeVisorBackend(Backend):
         self.worker_gpus = worker_gpus if worker_gpus is not None else [1]
         self.project_dir = project_dir
         self.engine_dir = engine_dir
-        self.dllama_path = dllama_path
+        self.edgevisor_path = edgevisor_path
         self.api_path = api_path
         self.model_path = model_path
         self.tokenizer_path = tokenizer_path
@@ -959,8 +959,8 @@ class EdgeVisorBackend(Backend):
         socket_path = None
         if dynamic_plan and dynamic_plan.get("enabled", True):
             socket_path = str(dynamic_plan.get("socket_path") or f"/tmp/edgevisor_agent_{os.getpid()}_{port_base}.sock")
-            env["DLLAMA_PLAN_CTRL_SOCKET"] = socket_path
-            env["DLLAMA_ENABLE_PLAN_BARRIER"] = "1"
+            env["EDGEVISOR_PLAN_CTRL_SOCKET"] = socket_path
+            env["EDGEVISOR_ENABLE_PLAN_BARRIER"] = "1"
             try:
                 os.unlink(socket_path)
             except FileNotFoundError:
@@ -978,7 +978,7 @@ class EdgeVisorBackend(Backend):
             launch_stagger_s = float(self.virtual_topology.get("launch_stagger_s", 0.0)) if self.virtual_topology else 0.0
             for idx, gpu in enumerate(self.worker_gpus):
                 worker_cmd = [
-                    str(self.dllama_path),
+                    str(self.edgevisor_path),
                     "worker",
                     "--port",
                     str(worker_actual_ports[idx]),
@@ -994,7 +994,7 @@ class EdgeVisorBackend(Backend):
                 time.sleep(3.0)
 
             root_cmd = [
-                str(self.dllama_path),
+                str(self.edgevisor_path),
                 "inference",
                 "--prompt",
                 prompt,
@@ -1338,8 +1338,8 @@ class EdgeVisorBackend(Backend):
         return events
 
 
-class DllamaBackend(EdgeVisorBackend):
-    name = "dllama"
+class EdgeVisorBackend(EdgeVisorBackend):
+    name = "edgevisor"
 
     def __init__(
         self,
@@ -1363,12 +1363,12 @@ class DllamaBackend(EdgeVisorBackend):
             ratios="",
             worker_gpus=worker_gpus if worker_gpus is not None else [1],
             backend_name=self.name,
-            project_dir=DLLAMA_PROJECT,
-            engine_dir=DLLAMA_ENGINE,
-            dllama_path=DLLAMA_CLI,
-            model_path=DLLAMA_MODEL,
-            tokenizer_path=DLLAMA_TOKENIZER,
-            vulkan_project=DLLAMA_PROJECT,
+            project_dir=EDGEVISOR_PROJECT,
+            engine_dir=EDGEVISOR_ENGINE,
+            edgevisor_path=EDGEVISOR_CLI,
+            model_path=EDGEVISOR_MODEL,
+            tokenizer_path=EDGEVISOR_TOKENIZER,
+            vulkan_project=EDGEVISOR_PROJECT,
             root_gpu=root_gpu,
             enable_benchmark=False,
         )
@@ -1397,7 +1397,7 @@ class EdgeVisorExoBackend(EdgeVisorBackend):
         total_layers: int = 28,
         memory_field: str = "total",
     ):
-        ensure_paths([EDGE_EXO_DLLAMA, EDGE_EXO_MODEL, EDGE_EXO_TOKENIZER, EDGE_EXO_PLAN])
+        ensure_paths([EDGE_EXO_EDGEVISOR, EDGE_EXO_MODEL, EDGE_EXO_TOKENIZER, EDGE_EXO_PLAN])
         self.gpu_indices = gpu_indices if gpu_indices is not None else [0, 1, 2]
         if not self.gpu_indices:
             raise BackendError("edgevisor_exo requires at least one GPU index")
@@ -1414,7 +1414,7 @@ class EdgeVisorExoBackend(EdgeVisorBackend):
             backend_name=self.name,
             project_dir=EDGE_EXO_PROJECT,
             engine_dir=EDGE_EXO_ENGINE,
-            dllama_path=EDGE_EXO_DLLAMA,
+            edgevisor_path=EDGE_EXO_EDGEVISOR,
             model_path=EDGE_EXO_MODEL,
             tokenizer_path=EDGE_EXO_TOKENIZER,
             vulkan_project=EDGE_EXO_PROJECT,
@@ -1466,7 +1466,7 @@ class EdgeVisorLinguaLinkedBackend(EdgeVisorBackend):
         overlap_layers: int = 2,
         memory_field: str = "total",
     ):
-        ensure_paths([EDGE_LL_DLLAMA, EDGE_LL_MODEL, EDGE_LL_TOKENIZER, EDGE_LL_PLAN])
+        ensure_paths([EDGE_LL_EDGEVISOR, EDGE_LL_MODEL, EDGE_LL_TOKENIZER, EDGE_LL_PLAN])
         self.gpu_indices = gpu_indices if gpu_indices is not None else [0, 1, 2]
         if not self.gpu_indices:
             raise BackendError("edgevisor_lingualinked requires at least one GPU index")
@@ -1486,7 +1486,7 @@ class EdgeVisorLinguaLinkedBackend(EdgeVisorBackend):
             backend_name=self.name,
             project_dir=EDGE_LL_PROJECT,
             engine_dir=EDGE_LL_ENGINE,
-            dllama_path=EDGE_LL_DLLAMA,
+            edgevisor_path=EDGE_LL_EDGEVISOR,
             model_path=EDGE_LL_MODEL,
             tokenizer_path=EDGE_LL_TOKENIZER,
             vulkan_project=EDGE_LL_PROJECT,
@@ -1504,8 +1504,8 @@ class EdgeVisorLinguaLinkedBackend(EdgeVisorBackend):
                 "0",
             ],
             extra_env={
-                "DLLAMA_LINGUALINKED_MODE": "1",
-                "DLLAMA_RUNTIME_PLAN_PRINT": "1",
+                "EDGEVISOR_LINGUALINKED_MODE": "1",
+                "EDGEVISOR_RUNTIME_PLAN_PRINT": "1",
             },
         )
         self.last_plan = self.current_plan
@@ -1750,7 +1750,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
     def _start_persistent_session(self, out_dir: Path) -> None:
         if self._persistent_started:
             return
-        ensure_paths([self.api_path, self.dllama_path, self.model_path, self.tokenizer_path])
+        ensure_paths([self.api_path, self.edgevisor_path, self.model_path, self.tokenizer_path])
         out_dir.mkdir(parents=True, exist_ok=True)
         self.api_port = self._choose_api_port()
         port_base = self._choose_port_base()
@@ -1770,11 +1770,11 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
         self._persistent_log_offsets = {name: 0 for name in self._persistent_logs}
 
         env = self._persistent_env()
-        env["DLLAMA_PLAN_CTRL_SOCKET"] = socket_path
-        env["DLLAMA_ENABLE_PLAN_BARRIER"] = "1"
+        env["EDGEVISOR_PLAN_CTRL_SOCKET"] = socket_path
+        env["EDGEVISOR_ENABLE_PLAN_BARRIER"] = "1"
         layer_prof_path = out_dir / "persistent_layer_prof_stage0_root0.bin"
-        env["DLLAMA_LAYER_PROF_PATH"] = str(layer_prof_path)
-        env["DLLAMA_DYN_LAYER_PROF_PATH"] = str(layer_prof_path)
+        env["EDGEVISOR_LAYER_PROF_PATH"] = str(layer_prof_path)
+        env["EDGEVISOR_DYN_LAYER_PROF_PATH"] = str(layer_prof_path)
 
         procs: List[subprocess.Popen[Any]] = []
         worker_cmds: List[List[str]] = []
@@ -1782,7 +1782,7 @@ class EdgeVisorAblationBackend(EdgeVisorBackend):
             launch_stagger_s = float(self.virtual_topology.get("launch_stagger_s", 0.0)) if self.virtual_topology else 0.0
             for idx, gpu in enumerate(self.worker_gpus):
                 worker_cmd = [
-                    str(self.dllama_path),
+                    str(self.edgevisor_path),
                     "worker",
                     "--port",
                     str(worker_ports[idx]),
@@ -1993,8 +1993,8 @@ def make_backend(name: str, **kwargs: Any) -> Backend:
         return PrimaBackend(**kwargs)
     if name == "edgevisor":
         return EdgeVisorBackend(**kwargs)
-    if name == "dllama":
-        return DllamaBackend(**kwargs)
+    if name == "edgevisor":
+        return EdgeVisorBackend(**kwargs)
     if name == "edgevisor_exo":
         return EdgeVisorExoBackend(**kwargs)
     if name == "edgevisor_lingualinked":

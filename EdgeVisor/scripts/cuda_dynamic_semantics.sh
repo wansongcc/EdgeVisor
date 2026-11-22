@@ -15,7 +15,7 @@ STEPS=${EDGEVISOR_STEPS:-64}
 MAX_SEQ_LEN=${EDGEVISOR_MAX_SEQ_LEN:-2048}
 NTHREADS=${EDGEVISOR_NTHREADS:-2}
 BUFFER_FLOAT_TYPE=${EDGEVISOR_BUFFER_FLOAT_TYPE:-q80}
-PLAN_SOCKET=${EDGEVISOR_PLAN_SOCKET:-"$LOG_DIR/dllama_plan.sock"}
+PLAN_SOCKET=${EDGEVISOR_PLAN_SOCKET:-"$LOG_DIR/edgevisor_plan.sock"}
 DYNAMIC_RATIOS=${EDGEVISOR_DYNAMIC_RATIOS:-"1:1"}
 
 mkdir -p "$LOG_DIR"
@@ -34,9 +34,9 @@ run_logged() {
 
 run_logged 00_clean make clean
 if [ -n "${CUDA_ARCHS:-}" ]; then
-    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" DLLAMA_CUDA=1 CUDA_ARCHS="$CUDA_ARCHS" dllama nn-cuda-test
+    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" EDGEVISOR_CUDA=1 CUDA_ARCHS="$CUDA_ARCHS" edgevisor nn-cuda-test
 else
-    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" DLLAMA_CUDA=1 dllama nn-cuda-test
+    run_logged 01_build make -j"${EDGEVISOR_MAKE_JOBS:-4}" EDGEVISOR_CUDA=1 edgevisor nn-cuda-test
 fi
 run_logged 02_nn_cuda_test_pr11_pr12 ./nn-cuda-test --gpu-index "$GPU_INDEX"
 
@@ -46,14 +46,14 @@ if [ "${EDGEVISOR_RUN_L5:-0}" = "1" ]; then
         exit 0
     fi
 
-    export DLLAMA_PLAN_CTRL_SOCKET="$PLAN_SOCKET"
-    export DLLAMA_BUBBLE_SHADOW_KV="${DLLAMA_BUBBLE_SHADOW_KV:-1}"
-    export DLLAMA_BUBBLE_SHADOW_KV_LOG="${DLLAMA_BUBBLE_SHADOW_KV_LOG:-1}"
+    export EDGEVISOR_PLAN_CTRL_SOCKET="$PLAN_SOCKET"
+    export EDGEVISOR_BUBBLE_SHADOW_KV="${EDGEVISOR_BUBBLE_SHADOW_KV:-1}"
+    export EDGEVISOR_BUBBLE_SHADOW_KV_LOG="${EDGEVISOR_BUBBLE_SHADOW_KV_LOG:-1}"
 
     # EDGEVISOR_WORKERS is intentionally expanded into multiple host:port arguments.
     # shellcheck disable=SC2086
     run_logged 03_l5_dynamic_head_ffn_pp_bubble \
-        ./dllama inference \
+        ./edgevisor inference \
         --backend cuda \
         --gpu-index "$GPU_INDEX" \
         --model "$EDGEVISOR_MODEL3" \

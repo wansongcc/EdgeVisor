@@ -80,7 +80,7 @@ static bool readFullFd(int fd, void *buf, size_t len) {
 
 static std::string defaultLayerPerfPath(uint32_t stageIndex, uint32_t rootNodeIndex) {
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "/tmp/dllama_layer_prof_stage%u_root%u.bin", (unsigned)stageIndex, (unsigned)rootNodeIndex);
+    std::snprintf(buf, sizeof(buf), "/tmp/edgevisor_layer_prof_stage%u_root%u.bin", (unsigned)stageIndex, (unsigned)rootNodeIndex);
     return std::string(buf);
 }
 
@@ -96,7 +96,7 @@ static json readLayerPerfSnapshotJson(const json &req) {
         path = req.value("path", "");
     }
     if (path.empty()) {
-        const char *env = std::getenv("DLLAMA_LAYER_PROF_PATH");
+        const char *env = std::getenv("EDGEVISOR_LAYER_PROF_PATH");
         if (env != nullptr && env[0] != '\0') path = std::string(env);
     }
     if (path.empty()) {
@@ -325,10 +325,10 @@ static json cmdToJson(const PlanCommand &c) {
         {"reserved0", c.reserved0}
     };
 
-    if (c.version == DLLAMA_PLAN_CMD_VERSION_V2 && c.nMoves != 0u) {
+    if (c.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && c.nMoves != 0u) {
         json arr = json::array();
         const uint32_t n = c.nMoves;
-        for (uint32_t i = 0; i < n && i < DLLAMA_PLAN_CMD_MAX_MOVES; ++i) {
+        for (uint32_t i = 0; i < n && i < EDGEVISOR_PLAN_CMD_MAX_MOVES; ++i) {
             const PlanMove &m = c.moves[i];
             arr.push_back(json{
                 {"fromNodeIndex", m.fromNodeIndex},
@@ -352,8 +352,8 @@ static bool parseMode(const std::string &s, uint32_t &out) {
 
 PlanCommand decodePpMigrationCommand(const json &jcmd) {
     PlanCommand cmd = makeEmptyPlanCommand();
-    cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
-    cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+    cmd.magic = EDGEVISOR_PLAN_CMD_MAGIC;
+    cmd.version = EDGEVISOR_PLAN_CMD_VERSION_V2;
     cmd.seq = parseU32(jcmd, "seq", 0u);
 
     const std::string modeStr = jcmd.value("mode", "");
@@ -450,8 +450,8 @@ static void populateAblationPlanEvent(
 }
 
 static bool planCommandHasHeadMove(const PlanCommand &cmd) {
-    if (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves > 0u) {
-        for (uint32_t i = 0; i < cmd.nMoves && i < DLLAMA_PLAN_CMD_MAX_MOVES; ++i) {
+    if (cmd.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && cmd.nMoves > 0u) {
+        for (uint32_t i = 0; i < cmd.nMoves && i < EDGEVISOR_PLAN_CMD_MAX_MOVES; ++i) {
             if (cmd.moves[i].headMove > 0u) return true;
         }
         return false;
@@ -698,8 +698,8 @@ void PlanUdsController::run() {
                 const json &jcmd = req.at("cmd");
 
                 PlanCommand cmd = makeEmptyPlanCommand();
-                cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
-                cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+                cmd.magic = EDGEVISOR_PLAN_CMD_MAGIC;
+                cmd.version = EDGEVISOR_PLAN_CMD_VERSION_V2;
                 cmd.seq = parseU32(jcmd, "seq", 0u);
 
                 const std::string modeStr = jcmd.value("mode", "");
@@ -736,8 +736,8 @@ void PlanUdsController::run() {
                         throw std::runtime_error("moves must be an array");
                     }
                     const size_t count = jmoves.size();
-                    if (count > (size_t)DLLAMA_PLAN_CMD_MAX_MOVES) {
-                        throw std::runtime_error("too many moves (exceeds DLLAMA_PLAN_CMD_MAX_MOVES)");
+                    if (count > (size_t)EDGEVISOR_PLAN_CMD_MAX_MOVES) {
+                        throw std::runtime_error("too many moves (exceeds EDGEVISOR_PLAN_CMD_MAX_MOVES)");
                     }
                     cmd.nMoves = (uint32_t)count;
                     for (size_t i = 0; i < count; ++i) {
@@ -768,7 +768,7 @@ void PlanUdsController::run() {
                 const bool hasHeadMove = planCommandHasHeadMove(cmd);
                 if (cfg.disableShardingController && hasHeadMove) {
                     const uint64_t rejectedCount =
-                        (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u;
+                        (cmd.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u;
                     logRejectedJitPlan(cmd, jcmd, "sharding_controller_disabled", rejectedCount);
                     resp = json{{"ok", false}, {"rejected", true}, {"reason", "sharding_controller_disabled"}, {"cmd", cmdToJson(cmd)}};
                     writeLine(cfd, resp.dump());
@@ -777,7 +777,7 @@ void PlanUdsController::run() {
                 }
 
                 const uint64_t bindingCount =
-                    (cmd.version == DLLAMA_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u;
+                    (cmd.version == EDGEVISOR_PLAN_CMD_VERSION_V2 && cmd.nMoves != 0u) ? cmd.nMoves : 1u;
                 const auto jitDecisionStart = std::chrono::steady_clock::now();
                 const JitGateDecision jitDecision = evaluateJitGate(jcmd);
                 const double jitDecisionMs = std::chrono::duration<double, std::milli>(
@@ -846,8 +846,8 @@ void PlanUdsController::run() {
                 const json &jcmd = req.at("cmd");
 
                 PlanCommand cmd = makeEmptyPlanCommand();
-                cmd.magic = DLLAMA_PLAN_CMD_MAGIC;
-                cmd.version = DLLAMA_PLAN_CMD_VERSION_V2;
+                cmd.magic = EDGEVISOR_PLAN_CMD_MAGIC;
+                cmd.version = EDGEVISOR_PLAN_CMD_VERSION_V2;
                 cmd.seq = parseU32(jcmd, "seq", 0u);
 
                 const std::string modeStr = jcmd.value("mode", "next_barrier");

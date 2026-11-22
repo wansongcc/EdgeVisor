@@ -33,7 +33,7 @@ static constexpr NnByte SEG_SYNC_ROOT_WAIT = 3;
 static constexpr NnByte SEG_SYNC_LOGITS = 4;
 
 static bool migrationVerboseLogEnabled() {
-    const char *value = std::getenv("DLLAMA_MIGRATION_VERBOSE_LOG");
+    const char *value = std::getenv("EDGEVISOR_MIGRATION_VERBOSE_LOG");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 && std::strcmp(value, "False") != 0 && std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
 }
 
@@ -158,13 +158,13 @@ static bool parseEnvBoolOr(const char *name, bool fallback) {
 static bool isSegRuntimePrintEnabled() {
     static int cached = -1;
     if (cached < 0) {
-        cached = parseEnvBoolOr("DLLAMA_SEG_RUNTIME_PRINT", false) ? 1 : 0;
+        cached = parseEnvBoolOr("EDGEVISOR_SEG_RUNTIME_PRINT", false) ? 1 : 0;
     }
     return cached == 1;
 }
 
 static bool isBubbleShadowKvEnabledForExecutor() {
-    return parseEnvBoolOr("DLLAMA_BUBBLE_SHADOW_KV", false);
+    return parseEnvBoolOr("EDGEVISOR_BUBBLE_SHADOW_KV", false);
 }
 
 // Runs the shadow KV pass inside the PP root-wait bubble (a pure sync step with
@@ -173,7 +173,7 @@ static bool isBubbleShadowKvEnabledForExecutor() {
 // scratch buffers, so overlapping it with the wait is free latency.
 static bool bubbleShadowRootWaitAsyncEnabled() {
     static const char *const keys[] = {"0", "false", "False", "off", "OFF"};
-    const char *v = std::getenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+    const char *v = std::getenv("EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC");
     if (v == nullptr || v[0] == '\0') return true;
     for (std::size_t i = 0u; i < sizeof(keys) / sizeof(keys[0]); ++i) {
         if (std::strcmp(v, keys[i]) == 0) return false;
@@ -225,14 +225,14 @@ struct TestComputeDelayConfig {
 // s times its nominal time, which is what a clock/power cap looks like from the
 // rest of the pipeline. `window` fields are inclusive positions.
 //
-// Format (DLLAMA_FAULT_SCHEDULE):
+// Format (EDGEVISOR_FAULT_SCHEDULE):
 //     node:posBegin-posEnd:slowdown[,node:posBegin-posEnd:slowdown]...
 // e.g. "2:1000-1400:4,2:3000-3400:6"
 //
-// `DLLAMA_FAULT_SCHEDULE_CALIBRATE=1` measures this node's nominal forward time
+// `EDGEVISOR_FAULT_SCHEDULE_CALIBRATE=1` measures this node's nominal forward time
 // during decode and uses it as the reference, so the injected slowdown is a
 // ratio rather than a wall-clock constant. Without calibration the schedule
-// falls back to DLLAMA_FAULT_STEP_COST_US (default 0 = disabled).
+// falls back to EDGEVISOR_FAULT_STEP_COST_US (default 0 = disabled).
 struct FaultWindow {
     long posBegin = 0;
     long posEnd = 0;
@@ -252,15 +252,15 @@ struct FaultScheduleConfig {
 static const TestComputeDelayConfig &testComputeDelayConfig() {
     static const TestComputeDelayConfig cfg = []() {
         TestComputeDelayConfig c;
-        c.delayUs = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_US", 0);
+        c.delayUs = parseEnvLongOr("EDGEVISOR_TEST_COMPUTE_DELAY_US", 0);
         c.enabled = c.delayUs > 0;
-        c.decodeOnly = parseEnvBoolOr("DLLAMA_TEST_COMPUTE_DELAY_DECODE_ONLY", true);
-        c.node = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_NODE", -1);
-        c.layer = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_LAYER", -1);
-        c.minPos = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_MIN_POS", -1);
-        c.afterDecodeTokens = parseEnvLongOr("DLLAMA_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS", -1);
-        c.kind = parseSegmentKindNameOrAny(std::getenv("DLLAMA_TEST_COMPUTE_DELAY_KIND"));
-        c.role = parseSegmentRoleNameOrAny(std::getenv("DLLAMA_TEST_COMPUTE_DELAY_ROLE"));
+        c.decodeOnly = parseEnvBoolOr("EDGEVISOR_TEST_COMPUTE_DELAY_DECODE_ONLY", true);
+        c.node = parseEnvLongOr("EDGEVISOR_TEST_COMPUTE_DELAY_NODE", -1);
+        c.layer = parseEnvLongOr("EDGEVISOR_TEST_COMPUTE_DELAY_LAYER", -1);
+        c.minPos = parseEnvLongOr("EDGEVISOR_TEST_COMPUTE_DELAY_MIN_POS", -1);
+        c.afterDecodeTokens = parseEnvLongOr("EDGEVISOR_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS", -1);
+        c.kind = parseSegmentKindNameOrAny(std::getenv("EDGEVISOR_TEST_COMPUTE_DELAY_KIND"));
+        c.role = parseSegmentRoleNameOrAny(std::getenv("EDGEVISOR_TEST_COMPUTE_DELAY_ROLE"));
         return c;
     }();
     return cfg;
@@ -307,13 +307,13 @@ static bool shouldInjectTestComputeDelay(const NnExecutorStep *step, const NnExe
 
 // --- Fault schedule -------------------------------------------------------
 // Injects repeatable compute slowdowns on one stage. Unlike the one-shot
-// DLLAMA_TEST_COMPUTE_DELAY_* knob, this can fire several times inside a single
+// EDGEVISOR_TEST_COMPUTE_DELAY_* knob, this can fire several times inside a single
 // episode, each window a different severity, so recovery cost is measured
 // against a pipeline that degrades, recovers, and degrades again.
 static const FaultScheduleConfig &faultScheduleConfig() {
     static const FaultScheduleConfig cfg = []() {
         FaultScheduleConfig c;
-        const char *spec = std::getenv("DLLAMA_FAULT_SCHEDULE");
+        const char *spec = std::getenv("EDGEVISOR_FAULT_SCHEDULE");
         if (spec == nullptr || spec[0] == '\0') return c;
         std::string text(spec);
         std::stringstream ss(text);
@@ -344,10 +344,10 @@ static const FaultScheduleConfig &faultScheduleConfig() {
             }
         }
         c.enabled = !c.windows.empty();
-        c.calibrate = parseEnvBoolOr("DLLAMA_FAULT_SCHEDULE_CALIBRATE", true);
-        c.stepCostUs = parseEnvLongOr("DLLAMA_FAULT_STEP_COST_US", 0);
-        c.calibPosBegin = parseEnvLongOr("DLLAMA_FAULT_CALIB_POS_BEGIN", -1);
-        c.calibPosEnd = parseEnvLongOr("DLLAMA_FAULT_CALIB_POS_END", -1);
+        c.calibrate = parseEnvBoolOr("EDGEVISOR_FAULT_SCHEDULE_CALIBRATE", true);
+        c.stepCostUs = parseEnvLongOr("EDGEVISOR_FAULT_STEP_COST_US", 0);
+        c.calibPosBegin = parseEnvLongOr("EDGEVISOR_FAULT_CALIB_POS_BEGIN", -1);
+        c.calibPosEnd = parseEnvLongOr("EDGEVISOR_FAULT_CALIB_POS_END", -1);
         return c;
     }();
     return cfg;
@@ -712,7 +712,7 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     segmentHasExecOps.assign(nodeConfig->nSegments, 0u);
     segmentSyncProfileKinds.assign(nodeConfig->nSegments, SEG_SYNC_OTHER);
     std::vector<int> segmentActiveLayers(nodeConfig->nSegments, -1);
-    const std::unordered_set<NnUint> skipPrimaryLayers = parseLayerSetEnv("DLLAMA_RUNTIME_PRIMARY_SKIP_LAYERS");
+    const std::unordered_set<NnUint> skipPrimaryLayers = parseLayerSetEnv("EDGEVISOR_RUNTIME_PRIMARY_SKIP_LAYERS");
     for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
         segmentKinds[s] = classifySegmentKind(nodeConfig->segments[s]);
         segmentRuntimeRoles[s] = classifySegmentRuntimeRole(&nodeConfig->segments[s], segmentKinds[s]);
@@ -733,8 +733,8 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     }
 
     segmentEnabled.reset(new std::atomic_uint8_t[nodeConfig->nSegments]);
-    const bool enablePrimaryByDefault = parseEnvBoolOr("DLLAMA_RUNTIME_ACTIVE_SEG_ENABLED", true);
-    const bool enableRedundantByDefault = parseEnvBoolOr("DLLAMA_RUNTIME_REDUNDANT_SEG_ENABLED", false);
+    const bool enablePrimaryByDefault = parseEnvBoolOr("EDGEVISOR_RUNTIME_ACTIVE_SEG_ENABLED", true);
+    const bool enableRedundantByDefault = parseEnvBoolOr("EDGEVISOR_RUNTIME_REDUNDANT_SEG_ENABLED", false);
     for (NnUint s = 0; s < nodeConfig->nSegments; ++s) {
         const NnByte role = segmentRuntimeRoles[s];
         const bool enabled =

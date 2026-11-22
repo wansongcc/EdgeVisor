@@ -251,7 +251,7 @@ if __name__ == '__main__':
     sourceFolderPath = sys.argv[1]
     weightsFloatType = parseFloatType(sys.argv[2])
     name = sys.argv[3]
-    outputFileName = f'dllama_model_{name}_{sys.argv[2]}.m'
+    outputFileName = f'edgevisor_model_{name}_{sys.argv[2]}.m'
 
     print(f'Output file: {outputFileName}')
 

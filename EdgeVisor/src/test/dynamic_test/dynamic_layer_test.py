@@ -92,29 +92,29 @@ def main() -> int:
 			"and verifies set_plan is issued/consumed via UDS."
 		)
 	)
-	ap.add_argument("--dllama", default="./dllama", help="Path to dllama binary")
-	ap.add_argument("--socket", default="/tmp/dllama_plan.sock", help="UDS plan controller socket path")
+	ap.add_argument("--edgevisor", default="./edgevisor", help="Path to edgevisor binary")
+	ap.add_argument("--socket", default="/tmp/edgevisor_plan.sock", help="UDS plan controller socket path")
 	ap.add_argument("--worker-port", type=int, default=9999, help="Worker listen port")
 	ap.add_argument("--nthreads", type=int, default=2, help="Threads for worker/inference")
 	ap.add_argument("--steps", type=int, default=128, help="Inference steps")
 	ap.add_argument("--prompt", default="The capital of France is", help="Prompt")
 	ap.add_argument("--stage", type=int, default=0, help="Stage index")
 	ap.add_argument("--root-node", type=int, default=0, help="Stage root node index")
-	ap.add_argument("--model", default=os.environ.get("DLLAMA_TEST_MODEL", ""), help="Model path (or env DLLAMA_TEST_MODEL)")
+	ap.add_argument("--model", default=os.environ.get("EDGEVISOR_TEST_MODEL", ""), help="Model path (or env EDGEVISOR_TEST_MODEL)")
 	ap.add_argument(
 		"--tokenizer",
-		default=os.environ.get("DLLAMA_TEST_TOKENIZER", ""),
-		help="Tokenizer path (or env DLLAMA_TEST_TOKENIZER)",
+		default=os.environ.get("EDGEVISOR_TEST_TOKENIZER", ""),
+		help="Tokenizer path (or env EDGEVISOR_TEST_TOKENIZER)",
 	)
 	ap.add_argument("--timeout", type=float, default=60.0, help="Overall timeout seconds")
 	args = ap.parse_args()
 
-	dllama = str(Path(args.dllama))
+	edgevisor = str(Path(args.edgevisor))
 	sock_path = args.socket
 
 	if not args.model or not args.tokenizer:
 		sys.stderr.write(
-			"ERROR: missing --model/--tokenizer. Provide CLI flags or set env: DLLAMA_TEST_MODEL, DLLAMA_TEST_TOKENIZER\n"
+			"ERROR: missing --model/--tokenizer. Provide CLI flags or set env: EDGEVISOR_TEST_MODEL, EDGEVISOR_TEST_TOKENIZER\n"
 		)
 		return 2
 
@@ -130,7 +130,7 @@ def main() -> int:
 
 	try:
 		worker_argv = [
-			dllama,
+			edgevisor,
 			"worker",
 			"--port",
 			str(args.worker_port),
@@ -140,20 +140,20 @@ def main() -> int:
 		worker = popen_safe(worker_argv, env=os.environ.copy())
 
 		env = os.environ.copy()
-		env["DLLAMA_PLAN_CTRL_SOCKET"] = sock_path
-		env["DLLAMA_ENABLE_PLAN_BARRIER"] = "1"
+		env["EDGEVISOR_PLAN_CTRL_SOCKET"] = sock_path
+		env["EDGEVISOR_ENABLE_PLAN_BARRIER"] = "1"
 
 		# Enable internal scheduler thread and force one optimization.
-		env["DLLAMA_DYNAMIC_LAYER_ENABLE"] = "1"
-		env["DLLAMA_DYN_FORCE_TRIGGER"] = "1"
-		env["DLLAMA_DYN_STAGE_INDEX"] = str(args.stage)
-		env["DLLAMA_DYN_ROOT_NODE_INDEX"] = str(args.root_node)
-		env.setdefault("DLLAMA_DYN_POLL_MS", "200")
-		env.setdefault("DLLAMA_DYN_UDS_TIMEOUT_MS", "2000")
-		env.setdefault("DLLAMA_DYN_DROP_RATIO", "0.30")
+		env["EDGEVISOR_DYNAMIC_LAYER_ENABLE"] = "1"
+		env["EDGEVISOR_DYN_FORCE_TRIGGER"] = "1"
+		env["EDGEVISOR_DYN_STAGE_INDEX"] = str(args.stage)
+		env["EDGEVISOR_DYN_ROOT_NODE_INDEX"] = str(args.root_node)
+		env.setdefault("EDGEVISOR_DYN_POLL_MS", "200")
+		env.setdefault("EDGEVISOR_DYN_UDS_TIMEOUT_MS", "2000")
+		env.setdefault("EDGEVISOR_DYN_DROP_RATIO", "0.30")
 
 		inf_argv = [
-			dllama,
+			edgevisor,
 			"inference",
 			"--prompt",
 			args.prompt,

@@ -1,8 +1,8 @@
-// This is a simple client for dllama-api.
+// This is a simple client for edgevisor-api.
 //
 // Usage:
 //
-// 1. Start the server, how to do it is described in the `src/apps/dllama-api/README.md` file.
+// 1. Start the server, how to do it is described in the `src/apps/edgevisor-api/README.md` file.
 // 2. Run this script: `node examples/chat-api-client.js`
 
 const HOST = process.env.HOST ? process.env.HOST : '127.0.0.1';

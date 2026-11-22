@@ -29,9 +29,9 @@ if [ "$1" == "start" ]; then
             echo "Killed process $PROC_ID"
         fi
 
-        mkdir -p dllama_worker_$w # macOs does not support -Logfile argument, so we place logs inside different directories
-        cd dllama_worker_$w
-        screen -d -L -S dllama_worker_$w -m ../../dllama worker --port $PORT --nthreads $T
+        mkdir -p edgevisor_worker_$w # macOs does not support -Logfile argument, so we place logs inside different directories
+        cd edgevisor_worker_$w
+        screen -d -L -S edgevisor_worker_$w -m ../../edgevisor worker --port $PORT --nthreads $T
         cd ..
         echo "Started worker $w on port $PORT"
     done
@@ -40,7 +40,7 @@ if [ "$1" == "start" ]; then
 elif [ "$1" == "stop" ]; then
     for (( w = 0; w < $W ; w += 1 ));
     do
-        screen -S dllama_worker_$w -X quit
+        screen -S edgevisor_worker_$w -X quit
     done
 
     echo "Stopped $W workers"

@@ -143,10 +143,10 @@ void testSynchronousShadowKv() {
     }
     NnNetConfig net = netBuilder.build();
     NnNodeConfig node = nodeBuilder.build();
-    setenv("DLLAMA_BUBBLE_SHADOW_KV", "1", 1);
-    unsetenv("DLLAMA_RUNTIME_REDUNDANT_SEG_ENABLED");
+    setenv("EDGEVISOR_BUBBLE_SHADOW_KV", "1", 1);
+    unsetenv("EDGEVISOR_RUNTIME_REDUNDANT_SEG_ENABLED");
     for (const char *legacyAsync : {"0", "1"}) {
-        setenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC", legacyAsync, 1);
+        setenv("EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC", legacyAsync, 1);
         state = State{};
         NnNetExecution execution(1u, &net);
         execution.setBatchSize(1u);
@@ -179,8 +179,8 @@ void testSynchronousShadowKv() {
         catch (const std::invalid_argument &) { rejected = true; }
         assert(rejected); // embedding callers cannot silently skip shadow work
     }
-    unsetenv("DLLAMA_BUBBLE_SHADOW_KV");
-    unsetenv("DLLAMA_BUBBLE_SHADOW_KV_ASYNC");
+    unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV");
+    unsetenv("EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC");
     releaseNetConfig(&net);
     releaseNodeConfig(&node);
 }

@@ -51,8 +51,8 @@ def main() -> int:
     parser.add_argument('--logs', required=True, type=Path, help='Output directory from run_six_benchmark_tests.sh')
     parser.add_argument('--out', required=True, type=Path, help='Directory for Markdown records')
     parser.add_argument('--project-root', type=Path, default=Path.cwd())
-    parser.add_argument('--model', default='/home/cc/dllama/distributed-llama/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m')
-    parser.add_argument('--tokenizer', default='/home/cc/dllama/distributed-llama/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t')
+    parser.add_argument('--model', default='/home/cc/edgevisor/distributed-llama/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m')
+    parser.add_argument('--tokenizer', default='/home/cc/edgevisor/distributed-llama/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t')
     args = parser.parse_args()
 
     logs = args.logs.resolve()
@@ -65,7 +65,7 @@ def main() -> int:
     tok = args.tokenizer
 
     cpu_single_cmd = f'''cd {engine}
-./dllama inference \\
+./edgevisor inference \\
   --prompt "What is 2+2? Answer with only the number." \\
   --steps 32 \\
   --model "{model}" \\
@@ -78,7 +78,7 @@ def main() -> int:
   --benchmark >"{logs}/01_cpu_single/root.log" 2>&1'''
 
     gpu_single_cmd = f'''cd {engine}
-./dllama inference \\
+./edgevisor inference \\
   --prompt "What is 2+2? Answer with only the number." \\
   --steps 32 \\
   --model "{model}" \\
@@ -94,10 +94,10 @@ def main() -> int:
     cpu_static_cmd = f'''cd {engine}
 PORT1=19601
 PORT2=19602
-./dllama worker --port "${{PORT1}}" --nthreads 2 >"{logs}/03_cpu_uneven_static/worker1.log" 2>&1 &
-./dllama worker --port "${{PORT2}}" --nthreads 2 >"{logs}/03_cpu_uneven_static/worker2.log" 2>&1 &
+./edgevisor worker --port "${{PORT1}}" --nthreads 2 >"{logs}/03_cpu_uneven_static/worker1.log" 2>&1 &
+./edgevisor worker --port "${{PORT2}}" --nthreads 2 >"{logs}/03_cpu_uneven_static/worker2.log" 2>&1 &
 sleep 4
-./dllama inference \\
+./edgevisor inference \\
   --prompt "What is 2+2? Answer with only the number." \\
   --steps 32 \\
   --model "{model}" \\
@@ -114,10 +114,10 @@ sleep 4
     gpu_static_cmd = f'''cd {engine}
 PORT1=19501
 PORT2=19502
-./dllama worker --port "${{PORT1}}" --nthreads 1 --gpu-index 1 >"{logs}/04_gpu_uneven_static/worker1.log" 2>&1 &
-./dllama worker --port "${{PORT2}}" --nthreads 1 --gpu-index 2 >"{logs}/04_gpu_uneven_static/worker2.log" 2>&1 &
+./edgevisor worker --port "${{PORT1}}" --nthreads 1 --gpu-index 1 >"{logs}/04_gpu_uneven_static/worker1.log" 2>&1 &
+./edgevisor worker --port "${{PORT2}}" --nthreads 1 --gpu-index 2 >"{logs}/04_gpu_uneven_static/worker2.log" 2>&1 &
 sleep 4
-./dllama inference \\
+./edgevisor inference \\
   --prompt "What is 2+2? Answer with only the number." \\
   --steps 64 \\
   --model "{model}" \\
@@ -135,13 +135,13 @@ sleep 4
     cpu_dyn_init = f'''cd {engine}
 PORT1=19711
 PORT2=19712
-SOCK=/tmp/dllama_bench_cpu_heads.sock
+SOCK=/tmp/edgevisor_bench_cpu_heads.sock
 PROMPT="Write a comma-separated list of the numbers from 1 to 20."
 rm -f "${{SOCK}}"
-./dllama worker --port "${{PORT1}}" --nthreads 1 >"{logs}/05_cpu_uneven_dynamic/worker_cpu1.log" 2>&1 &
-./dllama worker --port "${{PORT2}}" --nthreads 1 >"{logs}/05_cpu_uneven_dynamic/worker_cpu2.log" 2>&1 &
+./edgevisor worker --port "${{PORT1}}" --nthreads 1 >"{logs}/05_cpu_uneven_dynamic/worker_cpu1.log" 2>&1 &
+./edgevisor worker --port "${{PORT2}}" --nthreads 1 >"{logs}/05_cpu_uneven_dynamic/worker_cpu2.log" 2>&1 &
 sleep 4
-DLLAMA_PLAN_CTRL_SOCKET="${{SOCK}}" ./dllama inference \\
+EDGEVISOR_PLAN_CTRL_SOCKET="${{SOCK}}" ./edgevisor inference \\
   --prompt "${{PROMPT}}" \\
   --steps 64 \\
   --model "{model}" \\
@@ -162,13 +162,13 @@ DLLAMA_PLAN_CTRL_SOCKET="${{SOCK}}" ./dllama inference \\
     gpu_dyn_init = f'''cd {engine}
 PORT1=19701
 PORT2=19702
-SOCK=/tmp/dllama_bench_gpu_heads.sock
+SOCK=/tmp/edgevisor_bench_gpu_heads.sock
 PROMPT="Write a comma-separated list of the numbers from 1 to 20."
 rm -f "${{SOCK}}"
-./dllama worker --port "${{PORT1}}" --nthreads 1 --gpu-index 1 >"{logs}/06_gpu_uneven_dynamic/worker_gpu1.log" 2>&1 &
-./dllama worker --port "${{PORT2}}" --nthreads 1 --gpu-index 2 >"{logs}/06_gpu_uneven_dynamic/worker_gpu2.log" 2>&1 &
+./edgevisor worker --port "${{PORT1}}" --nthreads 1 --gpu-index 1 >"{logs}/06_gpu_uneven_dynamic/worker_gpu1.log" 2>&1 &
+./edgevisor worker --port "${{PORT2}}" --nthreads 1 --gpu-index 2 >"{logs}/06_gpu_uneven_dynamic/worker_gpu2.log" 2>&1 &
 sleep 4
-DLLAMA_PLAN_CTRL_SOCKET="${{SOCK}}" ./dllama inference \\
+EDGEVISOR_PLAN_CTRL_SOCKET="${{SOCK}}" ./edgevisor inference \\
   --prompt "${{PROMPT}}" \\
   --steps 96 \\
   --model "{model}" \\

@@ -1,4 +1,4 @@
-# 环境变量开关指南（distributed-llama）
+# EdgeVisor 环境变量开关指南
 
 本文汇总了仓库代码中**通过读取环境变量来切换行为**的所有开关，并给出默认值与用法示例。
 
@@ -13,61 +13,61 @@
 
 ### 1.1 Buffer 初始化与 NaN/未写检测
 
-- `DLLAMA_ZERO_INIT_BUFFERS`（存在即启用）
+- `EDGEVISOR_ZERO_INIT_BUFFERS`（存在即启用）
   - 默认：关闭
   - 作用：CPU 侧分配每个 buffer 后先 `memset(..., 0)`；便于排查未初始化值。
-  - 示例：`DLLAMA_ZERO_INIT_BUFFERS=1 ./dllama chat ...`
+  - 示例：`EDGEVISOR_ZERO_INIT_BUFFERS=1 ./edgevisor chat ...`
 
-- `DLLAMA_POISON_INIT_BUFFERS`（字符串模式）
+- `EDGEVISOR_POISON_INIT_BUFFERS`（字符串模式）
   - 默认：关闭
   - 作用：CPU 侧分配 buffer 后用特定“毒值”填充，帮助定位 read-before-write / partial-write。
   - 支持值：
     - `cd` / `0xcd` / `byte`：填充字节 `0xCD`
     - `nan` / `NaN`：若 buffer 为 `f32`，填充 `qNaN`；否则回退为 `0xCD`
-  - 示例：`DLLAMA_POISON_INIT_BUFFERS=nan ./dllama inference ...`
+  - 示例：`EDGEVISOR_POISON_INIT_BUFFERS=nan ./edgevisor inference ...`
 
-- `DLLAMA_POISON_CHECK_NAN`（存在即启用）
+- `EDGEVISOR_POISON_CHECK_NAN`（存在即启用）
   - 默认：关闭
   - 作用：在每个 op 执行前抽样扫描关键输入（以及一些 op 的“隐式二次读取”buffer/pipe），若检测到 NaN 则打印最近写入者并输出上下文。
-  - 建议组合：`DLLAMA_POISON_INIT_BUFFERS=nan` 一起用效果最好。
+  - 建议组合：`EDGEVISOR_POISON_INIT_BUFFERS=nan` 一起用效果最好。
 
-- `DLLAMA_POISON_CHECK_WRITE_NAN`（存在即启用）
+- `EDGEVISOR_POISON_CHECK_WRITE_NAN`（存在即启用）
   - 默认：关闭
   - 作用：在每个 op 执行后抽样扫描 primary output（仅扫描本次运行的 active batch 范围），若写出 NaN 则打印该 op 的输出指针配置。
 
-- `DLLAMA_POISON_CHECK_LIMIT`（无符号整数）
+- `EDGEVISOR_POISON_CHECK_LIMIT`（无符号整数）
   - 默认：`200`
   - 作用：限制 poison 相关日志总条数；`0` 表示不限制。
 
-- `DLLAMA_POISON_CHECK_SAMPLES`（无符号整数）
+- `EDGEVISOR_POISON_CHECK_SAMPLES`（无符号整数）
   - 默认：`64`
   - 作用：每次抽样检查的采样点数量（越大越慢，但更容易命中 NaN）。
 
-- `DLLAMA_POISON_CHECK_FILTER`（字符串）
+- `EDGEVISOR_POISON_CHECK_FILTER`（字符串）
   - 默认：不过滤
   - 作用：仅对 opName 包含该子串的 op 做 poison 检查。
 
-- `DLLAMA_POISON_CHECK_PTRS`（无符号整数）
+- `EDGEVISOR_POISON_CHECK_PTRS`（无符号整数）
   - 默认：`1`
   - 作用：对 primary input 检查前 N 个 pointer（有些 op 的 input 是 pointer 数组）。
 
 示例（定位 NaN 的首次读/写）：
 
 ```bash
-export DLLAMA_POISON_INIT_BUFFERS=nan
-export DLLAMA_POISON_CHECK_NAN=1
-export DLLAMA_POISON_CHECK_WRITE_NAN=1
-export DLLAMA_POISON_CHECK_FILTER=matmul
-export DLLAMA_POISON_CHECK_LIMIT=50
-./dllama inference ...
+export EDGEVISOR_POISON_INIT_BUFFERS=nan
+export EDGEVISOR_POISON_CHECK_NAN=1
+export EDGEVISOR_POISON_CHECK_WRITE_NAN=1
+export EDGEVISOR_POISON_CHECK_FILTER=matmul
+export EDGEVISOR_POISON_CHECK_LIMIT=50
+./edgevisor inference ...
 ```
 
 ### 1.2 Embedding token 合法性检查
 
-- `DLLAMA_CHECK_EMBEDDING_TOKENS`（存在即启用，且进程内缓存一次）
+- `EDGEVISOR_CHECK_EMBEDDING_TOKENS`（存在即启用，且进程内缓存一次）
   - 默认：关闭
   - 作用：embedding op 会检查 token 是否有限值且在 `[0, vocabSize)`，否则抛异常终止。
-  - 注意：代码只判断“是否存在”，即使设置为 `0` 也会启用；要关闭请 `unset DLLAMA_CHECK_EMBEDDING_TOKENS`。
+  - 注意：代码只判断“是否存在”，即使设置为 `0` 也会启用；要关闭请 `unset EDGEVISOR_CHECK_EMBEDDING_TOKENS`。
 
 ### 1.3 网络/执行路径行为开关
 
@@ -79,7 +79,7 @@ export DLLAMA_POISON_CHECK_LIMIT=50
     - op 通过 `PNTR_BATCHED_SLICE`（必要时显式 start/stride）在 full buffer 上运行 slice
   - 备注：该开关由 root 通过 bootstrap 同步到 workers。
 
-- `DLLAMA_FORCE_MATMUL_VIEWS`（存在即启用）
+- `EDGEVISOR_FORCE_MATMUL_VIEWS`（存在即启用）
   - 默认：关闭
   - 作用：强制所有 `OP_MATMUL` 走“view-aware（offset=0）”代码路径，用于分布式 A/B 对照。
   - 影响：可能禁用部分 fast path（例如 llamafile sgemm）。
@@ -93,26 +93,26 @@ export DLLAMA_POISON_CHECK_LIMIT=50
 
 > 说明：该能力仅在进程启用了 layer profiling 时才会生效（当前通常跟 `--benchmark` 一起开启）。
 
-- `DLLAMA_LAYER_PROF_PRINT`（解析数值）
+- `EDGEVISOR_LAYER_PROF_PRINT`（解析数值）
   - 默认：`0`（关闭）
   - 作用：在 **stage root** 上把每层汇总到的各节点耗时打印到 stdout。
-  - 示例：`DLLAMA_LAYER_PROF_PRINT=1 ./dllama inference ...`
+  - 示例：`EDGEVISOR_LAYER_PROF_PRINT=1 ./edgevisor inference ...`
 
-- `DLLAMA_LAYER_PROF_PATH`（字符串：文件路径）
-  - 默认：未设置时使用 `/tmp/dllama_layer_prof_stage<stage>_root<root>.bin`
+- `EDGEVISOR_LAYER_PROF_PATH`（字符串：文件路径）
+  - 默认：未设置时使用 `/tmp/edgevisor_layer_prof_stage<stage>_root<root>.bin`
   - 作用：在 **stage root** 上创建/更新一个可被其它进程读取的 snapshot 文件（mmap + msync）。
   - 数据布局（v1）：`Header(DLPS)` + `NnLayerPerfMsg[nLayers][nStageNodes]`。
-  - 示例：`DLLAMA_LAYER_PROF_PATH=/tmp/layerprof.bin ./dllama inference ...`
+  - 示例：`EDGEVISOR_LAYER_PROF_PATH=/tmp/layerprof.bin ./edgevisor inference ...`
 
 
 ### 1.3.2 Root 逐 token 端到端与节点计时打印
 
-- `DLLAMA_TOKEN_TIMING_PRINT`（布尔，默认 `0`）
-  - 作用：在 `dllama inference` 的普通 prediction loop 中，每生成一个 token 后由 root 打印：
+- `EDGEVISOR_TOKEN_TIMING_PRINT`（布尔，默认 `0`）
+  - 作用：在 `edgevisor inference` 的普通 prediction loop 中，每生成一个 token 后由 root 打印：
     - `[token-e2e]`：该 token 在 root 侧的端到端 wall-clock 时间，覆盖 `forward()`、profile 等待、采样、decode、token 输出和 flush。
     - `[token-prof]`：每个节点该 token 的 `total/exec/sync/bubble` 时间，来自已有 `LlmPerfPacket`。
   - 说明：`[token-e2e]` 只需要设置该变量；`[token-prof]` 需要同时启用 executor profiling，例如 `--benchmark` 或 `--enable-dynamic-tpot`。
-  - 示例：`DLLAMA_TOKEN_TIMING_PRINT=1 ./dllama inference ... --benchmark`
+  - 示例：`EDGEVISOR_TOKEN_TIMING_PRINT=1 ./edgevisor inference ... --benchmark`
 
 ### 1.4 在线迁移 / 计划屏障 / PP layer 迁移
 
@@ -124,28 +124,28 @@ export DLLAMA_POISON_CHECK_LIMIT=50
   - 默认：关闭
   - 作用：启用 root 侧单请求 decode TPOT 在线调度器，并自动补齐当前自动迁移必须条件。
   - 自动设置/打开：
-    - `DLLAMA_DYNAMIC_TPOT_ENABLE=1`
-    - `DLLAMA_PLAN_CTRL_SOCKET=<socket>`（若未指定 socket，默认 `/tmp/dllama_plan.sock`）
-    - `DLLAMA_KV_ACK_TIMEOUT_MS=180000`（仅当未设置时）
-    - `DLLAMA_IO_TIMEOUT_MS=180000`（仅当未设置时）
-    - `DLLAMA_ASYNC_KV_COLLECT_SUBMIT=0`（仅当未设置时）
+    - `EDGEVISOR_DYNAMIC_TPOT_ENABLE=1`
+    - `EDGEVISOR_PLAN_CTRL_SOCKET=<socket>`（若未指定 socket，默认 `/tmp/edgevisor_plan.sock`）
+    - `EDGEVISOR_KV_ACK_TIMEOUT_MS=180000`（仅当未设置时）
+    - `EDGEVISOR_IO_TIMEOUT_MS=180000`（仅当未设置时）
+    - `EDGEVISOR_ASYNC_KV_COLLECT_SUBMIT=0`（仅当未设置时）
     - `--enable-plan-barrier`
     - `--enable-pp-migration`
   - 备注：`--enable-pp-migration` 会继续自动打开 `--enable-kv-aggregate` 和 `--enable-stage-full-weights`。
 
 - `--plan-ctrl-socket <path>`（命令行参数）
-  - 默认：未设置；若与 `--enable-dynamic-tpot` 一起使用且未显式提供，则使用 `/tmp/dllama_plan.sock`。
-  - 作用：指定 root 内部 UDS 控制器路径，替代直接设置 `DLLAMA_PLAN_CTRL_SOCKET`。
-  - 示例：`--plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock`
+  - 默认：未设置；若与 `--enable-dynamic-tpot` 一起使用且未显式提供，则使用 `/tmp/edgevisor_plan.sock`。
+  - 作用：指定 root 内部 UDS 控制器路径，替代直接设置 `EDGEVISOR_PLAN_CTRL_SOCKET`。
+  - 示例：`--plan-ctrl-socket /tmp/edgevisor_plan_pp_auto.sock`
 
 当前推荐 root 启动片段：
 
 ```bash
-./dllama inference ... \
+./edgevisor inference ... \
   --enable-dynamic-tpot \
-  --plan-ctrl-socket /tmp/dllama_plan_pp_auto.sock \
+  --plan-ctrl-socket /tmp/edgevisor_plan_pp_auto.sock \
   --runtime-redundant-boundary-layers 1 \
-  --io-profile-log /tmp/dllama-io.log
+  --io-profile-log /tmp/edgevisor-io.log
 ```
 
 #### 手动 UDS / 兼容入口
@@ -155,25 +155,25 @@ export DLLAMA_POISON_CHECK_LIMIT=50
   - 作用：启用每层 plan barrier/apply，用于 TP `set_plan` 和在线迁移命令生效。
   - 备注：该开关由 root 通过 bootstrap 同步到 workers。
 
-- `DLLAMA_PLAN_CTRL_SOCKET`（字符串：UDS 路径）
+- `EDGEVISOR_PLAN_CTRL_SOCKET`（字符串：UDS 路径）
   - 默认：未设置（不启动控制器）；可由 `--plan-ctrl-socket` 替代。
   - 作用：在 root 进程内启动 UDS 控制器线程，供外部监控/规划进程下发 `PlanCommand`。
-  - 示例：`export DLLAMA_PLAN_CTRL_SOCKET=/tmp/dllama_plan.sock`
+  - 示例：`export EDGEVISOR_PLAN_CTRL_SOCKET=/tmp/edgevisor_plan.sock`
 
 UDS 协议为“单行 JSON 请求 → 单行 JSON 响应”（每次连接只处理 1 条请求）。支持的 `op`：`ping` / `status` / `perf` / `set_plan` / `set_pp_migration` / `clear`。
 
 示例（使用仓库自带客户端 [examples/plan-uds-client.py](../examples/plan-uds-client.py)）：
 
 ```bash
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock ping
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock status
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock ping
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock status
 
 # TP stage 内迁移：下一次 barrier 触发
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_plan \
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock set_plan \
   --seq 1 --mode next_barrier --stage 0 --from 0 --to 1 --kind 3 --heads 1 --ffn 256
 
 # PP layer 迁移：global root 下发到对应 stage root 路由
-python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
+python3 examples/plan-uds-client.py /tmp/edgevisor_plan.sock set_pp_migration \
   --seq 3 --mode exact --from 0 --to 1 --layer-count 1 --trigger-pos 64
 ```
 
@@ -195,113 +195,113 @@ python3 examples/plan-uds-client.py /tmp/dllama_plan.sock set_pp_migration \
 
 - `set_pp_migration.layerCount`（UDS 字段）
   - 默认：`1`
-  - 作用：控制 PP 迁移时按边界向内扩展的层数。自动调度会在 `1..K` 的候选层数中选择；其中 `K` 由 `--tpot-max-pp-layer-move` 或 `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` 配置。
+  - 作用：控制 PP 迁移时按边界向内扩展的层数。自动调度会在 `1..K` 的候选层数中选择；其中 `K` 由 `--tpot-max-pp-layer-move` 或 `EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE` 配置。
 
 - `set_pp_migration.firstLayer`（UDS 字段）
   - 默认：未设置时按静态边界兼容推导。
   - 作用：指定连续迁移范围的第一个 layer；自动调度始终发送该字段，使前向迁移与回滚使用完全相同的 `[firstLayer, firstLayer + layerCount)` 范围。
 
-- `DLLAMA_MIGRATION_LAYER_LIST`（逗号分隔整数列表）
+- `EDGEVISOR_MIGRATION_LAYER_LIST`（逗号分隔整数列表）
   - 默认：未设置
   - 作用：指定在线迁移要批量处理的 layer 列表（transfer/ack/switch 按该列表批量执行）。
   - 优先级：高于 UDS `set_pp_migration.layerCount`。
   - 状态：调试/手动复现用；自动调度不建议设置。
 
-- `DLLAMA_PP_MIGRATION_POS`（整数）
+- `EDGEVISOR_PP_MIGRATION_POS`（整数）
   - 默认：未设置
   - 作用：为 PP layer 迁移设置固定触发位置。
   - 状态：legacy/debug；自动调度由 UDS `triggerPos` 或 runtime 决策控制，不建议常规使用。
 
-- `DLLAMA_HARD_MIGRATE_POS` / `DLLAMA_HARD_MIGRATE_LAYER` / `DLLAMA_HARD_MIGRATE_KIND` / `DLLAMA_HARD_MIGRATE_HEAD_MOVE` / `DLLAMA_HARD_MIGRATE_FFN_MOVE`
+- `EDGEVISOR_HARD_MIGRATE_POS` / `EDGEVISOR_HARD_MIGRATE_LAYER` / `EDGEVISOR_HARD_MIGRATE_KIND` / `EDGEVISOR_HARD_MIGRATE_HEAD_MOVE` / `EDGEVISOR_HARD_MIGRATE_FFN_MOVE`
   - 状态：Deprecated（兼容兜底）
   - 作用：启动时自动生成一条 `PlanCommand(mode=exact)`。新测试请使用 UDS 或 `--enable-dynamic-tpot`。
 
 ### 1.5 单请求 TPOT 在线调度器
 
-自动 TPOT 调度器由 `--enable-dynamic-tpot` 或 `DLLAMA_DYNAMIC_TPOT_ENABLE=1` 启用。它会在 root 侧异步读取 UDS `status` / `perf`，并通过 `set_plan` / `set_pp_migration` 下发单请求 decode 迁移。
+自动 TPOT 调度器由 `--enable-dynamic-tpot` 或 `EDGEVISOR_DYNAMIC_TPOT_ENABLE=1` 启用。它会在 root 侧异步读取 UDS `status` / `perf`，并通过 `set_plan` / `set_pp_migration` 下发单请求 decode 迁移。
 
 | 参数 | 类型 | 默认值 | 作用 | 调大后的效果 |
 | --- | --- | --- | --- | --- |
 | `--enable-dynamic-tpot` | CLI 开关 | 关闭 | 启用 root 侧自动 TPOT 调度，并自动补齐 plan barrier、PP migration 等依赖 | 不适用 |
 | `--plan-ctrl-socket <path>` | CLI 参数 | 未设置 | 指定自动调度器和 plan controller 使用的 UDS 路径 | 不适用 |
 | `--enable-pp-migration` | CLI 开关 | 自动模式会开启 | 启用 PP layer 迁移执行路径 | 不适用 |
-| `DLLAMA_DYNAMIC_TPOT_ENABLE` | 布尔 | `0` | 直接启用/关闭自动 TPOT 调度器 | 不适用 |
-| `DLLAMA_TPOT_LOG` | 路径 | `/tmp/dllama_tpot_scheduler.log` | 调度器结构化日志，包含所选/待验证动作字段 `gain_ms`、`threshold_ms`、`layer_count`、`note`，以及新鲜 PP 候选字段 `pp_best_valid`、`pp_best_gain_ms`、`pp_best_threshold_ms`、`pp_best_reason`、`pp_best_from_stage`、`pp_best_to_stage`、`pp_best_layer`、`pp_best_layer_count` | 不影响策略 |
-| `DLLAMA_TPOT_WINDOW_TOKENS` | 整数 | `16` | 每次决策累计的 decode token 窗口 | 决策更稳但更慢 |
-| `DLLAMA_TPOT_MIN_SAMPLES` | 整数 | `8` | 形成一次有效决策窗口所需最少样本 | 降低低样本误判 |
-| `DLLAMA_TPOT_COOLDOWN_TOKENS` | 整数 | `32` | 一次迁移后禁止再次迁移的 token 数 | 减少连续迁移 |
-| `DLLAMA_TPOT_ROLLBACK_WINDOW` | 整数 | `16` | 迁移后观察多少 token 再判断是否回滚 | 回滚判断更稳但反馈更慢 |
-| `DLLAMA_TPOT_EWMA_ALPHA` | 浮点 | `0.2` | stage 性能 EWMA 平滑系数，范围 `(0,1]` | 较小值更平滑、更不敏感 |
-| `DLLAMA_TPOT_MIN_PP_GAIN_MS` | 浮点 ms | `5` | PP 迁移最小收益门槛 | 更少触发 PP 迁移 |
-| `DLLAMA_TPOT_MIN_TP_GAIN_MS` | 浮点 ms | `2` | TP head/FFN 迁移最小收益门槛 | 更少触发 TP 迁移 |
-| `DLLAMA_TPOT_PP_RISK_MARGIN_MS` | 浮点 ms | `0` | PP 候选额外风险余量，会从收益中扣除 | 要求 PP 收益更确定 |
-| `DLLAMA_TPOT_TP_RISK_MARGIN_MS` | 浮点 ms | `0` | TP 候选额外风险余量，会从收益中扣除 | 要求 TP 收益更确定 |
-| `DLLAMA_TPOT_PP_MIGRATION_COST_MS` | 浮点 ms | `0` | PP 迁移成本模型输入 | 避免小收益 PP 迁移 |
-| `DLLAMA_TPOT_TP_MIGRATION_COST_MS` | 浮点 ms | `0` | TP 迁移成本模型输入 | 避免小收益 TP 迁移 |
-| `DLLAMA_TPOT_LOAD_PENALTY_BETA` | 浮点 | `0` | 负载惩罚系数 | 更偏向保守分配 |
-| `DLLAMA_TPOT_PP_GAIN_RATIO` / `--tpot-pp-gain-ratio` | 浮点 `[0,1]` | `0.03` | PP 收益相对门槛系数；`0` 表示只使用绝对毫秒门槛 | 越小越容易触发 PP 迁移 |
-| `DLLAMA_TPOT_EXPECTED_REMAINING_TOKENS` | 整数 | `128` | 预期剩余 token，用于摊销迁移成本 | 越小越保守 |
-| `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` / `--tpot-max-pp-layer-move K` | 整数 | `1` | 单次 PP 最多迁移 layer 数；CLI 参数映射到 `DLLAMA_TPOT_MAX_PP_LAYER_MOVE` | 有效范围 `1..64`；调度器评估 `1..K` 的所有候选层数，并始终保留源 stage 至少一层。更大的 `K` 会增加迁移状态/KV 的迁移成本。 |
-| `DLLAMA_TPOT_MAX_HEAD_MOVE` | 整数 | `1` | 单次 TP head 迁移数量 | 更大时单次迁移幅度更大 |
-| `DLLAMA_TPOT_MAX_FFN_MOVE` | 整数 | `256` | 单次 TP FFN 维度迁移数量 | 更大时单次迁移幅度更大 |
-| `DLLAMA_TPOT_POLL_MS` | 整数 ms | `200` | 自动调度线程轮询 UDS 的间隔 | 降低调度频率 |
-| `DLLAMA_TPOT_UDS_TIMEOUT_MS` | 整数 ms | `2000` | 自动调度 UDS 请求超时 | 只影响异常等待 |
-| `DLLAMA_MIGRATION_VERBOSE_LOG` | 布尔 | `0` | 打开 KV export/write/merge/ack 的逐 row 详细日志 | 不影响策略，只增加日志 |
+| `EDGEVISOR_DYNAMIC_TPOT_ENABLE` | 布尔 | `0` | 直接启用/关闭自动 TPOT 调度器 | 不适用 |
+| `EDGEVISOR_TPOT_LOG` | 路径 | `/tmp/edgevisor_tpot_scheduler.log` | 调度器结构化日志，包含所选/待验证动作字段 `gain_ms`、`threshold_ms`、`layer_count`、`note`，以及新鲜 PP 候选字段 `pp_best_valid`、`pp_best_gain_ms`、`pp_best_threshold_ms`、`pp_best_reason`、`pp_best_from_stage`、`pp_best_to_stage`、`pp_best_layer`、`pp_best_layer_count` | 不影响策略 |
+| `EDGEVISOR_TPOT_WINDOW_TOKENS` | 整数 | `16` | 每次决策累计的 decode token 窗口 | 决策更稳但更慢 |
+| `EDGEVISOR_TPOT_MIN_SAMPLES` | 整数 | `8` | 形成一次有效决策窗口所需最少样本 | 降低低样本误判 |
+| `EDGEVISOR_TPOT_COOLDOWN_TOKENS` | 整数 | `32` | 一次迁移后禁止再次迁移的 token 数 | 减少连续迁移 |
+| `EDGEVISOR_TPOT_ROLLBACK_WINDOW` | 整数 | `16` | 迁移后观察多少 token 再判断是否回滚 | 回滚判断更稳但反馈更慢 |
+| `EDGEVISOR_TPOT_EWMA_ALPHA` | 浮点 | `0.2` | stage 性能 EWMA 平滑系数，范围 `(0,1]` | 较小值更平滑、更不敏感 |
+| `EDGEVISOR_TPOT_MIN_PP_GAIN_MS` | 浮点 ms | `5` | PP 迁移最小收益门槛 | 更少触发 PP 迁移 |
+| `EDGEVISOR_TPOT_MIN_TP_GAIN_MS` | 浮点 ms | `2` | TP head/FFN 迁移最小收益门槛 | 更少触发 TP 迁移 |
+| `EDGEVISOR_TPOT_PP_RISK_MARGIN_MS` | 浮点 ms | `0` | PP 候选额外风险余量，会从收益中扣除 | 要求 PP 收益更确定 |
+| `EDGEVISOR_TPOT_TP_RISK_MARGIN_MS` | 浮点 ms | `0` | TP 候选额外风险余量，会从收益中扣除 | 要求 TP 收益更确定 |
+| `EDGEVISOR_TPOT_PP_MIGRATION_COST_MS` | 浮点 ms | `0` | PP 迁移成本模型输入 | 避免小收益 PP 迁移 |
+| `EDGEVISOR_TPOT_TP_MIGRATION_COST_MS` | 浮点 ms | `0` | TP 迁移成本模型输入 | 避免小收益 TP 迁移 |
+| `EDGEVISOR_TPOT_LOAD_PENALTY_BETA` | 浮点 | `0` | 负载惩罚系数 | 更偏向保守分配 |
+| `EDGEVISOR_TPOT_PP_GAIN_RATIO` / `--tpot-pp-gain-ratio` | 浮点 `[0,1]` | `0.03` | PP 收益相对门槛系数；`0` 表示只使用绝对毫秒门槛 | 越小越容易触发 PP 迁移 |
+| `EDGEVISOR_TPOT_EXPECTED_REMAINING_TOKENS` | 整数 | `128` | 预期剩余 token，用于摊销迁移成本 | 越小越保守 |
+| `EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE` / `--tpot-max-pp-layer-move K` | 整数 | `1` | 单次 PP 最多迁移 layer 数；CLI 参数映射到 `EDGEVISOR_TPOT_MAX_PP_LAYER_MOVE` | 有效范围 `1..64`；调度器评估 `1..K` 的所有候选层数，并始终保留源 stage 至少一层。更大的 `K` 会增加迁移状态/KV 的迁移成本。 |
+| `EDGEVISOR_TPOT_MAX_HEAD_MOVE` | 整数 | `1` | 单次 TP head 迁移数量 | 更大时单次迁移幅度更大 |
+| `EDGEVISOR_TPOT_MAX_FFN_MOVE` | 整数 | `256` | 单次 TP FFN 维度迁移数量 | 更大时单次迁移幅度更大 |
+| `EDGEVISOR_TPOT_POLL_MS` | 整数 ms | `200` | 自动调度线程轮询 UDS 的间隔 | 降低调度频率 |
+| `EDGEVISOR_TPOT_UDS_TIMEOUT_MS` | 整数 ms | `2000` | 自动调度 UDS 请求超时 | 只影响异常等待 |
+| `EDGEVISOR_MIGRATION_VERBOSE_LOG` | 布尔 | `0` | 打开 KV export/write/merge/ack 的逐 row 详细日志 | 不影响策略，只增加日志 |
 
 纯 PP 自动迁移测试常用调参：
 
 ```bash
-export DLLAMA_TPOT_LOG=/tmp/dllama_tpot_pp_auto.log
-export DLLAMA_TPOT_WINDOW_TOKENS=6
-export DLLAMA_TPOT_MIN_SAMPLES=6
-export DLLAMA_TPOT_COOLDOWN_TOKENS=8
-export DLLAMA_TPOT_ROLLBACK_WINDOW=8
-export DLLAMA_TPOT_MIN_PP_GAIN_MS=1
-export DLLAMA_TPOT_PP_RISK_MARGIN_MS=0
-export DLLAMA_TPOT_PP_MIGRATION_COST_MS=0
-export DLLAMA_TPOT_MIN_TP_GAIN_MS=1000000
-export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
+export EDGEVISOR_TPOT_LOG=/tmp/edgevisor_tpot_pp_auto.log
+export EDGEVISOR_TPOT_WINDOW_TOKENS=6
+export EDGEVISOR_TPOT_MIN_SAMPLES=6
+export EDGEVISOR_TPOT_COOLDOWN_TOKENS=8
+export EDGEVISOR_TPOT_ROLLBACK_WINDOW=8
+export EDGEVISOR_TPOT_MIN_PP_GAIN_MS=1
+export EDGEVISOR_TPOT_PP_RISK_MARGIN_MS=0
+export EDGEVISOR_TPOT_PP_MIGRATION_COST_MS=0
+export EDGEVISOR_TPOT_MIN_TP_GAIN_MS=1000000
+export EDGEVISOR_TPOT_TP_RISK_MARGIN_MS=1000000
 ```
 
 例如，允许调度器在一次 PP 决策中评估并选择最多 4 层的迁移量：
 
 ```bash
-./dllama inference ... --enable-dynamic-tpot --tpot-max-pp-layer-move 4
+./edgevisor inference ... --enable-dynamic-tpot --tpot-max-pp-layer-move 4
 ```
 
 该命令未显式指定 `--runtime-redundant-boundary-layers` 时，会自动按 `4` 层构建 boundary 两侧的 runtime redundant coverage。若显式同时指定较小的值（例如 `--runtime-redundant-boundary-layers 2`），启动会拒绝配置，避免 target 未 provisioned 时关闭 source layer。一次成功 PP layout 变更后，当前进程不再生成新的 PP 候选；若验证触发并成功下发回滚，则恢复候选资格。TP 候选不受影响。
 
 ### 1.5.1 KV/网络稳定性与 collector
 
-- `DLLAMA_KV_ACK_TIMEOUT_MS`（整数 ms，默认：未设置；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `180000`）
-  - 作用：PP KV transfer 后等待 target ACK batch 的墙钟超时。优先级高于 `DLLAMA_IO_TIMEOUT_MS`。
+- `EDGEVISOR_KV_ACK_TIMEOUT_MS`（整数 ms，默认：未设置；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `180000`）
+  - 作用：PP KV transfer 后等待 target ACK batch 的墙钟超时。优先级高于 `EDGEVISOR_IO_TIMEOUT_MS`。
 
-- `DLLAMA_IO_TIMEOUT_MS`（整数 ms，默认 `0`：legacy 无限等待；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `180000`）
+- `EDGEVISOR_IO_TIMEOUT_MS`（整数 ms，默认 `0`：legacy 无限等待；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `180000`）
   - 作用：socket read/write/poll timeout。
 
-- `DLLAMA_ASYNC_KV_COLLECT_SUBMIT`（布尔，默认 `0`；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `0`）
-  - 作用：控制 `RootKvCollector` dump 到 `/tmp/dllama_async_layer*_pos*_root_{k,v}.bin` 后是否再次提交 KV transfer。
+- `EDGEVISOR_ASYNC_KV_COLLECT_SUBMIT`（布尔，默认 `0`；启用 `--enable-dynamic-tpot` 且该变量未设置时自动填 `0`）
+  - 作用：控制 `RootKvCollector` dump 到 `/tmp/edgevisor_async_layer*_pos*_root_{k,v}.bin` 后是否再次提交 KV transfer。
   - 说明：当前 PP real-transfer 已经批量转移 `[0,pos]` 历史 KV，collector 默认只 dump，不再重复 submit，避免迁移后残留 `waiting previous ack`。
 
-- `DLLAMA_ASYNC_KV_COLLECT_POLL_MS`（整数，默认 `20`）
+- `EDGEVISOR_ASYNC_KV_COLLECT_POLL_MS`（整数，默认 `20`）
   - 作用：root KV collector 后台线程轮询间隔。
 
-- `DLLAMA_ASYNC_KV_COLLECT_LAYER`（整数，默认：当前 stage 的右边界 layer）
+- `EDGEVISOR_ASYNC_KV_COLLECT_LAYER`（整数，默认：当前 stage 的右边界 layer）
   - 作用：构建 KV aggregate pipe 时指定 collector 观测的 layer。通常无需手动设置。
 
 ### 1.6 分布式：Root 同步环境变量到 Workers
 
-- `DLLAMA_SYNC_ENV_VARS`（逗号分隔列表）
+- `EDGEVISOR_SYNC_ENV_VARS`（逗号分隔列表）
   - 默认：空
   - 作用：Root 会把一组“默认名单 + 你额外指定的名单”里的环境变量（存在与否以及具体值）同步到所有 worker 进程。
   - 用法：
     - 例如你想把 `kvcache_debug`、`kvcache_debug_limit` 也一起同步：
-      - `export DLLAMA_SYNC_ENV_VARS="kvcache_debug,kvcache_debug_limit"`
-  - 备注：默认同步名单在代码里硬编码（见 nn-network.cpp），包括 `DLLAMA_FORCE_MATMUL_VIEWS`、`DLLAMA_KV_AGGREGATE` 等。
+      - `export EDGEVISOR_SYNC_ENV_VARS="kvcache_debug,kvcache_debug_limit"`
+  - 备注：默认同步名单在代码里硬编码（见 nn-network.cpp），包括 `EDGEVISOR_FORCE_MATMUL_VIEWS`、`EDGEVISOR_KV_AGGREGATE` 等。
 
 ### 1.7 E2E Matmul-View（offset=0）对照检查
 
-- `DLLAMA_E2E_MATMUL_VIEW0_CHECK`（严格布尔：仅当值为 `1/true/TRUE` 才启用）
+- `EDGEVISOR_E2E_MATMUL_VIEW0_CHECK`（严格布尔：仅当值为 `1/true/TRUE` 才启用）
   - 默认：关闭
   - 作用：在 inference mode 下跑两次 prompt eval：
     - Pass A：清空所有 matmul 的 a/b/c view（legacy）
@@ -311,97 +311,97 @@ export DLLAMA_TPOT_TP_RISK_MARGIN_MS=1000000
 
 ---
 
-## 2) 调试/Tracing 开关（需要编译时启用 `DLLAMA_DEBUG_ATTN=1`）
+## 2) 调试/Tracing 开关（需要编译时启用 `EDGEVISOR_DEBUG_ATTN=1`）
 
-很多注意力/KV/同步相关的 tracing 代码被 `#if DLLAMA_DEBUG_ATTN` 包住；要使用下面这些环境变量，请先重新编译：
+很多注意力/KV/同步相关的 tracing 代码被 `#if EDGEVISOR_DEBUG_ATTN` 包住；要使用下面这些环境变量，请先重新编译：
 
 ```bash
-DLLAMA_DEBUG_ATTN=1 make dllama
+EDGEVISOR_DEBUG_ATTN=1 make edgevisor
 ```
 
 ### 2.1 Slice / Pointer / Weight 范围调试
 
-- `DLLAMA_DEBUG_SLICE_PARAMS`（存在即启用）
-- `DLLAMA_DEBUG_SLICE_PARAMS_FILTER`（子串过滤）
+- `EDGEVISOR_DEBUG_SLICE_PARAMS`（存在即启用）
+- `EDGEVISOR_DEBUG_SLICE_PARAMS_FILTER`（子串过滤）
   - 作用：打印 build-time 的 slice/view 参数（更偏配置验证）。
 
-- `DLLAMA_DEBUG_SLICE_PARAMS_FWD`（存在即启用）
-- `DLLAMA_DEBUG_SLICE_PARAMS_FWD_REPEAT`（把 `0`/`false` 视为关闭；其他值视为开启）
-- `DLLAMA_DEBUG_SLICE_PARAMS_FILTER`（同上）
+- `EDGEVISOR_DEBUG_SLICE_PARAMS_FWD`（存在即启用）
+- `EDGEVISOR_DEBUG_SLICE_PARAMS_FWD_REPEAT`（把 `0`/`false` 视为关闭；其他值视为开启）
+- `EDGEVISOR_DEBUG_SLICE_PARAMS_FILTER`（同上）
   - 作用：forward-time 打印 slice 参数与 pointer 样本，用于验证运行时 resolve 是否符合预期。
 
-- `DLLAMA_DEBUG_RESOLVE_POINTER`（把 `0`/`false` 视为关闭；其他值视为开启）
-- `DLLAMA_DEBUG_RESOLVE_POINTER_FILTER`（既支持数字 buffer/pipe index，也支持如 `HEAD`/`KV` 等 tag 子串）
-- `DLLAMA_DEBUG_RESOLVE_POINTER_LIMIT`（整数，默认 `200`，上限 `100000`；`<=0` 视为 0）
+- `EDGEVISOR_DEBUG_RESOLVE_POINTER`（把 `0`/`false` 视为关闭；其他值视为开启）
+- `EDGEVISOR_DEBUG_RESOLVE_POINTER_FILTER`（既支持数字 buffer/pipe index，也支持如 `HEAD`/`KV` 等 tag 子串）
+- `EDGEVISOR_DEBUG_RESOLVE_POINTER_LIMIT`（整数，默认 `200`，上限 `100000`；`<=0` 视为 0）
   - 作用：输出 resolvePointer 相关调试信息。
 
-- `DLLAMA_DEBUG_WEIGHT_RANGES`（存在即启用）
-- `DLLAMA_DEBUG_WEIGHT_RANGES_FILTER`（子串过滤）
-- `DLLAMA_DEBUG_WEIGHT_RANGES_LIMIT`（整数；用于限制 matmul weight-read 范围日志次数）
+- `EDGEVISOR_DEBUG_WEIGHT_RANGES`（存在即启用）
+- `EDGEVISOR_DEBUG_WEIGHT_RANGES_FILTER`（子串过滤）
+- `EDGEVISOR_DEBUG_WEIGHT_RANGES_LIMIT`（整数；用于限制 matmul weight-read 范围日志次数）
   - 作用：打印“可能读到的权重范围”与（matmul）更精确的按调用读范围。
 
-- `DLLAMA_DEBUG_MATMUL_VIEWS`（存在即启用）
-- `DLLAMA_DEBUG_MATMUL_VIEWS_FILTER`（子串过滤）
-- `DLLAMA_DEBUG_MATMUL_VIEWS_LIMIT`（整数，默认 `50`）
+- `EDGEVISOR_DEBUG_MATMUL_VIEWS`（存在即启用）
+- `EDGEVISOR_DEBUG_MATMUL_VIEWS_FILTER`（子串过滤）
+- `EDGEVISOR_DEBUG_MATMUL_VIEWS_LIMIT`（整数，默认 `50`）
   - 作用：当 matmul 走 llamafile fast path 时打印 view 配置，确认是否命中预期路径。
 
 ### 2.2 KV range tracing（粗粒度）
 
 - `kvcache_debug`（存在即启用）
-- `DLLAMA_DEBUG_KV_RANGE`（存在即启用；legacy alias）
+- `EDGEVISOR_DEBUG_KV_RANGE`（存在即启用；legacy alias）
 - `kvcache_debug_limit`（整数，默认 `8`；`0` 不限制）
   - 作用：打印各类 KV 相关 op（K/V projection、RoPE、KV cache write、attention read）的有效 KV range。
 
 ### 2.3 KV cache per-head 细粒度 dump
 
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD`（数值解析；非 0 启用）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_FILTER`（子串过滤）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_LIMIT`（整数，默认 `32`；`0` 不限制）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_BATCH`（整数，默认 `0`）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_POS`（整数，默认 `-1`：所有位置；`>=0`：仅该 pos）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_DIMS`（整数，默认 `8`；`0` 打印 full headDim）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEAD`（整数，默认 `-1`：所有 owned kvHeads；`>=0`：仅该 global kvHead）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_KVHEADS`（字符串，例：`"4,5"` 或 `"4-7"`，优先级高于 KVHEAD）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_GLOBAL`（数值解析；非 0 启用）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_SHIFT`（数值解析；非 0 启用）
-- `DLLAMA_DEBUG_KVCACHE_PER_HEAD_HEADDIM`（整数；覆盖 headDim）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD`（数值解析；非 0 启用）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_FILTER`（子串过滤）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_LIMIT`（整数，默认 `32`；`0` 不限制）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_BATCH`（整数，默认 `0`）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_POS`（整数，默认 `-1`：所有位置；`>=0`：仅该 pos）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_DIMS`（整数，默认 `8`；`0` 打印 full headDim）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_KVHEAD`（整数，默认 `-1`：所有 owned kvHeads；`>=0`：仅该 global kvHead）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_KVHEADS`（字符串，例：`"4,5"` 或 `"4-7"`，优先级高于 KVHEAD）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_GLOBAL`（数值解析；非 0 启用）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_SHIFT`（数值解析；非 0 启用）
+- `EDGEVISOR_DEBUG_KVCACHE_PER_HEAD_HEADDIM`（整数；覆盖 headDim）
 
 ### 2.4 Attention 计算调试
 
-- `DLLAMA_DEBUG_ATT`（数值解析；非 0 启用）
-- `DLLAMA_DEBUG_ATT_FILTER`（子串过滤）
-- `DLLAMA_DEBUG_ATT_LIMIT`（整数；`0` 不限制）
-- `DLLAMA_DEBUG_ATT_BATCH`（整数，默认 `0`）
-- `DLLAMA_DEBUG_ATT_HEAD`（整数，默认 `0`；`-1` 打印所有 local q-head）
+- `EDGEVISOR_DEBUG_ATT`（数值解析；非 0 启用）
+- `EDGEVISOR_DEBUG_ATT_FILTER`（子串过滤）
+- `EDGEVISOR_DEBUG_ATT_LIMIT`（整数；`0` 不限制）
+- `EDGEVISOR_DEBUG_ATT_BATCH`（整数，默认 `0`）
+- `EDGEVISOR_DEBUG_ATT_HEAD`（整数，默认 `0`；`-1` 打印所有 local q-head）
 
-- `DLLAMA_DEBUG_ATT_QK`（数值解析；非 0 启用）
-- `DLLAMA_DEBUG_ATT_QK_DIMS`（整数，默认 `16`；`0` full headDim）
-- `DLLAMA_DEBUG_ATT_QK_TOPK`（整数，默认 `5`）
-- `DLLAMA_DEBUG_ATT_QK_POS`（整数，默认 `-1`：所有 pos；`>=0`：仅该 pos）
+- `EDGEVISOR_DEBUG_ATT_QK`（数值解析；非 0 启用）
+- `EDGEVISOR_DEBUG_ATT_QK_DIMS`（整数，默认 `16`；`0` full headDim）
+- `EDGEVISOR_DEBUG_ATT_QK_TOPK`（整数，默认 `5`）
+- `EDGEVISOR_DEBUG_ATT_QK_POS`（整数，默认 `-1`：所有 pos；`>=0`：仅该 pos）
 
-- `DLLAMA_DEBUG_ATT_SCORES`（数值解析；非 0 启用）
-- `DLLAMA_DEBUG_ATT_SCORES_MAXLEN`（整数，默认 `64`；`0` full length（有 cap））
+- `EDGEVISOR_DEBUG_ATT_SCORES`（数值解析；非 0 启用）
+- `EDGEVISOR_DEBUG_ATT_SCORES_MAXLEN`（整数，默认 `64`；`0` full length（有 cap））
 
 ### 2.5 Matmul / RoPE I/O 摘要日志
 
-- `DLLAMA_DEBUG_MATMUL_IO`（存在即启用）
-- `DLLAMA_DEBUG_MATMUL_IO_FILTER`（子串过滤）
-- `DLLAMA_DEBUG_MATMUL_IO_LIMIT`（整数，默认 `20`；`0` 不限制）
-- `DLLAMA_DEBUG_MATMUL_IO_OUT_OFFSET`（整数，默认 `0`）
-- `DLLAMA_DEBUG_MATMUL_IO_OUT_LEN`（整数，默认 `64`；`0` 使用内部上限）
+- `EDGEVISOR_DEBUG_MATMUL_IO`（存在即启用）
+- `EDGEVISOR_DEBUG_MATMUL_IO_FILTER`（子串过滤）
+- `EDGEVISOR_DEBUG_MATMUL_IO_LIMIT`（整数，默认 `20`；`0` 不限制）
+- `EDGEVISOR_DEBUG_MATMUL_IO_OUT_OFFSET`（整数，默认 `0`）
+- `EDGEVISOR_DEBUG_MATMUL_IO_OUT_LEN`（整数，默认 `64`；`0` 使用内部上限）
 
-- `DLLAMA_DEBUG_ROPE_IO`（存在即启用）
-- `DLLAMA_DEBUG_ROPE_IO_FILTER`（子串过滤）
-- `DLLAMA_DEBUG_ROPE_IO_LIMIT`（整数，默认 `50`；`0` 不限制）
-- `DLLAMA_DEBUG_ROPE_IO_OFFSET`（整数，默认 `0`）
-- `DLLAMA_DEBUG_ROPE_IO_LEN`（整数，默认 `256`；`0` 使用内部上限）
+- `EDGEVISOR_DEBUG_ROPE_IO`（存在即启用）
+- `EDGEVISOR_DEBUG_ROPE_IO_FILTER`（子串过滤）
+- `EDGEVISOR_DEBUG_ROPE_IO_LIMIT`（整数，默认 `50`；`0` 不限制）
+- `EDGEVISOR_DEBUG_ROPE_IO_OFFSET`（整数，默认 `0`）
+- `EDGEVISOR_DEBUG_ROPE_IO_LEN`（整数，默认 `256`；`0` 使用内部上限）
 
 ### 2.6 同步与 KV 聚合验证
 
-- `DLLAMA_KV_AGGREGATE_PROOF`（存在即启用）
-- `DLLAMA_KV_AGGREGATE_PROOF_ALL_BATCHES`（存在即启用）
-- `DLLAMA_SYNC_TRACE`（存在即启用）
-- `DLLAMA_SYNC_PROFILE`（存在即启用；会启用 spin-wait barrier 做全线程 wall-time 计时）
+- `EDGEVISOR_KV_AGGREGATE_PROOF`（存在即启用）
+- `EDGEVISOR_KV_AGGREGATE_PROOF_ALL_BATCHES`（存在即启用）
+- `EDGEVISOR_SYNC_TRACE`（存在即启用）
+- `EDGEVISOR_SYNC_PROFILE`（存在即启用；会启用 spin-wait barrier 做全线程 wall-time 计时）
 
 ---
 
@@ -409,41 +409,41 @@ DLLAMA_DEBUG_ATTN=1 make dllama
 
 这些不是运行时 `getenv()` 读取，而是**编译期宏**，常见用法是通过 `make` 变量传入：
 
-- `DLLAMA_DEBUG_ATTN`（默认 `0`）
-  - 用法：`DLLAMA_DEBUG_ATTN=1 make dllama`
+- `EDGEVISOR_DEBUG_ATTN`（默认 `0`）
+  - 用法：`EDGEVISOR_DEBUG_ATTN=1 make edgevisor`
   - 作用：编译进大量 attention/KV/sync 的 tracing/调试分支（上面第 2 节的环境变量多数依赖它）。
 
-- `DLLAMA_DEBUG_ONLINE_CHANGE`（默认 `0`）
-  - 用法：`DLLAMA_DEBUG_ONLINE_CHANGE=1 make dllama`
+- `EDGEVISOR_DEBUG_ONLINE_CHANGE`（默认 `0`）
+  - 用法：`EDGEVISOR_DEBUG_ONLINE_CHANGE=1 make edgevisor`
   - 作用：输出 online plan apply / migration 的更详细日志。
 
-- `DLLAMA_CONTROL_LOG`（默认 `0`）
-  - 用法：`DLLAMA_CONTROL_LOG=1 make dllama`
+- `EDGEVISOR_CONTROL_LOG`（默认 `0`）
+  - 用法：`EDGEVISOR_CONTROL_LOG=1 make edgevisor`
   - 作用：打印 root 侧 control packet 发送日志。
 
 - `DEBUG_OP_INPUT_OUTPUT`（默认 `0`）
-  - 用法：`DEBUG_OP_INPUT_OUTPUT=1 make dllama`
+  - 用法：`DEBUG_OP_INPUT_OUTPUT=1 make edgevisor`
   - 作用：编译进 op 输入输出调试打印（用于算子级排查）。
 
 - `TOPK=1`（默认关闭）
-  - 用法：`TOPK=1 make dllama`
+  - 用法：`TOPK=1 make edgevisor`
   - 作用：编译进 TopK logits 调试能力；运行时再配合：
-    - `DLLAMA_DEBUG_LOGITS_BATCH`（整数；默认 `0`，`-1` 表示所有 batch）
+    - `EDGEVISOR_DEBUG_LOGITS_BATCH`（整数；默认 `0`，`-1` 表示所有 batch）
 
-- `DLLAMA_VULKAN`（通过 `make` 环境变量存在与否判断）
-  - 用法：`DLLAMA_VULKAN=1 make dllama` 或 `DLLAMA_VULKAN=1 make dllama-api`
+- `EDGEVISOR_VULKAN`（通过 `make` 环境变量存在与否判断）
+  - 用法：`EDGEVISOR_VULKAN=1 make edgevisor` 或 `EDGEVISOR_VULKAN=1 make edgevisor-api`
   - 作用：启用 Vulkan 相关代码与 shader 编译。
 
 ---
 
 ## 4) 脚本工具相关环境变量
 
-- `DLLAMA_SHARDING_UPDATE_FILE`（文件路径）
+- `EDGEVISOR_SHARDING_UPDATE_FILE`（文件路径）
   - 使用处：Python 工具 [src/sharding_scheduler.py](../src/sharding_scheduler.py) 与示例脚本 [examples/sharding-update.sh](../examples/sharding-update.sh)
-  - 作用：指定“sharding 请求文件”的路径（默认 `/tmp/dllama_sharding_req.txt`）。
+  - 作用：指定“sharding 请求文件”的路径（默认 `/tmp/edgevisor_sharding_req.txt`）。
   - 示例：
 
 ```bash
-export DLLAMA_SHARDING_UPDATE_FILE=/tmp/dllama_sharding_req.txt
+export EDGEVISOR_SHARDING_UPDATE_FILE=/tmp/edgevisor_sharding_req.txt
 python3 src/sharding_scheduler.py --plan 'layer=21 pos=4'
 ```

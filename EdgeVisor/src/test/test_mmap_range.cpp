@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 int main() {
-    char path[] = "/tmp/dllama-mmap-range-XXXXXX";
+    char path[] = "/tmp/edgevisor-mmap-range-XXXXXX";
     const int fd = mkstemp(path);
     assert(fd >= 0);
 

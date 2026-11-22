@@ -1,6 +1,6 @@
-# How to Run Distributed Llama on 💻 Linux, MacOS or Windows
+# How to Run EdgeVisor on 💻 Linux, MacOS or Windows
 
-This article describes how to run Distributed Llama on 4 devices, but you can also run it on 1, 2, 4, 8... devices. Please adjust the commands and topology according to your configuration.
+This article describes how to run EdgeVisor on 4 devices, but you can also run it on 1, 2, 4, 8... devices. Please adjust the commands and topology according to your configuration.
 
 ````
 [🔀 SWITCH OR ROUTER]
@@ -30,21 +30,21 @@ This article describes how to run Distributed Llama on 4 devices, but you can al
 
 2. Connect **🔸🔹 ALL** devices to your **🔀 SWITCH OR ROUTER** via Ethernet cable. If you're using only two devices, it's better to connect them directly without a switch.
 
-3. Clone this repository and compile Distributed Llama on **🔸🔹 ALL** devices:
+3. Clone this repository and compile EdgeVisor on **🔸🔹 ALL** devices:
 
 ```sh
-git clone https://github.com/b4rtaz/distributed-llama.git
-cd distributed-llama
-make dllama
-make dllama-api
+git clone https://github.com/wansongcc/EdgeVisor.git
+cd EdgeVisor/EdgeVisor
+make edgevisor
+make edgevisor-api
 ```
 
 ## Notes for ARM boards (Raspberry Pi / NVIDIA Jetson)
 
 - Recommended: compile *on the target device* (Raspberry Pi OS 64-bit / Jetson Linux aarch64).
 - If you need a **portable** binary that can run across different ARM CPUs (e.g. build on one Jetson and run on another Jetson/Pi), build with:
-  - `make DLLAMA_PORTABLE=1 dllama`
-  - `make DLLAMA_PORTABLE=1 dllama-api`
+  - `make EDGEVISOR_PORTABLE=1 edgevisor`
+  - `make EDGEVISOR_PORTABLE=1 edgevisor-api`
 - For Jetson GPU usage via Vulkan, see [docs/HOW_TO_RUN_GPU.md](./HOW_TO_RUN_GPU.md). When using `--gpu-index`, set `--nthreads 1`.
 
 4. Download the model to the **🔸 ROOT** device using the `launch.py` script. You don't need to download the model on worker devices.
@@ -58,17 +58,17 @@ python3 launch.py llama3_2_3b_instruct_q40 # Downloads the model to the root dev
 5. Start workers on all **🔹 WORKER** devices:
 
 ```sh
-./dllama worker --port 9999 --nthreads 4
+./edgevisor worker --port 9999 --nthreads 4
 ```
 
 6. Run the inference to test if everything works fine on the **🔸 ROOT** device:
 
 ```sh
-./dllama inference \
+./edgevisor inference \
   --prompt "Hello world" \
   --steps 32 \
-  --model models/llama3_2_3b_instruct_q40/dllama_model_llama3_2_3b_instruct_q40.m \
-  --tokenizer models/llama3_2_3b_instruct_q40/dllama_tokenizer_llama3_2_3b_instruct_q40.t \
+  --model models/llama3_2_3b_instruct_q40/edgevisor_model_llama3_2_3b_instruct_q40.m \
+  --tokenizer models/llama3_2_3b_instruct_q40/edgevisor_tokenizer_llama3_2_3b_instruct_q40.t \
   --buffer-float-type q80 \
   --nthreads 4 \
   --max-seq-len 4096 \
@@ -78,10 +78,10 @@ python3 launch.py llama3_2_3b_instruct_q40 # Downloads the model to the root dev
 7. To run the API server, start it on the **🔸 ROOT** device:
 
 ```sh
-./dllama-api \
+./edgevisor-api \
   --port 9999 \
-  --model models/llama3_2_3b_instruct_q40/dllama_model_llama3_2_3b_instruct_q40.m \
-  --tokenizer models/llama3_2_3b_instruct_q40/dllama_tokenizer_llama3_2_3b_instruct_q40.t \
+  --model models/llama3_2_3b_instruct_q40/edgevisor_model_llama3_2_3b_instruct_q40.m \
+  --tokenizer models/llama3_2_3b_instruct_q40/edgevisor_tokenizer_llama3_2_3b_instruct_q40.t \
   --buffer-float-type q80 \
   --nthreads 4 \
   --max-seq-len 4096 \

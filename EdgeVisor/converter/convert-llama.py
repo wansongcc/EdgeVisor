@@ -110,7 +110,7 @@ if __name__ == '__main__':
     targetFloatTypeStr = strFloatType(targetFloatType)
 
     modelName = os.path.basename(modelPath)
-    outputFileName = f'dllama_model_{modelName.lower()}_{targetFloatTypeStr}.m'
+    outputFileName = f'edgevisor_model_{modelName.lower()}_{targetFloatTypeStr}.m'
 
     print(f'Model name: {modelName}')
     print(f'Target float type: {targetFloatTypeStr}')

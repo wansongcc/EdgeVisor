@@ -43,7 +43,7 @@ if __name__ == '__main__':
         exit(1)
 
     modelPath = sys.argv[1]
-    outputFileName = 'dllama_tokenizer_llama3.t'
+    outputFileName = 'edgevisor_tokenizer_llama3.t'
 
     with open(modelPath, 'r') as inputFile:
         with open(outputFileName, 'wb') as outputFile:

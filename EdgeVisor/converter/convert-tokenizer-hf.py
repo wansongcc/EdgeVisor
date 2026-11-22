@@ -124,7 +124,7 @@ if __name__ == '__main__':
     if ('add_bos_token' in tokenizerConfig):
         addBos = tokenizerConfig['add_bos_token']
 
-    outputFileName = f'dllama_tokenizer_{name}.t'
+    outputFileName = f'edgevisor_tokenizer_{name}.t'
     with open(outputFileName, 'wb') as outputFile:
         writer.writeTokenizer(
             outputFile,

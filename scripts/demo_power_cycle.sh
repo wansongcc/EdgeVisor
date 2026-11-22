@@ -6,7 +6,7 @@
 #   bash /home/byh/B01/EdgeVisor-wansongcc/scripts/demo_power_cycle.sh --rebuild
 #
 # 二进制放在掉电也不会丢的目录：rog 用 /home/cc/ev_demo2，四台 Jetson 用 /home/jetson/ev_demo2。
-# Ctrl-C 会停掉五台机器上的 dllama。
+# Ctrl-C 会停掉五台机器上的 edgevisor。
 
 set -u
 
@@ -29,10 +29,10 @@ BUILD_DIR=/tmp/ev_demo2_build
 LOCAL_STARTER=/tmp/ev_demo2_start_worker.sh
 TYPESCRIPT=/tmp/ev_demo2_ui.typescript
 NEXT_FILE=/tmp/ev_demo2_next.txt
-MODEL_JETSON=/home/jetson/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
-TOK_JETSON=/home/jetson/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
-MODEL_ROG=/home/cc/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m
-TOK_ROG=/home/cc/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t
+MODEL_JETSON=/home/jetson/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m
+TOK_JETSON=/home/jetson/cc/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t
+MODEL_ROG=/home/cc/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m
+TOK_ROG=/home/cc/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1)
 LAB_SSH="ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_lab"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -77,7 +77,7 @@ remote() {
 stop_all() {
     local host
     for host in "$ROOT_HOST" "${WORKER_HOSTS[@]}"; do
-        remote "$host" 'pkill -x dllama >/dev/null 2>&1 || true' >/dev/null 2>&1 &
+        remote "$host" 'pkill -x edgevisor >/dev/null 2>&1 || true' >/dev/null 2>&1 &
     done
     wait || true
 }
@@ -89,7 +89,7 @@ on_exit() {
 on_interrupt() {
     trap - EXIT INT TERM
     printf '\n已中断。\n'
-    # 本地没有后台驱动要收，只把五台机器上的 dllama 停掉；放到后台跑，不在前台再开 ssh。
+    # 本地没有后台驱动要收，只把五台机器上的 edgevisor 停掉；放到后台跑，不在前台再开 ssh。
     stop_all >/dev/null 2>&1 &
     exit 130
 }
@@ -112,7 +112,7 @@ if ss -ltn 2>/dev/null | grep -q ':${PORT}'; then
     echo "already listening on ${PORT}"
     exit 0
 fi
-export DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3 DLLAMA_TCP_USER_TIMEOUT_MS=5000
+export EDGEVISOR_TCP_KEEPIDLE_S=2 EDGEVISOR_TCP_KEEPINTVL_S=1 EDGEVISOR_TCP_KEEPCNT=3 EDGEVISOR_TCP_USER_TIMEOUT_MS=5000
 python3 <<'PY'
 import os
 if os.fork() > 0:
@@ -125,7 +125,7 @@ os.dup2(log, 1)
 os.dup2(log, 2)
 null = os.open("/dev/null", os.O_RDONLY)
 os.dup2(null, 0)
-os.execv("./dllama", ["./dllama", "worker", "--port", "${PORT}",
+os.execv("./edgevisor", ["./edgevisor", "worker", "--port", "${PORT}",
                       "--model", "${MODEL_JETSON}",
                       "--nthreads", "1"])
 PY
@@ -175,8 +175,8 @@ need_build() {
     head="$(git -C "$REPO" rev-parse HEAD)"
     for host in "$ROOT_HOST" "${WORKER_HOSTS[@]}"; do
         dir="$(persist_dir "$host")"
-        if ! remote "$host" "test -x ${dir}/dllama"; then
-            say "$host 上没有可执行的 ${dir}/dllama，重新编译。"
+        if ! remote "$host" "test -x ${dir}/edgevisor"; then
+            say "$host 上没有可执行的 ${dir}/edgevisor，重新编译。"
             return 0
         fi
         rev="$(remote "$host" "cat ${dir}/source_rev 2>/dev/null" | tr -d '\r')"
@@ -191,41 +191,41 @@ need_build() {
 ensure_binaries() {
     local head rc host dir
     if ! need_build; then
-        say "使用五台机器持久目录里已有的 dllama（对应 HEAD $(git -C "$REPO" rev-parse --short HEAD)）。"
+        say "使用五台机器持久目录里已有的 edgevisor（对应 HEAD $(git -C "$REPO" rev-parse --short HEAD)）。"
         return 0
     fi
     head="$(git -C "$REPO" rev-parse HEAD)"
     say "同步源码到 rog:${BUILD_DIR}，先编 rog，再编 nx1，最后把 aarch64 二进制拷到其余三台..."
     "${SSH[@]}" rog "mkdir -p ${BUILD_DIR}"
     rsync -az \
-        --exclude '*.o' --exclude '*.d' --exclude 'dllama' --exclude 'dllama-api' \
+        --exclude '*.o' --exclude '*.d' --exclude 'edgevisor' --exclude 'edgevisor-api' \
         --exclude '*-test' --exclude '.git' \
         "${REPO}/EdgeVisor/" rog:${BUILD_DIR}/
     # 这一整段是长时间编译，不能用 remote 里那 12/15 秒的 timeout 包住。
     "${SSH[@]}" rog 'bash -s' << EOF
 set -e
 cd ${BUILD_DIR}
-DLLAMA_VULKAN=0 make dllama -j4 DLLAMA_CUDA=0
+EDGEVISOR_VULKAN=0 make edgevisor -j4 EDGEVISOR_CUDA=0
 mkdir -p ${ROG_DIR}
-cp ${BUILD_DIR}/dllama ${ROG_DIR}/dllama
-chmod +x ${ROG_DIR}/dllama
+cp ${BUILD_DIR}/edgevisor ${ROG_DIR}/edgevisor
+chmod +x ${ROG_DIR}/edgevisor
 printf '%s\n' '${head}' > ${ROG_DIR}/source_rev
 RSH="ssh -o BatchMode=yes -o ConnectTimeout=5 -o IdentitiesOnly=yes -i \$HOME/.ssh/id_ed25519_lab"
 rsync -az -e "\$RSH" \
-    --exclude '*.o' --exclude '*.d' --exclude 'dllama' --exclude 'dllama-api' \
+    --exclude '*.o' --exclude '*.d' --exclude 'edgevisor' --exclude 'edgevisor-api' \
     --exclude '*-test' --exclude '.git' \
     ${BUILD_DIR}/ jetson@192.168.137.13:${BUILD_DIR}/
-\$RSH -n jetson@192.168.137.13 'cd ${BUILD_DIR} && DLLAMA_VULKAN=0 make dllama -j4 DLLAMA_CUDA=0' </dev/null
+\$RSH -n jetson@192.168.137.13 'cd ${BUILD_DIR} && EDGEVISOR_VULKAN=0 make edgevisor -j4 EDGEVISOR_CUDA=0' </dev/null
 \$RSH -n jetson@192.168.137.13 'mkdir -p ${JETSON_DIR}' </dev/null
-rsync -az -e "\$RSH" jetson@192.168.137.13:${BUILD_DIR}/dllama /tmp/ev_demo2_aarch64_dllama
-rsync -az -e "\$RSH" /tmp/ev_demo2_aarch64_dllama jetson@192.168.137.13:${JETSON_DIR}/dllama
-\$RSH -n jetson@192.168.137.13 "chmod +x ${JETSON_DIR}/dllama && printf '%s\n' '${head}' > ${JETSON_DIR}/source_rev" </dev/null
+rsync -az -e "\$RSH" jetson@192.168.137.13:${BUILD_DIR}/edgevisor /tmp/ev_demo2_aarch64_edgevisor
+rsync -az -e "\$RSH" /tmp/ev_demo2_aarch64_edgevisor jetson@192.168.137.13:${JETSON_DIR}/edgevisor
+\$RSH -n jetson@192.168.137.13 "chmod +x ${JETSON_DIR}/edgevisor && printf '%s\n' '${head}' > ${JETSON_DIR}/source_rev" </dev/null
 for ip in 192.168.137.15 192.168.137.18 192.168.137.16; do
     \$RSH -n jetson@\$ip 'mkdir -p ${JETSON_DIR}' </dev/null
-    rsync -az -e "\$RSH" /tmp/ev_demo2_aarch64_dllama jetson@\$ip:${JETSON_DIR}/dllama
-    \$RSH -n jetson@\$ip "chmod +x ${JETSON_DIR}/dllama && printf '%s\n' '${head}' > ${JETSON_DIR}/source_rev" </dev/null
+    rsync -az -e "\$RSH" /tmp/ev_demo2_aarch64_edgevisor jetson@\$ip:${JETSON_DIR}/edgevisor
+    \$RSH -n jetson@\$ip "chmod +x ${JETSON_DIR}/edgevisor && printf '%s\n' '${head}' > ${JETSON_DIR}/source_rev" </dev/null
 done
-rm -f /tmp/ev_demo2_aarch64_dllama
+rm -f /tmp/ev_demo2_aarch64_edgevisor
 EOF
     rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -233,11 +233,11 @@ EOF
         return "$rc"
     fi
     # ssh 退出 0 只说明 rog 上那段脚本跑完了；heredoc 里任何一条命令读走标准输入都会让它提前结束。
-    # 所以再回读五台机器的持久目录，确认 aarch64 二进制真的落到了 ${JETSON_DIR}/dllama。
+    # 所以再回读五台机器的持久目录，确认 aarch64 二进制真的落到了 ${JETSON_DIR}/edgevisor。
     for host in "$ROOT_HOST" "${WORKER_HOSTS[@]}"; do
         dir="$(persist_dir "$host")"
-        if ! remote "$host" "test -x ${dir}/dllama"; then
-            say "$host 的持久目录里没有可执行的 ${dir}/dllama，编译产物没拷到位。"
+        if ! remote "$host" "test -x ${dir}/edgevisor"; then
+            say "$host 的持久目录里没有可执行的 ${dir}/edgevisor，编译产物没拷到位。"
             return 1
         fi
     done
@@ -263,7 +263,7 @@ say "${DROP_HOST} 重新上电以后，打开第二个终端跑下面这条命�
 say
 say "$(rejoin_command)"
 say
-say "同样的内容也写在 ${NEXT_FILE}。这一轮大约 6 到 10 分钟。Ctrl-C 会停掉五台机器上的 dllama。"
+say "同样的内容也写在 ${NEXT_FILE}。这一轮大约 6 到 10 分钟。Ctrl-C 会停掉五台机器上的 edgevisor。"
 say
 
 say "检查五台机器（经 rog 的 192.168.137.x）..."
@@ -290,7 +290,7 @@ for host in "${WORKER_HOSTS[@]}"; do
     install_worker_starter "$host"
 done
 
-say "停掉残留的 dllama..."
+say "停掉残留的 edgevisor..."
 stop_all
 sleep 1
 
@@ -315,7 +315,7 @@ say "${DROP_HOST} 回来后，在第二个终端里跑（同样的内容也在 $
 say "$(rejoin_command)"
 sleep 2
 
-"${SSH[@]}" -t rog "rm -f ${TYPESCRIPT}; cd ${ROG_DIR} && script -q -f -c 'DLLAMA_IGNORE_EOS=1 DLLAMA_BUBBLE_SHADOW_KV=1 DLLAMA_TCP_KEEPIDLE_S=2 DLLAMA_TCP_KEEPINTVL_S=1 DLLAMA_TCP_KEEPCNT=3 DLLAMA_TCP_USER_TIMEOUT_MS=5000 stdbuf -oL -eL ./dllama inference --model ${MODEL_ROG} --tokenizer ${TOK_ROG} --prompt Hi --steps ${STEPS} --temperature 0 --seed 1 --buffer-float-type q80 --max-seq-len 512 --nthreads 1 --ui --enable-pp-migration --workers ${WORKERS}' ${TYPESCRIPT}"
+"${SSH[@]}" -t rog "rm -f ${TYPESCRIPT}; cd ${ROG_DIR} && script -q -f -c 'EDGEVISOR_IGNORE_EOS=1 EDGEVISOR_BUBBLE_SHADOW_KV=1 EDGEVISOR_TCP_KEEPIDLE_S=2 EDGEVISOR_TCP_KEEPINTVL_S=1 EDGEVISOR_TCP_KEEPCNT=3 EDGEVISOR_TCP_USER_TIMEOUT_MS=5000 stdbuf -oL -eL ./edgevisor inference --model ${MODEL_ROG} --tokenizer ${TOK_ROG} --prompt Hi --steps ${STEPS} --temperature 0 --seed 1 --buffer-float-type q80 --max-seq-len 512 --nthreads 1 --ui --enable-pp-migration --workers ${WORKERS}' ${TYPESCRIPT}"
 ui_rc=$?
 
 say
@@ -324,5 +324,5 @@ say "${DROP_HOST} 还没回来的话，在第二个终端里跑（同样的内�
 say "$(rejoin_command)"
 say "---- rog 日志里的接管 / 重连 ----"
 remote rog "tr -d '\\r' < ${TYPESCRIPT} 2>/dev/null | grep -aE 'takeover deadNode|dropout node=|rejoining|rejoined|ambiguous|inference stopped|\\[e1-end\\]|tokens/s' | grep -av redundant-infer" || true
-say "界面进程退出码 ${ui_rc}。五台 dllama 正在停掉。"
+say "界面进程退出码 ${ui_rc}。五台 edgevisor 正在停掉。"
 exit "$ui_rc"

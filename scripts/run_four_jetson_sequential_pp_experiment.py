@@ -78,7 +78,7 @@ class Run:
         self.ssh(host,"nohup %s > /tmp/%s.log 2>&1 & echo $!"%(cmd,tag),"injections/%s.log"%tag)
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--socket",default="/tmp/dllama_plan_pp_auto.sock"); p.add_argument("--run-id",required=True); p.add_argument("--output-dir",required=True)
+    p=argparse.ArgumentParser(); p.add_argument("--socket",default="/tmp/edgevisor_plan_pp_auto.sock"); p.add_argument("--run-id",required=True); p.add_argument("--output-dir",required=True)
     p.add_argument("--p1",type=int,required=True); p.add_argument("--p2",type=int,required=True); p.add_argument("--p3",type=int,required=True); p.add_argument("--p4",type=int,required=True)
     p.add_argument("--network-interface",required=True); p.add_argument("--netem",default="delay 200ms 30ms loss 5%"); p.add_argument("--compute-duration",type=int,default=120); p.add_argument("--timeout",type=int,default=180); p.add_argument("--poll-seconds",type=float,default=0.5)
     p.add_argument("--ssh-options",default=""); p.add_argument("--root-cli",default=""); p.add_argument("--worker-cli",default=""); p.add_argument("--dry-run",action="store_true"); a=p.parse_args(); r=Run(a)

@@ -30,7 +30,7 @@
 #include <map>
 
 static void appendMigrationTpotLog(const std::string &line) {
-    const char *path = std::getenv("DLLAMA_TPOT_LOG");
+    const char *path = std::getenv("EDGEVISOR_TPOT_LOG");
     if (path == nullptr || path[0] == '\0') return;
     std::ofstream f(path, std::ios::app);
     if (!f) return;
@@ -38,7 +38,7 @@ static void appendMigrationTpotLog(const std::string &line) {
 }
 
 static bool microbatchTraceEnabled() {
-    const char *v = std::getenv("DLLAMA_MICROBATCH_TRACE");
+    const char *v = std::getenv("EDGEVISOR_MICROBATCH_TRACE");
     if (v == nullptr || v[0] == '\0') return false;
     return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 && std::strcmp(v, "False") != 0;
 }
@@ -105,7 +105,7 @@ static void computeLogitsStats(const float* logits, NnUint vocabSize,
 }
 
 static bool debugRootLogitsSplitEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_ROOT_LOGITS_SPLIT");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_ROOT_LOGITS_SPLIT");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -178,7 +178,7 @@ static void printRootLogitsSplitStats(const char* phase, NnUint pos, const float
 }
 
 static bool debugSyncTopkEnabled() {
-    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_SYNC_TOPK");
     if (v == nullptr) return false;
     if (v[0] == '0') return false;
     if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return false;
@@ -186,7 +186,7 @@ static bool debugSyncTopkEnabled() {
 }
 
 static NnUint debugSyncTopkK() {
-    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK_K");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_SYNC_TOPK_K");
     if (v == nullptr || v[0] == '\0') return 10u;
     long n = std::strtol(v, nullptr, 10);
     if (n <= 0) return 10u;
@@ -195,17 +195,17 @@ static NnUint debugSyncTopkK() {
 }
 
 static const char* debugSyncTopkTag() {
-    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK_TAG");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_SYNC_TOPK_TAG");
     return (v == nullptr || v[0] == '\0') ? "unknown" : v;
 }
 
 static const char* debugSyncTopkMode() {
-    const char *v = std::getenv("DLLAMA_DEBUG_SYNC_TOPK_MODE");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_SYNC_TOPK_MODE");
     return (v == nullptr || v[0] == '\0') ? "print" : v;
 }
 
 static const char* debugSyncTopkFile() {
-    return std::getenv("DLLAMA_DEBUG_SYNC_TOPK_FILE");
+    return std::getenv("EDGEVISOR_DEBUG_SYNC_TOPK_FILE");
 }
 
 static bool debugSyncTopkModeIs(const char* mode) {
@@ -424,8 +424,8 @@ static void debugSyncTopkTrace(const float* logits, NnUint vocabSize, const char
     printSyncTopkTrace(phase, pos, batchIndex, ids, vals);
 }
 
-#ifndef DLLAMA_DEBUG_TOPK_LOGITS
-#define DLLAMA_DEBUG_TOPK_LOGITS 0
+#ifndef EDGEVISOR_DEBUG_TOPK_LOGITS
+#define EDGEVISOR_DEBUG_TOPK_LOGITS 0
 #endif
 
 /* computeLogitsStats walks the whole vocabulary (128K floats on llama3) and its
@@ -434,16 +434,16 @@ static void debugSyncTopkTrace(const float* logits, NnUint vocabSize, const char
  * inference runs at level 0 with TOPK compiled out, so the scan is pure
  * per-token overhead there and must not run. */
 static bool logitsStatsNeeded() {
-#if DLLAMA_DEBUG_TOPK_LOGITS
+#if EDGEVISOR_DEBUG_TOPK_LOGITS
     return true;
 #else
     return productLogLevel() >= 1 || debugRootLogitsSplitEnabled();
 #endif
 }
 
-#if DLLAMA_DEBUG_TOPK_LOGITS
+#if EDGEVISOR_DEBUG_TOPK_LOGITS
 static int debugLogitsBatchSelect() {
-    const char *v = std::getenv("DLLAMA_DEBUG_LOGITS_BATCH");
+    const char *v = std::getenv("EDGEVISOR_DEBUG_LOGITS_BATCH");
     if (v == nullptr || *v == '\0') return 0; // default: batch 0
     return std::atoi(v); // -1 => all batches
 }
@@ -893,7 +893,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     int nInputTokens;
     context->tokenizer->encode(const_cast<char*>(effectivePrompt.c_str()), inputTokens, &nInputTokens, true, true);
 
-#if DLLAMA_DEBUG_TOPK_LOGITS
+#if EDGEVISOR_DEBUG_TOPK_LOGITS
     if (context->tokenizer->vocabSize != context->header->vocabSize) {
         printf("⚠️ Tokenizer vocabSize=%u != Model vocabSize=%u (强烈怀疑 tokenizer/model 不匹配)\n",
             context->tokenizer->vocabSize,
@@ -986,7 +986,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     const NnUint migrationWindowTokens = 20u;
     const NnUint predPhaseStartPos = (NnUint)(nInputTokens - 1);
     MigrationTpotSummary migrationTpotSummary;
-    const bool tokenTimingPrint = dllamaTokenTimingPrintEnabled();
+    const bool tokenTimingPrint = edgevisorTokenTimingPrintEnabled();
     if (context->args->benchmark) {
         perfAgg.resize(nNodes);
     }
@@ -1075,7 +1075,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             computeLogitsStats(logitsRow, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex, zeroCount);
         }
 
-#if DLLAMA_DEBUG_TOPK_LOGITS
+#if EDGEVISOR_DEBUG_TOPK_LOGITS
         debugValidateLogits(logits, vocabSize, hasNaN, hasInf, minLogit, maxLogit, maxIndex);
 
 
@@ -1148,11 +1148,11 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     // forward(), worker/profile waits, sampling/decoding, and token output/flush.
     if (context->args->showTerminalUi) edgeVisorUiOpen();
     const auto predWallStart = std::chrono::steady_clock::now();
-    dllama::dynamic_tpot::algo2ResetTokenClock();
+    edgevisor::dynamic_tpot::algo2ResetTokenClock();
     // Anchor timestamps for every position a degradation can start at. The
     // matrix injects several faults in one episode, so one mark is not enough.
     std::vector<NnUint> markPositions;
-    if (const char *mark = std::getenv("DLLAMA_MARK_POS")) {
+    if (const char *mark = std::getenv("EDGEVISOR_MARK_POS")) {
         std::stringstream ss{std::string(mark)};
         std::string item;
         while (std::getline(ss, item, ',')) {
@@ -1198,7 +1198,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
     auto recordProfileForToken = [&](const std::vector<LlmPerfPacket> &perf, NnUint tokenPos) {
         if (tokenTimingPrint) {
             for (const LlmPerfPacket& p : perf) {
-                DllamaTokenNodeTiming timing;
+                EdgeVisorTokenNodeTiming timing;
                 timing.nodeIndex = p.nodeIndex;
                 timing.stageIndex = p.stageIndex;
                 timing.hasStage = true;
@@ -1591,7 +1591,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
             }
         }
 
-#if DLLAMA_DEBUG_TOPK_LOGITS
+#if EDGEVISOR_DEBUG_TOPK_LOGITS
         // 预测阶段：前若干步打印 topK，快速判断 logits 是否“像正常语言模型”
         {
             char tag[64];
@@ -1641,7 +1641,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         } catch (const NnPeerTimeoutException &e) {
             armSessionRestart(e.peerNodeIndex, true);
         }
-        dllama::dynamic_tpot::algo2NoteTokenComplete((NnUint)pos, pos + 1u, true);
+        edgevisor::dynamic_tpot::algo2NoteTokenComplete((NnUint)pos, pos + 1u, true);
         context->inference->pollRevisedSwitchReconcile();
         // Per-token completion timestamps. The matrix measures "trigger to the
         // first token emitted on the new route", which needs the emission time
@@ -1696,7 +1696,7 @@ static void inferenceRunOnce(AppInferenceContext *context, const char* prompt, N
         }
         predTotalTime += predTime + syncTime + predBubbleTime;
         if (eosType == EOS) {
-            const char *ignoreEos = std::getenv("DLLAMA_IGNORE_EOS");
+            const char *ignoreEos = std::getenv("EDGEVISOR_IGNORE_EOS");
             if (ignoreEos == nullptr || ignoreEos[0] != '1') {
                 pos++;
                 break;
@@ -1892,10 +1892,10 @@ static unsigned long long episodeNowMs() {
 }
 
 static const char *episodeEventLogPath() {
-    const char *path = std::getenv("DLLAMA_EPISODE_EVENT_LOG");
+    const char *path = std::getenv("EDGEVISOR_EPISODE_EVENT_LOG");
     if (path != nullptr && path[0] != '\0') return path;
-    // Preserve older replay invocations that only provide DLLAMA_EPISODE_LOG.
-    return std::getenv("DLLAMA_EPISODE_LOG");
+    // Preserve older replay invocations that only provide EDGEVISOR_EPISODE_LOG.
+    return std::getenv("EDGEVISOR_EPISODE_LOG");
 }
 
 static void appendEpisodeEvent(const char *eventType, unsigned int round, NnUint pos,
@@ -1965,7 +1965,7 @@ static bool parseEpisodeScript(const char *path, std::string &prompt, std::vecto
 }
 
 static bool episodeRollbackContinuationEnabled() {
-    const char *value = std::getenv("DLLAMA_E5_CONTINUE_AFTER_ROLLBACK");
+    const char *value = std::getenv("EDGEVISOR_E5_CONTINUE_AFTER_ROLLBACK");
     if (value == nullptr) return false;
     return std::strcmp(value, "1") == 0 ||
         std::strcmp(value, "true") == 0 ||
@@ -2018,11 +2018,11 @@ static int episodeForwardAndSample(AppInferenceContext *context, NnUint pos, int
     const double wallMs = std::chrono::duration<double, std::milli>(wallEnd - wallStart).count();
     std::printf("[episode-token] phase=%s round=%u pos=%u input=%d output=%d wall_ms=%.2f\n",
         phase, round, (unsigned)pos, inputToken, sampledToken, wallMs);
-    if (dllamaTokenTimingPrintEnabled()) {
+    if (edgevisorTokenTimingPrintEnabled()) {
         const std::string e2eLine = formatTokenE2eTimingLine((unsigned int)pos, sampledToken, wallMs);
         std::printf("%s\n", e2eLine.c_str());
         for (const LlmPerfPacket &packet : perf) {
-            DllamaTokenNodeTiming timing;
+            EdgeVisorTokenNodeTiming timing;
             timing.nodeIndex = packet.nodeIndex;
             timing.stageIndex = packet.stageIndex;
             timing.hasStage = true;
@@ -2103,7 +2103,7 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
     std::string prompt;
     std::vector<EpisodeRound> rounds;
     if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
-        throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
+        throw std::runtime_error("Cannot read a valid episode script from EDGEVISOR_EPISODE_SCRIPT");
     }
     // The round count used to be pinned to five because every formal run had
     // five. Different agent workloads have different tool-call cadences, so the
@@ -2126,11 +2126,11 @@ static void inferenceRunEpisodeScript(AppInferenceContext *context, const char *
         appendEpisodeEvent("tool_wait_start", roundNumber, pos, round.toolWaitMs, 0u);
         const auto waitStart = std::chrono::steady_clock::now();
         unsigned long long toolShadowUs = 0u;
-        if (std::getenv("DLLAMA_TOOL_WINDOW_SHADOW") != nullptr) {
+        if (std::getenv("EDGEVISOR_TOOL_WINDOW_SHADOW") != nullptr) {
             toolShadowUs = context->inference->runToolWindowShadow();
             appendEpisodeEvent("tool_shadow_run", roundNumber, pos, 0u, toolShadowUs);
         }
-        if (std::getenv("DLLAMA_BACKGROUND_PRECOPY") != nullptr) {
+        if (std::getenv("EDGEVISOR_BACKGROUND_PRECOPY") != nullptr) {
             // Hold ownership until the migration trigger. The copy is the
             // prefix; the trigger sends the delta and switches.
             const unsigned long long bgUs = context->inference->runBackgroundPreCopy(pos, true);
@@ -2266,7 +2266,7 @@ static const char *msPhaseName(MsPhase phase) {
 // P0 batched decode: one forward covers k runnable sessions (k >= 1), each
 // item carrying its own KV slot (SLT pipe), position (POS pipe) and token.
 // Per-item greedy sampling reads the [batch][vocab] logits pipe row i.
-// Enabled only when DLLAMA_MS_DECODE_BATCH > 1; the default scheduler below
+// Enabled only when EDGEVISOR_MS_DECODE_BATCH > 1; the default scheduler below
 // remains exactly the validated batch=1 path.
 static void msForwardBatchAndSample(AppInferenceContext *context,
                                     std::vector<MsSessionState *> &states) {
@@ -2311,7 +2311,7 @@ static void msForwardBatchAndSample(AppInferenceContext *context,
 }
 
 // Batched decode scheduler. Mirrors the round-robin scheduler state machine,
-// but gathers every runnable session (up to DLLAMA_MS_DECODE_BATCH) into one
+// but gathers every runnable session (up to EDGEVISOR_MS_DECODE_BATCH) into one
 // forward. Tool-wait deadline handling and tool-window ShadowKV behaviour are
 // identical. Returns true when all sessions completed.
 static bool inferenceRunMultiSessionEpisodeBatched(AppInferenceContext *context,
@@ -2439,19 +2439,19 @@ static void inferenceRunMultiSessionEpisode(AppInferenceContext *context, const 
     std::string prompt;
     std::vector<EpisodeRound> rounds;
     if (!parseEpisodeScript(scriptPath, prompt, rounds)) {
-        throw std::runtime_error("Cannot read a valid episode script from DLLAMA_EPISODE_SCRIPT");
+        throw std::runtime_error("Cannot read a valid episode script from EDGEVISOR_EPISODE_SCRIPT");
     }
     if (rounds.empty()) {
         throw std::runtime_error("Episode script declares no ROUND records");
     }
     if (sessionCount < 1u || sessionCount > 64u) {
-        throw std::runtime_error("DLLAMA_MULTI_SESSION_COUNT must be within 1..64");
+        throw std::runtime_error("EDGEVISOR_MULTI_SESSION_COUNT must be within 1..64");
     }
     if (context->args->maxActiveSeqs < sessionCount) {
-        throw std::runtime_error("--max-active-seqs must be >= DLLAMA_MULTI_SESSION_COUNT on every node");
+        throw std::runtime_error("--max-active-seqs must be >= EDGEVISOR_MULTI_SESSION_COUNT on every node");
     }
-    const bool toolWindowShadow = std::getenv("DLLAMA_TOOL_WINDOW_SHADOW") != nullptr;
-    const char *msBatchEnv = std::getenv("DLLAMA_MS_DECODE_BATCH");
+    const bool toolWindowShadow = std::getenv("EDGEVISOR_TOOL_WINDOW_SHADOW") != nullptr;
+    const char *msBatchEnv = std::getenv("EDGEVISOR_MS_DECODE_BATCH");
     unsigned int decodeBatchSize = 1u;
     if (msBatchEnv != nullptr && msBatchEnv[0] != '\0') {
         decodeBatchSize = (unsigned int)std::strtoul(msBatchEnv, nullptr, 10);
@@ -2499,7 +2499,7 @@ static void inferenceRunMultiSessionEpisode(AppInferenceContext *context, const 
         appendMsEvent("generation_start", s, 1u, state.pos, 0u, 0u);
     }
 
-    // P0 batched decode path (DLLAMA_MS_DECODE_BATCH > 1). Gathers runnable
+    // P0 batched decode path (EDGEVISOR_MS_DECODE_BATCH > 1). Gathers runnable
     // sessions into shared forwards; the default batch=1 scheduler below is
     // untouched and remains the validated reference path.
     if (decodeBatchSize > 1u) {
@@ -2647,8 +2647,8 @@ static bool parseStepsCommand(const std::string& line, NnUint& outSteps) {
 }
 
 static void inference(AppInferenceContext *context) {
-    const char *episodeScript = std::getenv("DLLAMA_EPISODE_SCRIPT");
-    const char *multiSessionCount = std::getenv("DLLAMA_MULTI_SESSION_COUNT");
+    const char *episodeScript = std::getenv("EDGEVISOR_EPISODE_SCRIPT");
+    const char *multiSessionCount = std::getenv("EDGEVISOR_MULTI_SESSION_COUNT");
     if (episodeScript != nullptr && episodeScript[0] != '\0' &&
         multiSessionCount != nullptr && multiSessionCount[0] != '\0') {
         const unsigned int count = (unsigned int)std::strtoul(multiSessionCount, nullptr, 10);
@@ -2716,7 +2716,7 @@ static void inference(AppInferenceContext *context) {
 // E2E Matmul-View Zero-Offset Check (Inference Mode)
 //
 // Enable via env var:
-//   DLLAMA_E2E_MATMUL_VIEW0_CHECK=1
+//   EDGEVISOR_E2E_MATMUL_VIEW0_CHECK=1
 //
 // What it does:
 // - Run prompt eval stage twice in two independent runInferenceApp() invocations.
@@ -3103,7 +3103,7 @@ static void printCliUsage(const char *argv0) {
         "  --debug\n"
         "\n"
         "Build:\n"
-        "  make dllama                      enables CUDA and Vulkan when the toolchains exist\n",
+        "  make edgevisor                      enables CUDA and Vulkan when the toolchains exist\n",
         argv0, argv0, argv0, argv0);
 }
 
@@ -3125,9 +3125,9 @@ int main(int argc, char **argv) {
         } else if (std::strcmp(args.mode, "inference") == 0) {
             if (productLogLevel() >= 1)
                 printf("workers=%d\n", args.nWorkers);
-            if (envFlagEnabled("DLLAMA_E2E_MATMUL_VIEW0_CHECK")) {
+            if (envFlagEnabled("EDGEVISOR_E2E_MATMUL_VIEW0_CHECK")) {
                 if (args.nWorkers != 0) {
-                    throw std::runtime_error("DLLAMA_E2E_MATMUL_VIEW0_CHECK currently requires single-node run (--n-workers 0)");
+                    throw std::runtime_error("EDGEVISOR_E2E_MATMUL_VIEW0_CHECK currently requires single-node run (--n-workers 0)");
                 }
 
                 printf("🧪 [E2E View0] Running prompt-eval twice: (A) clear matmul views, (B) keep matmul views\n");

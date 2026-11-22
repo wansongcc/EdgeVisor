@@ -14,6 +14,7 @@ def parts(length):
     return result
 
 # [['model-url-0', 'model-url-1', ...], 'tokenizer-url', 'weights-float-type', 'buffer-float-type', 'model-type']
+# Upstream assets retain their original dllama_* names; local files use edgevisor_*.
 MODELS = {
     'llama3_1_8b_instruct_q40': [
         ['https://huggingface.co/b4rtaz/Llama-3_1-8B-Q40-Instruct-Distributed-Llama/resolve/main/dllama_model_llama3.1_instruct_q40.m?download=true'],
@@ -122,8 +123,8 @@ def download(modelName: str, model: list):
     os.makedirs(dirPath, exist_ok=True)
     modelUrls = model[0]
     tokenizerUrl = model[1]
-    modelPath = os.path.join(dirPath, f'dllama_model_{modelName}.m')
-    tokenizerPath = os.path.join(dirPath, f'dllama_tokenizer_{modelName}.t')
+    modelPath = os.path.join(dirPath, f'edgevisor_model_{modelName}.m')
+    tokenizerPath = os.path.join(dirPath, f'edgevisor_tokenizer_{modelName}.t')
     downloadFile(modelUrls, modelPath)
     downloadFile([tokenizerUrl], tokenizerPath)
     print('📀 All files are downloaded')
@@ -167,14 +168,14 @@ if __name__ == '__main__':
 
     nThreads = multiprocessing.cpu_count()
     if (model[4] == 'chat'):
-        command = './dllama chat'
+        command = './edgevisor chat'
     else:
-        command = './dllama inference --steps 64 --prompt "Hello world"'
+        command = './edgevisor inference --steps 64 --prompt "Hello world"'
     command += f' --model {modelPath} --tokenizer {tokenizerPath} --buffer-float-type {model[3]} --nthreads {nThreads}'
     if (len(model) > 5):
         command += f' {model[5]}'
 
-    print('To run Distributed Llama you need to execute:')
+    print('To run EdgeVisor you need to execute:')
     print('--- copy start ---')
     print()
     print('\033[96m' + command + '\033[0m')
@@ -189,7 +190,7 @@ if __name__ == '__main__':
         print(f'🌻 Created {runFilePath} script to easy run')
 
     if (not skipRun):
-        if (confirm('Do you want to run Distributed Llama?')):
-            if (not os.path.isfile('dllama')):
-                os.system('make dllama')
+        if (confirm('Do you want to run EdgeVisor?')):
+            if (not os.path.isfile('edgevisor')):
+                os.system('make edgevisor')
             os.system(command)

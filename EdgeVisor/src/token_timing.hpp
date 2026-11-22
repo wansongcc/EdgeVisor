@@ -3,7 +3,7 @@
 
 #include <string>
 
-struct DllamaTokenNodeTiming {
+struct EdgeVisorTokenNodeTiming {
     unsigned int nodeIndex = 0u;
     unsigned int stageIndex = 0u;
     bool hasStage = false;
@@ -12,8 +12,8 @@ struct DllamaTokenNodeTiming {
     unsigned long long bubbleUs = 0ull;
 };
 
-bool dllamaTokenTimingPrintEnabled();
+bool edgevisorTokenTimingPrintEnabled();
 std::string formatTokenE2eTimingLine(unsigned int pos, int token, double wallMs);
-std::string formatTokenNodeTimingLine(unsigned int pos, const DllamaTokenNodeTiming &timing);
+std::string formatTokenNodeTimingLine(unsigned int pos, const EdgeVisorTokenNodeTiming &timing);
 
 #endif

@@ -4,24 +4,24 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  # 1) 推荐：source 进当前 shell，自动 export DLLAMA_SHARDING_UPDATE_FILE
-  source examples/sharding-update.sh -f /tmp/dllama_shard_update.txt \
+  # 1) 推荐：source 进当前 shell，自动 export EDGEVISOR_SHARDING_UPDATE_FILE
+  source examples/sharding-update.sh -f /tmp/edgevisor_shard_update.txt \
     -l 9 -p 0 -n 2,3,4 -H 8,12,12
 
   # 2) 不 source：只写文件并 touch 触发更新（export 只在脚本进程内生效）
-  examples/sharding-update.sh -f /tmp/dllama_shard_update.txt \
+  examples/sharding-update.sh -f /tmp/edgevisor_shard_update.txt \
     -l 9 -p 0 -n 2,3,4 -H 8,12,12
 
   # 3) 不 source 但想设置环境变量：打印 export 语句
-  examples/sharding-update.sh --print-export -f /tmp/dllama_shard_update.txt
+  examples/sharding-update.sh --print-export -f /tmp/edgevisor_shard_update.txt
 
 Options:
-  -f <path>   请求文件路径（DLLAMA_SHARDING_UPDATE_FILE 指向它）
+  -f <path>   请求文件路径（EDGEVISOR_SHARDING_UPDATE_FILE 指向它）
   -l <u32>    layerIndex
   -p <u32>    pos（可选，默认 0）
   -n <csv>    stage_nodes（例如 2,3,4）
   -H <csv>    head_lens（例如 8,12,12；必须与 stage_nodes 数量一致）
-  --print-export  仅打印 export DLLAMA_SHARDING_UPDATE_FILE=...（不写文件）
+  --print-export  仅打印 export EDGEVISOR_SHARDING_UPDATE_FILE=...（不写文件）
   -h          显示帮助
 
 Notes:
@@ -67,7 +67,7 @@ if [[ -z "$FILE" ]]; then
 fi
 
 if [[ "$PRINT_EXPORT" == "1" ]]; then
-  printf 'export DLLAMA_SHARDING_UPDATE_FILE=%q\n' "$FILE"
+  printf 'export EDGEVISOR_SHARDING_UPDATE_FILE=%q\n' "$FILE"
   exit 0
 fi
 
@@ -86,11 +86,11 @@ if [[ "${#_nodes[@]}" -ne "${#_lens[@]}" ]]; then
 fi
 
 # Export env var if sourced, otherwise only in this process.
-export DLLAMA_SHARDING_UPDATE_FILE="$FILE"
+export EDGEVISOR_SHARDING_UPDATE_FILE="$FILE"
 if is_sourced; then
   : # exported into caller shell
 else
-  echo "[info] DLLAMA_SHARDING_UPDATE_FILE exported only for this script process." >&2
+  echo "[info] EDGEVISOR_SHARDING_UPDATE_FILE exported only for this script process." >&2
   echo "[info] If you want it in your current shell: source examples/sharding-update.sh ..." >&2
 fi
 

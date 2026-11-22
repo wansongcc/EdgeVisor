@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """EdgeVisor PP 层迁移 / 算力扰动实验数据记录脚本。
 
-从 dllama root 进程的 stdout 日志（如 root_gpu0.log）中解析一次完整实验，
+从 edgevisor root 进程的 stdout 日志（如 root_gpu0.log）中解析一次完整实验，
 产出两个文件：
 
   * <name>_<时间戳>_tokens.csv —— 逐 token 时序表（e2e wall、各 node/stage exec、
@@ -31,7 +31,7 @@
 ----
   python3 record_migration_experiment.py path/to/root_gpu0.log
   python3 record_migration_experiment.py - < root_gpu0.log          # stdin
-  dllama inference ... 2>&1 | python3 record_migration_experiment.py - --name disturb_run1
+  edgevisor inference ... 2>&1 | python3 record_migration_experiment.py - --name disturb_run1
   python3 record_migration_experiment.py run.log --onset-pos 233 --meta disturbance=gpu_node2
 """
 

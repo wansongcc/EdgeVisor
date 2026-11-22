@@ -14,8 +14,8 @@ __pycache__
 main
 run*.sh
 server
-/dllama
-/dllama-*
+/edgevisor
+/edgevisor-*
 *.exe
 *.spv
 .vscode/launch.json
@@ -25,4 +25,4 @@ server
 *.bak
 *.bak_*
 *.pre_*
-dllama.pre_*
+edgevisor.pre_*

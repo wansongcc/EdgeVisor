@@ -15,7 +15,7 @@ class RootLlmInference;
 // - Runs an embedded kv_reused-style optimizer and issues set_plan via UDS.
 class DynamicLayerController {
 public:
-	// Enabled by setting env: DLLAMA_DYNAMIC_LAYER_ENABLE=1
+	// Enabled by setting env: EDGEVISOR_DYNAMIC_LAYER_ENABLE=1
 	static std::unique_ptr<DynamicLayerController> start(const std::string &socketPath, RootLlmInference *inference);
 
 	~DynamicLayerController();

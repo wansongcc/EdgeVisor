@@ -5,28 +5,28 @@
 # leaves the overlap with the previous stage would log front=[8,11).
 set -u
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="${BIN:-$ROOT_DIR/EdgeVisor/dllama}"
-MODEL="${MODEL:-/home/byh/B01/models/llama3.2_3b_instruct_q40/dllama_model_llama3.2-3b-instruct_q40.m}"
-TOK="${TOK:-/home/byh/B01/models/llama3.1_instruct_q40/dllama_tokenizer_llama_3_1.t}"
+BIN="${BIN:-$ROOT_DIR/EdgeVisor/edgevisor}"
+MODEL="${MODEL:-/home/byh/B01/models/llama3.2_3b_instruct_q40/edgevisor_model_llama3.2-3b-instruct_q40.m}"
+TOK="${TOK:-/home/byh/B01/models/llama3.1_instruct_q40/edgevisor_tokenizer_llama_3_1.t}"
 DIR="${DIR:-$ROOT_DIR/experiments/algo2/logs/t4_rejoin}"
 mkdir -p "$DIR"
 rm -f "$DIR"/*.log "$DIR"/*.txt
 
-export DLLAMA_IGNORE_EOS=1
-export DLLAMA_BUBBLE_SHADOW_KV=1
-export DLLAMA_BUBBLE_SHADOW_KV_ASYNC=0
-export DLLAMA_BUBBLE_SHADOW_KV_DURING_FORWARD=1
-export DLLAMA_REDUNDANT_BOUNDARY_DEPTHS='3,1;1,3;1,1'
-export DLLAMA_TCP_KEEPIDLE_S=2
-export DLLAMA_TCP_KEEPINTVL_S=1
-export DLLAMA_TCP_KEEPCNT=3
-export DLLAMA_TCP_USER_TIMEOUT_MS=4000
+export EDGEVISOR_IGNORE_EOS=1
+export EDGEVISOR_BUBBLE_SHADOW_KV=1
+export EDGEVISOR_BUBBLE_SHADOW_KV_ASYNC=0
+export EDGEVISOR_BUBBLE_SHADOW_KV_DURING_FORWARD=1
+export EDGEVISOR_REDUNDANT_BOUNDARY_DEPTHS='3,1;1,3;1,1'
+export EDGEVISOR_TCP_KEEPIDLE_S=2
+export EDGEVISOR_TCP_KEEPINTVL_S=1
+export EDGEVISOR_TCP_KEEPCNT=3
+export EDGEVISOR_TCP_USER_TIMEOUT_MS=4000
 # One root layer sleeps 80ms, so stage 0 is several times slower than stage 2.
-export DLLAMA_TEST_COMPUTE_DELAY_US=80000
-export DLLAMA_TEST_COMPUTE_DELAY_NODE=0
-export DLLAMA_TEST_COMPUTE_DELAY_LAYER=2
-export DLLAMA_TEST_COMPUTE_DELAY_DECODE_ONLY=1
-export DLLAMA_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS=4
+export EDGEVISOR_TEST_COMPUTE_DELAY_US=80000
+export EDGEVISOR_TEST_COMPUTE_DELAY_NODE=0
+export EDGEVISOR_TEST_COMPUTE_DELAY_LAYER=2
+export EDGEVISOR_TEST_COMPUTE_DELAY_DECODE_ONLY=1
+export EDGEVISOR_TEST_COMPUTE_DELAY_AFTER_DECODE_TOKENS=4
 
 P1=29241
 P2=29242
